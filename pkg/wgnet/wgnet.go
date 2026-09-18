@@ -9,6 +9,7 @@
 package wgnet
 
 import (
+	"context"
 	"fmt"
 	"net"
 	"net/netip"
@@ -22,7 +23,6 @@ import (
 	"gvisor.dev/gvisor/pkg/tcpip"
 	"gvisor.dev/gvisor/pkg/tcpip/adapters/gonet"
 	"gvisor.dev/gvisor/pkg/tcpip/header"
-	"gvisor.dev/gvisor/pkg/waiter"
 	"gvisor.dev/gvisor/pkg/tcpip/link/channel"
 	"gvisor.dev/gvisor/pkg/tcpip/network/ipv4"
 	"gvisor.dev/gvisor/pkg/tcpip/network/ipv6"
@@ -30,6 +30,7 @@ import (
 	"gvisor.dev/gvisor/pkg/tcpip/transport/icmp"
 	"gvisor.dev/gvisor/pkg/tcpip/transport/tcp"
 	"gvisor.dev/gvisor/pkg/tcpip/transport/udp"
+	"gvisor.dev/gvisor/pkg/waiter"
 )
 
 // Net：兼具 tun.Device（交给 wireguard-go device）与拨号/监听面（gVisor gonet）。
@@ -45,7 +46,7 @@ type Net struct {
 // Create 装配 netstack：SACK 开、Nagle 关。
 func Create(localAddresses []netip.Addr, mtu int) (tun.Device, *Net, error) {
 	n := &Net{
-		ep:       channel.New(1024, uint32(mtu), ""),
+		ep: channel.New(1024, uint32(mtu), ""),
 		stack: stack.New(stack.Options{
 			NetworkProtocols:   []stack.NetworkProtocolFactory{ipv4.NewProtocol, ipv6.NewProtocol},
 			TransportProtocols: []stack.TransportProtocolFactory{tcp.NewProtocol, udp.NewProtocol, icmp.NewProtocol4, icmp.NewProtocol6},
@@ -108,8 +109,8 @@ func (n *Net) WriteNotify() {
 
 // ---------- tun.Device（给 wireguard-go 的 NewDevice） ----------
 
-func (n *Net) Name() (string, error) { return "wgnet", nil }
-func (n *Net) File() *os.File        { return nil }
+func (n *Net) Name() (string, error)    { return "wgnet", nil }
+func (n *Net) File() *os.File           { return nil }
 func (n *Net) Events() <-chan tun.Event { return n.events }
 
 func (n *Net) Read(buf [][]byte, sizes []int, offset int) (int, error) {
@@ -164,6 +165,13 @@ func (n *Net) BatchSize() int { return 1 }
 // SetDelayOption(true)，false 被无视）⇒ 必须逐端点关。
 
 func (n *Net) DialTCPAddrPort(addr netip.AddrPort) (*gonet.TCPConn, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	return n.DialTCPAddrPortCtx(ctx, addr)
+}
+
+// DialTCPAddrPortCtx：可取消的拨号（取消/超时即时关端点，不给上层留悬挂 socket）。
+func (n *Net) DialTCPAddrPortCtx(ctx context.Context, addr netip.AddrPort) (*gonet.TCPConn, error) {
 	fa, netProto := fullAddr(addr)
 	var wq waiter.Queue
 	ep, err := n.stack.NewEndpoint(tcp.ProtocolNumber, netProto, &wq)
@@ -180,9 +188,9 @@ func (n *Net) DialTCPAddrPort(addr netip.AddrPort) (*gonet.TCPConn, error) {
 	if _, ok := err.(*tcpip.ErrConnectStarted); ok {
 		select {
 		case <-notifyCh:
-		case <-time.After(15 * time.Second):
+		case <-ctx.Done():
 			ep.Close()
-			return nil, fmt.Errorf("wgnet: connect 超时")
+			return nil, fmt.Errorf("wgnet: connect 取消: %w", ctx.Err())
 		}
 		err = ep.LastError()
 	}
@@ -255,10 +263,19 @@ func (l *Listener) Addr() net.Addr {
 	return &net.TCPAddr{IP: net.IP(a.Addr.AsSlice()), Port: int(a.Port)}
 }
 
+// ListenUDPAddrPort：未连接（监听型）UDP socket —— 可以 ReadFrom/WriteTo 任意对端。
+// ⚠️ raddr 必须传 nil：传 &FullAddress{} 会把 socket「连接」到 0.0.0.0:0，
+// 之后 WriteTo 的目标被忽略 ⇒ 数据报无声消失（上游 netstack.ListenUDPAddrPort 就是传 nil）。
 func (n *Net) ListenUDPAddrPort(addr netip.AddrPort) (*gonet.UDPConn, error) {
 	fa, netProto := fullAddr(addr)
-	zero := tcpip.FullAddress{}
-	return gonet.DialUDP(n.stack, &fa, &zero, netProto)
+	return gonet.DialUDP(n.stack, &fa, nil, netProto)
+}
+
+// DialUDPAddrPort：已连接 UDP socket（固定对端，读写不需要地址；对称于 gonet.DialUDP）。
+func (n *Net) DialUDPAddrPort(laddr, raddr netip.AddrPort) (*gonet.UDPConn, error) {
+	fa, netProto := fullAddr(laddr)
+	ra, _ := fullAddr(raddr)
+	return gonet.DialUDP(n.stack, &fa, &ra, netProto)
 }
 
 func fullAddr(ap netip.AddrPort) (tcpip.FullAddress, tcpip.NetworkProtocolNumber) {

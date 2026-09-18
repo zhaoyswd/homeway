@@ -37,6 +37,12 @@ const (
 	ErrCodeProto   = "proto"
 )
 
+// RemoteError：服务端以 ERR <code> 拒绝（code 见 ErrCode*）。
+// 上层按 code 做中文归因（files/端口转发/终端共用），不要靠字符串匹配。
+type RemoteError struct{ Code string }
+
+func (e *RemoteError) Error() string { return "flows: 远端拨号失败 code=" + e.Code }
+
 // ---------- CONNECT 编解码 ----------
 
 // WriteConnect 写入 CONNECT 首行。
@@ -96,7 +102,7 @@ func ReadResponse(r *bufio.Reader) error {
 		return nil
 	}
 	if code, ok := strings.CutPrefix(line, "ERR "); ok {
-		return fmt.Errorf("flows: 远端拨号失败 code=%s", code)
+		return &RemoteError{Code: code}
 	}
 	return fmt.Errorf("%w: 未知响应 %q", errProto, line)
 }
