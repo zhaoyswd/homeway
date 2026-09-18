@@ -8,7 +8,7 @@
 package main
 
 import (
-	"encoding/hex"
+	"context"
 	"flag"
 	"fmt"
 	"os"
@@ -18,9 +18,6 @@ import (
 
 	"github.com/zhaoyswd/homeway/internal/server"
 	"github.com/zhaoyswd/homeway/pkg/proto"
-	"golang.zx2c4.com/wireguard/device"
-	"golang.zx2c4.com/wireguard/tun/tuntest"
-	"golang.zx2c4.com/wireguard/wgctrl/wgtypes"
 )
 
 const version = "0.0.0-dev"
@@ -108,73 +105,18 @@ func mustEps(eps []proto.Endpoint, err error) []proto.Endpoint {
 
 func cmdServe(args []string) error {
 	fs := flag.NewFlagSet("serve", flag.ExitOnError)
-	stateDir := fs.String("state", defaultStateDir(), "state 目录")
+	stateDir := fs.String("state", defaultStateDir(), "state 目录（身份密钥+token 台账）")
 	listen := fs.Uint("listen", 41641, "WG 监听端口")
 	verbose := fs.Bool("verbose", false, "打印 wireguard-go 详细日志")
 	fs.Parse(args)
 
-	st, err := server.OpenState(*stateDir)
-	if err != nil {
-		return err
-	}
-	priv, err := st.PrivateKey()
-	if err != nil {
-		return err
-	}
-	secrets, err := st.Secrets()
-	if err != nil {
-		return err
-	}
-
-	// WG device：内存 tun（netstack 接管在 3.3）+ ServerBind + 动态 peer 表
-	tun := tuntest.NewChannelTUN()
-	level := device.LogLevelError
-	if *verbose {
-		level = device.LogLevelVerbose
-	}
-	sbind := &server.ServerBind{Logf: logf}
-	dev := device.NewDevice(tun.TUN(), sbind, device.NewLogger(level, "homewayd"))
-	defer dev.Close()
-
-	// deviceConfigurer：把 PeerTable 的表项落到 device（IpcSet）。
-	dc := &deviceConfigurer{dev: dev}
-	table := server.NewPeerTable(dc, secrets, 8, 0)
-	sbind.Table = table
-
-	if err := dev.IpcSet(fmt.Sprintf("private_key=%s\nlisten_port=%d\n", hex.EncodeToString(priv[:]), *listen)); err != nil {
-		return err
-	}
-	if err := dev.Up(); err != nil { // FINDINGS 0.1-1：NewDevice 后必须显式 Up()
-		return err
-	}
-
-	// 隧道内出站包（当前无流服务，drain 记日志防阻塞）
-	go func() {
-		for pkt := range tun.Outbound {
-			logf("tun outbound %d bytes（流服务未接入，丢弃）", len(pkt))
-		}
-	}()
-
-	pub := priv.PublicKey()
-	logf("serve 就绪：port=%d peers(已签发token)=%d key=%s…（issue 子命令出 token）", *listen, len(secrets), shortB64(pub[:]))
-
-	ch := make(chan os.Signal, 1)
-	signal.Notify(ch, os.Interrupt, syscall.SIGTERM)
-	<-ch
-	logf("退出")
-	return nil
-}
-
-type deviceConfigurer struct{ dev *device.Device }
-
-func (d *deviceConfigurer) AddPeer(pc server.PeerConfig) error {
-	return d.dev.IpcSet(fmt.Sprintf(
-		"public_key=%s\npreshared_key=%s\nallowed_ip=%s/32\npersistent_keepalive_interval=%d\n",
-		hex.EncodeToString(pc.Pubkey[:]), hex.EncodeToString(pc.PSK[:]), pc.TunnelIP, pc.Keepalive))
-}
-
-func (d *deviceConfigurer) RemovePeer(pub [32]byte) error {
-	return d.dev.IpcSet(fmt.Sprintf("public_key=%s\nremove=true\n", hex.EncodeToString(pub[:])))
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	return server.Run(ctx, server.ServeConfig{
+		StateDir:   *stateDir,
+		ListenPort: uint16(*listen),
+		Verbose:    *verbose,
+	})
 }
 
 func defaultStateDir() string {
@@ -199,4 +141,3 @@ func shortB64(b []byte) string {
 	return fmt.Sprintf("%x", b)
 }
 
-var _ = wgtypes.Key{} // 保留引用（后续流服务使用）
