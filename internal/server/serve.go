@@ -4,8 +4,10 @@ import (
 	"context"
 	"encoding/hex"
 	"fmt"
+	"net"
 	"net/netip"
 
+	"github.com/zhaoyswd/homeway/pkg/files"
 	"github.com/zhaoyswd/homeway/pkg/flows"
 	"github.com/zhaoyswd/homeway/pkg/wgnet"
 	"golang.zx2c4.com/wireguard/device"
@@ -17,6 +19,7 @@ const (
 	DefaultTunnelIP   = "100.64.255.1"
 	DefaultFlowPort   = uint16(7800) // TCP CONNECT 流
 	DefaultUDPFlowPrt = uint16(7801) // UDP 数据报（DNS 等）
+	DefaultFilesPort  = uint16(7802) // files 原生协议（后端本机 127.0.0.1）
 )
 
 type ServeConfig struct {
@@ -25,6 +28,8 @@ type ServeConfig struct {
 	TunnelIP    netip.Addr
 	FlowPort    uint16
 	UDPFlowPort uint16
+	FilesPort   uint16 // files 服务在本机的监听端口（客户端经流协议 CONNECT 到它）
+	FilesRoot   string // files 根（空 = 用户主目录；协议恒读写）
 	Verbose     bool
 }
 
@@ -41,6 +46,9 @@ func (c *ServeConfig) fill() {
 	if c.UDPFlowPort == 0 {
 		c.UDPFlowPort = DefaultUDPFlowPrt
 	}
+	if c.FilesPort == 0 {
+		c.FilesPort = DefaultFilesPort
+	}
 }
 
 // Server：homewayd 的完整数据面装配（netstack + WG device + ServerBind + PeerTable + flows）。
@@ -52,6 +60,8 @@ type Server struct {
 	dev     *device.Device
 	stopTCP func()
 	stopUDP func()
+	filesLn net.Listener
+	files   *files.Server
 }
 
 // Start 装配并启动（非阻塞）。
@@ -107,6 +117,29 @@ func Start(cfg ServeConfig) (*Server, error) {
 	}
 	s.stopUDP, _ = flows.ServeUDP(udpPC, s.Stats)
 
+	// files 原生协议服务：只监听本机回环（客户端经内部流的 CONNECT 让后端按本机网络重拨到这里）。
+	// 根 = 用户主目录、恒读写（协议无参数）；启动打一行根目录判据。
+	fsrv, err := files.Open(cfg.FilesRoot)
+	if err != nil {
+		s.Close()
+		return nil, fmt.Errorf("files 根目录不可用：%w", err)
+	}
+	fsrv.SetLogger(logf)
+	fln, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", cfg.FilesPort))
+	if err != nil {
+		fsrv.Close()
+		s.Close()
+		return nil, fmt.Errorf("files 监听 %d 失败：%w", cfg.FilesPort, err)
+	}
+	s.filesLn, s.files = fln, fsrv
+	go func() {
+		if err := fsrv.Serve(fln); err != nil {
+			logf("files 服务收工：%v", err)
+		}
+	}()
+	rootDir := fsrv.RootDir()
+	logf("files 就绪：root=%s (rw) listen=127.0.0.1:%d", rootDir, cfg.FilesPort)
+
 	if err := s.dev.Up(); err != nil { // FINDINGS 0.1-1
 		s.Close()
 		return nil, err
@@ -127,6 +160,12 @@ func (s *Server) Close() {
 	}
 	if s.dev != nil {
 		s.dev.Close()
+	}
+	if s.filesLn != nil {
+		s.filesLn.Close()
+	}
+	if s.files != nil {
+		s.files.Close()
 	}
 }
 
