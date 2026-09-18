@@ -4,7 +4,7 @@
 //
 // 设计要点（见 openspec exit-terminal 设计 D3–D8）：
 //   - **会话由出口持有**：客户端断开只摘泵、不杀进程；重进 attach 先回放有界历史。
-//   - 默认开启（只要服务里有 exit-node）、零 CLI 旗标；调参走 TAILCAT_TERM_* 环境变量。
+//   - 默认开启（只要服务里有 exit-node）、零 CLI 旗标；调参走 HOMEWAY_TERM_* 环境变量。
 //   - 历史是**输出字节环**（不存输入）⇒ 回放不会重复用户敲过的命令；
 //     回放窗口 = 尾部优先 + 时间预算，起点对齐行边界/ESC，attach 完成后用**尺寸哨兵**逼 TUI 重绘。
 //   - 私有模式位与 OSC 标题由旁路扫描器维护（term_modes.go），随 ATTACHED/STATE 下发。
@@ -59,9 +59,9 @@ type termConfig struct {
 	detect      bool
 }
 
-// termDisabledByEnv：TAILCAT_TERM=off 是唯一的关闭方式（刻意不做 CLI 旗标）。
+// termDisabledByEnv：HOMEWAY_TERM=off 是唯一的关闭方式（刻意不做 CLI 旗标）。
 func termDisabledByEnv() bool {
-	return strings.EqualFold(strings.TrimSpace(os.Getenv("TAILCAT_TERM")), "off")
+	return strings.EqualFold(strings.TrimSpace(os.Getenv("HOMEWAY_TERM")), "off")
 }
 
 func termEnvInt(name string, def int) int {
@@ -78,13 +78,13 @@ func termEnvInt(name string, def int) int {
 
 func termConfigFromEnv() termConfig {
 	cfg := termConfig{
-		port:        uint16(termEnvInt("TAILCAT_TERM_PORT", termDefaultPort)),
-		shell:       strings.TrimSpace(os.Getenv("TAILCAT_TERM_SHELL")),
-		history:     termEnvInt("TAILCAT_TERM_HISTORY", termDefaultHistory),
-		replay:      termEnvInt("TAILCAT_TERM_REPLAY", termDefaultReplay),
-		replayEpoch: strings.ToLower(strings.TrimSpace(os.Getenv("TAILCAT_TERM_REPLAY_EPOCH"))),
-		maxSessions: termEnvInt("TAILCAT_TERM_MAX_SESSIONS", termDefaultMaxSessions),
-		detect:      !strings.EqualFold(strings.TrimSpace(os.Getenv("TAILCAT_TERM_DETECT")), "off"),
+		port:        uint16(termEnvInt("HOMEWAY_TERM_PORT", termDefaultPort)),
+		shell:       strings.TrimSpace(os.Getenv("HOMEWAY_TERM_SHELL")),
+		history:     termEnvInt("HOMEWAY_TERM_HISTORY", termDefaultHistory),
+		replay:      termEnvInt("HOMEWAY_TERM_REPLAY", termDefaultReplay),
+		replayEpoch: strings.ToLower(strings.TrimSpace(os.Getenv("HOMEWAY_TERM_REPLAY_EPOCH"))),
+		maxSessions: termEnvInt("HOMEWAY_TERM_MAX_SESSIONS", termDefaultMaxSessions),
+		detect:      !strings.EqualFold(strings.TrimSpace(os.Getenv("HOMEWAY_TERM_DETECT")), "off"),
 	}
 	if cfg.replayEpoch != "last" {
 		cfg.replayEpoch = "all"
@@ -293,7 +293,7 @@ func New(logf Logf) *termService {
 func (s *termService) Port() uint16      { return s.cfg.port }
 func (s *termService) ShellText() string { return loginShell() }
 
-// Disabled 报告环境变量是否显式关闭了终端服务（TAILCAT_TERM=off）。
+// Disabled 报告环境变量是否显式关闭了终端服务（HOMEWAY_TERM=off）。
 func Disabled() bool { return termDisabledByEnv() }
 
 // FeaturesText 本构建支持的终端能力位（就绪行里打出来，供运维核对）。
@@ -909,13 +909,13 @@ func (s *termService) attachOrCreate(name string, cols, rows uint16, create bool
 //
 // 两种模式都走**登录 shell + 环境白名单**（见「登录 shell 与登录环境」一节）：
 //   - 默认：`shell -l`（交互式登录 shell，rc 文件决定 PATH 等）
-//   - TAILCAT_TERM_SHELL：`shell -lc '<命令>'`（例如 tmux；profile 里的 PATH 同样生效，
+//   - HOMEWAY_TERM_SHELL：`shell -lc '<命令>'`（例如 tmux；profile 里的 PATH 同样生效，
 //     所以 homebrew 装的 tmux 在 macOS 上也找得到）
 func (s *termService) spawnLocked(name string, cols, rows uint16) (*termSession, error) {
 	shell := loginShell()
 	var cmd *exec.Cmd
 	if s.cfg.shell != "" {
-		// TAILCAT_TERM_SHELL：一条命令（例如 tmux new -A -s tier / screen -dR）。
+		// HOMEWAY_TERM_SHELL：一条命令（例如 tmux new -A -s tier / screen -dR）。
 		// ⚠️ 不要退回硬编码的 /bin/sh：distroless 之类没有 /bin/sh 的镜像里那条逃生口会直接死。
 		cmd = exec.Command(shell, "-lc", s.cfg.shell)
 	} else {

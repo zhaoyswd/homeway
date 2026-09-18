@@ -6,7 +6,7 @@ import (
 	"testing"
 )
 
-var goldenToken = "aG13MQECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8g__79_Pv6-fj39vX08_Lx8O_u7ezr6uno5-bl5OPi4eADABIxOTIuMTY4LjMuMTI6NDE2NDEAFmV4aXQuZXhhbXBsZS5uZXQ6NDE2NDEBEzEyMy41Ni4yMTguMjEyOjQ0MzC8B8pm"
+var goldenToken = "hmw1AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyD__v38-_r5-Pf29fTz8vHw7-7t7Ovq6ejn5uXk4-Lh4AMAEjE5Mi4xNjguMy4xMjo0MTY0MQAWZXhpdC5leGFtcGxlLm5ldDo0MTY0MQETMTIzLjU2LjIxOC4yMTI6NDQzMKbgCFU"
 
 var goldenFields = Token{
 	PeerID: func() [32]byte {
@@ -61,21 +61,28 @@ func TestTokenGoldenRoundTrip(t *testing.T) {
 	}
 }
 
-func TestTokenLegacyTailcat(t *testing.T) {
-	if _, err := DecodeToken("tcpGFwWCB3A0uFakeOldTailcatAddress000000"); !errors.Is(err, ErrLegacyTailcat) {
-		t.Fatalf("err = %v, want ErrLegacyTailcat", err)
+func TestTokenWrongPrefix(t *testing.T) {
+	// 旧 tailcat 地址、随便一段 base64、空串：都不是 homeway token ⇒ 格式错误
+	for _, s := range []string{"tcpGFwWCB3A0uFakeOldTailcatAddress000000", "aG13MABCDEF", ""} {
+		if _, err := DecodeToken(s); !errors.Is(err, ErrMalformed) {
+			t.Fatalf("DecodeToken(%q) err = %v, want ErrMalformed", s, err)
+		}
 	}
 }
 
 func TestTokenCorrupted(t *testing.T) {
-	// 改一个字符（中段）
+	// 改一个字符（中段，仍在 base64url 字符集内 ⇒ 走 crc 判据）
 	b := []byte(goldenToken)
-	b[40] ^= 1
+	if b[40] == 'A' {
+		b[40] = 'B'
+	} else {
+		b[40] = 'A'
+	}
 	if _, err := DecodeToken(string(b)); !errors.Is(err, ErrCorrupted) {
 		t.Fatalf("err = %v, want ErrCorrupted", err)
 	}
-	// 截断（尾部砍 6 字符）
-	if _, err := DecodeToken(goldenToken[:len(goldenToken)-6]); !errors.Is(err, ErrCorrupted) {
+	// 截断：砍掉尾部 4 个 base64 字符（长度仍合法）⇒ 载荷短了、crc 对不上
+	if _, err := DecodeToken(goldenToken[:len(goldenToken)-4]); !errors.Is(err, ErrCorrupted) {
 		t.Fatalf("err = %v, want ErrCorrupted", err)
 	}
 }
@@ -85,26 +92,17 @@ func TestTokenMalformed(t *testing.T) {
 	if _, err := DecodeToken("hmw1+++++++"); !errors.Is(err, ErrMalformed) {
 		t.Fatalf("err = %v, want ErrMalformed", err)
 	}
-	// 未知 magic
-	enc, _ := EncodeToken(goldenFields)
-	flipMagic := []byte(enc)
-	// 解开改首字节再编码成本高，直接构造："xxw1..." 合法 base64 但 magic 不符
-	bad := "eHh3MQ" + strings.Repeat("A", 100)
-	if _, err := DecodeToken(bad); !errors.Is(err, ErrMalformed) {
+	// 合法 base64 但没有 hmw1 前缀
+	if _, err := DecodeToken("xxw1"+strings.Repeat("A", 100)); !errors.Is(err, ErrMalformed) {
 		t.Fatalf("err = %v, want ErrMalformed", err)
 	}
-	_ = flipMagic
 }
 
 func TestTokenUnsupportedVersion(t *testing.T) {
-	// 用解码-改版本位-重编码构造 hmw2
-	raw := mustDecode(t, goldenToken)
-	raw[3] = '2'
-	enc2 := b64url(raw)
-	if _, err := DecodeToken(enc2); !errors.Is(err, ErrUnsupportedVersion) {
+	// 版本位在**可见前缀**里：hmw2… 直接报版本不支持（载荷根本不用解）
+	if _, err := DecodeToken("hmw2" + strings.Repeat("A", 100)); !errors.Is(err, ErrUnsupportedVersion) {
 		t.Fatalf("err = %v, want ErrUnsupportedVersion", err)
 	}
-	// 版本改了 crc 不再匹配也应先报版本（版本检查在 crc 前）
 }
 
 func TestTokenEncodeRejectsBadEndpoints(t *testing.T) {

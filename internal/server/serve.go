@@ -165,9 +165,9 @@ func Start(cfg ServeConfig) (*Server, error) {
 	logf("files 就绪：root=%s (rw) listen=127.0.0.1:%d", rootDir, cfg.FilesPort)
 
 	// 终端会话 / agent gateway：只监听本机回环，客户端经内部流 CONNECT 到 127.0.0.1:<TermPort>。
-	// 会话由后端持有（客户端断开只摘泵，不杀进程）；开关 TAILCAT_TERM=off，调参 TAILCAT_TERM_*。
+	// 会话由后端持有（客户端断开只摘泵，不杀进程）；开关 HOMEWAY_TERM=off，调参 HOMEWAY_TERM_*。
 	if term.Disabled() {
-		logf("term 服务被 TAILCAT_TERM=off 关闭")
+		logf("term 服务被 HOMEWAY_TERM=off 关闭")
 	} else {
 		tsrv := term.New(logf)
 		tln, terr := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", cfg.TermPort))

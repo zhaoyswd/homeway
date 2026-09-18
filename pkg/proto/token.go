@@ -1,12 +1,13 @@
 // Package proto 定义 homeway 的线上契约（两仓库唯一真源）：
 // token（凭证）、注册报文（reg）、中继帧（frame）。
 //
-// token 布局（裸二进制，整体 base64url 编码）：
+// token 布局（可见前缀 + base64url(裸二进制)）：
 //
-//	"hmw1"(4B) ‖ peerId(32B) ‖ secret(32B) ‖ epCount(1B) ‖ [type(1B)+len(1B)+addr]* ‖ crc(4B)
+//	"hmw1" ‖ base64url( peerId(32B) ‖ secret(32B) ‖ epCount(1B) ‖ [type(1B)+len(1B)+addr]* ‖ crc(4B) )
 //
 // peerId = 后端静态 WG 公钥；secret = 凭证种子（派生临时钥注册 HMAC / WG PSK）；
 // type：0=direct 1=relay；addr = "host:port"（host 可为域名）；crc = SHA-256(前文)[:4]。
+// 版本进可见前缀（"hmw2" = 下一版）：粘贴前就能看出是哪一代，未知前缀直接报错。
 package proto
 
 import (
@@ -19,19 +20,17 @@ import (
 )
 
 const (
-	// Magic + 版本。版本升级换尾字节（"hmw2"...），未知版本必须显式报错。
-	tokenMagic   = "hmw"
-	tokenVersion = byte('1')
+	// tokenPrefix 是**可见**前缀（版本位），后面跟 base64url 的裸载荷。
+	tokenPrefix = "hmw1"
 
-	tokenMinLen = 4 + 32 + 32 + 1 + 4 // magic+ver / peerId / secret / epCount / crc
+	tokenMinLen = 32 + 32 + 1 + 4 // peerId / secret / epCount / crc
 
 	EndpointTypeDirect = 0
 	EndpointTypeRelay  = 1
 )
 
-// 三类可区分的失败 + 一个兼容性特判。App 端按码归因（「串损坏」/「旧版地址」/「格式不对」）。
+// 三类可区分的失败。App 端按码归因（「串损坏」/「版本不对」/「格式不对」）。
 var (
-	ErrLegacyTailcat      = errors.New("homeway/token: 旧版 tailcat 地址，请粘贴 homeway token")
 	ErrCorrupted          = errors.New("homeway/token: 校验失败（串被截断或损坏）")
 	ErrUnsupportedVersion = errors.New("homeway/token: 不支持的 token 版本")
 	ErrMalformed          = errors.New("homeway/token: 格式非法")
@@ -76,7 +75,6 @@ func EncodeToken(t Token) (string, error) {
 	}
 
 	buf := make([]byte, 0, tokenMinLen+len(t.Endpoints)*3)
-	buf = append(buf, tokenMagic[0], tokenMagic[1], tokenMagic[2], tokenVersion)
 	buf = append(buf, t.PeerID[:]...)
 	buf = append(buf, t.Secret[:]...)
 	buf = append(buf, byte(len(t.Endpoints)))
@@ -90,16 +88,20 @@ func EncodeToken(t Token) (string, error) {
 	}
 	sum := sha256.Sum256(buf)
 	buf = append(buf, sum[0], sum[1], sum[2], sum[3])
-	return base64.RawURLEncoding.EncodeToString(buf), nil
+	return tokenPrefix + base64.RawURLEncoding.EncodeToString(buf), nil
 }
 
 // DecodeToken 解析并分类报错。深解析只应在 Go 侧发生（NAPI probe）；
 // App/ArkTS 侧只做表面检查（前缀、base64url 字符集、长度）。
 func DecodeToken(s string) (Token, error) {
-	if strings.HasPrefix(s, "tcp") {
-		return Token{}, ErrLegacyTailcat
+	s = strings.TrimSpace(s)
+	if strings.HasPrefix(s, "hmw") && !strings.HasPrefix(s, tokenPrefix) {
+		return Token{}, fmt.Errorf("%w: %s", ErrUnsupportedVersion, s[:4])
 	}
-	raw, err := base64.RawURLEncoding.DecodeString(strings.TrimRight(s, "="))
+	if !strings.HasPrefix(s, tokenPrefix) {
+		return Token{}, fmt.Errorf("%w: 缺少 %s 前缀", ErrMalformed, tokenPrefix)
+	}
+	raw, err := base64.RawURLEncoding.DecodeString(strings.TrimRight(s[len(tokenPrefix):], "="))
 	if err != nil {
 		return Token{}, fmt.Errorf("%w: %v", ErrMalformed, err)
 	}
@@ -110,12 +112,6 @@ func decodeTokenBytes(raw []byte) (Token, error) {
 	if len(raw) < tokenMinLen {
 		return Token{}, ErrCorrupted // 截断（含 base64 解码后过短）
 	}
-	if string(raw[:3]) != tokenMagic {
-		return Token{}, ErrMalformed
-	}
-	if raw[3] != tokenVersion {
-		return Token{}, fmt.Errorf("%w: v%c", ErrUnsupportedVersion, raw[3])
-	}
 	body := raw[:len(raw)-4]
 	sum := sha256.Sum256(body)
 	if raw[len(raw)-4] != sum[0] || raw[len(raw)-3] != sum[1] || raw[len(raw)-2] != sum[2] || raw[len(raw)-1] != sum[3] {
@@ -123,7 +119,7 @@ func decodeTokenBytes(raw []byte) (Token, error) {
 	}
 
 	var t Token
-	off := 4
+	off := 0
 	copy(t.PeerID[:], raw[off:])
 	off += 32
 	copy(t.Secret[:], raw[off:])

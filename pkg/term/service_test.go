@@ -27,14 +27,14 @@ func startTestTermService(t *testing.T) (*termService, net.Listener) {
 	return startTestTermServiceShell(t, testTermShell)
 }
 
-// startTestTermServiceShell 同 startTestTermService，但指定 TAILCAT_TERM_SHELL
+// startTestTermServiceShell 同 startTestTermService，但指定 HOMEWAY_TERM_SHELL
 // （"" = 走登录 shell 模式，和线上默认路径一致）。
 func startTestTermServiceShell(t *testing.T, shellCmd string) (*termService, net.Listener) {
 	t.Helper()
-	t.Setenv("TAILCAT_TERM_SHELL", shellCmd)
-	t.Setenv("TAILCAT_TERM_HISTORY", "65536")
-	t.Setenv("TAILCAT_TERM_REPLAY", "32768")
-	t.Setenv("TAILCAT_TERM_DETECT", "off")
+	t.Setenv("HOMEWAY_TERM_SHELL", shellCmd)
+	t.Setenv("HOMEWAY_TERM_HISTORY", "65536")
+	t.Setenv("HOMEWAY_TERM_REPLAY", "32768")
+	t.Setenv("HOMEWAY_TERM_DETECT", "off")
 	svc := New(nil)
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -372,7 +372,7 @@ func TestTermLoginEnvWhitelist(t *testing.T) {
 	t.Setenv("XPC_SERVICE_NAME", "me.zhaozhe.tailcat-exit")
 	t.Setenv("XPC_FLAGS", "1")
 	t.Setenv("OSLogRateLimit", "64")
-	t.Setenv("TAILCAT_TERM_DUMMY", "leak")
+	t.Setenv("HOMEWAY_TERM_DUMMY", "leak")
 	t.Setenv("SHELL", "/bin/false") // 服务环境的 $SHELL 不得直接进会话
 	t.Setenv("LANG", "zh_CN.UTF-8")
 	t.Setenv("SSH_AUTH_SOCK", "/var/run/agent.sock")
@@ -381,7 +381,7 @@ func TestTermLoginEnvWhitelist(t *testing.T) {
 	env := termLoginEnv("/bin/zsh", "tailcat-s1")
 	got := func(k string) string { return termEnvLookup(env, k) }
 
-	for _, k := range []string{"XPC_SERVICE_NAME", "XPC_FLAGS", "OSLogRateLimit", "TAILCAT_TERM_DUMMY"} {
+	for _, k := range []string{"XPC_SERVICE_NAME", "XPC_FLAGS", "OSLogRateLimit", "HOMEWAY_TERM_DUMMY"} {
 		if v := got(k); v != "" {
 			t.Errorf("服务环境变量 %s=%q 泄漏进会话环境", k, v)
 		}
