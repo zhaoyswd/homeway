@@ -36,6 +36,7 @@ type ServeConfig struct {
 	TermPort     uint16        // 终端会话 / agent gateway 在本机的监听端口
 	FlowMaxConns int           // 内部流并发上限（0 = 默认 64）
 	FlowIdle     time.Duration // 内部流空闲回收（0 = 默认 30 分钟；终端会话腿也走这里，别设太短）
+	BuildTag     string        // 探测应答里回报的构建标记（空 = 用内置默认）
 	Verbose      bool
 }
 
@@ -106,7 +107,11 @@ func Start(cfg ServeConfig) (*Server, error) {
 	if cfg.Verbose {
 		level = device.LogLevelVerbose
 	}
-	sbind := &ServerBind{Logf: logf}
+	buildTag := cfg.BuildTag
+	if buildTag == "" {
+		buildTag = "homewayd-dev"
+	}
+	sbind := &ServerBind{Logf: logf, Build: buildTag}
 	s.dev = device.NewDevice(tunDev, sbind, device.NewLogger(level, "homewayd"))
 	s.Table = NewPeerTable(&ipcConfigurer{dev: s.dev}, secrets, 8, 0)
 	sbind.Table = s.Table

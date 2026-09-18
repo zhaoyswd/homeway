@@ -6,6 +6,7 @@ import (
 	"net/netip"
 	"time"
 
+	"github.com/zhaoyswd/homeway/pkg/probe"
 	"github.com/zhaoyswd/homeway/pkg/proto"
 	"golang.zx2c4.com/wireguard/conn"
 )
@@ -25,6 +26,7 @@ var nowTime = time.Now
 type ServerBind struct {
 	Port   uint16
 	Table  *PeerTable
+	Build  string            // 探测应答里回报的构建标记（就绪行/排障用）
 	OnHint func(addr string) // 中继观察到的客户端公网地址（打洞用，阶段 6）
 	Logf   func(format string, args ...any)
 
@@ -61,6 +63,13 @@ func (b *ServerBind) Open(port uint16) ([]conn.ReceiveFunc, uint16, error) {
 			src = netip.AddrPortFrom(src.Addr().Unmap(), src.Port())
 		}
 		buf := packets[0][:n]
+
+		// 参照点探测（tasks 3.6）：明文一问一答，不进 WG、不登记 peer、不碰会话状态。
+		// 客户端在「全部候选失败」时用它做三档归因（本机 / 链路 / 后端）。
+		if resp := probe.Respond(buf, src, b.Build); resp != nil {
+			_, _ = c.WriteToUDPAddrPort(resp, src)
+			return 0, nil
+		}
 
 		if len(buf) > 0 && buf[0] == 0xBB {
 			typ, payload, err := proto.DecodeFrame(buf)
