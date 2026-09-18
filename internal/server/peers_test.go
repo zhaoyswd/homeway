@@ -67,6 +67,14 @@ func TestPeerTableRegisterAndIdempotent(t *testing.T) {
 	if !found || !ip.IsValid() {
 		t.Fatalf("TunnelIP found=%v ip=%v", found, ip)
 	}
+	// 隧道地址 = 两端从临时公钥派生（tasks 3.7）：POST 的 allowed_ip 必须是它，
+	// 否则客户端（用派生地址做流侧源）的包会被 allowed_ip 检查丢掉。
+	if want := proto.DeriveTunnelIP(testSecret, pubN(1)); ip != want {
+		t.Fatalf("TunnelIP 应为派生地址：got=%v want=%v", ip, want)
+	}
+	if fc.added[pubN(1)].TunnelIP != ip {
+		t.Fatalf("AddPeer 的 allowed_ip 与表内地址不一致：%v vs %v", fc.added[pubN(1)].TunnelIP, ip)
+	}
 	// PSK 正确派生
 	if fc.added[pubN(1)].PSK != proto.DerivePSK(testSecret) {
 		t.Fatal("PSK 派生不匹配")
@@ -136,8 +144,8 @@ func TestIPPoolZeroValueSentinelRegression(t *testing.T) {
 	if !ip1.IsValid() || !ip2.IsValid() || ip1 == ip2 {
 		t.Fatalf("分配非法：%v %v", ip1, ip2)
 	}
-	if !ip1.Is4() || ip1.String() != "100.64.0.0" {
-		t.Fatalf("首个分配应为基址：%v", ip1)
+	if !ip1.Is4() || ip1.String() != "100.64.0.1" {
+		t.Fatalf("首个分配应为基址+1（网段地址 .0 不分配给主机）：%v", ip1)
 	}
 	p.Release(ip1)
 	// 回收的地址应优先复用（而非继续顺序分配）

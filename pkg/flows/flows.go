@@ -115,10 +115,10 @@ type Stats struct {
 	dialOK, dialFail, flows uint64
 }
 
-func (s *Stats) IncrOK()      { atomic.AddUint64(&s.dialOK, 1) }
-func (s *Stats) IncrFail()    { atomic.AddUint64(&s.dialFail, 1) }
-func (s *Stats) IncrFlow()    { atomic.AddUint64(&s.flows, 1) }
-func (s *Stats) DecrFlow()    { atomic.AddUint64(&s.flows, ^uint64(0)) }
+func (s *Stats) IncrOK()   { atomic.AddUint64(&s.dialOK, 1) }
+func (s *Stats) IncrFail() { atomic.AddUint64(&s.dialFail, 1) }
+func (s *Stats) IncrFlow() { atomic.AddUint64(&s.flows, 1) }
+func (s *Stats) DecrFlow() { atomic.AddUint64(&s.flows, ^uint64(0)) }
 func (s *Stats) Snapshot() map[string]uint64 {
 	return map[string]uint64{
 		"dialok":   atomic.LoadUint64(&s.dialOK),

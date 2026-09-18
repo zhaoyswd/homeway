@@ -96,7 +96,22 @@ func (t *PeerTable) Register(reg []byte, now time.Time) ([32]byte, error) {
 	if len(t.entries) >= t.cap {
 		t.evictLRULocked()
 	}
-	ip := t.pool.Acquire()
+	// 隧道地址 = 两端各自从临时公钥派生（tasks 3.7）：客户端用它做流侧源地址，
+	// 后端把它写进 allowed_ip。逐设备唯一，且不需要额外往返/协议字段。
+	ip := proto.DeriveTunnelIP(secret, pubkey)
+	if t.ipTakenLocked(ip) {
+		// 理论冲突（cap=8 时 ≈0.04%）：退到池分配并大声打一行——重启其中一台设备
+		// 会换新临时公钥、重新抽地址（不要在这里驱逐对方：那会让两台设备反复互相踢）。
+		for {
+			fallback := t.pool.Acquire()
+			if t.ipTakenLocked(fallback) {
+				continue
+			}
+			logf("⚠️ 隧道地址冲突：派生地址 %v 已被其他 peer 占用，本次退到池地址 %v（重启任一台设备即可换地址）", ip, fallback)
+			ip = fallback
+			break
+		}
+	}
 	e := &pentry{pub: pubkey, psk: psk, ip: ip, lastReg: now}
 	e.el = t.lru.PushFront(e)
 	t.entries[pubkey] = e
@@ -127,6 +142,16 @@ func (t *PeerTable) evictLRULocked() {
 		return
 	}
 	t.removeLocked(el.Value.(*pentry))
+}
+
+// ipTakenLocked 判断某地址是否已被表内其他 peer 占用（调用方持锁）。
+func (t *PeerTable) ipTakenLocked(ip netip.Addr) bool {
+	for _, e := range t.entries {
+		if e.ip == ip {
+			return true
+		}
+	}
+	return false
 }
 
 func (t *PeerTable) removeLocked(e *pentry) {
@@ -162,7 +187,8 @@ type ipPool struct {
 }
 
 func newIPPool(base netip.Addr) *ipPool {
-	return &ipPool{base: base, used: make(map[netip.Addr]struct{})}
+	// next 从 1 起：base+0 是网段地址（100.64.0.0），不该分配给主机（FINDINGS/设计 §9-1）。
+	return &ipPool{base: base, next: 1, used: make(map[netip.Addr]struct{})}
 }
 
 func (p *ipPool) Acquire() netip.Addr {
