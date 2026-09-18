@@ -44,11 +44,28 @@ func DecodeDgram(b []byte) (netip.AddrPort, []byte, error) {
 	return netip.AddrPortFrom(addr, port), b[18:], nil
 }
 
+// UDPOption：UDP 中继的可选项。
+type UDPOption func(*udpRelay)
+
+type udpRelay struct {
+	// targetMap：目标地址映射（测试/特殊部署用；把逻辑目标换成本机可达地址）。
+	targetMap func(netip.AddrPort) netip.AddrPort
+}
+
+// WithTargetMap 注入目标地址映射（nil = 原样使用；embedding/测试用）。
+func WithTargetMap(f func(netip.AddrPort) netip.AddrPort) UDPOption {
+	return func(r *udpRelay) { r.targetMap = f }
+}
+
 // ServeUDP 在内部 UDP 流端口上做逐报中继（拨真实目标、等单应答、回投）。
 // 返回停止函数。writeBack 超时 5s。
-func ServeUDP(pc net.PacketConn, st *Stats) (stop func(), err error) {
+func ServeUDP(pc net.PacketConn, st *Stats, opts ...UDPOption) (stop func(), err error) {
 	if st == nil {
 		st = &Stats{}
+	}
+	relay := &udpRelay{}
+	for _, o := range opts {
+		o(relay)
 	}
 	done := make(chan struct{})
 	go func() {
@@ -66,6 +83,9 @@ func ServeUDP(pc net.PacketConn, st *Stats) (stop func(), err error) {
 			dst, payload, err := DecodeDgram(buf[:n])
 			if err != nil {
 				continue
+			}
+			if relay.targetMap != nil {
+				dst = relay.targetMap(dst)
 			}
 			go relayOne(pc, from, dst, payload, st)
 		}

@@ -1,4 +1,4 @@
-package server
+package servercore
 
 import (
 	"container/list"

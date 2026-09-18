@@ -10,6 +10,7 @@ import (
 
 	"github.com/zhaoyswd/homeway/pkg/files"
 	"github.com/zhaoyswd/homeway/pkg/flows"
+	"github.com/zhaoyswd/homeway/pkg/servercore"
 	"github.com/zhaoyswd/homeway/pkg/term"
 	"github.com/zhaoyswd/homeway/pkg/wgnet"
 	"golang.zx2c4.com/wireguard/device"
@@ -71,7 +72,7 @@ func (c *ServeConfig) fill() {
 type Server struct {
 	cfg   ServeConfig
 	Stats *flows.Stats // dialok / dialfail / flows（状态面 3.6 消费）
-	Table *PeerTable
+	Table *servercore.PeerTable
 
 	dev     *device.Device
 	stopTCP func()
@@ -111,9 +112,9 @@ func Start(cfg ServeConfig) (*Server, error) {
 	if buildTag == "" {
 		buildTag = "homewayd-dev"
 	}
-	sbind := &ServerBind{Logf: logf, Build: buildTag}
+	sbind := &servercore.ServerBind{Logf: logf, Build: buildTag}
 	s.dev = device.NewDevice(tunDev, sbind, device.NewLogger(level, "homewayd"))
-	s.Table = NewPeerTable(&ipcConfigurer{dev: s.dev}, secrets, 8, 0)
+	s.Table = servercore.NewPeerTable(servercore.NewIPCConfigurer(s.dev), secrets, 8, 0)
 	sbind.Table = s.Table
 
 	if err := s.dev.IpcSet(fmt.Sprintf("private_key=%s\nlisten_port=%d\n", hex.EncodeToString(priv[:]), cfg.ListenPort)); err != nil {
@@ -236,18 +237,6 @@ func Run(ctx context.Context, cfg ServeConfig) error {
 }
 
 // ipcConfigurer：PeerTable 表项 → device IpcSet。
-type ipcConfigurer struct{ dev *device.Device }
-
-func (d *ipcConfigurer) AddPeer(pc PeerConfig) error {
-	return d.dev.IpcSet(fmt.Sprintf(
-		"public_key=%s\npreshared_key=%s\nallowed_ip=%s/32\n",
-		hex.EncodeToString(pc.Pubkey[:]), hex.EncodeToString(pc.PSK[:]), pc.TunnelIP))
-}
-
-func (d *ipcConfigurer) RemovePeer(pub [32]byte) error {
-	return d.dev.IpcSet(fmt.Sprintf("public_key=%s\nremove=true\n", hex.EncodeToString(pub[:])))
-}
-
 func logf(format string, args ...any) {
 	fmt.Printf("[homewayd] "+format+"\n", args...)
 }

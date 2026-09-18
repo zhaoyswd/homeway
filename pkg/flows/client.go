@@ -117,3 +117,19 @@ type bufConn struct {
 }
 
 func (b *bufConn) Read(p []byte) (int, error) { return b.r.Read(p) }
+
+// CloseWrite / CloseRead：包装层必须转发可选接口，否则半关闭会在这一层静默失效
+// （FINDINGS #21：flows 的空闲回收包装吞过同样的亏；表现是对端永远等不到 EOF，双方互等）。
+func (b *bufConn) CloseWrite() error {
+	if cw, ok := b.Conn.(interface{ CloseWrite() error }); ok {
+		return cw.CloseWrite()
+	}
+	return nil
+}
+
+func (b *bufConn) CloseRead() error {
+	if cr, ok := b.Conn.(interface{ CloseRead() error }); ok {
+		return cr.CloseRead()
+	}
+	return nil
+}
