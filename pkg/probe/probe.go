@@ -218,7 +218,9 @@ func roundTrip(ctx context.Context, pc net.PacketConn, target netip.AddrPort, re
 			return nil, err
 		}
 		if ua, ok := from.(*net.UDPAddr); ok && ua != nil {
-			if got := ua.AddrPort(); got.IsValid() && got != target {
+			// 双栈 socket 上，回包来源可能是 4-in-6 形式——比较前归一，否则 IPv4 目标永远匹配不上
+			//（实测：客户端监听 [::]、目标是 127.0.0.1 时，回包来源是 ::ffff:127.0.0.1）。
+			if got := ua.AddrPort(); got.IsValid() && !sameAddr(got, target) {
 				continue // 不是这个参照点的回应：丢弃
 			}
 		}
@@ -227,6 +229,11 @@ func roundTrip(ctx context.Context, pc net.PacketConn, target netip.AddrPort, re
 		}
 		return buf[:n], nil
 	}
+}
+
+// sameAddr：地址+端口比较，4-in-6 与 IPv4 视为同一（netip.AddrPort 没有 Unmap 方法）。
+func sameAddr(a, b netip.AddrPort) bool {
+	return a.Port() == b.Port() && a.Addr().Unmap() == b.Addr().Unmap()
 }
 
 func randomNonce() [8]byte {
