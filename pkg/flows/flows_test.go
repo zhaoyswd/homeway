@@ -266,3 +266,85 @@ func TestServeUDPRelay(t *testing.T) {
 		t.Fatalf("udp dialok=%v", st.Snapshot())
 	}
 }
+
+// 并发闸 + 空闲回收（旧栈桥接闸教训）：超限连接立即被拒，空闲流被回收、handler 收工。
+func TestServeTCPConnLimitAndIdle(t *testing.T) {
+	// 目标服务：接受连接后什么都不做（保持流活着，用于占满并发闸）
+	targetLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer targetLn.Close()
+	accepted := make(chan net.Conn, 8)
+	go func() {
+		for {
+			c, aerr := targetLn.Accept()
+			if aerr != nil {
+				return
+			}
+			accepted <- c
+		}
+	}()
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	st := &Stats{}
+	stop, _ := ServeTCP(ln, nil, st, WithMaxConns(1), WithIdleTimeout(400*time.Millisecond))
+	defer stop()
+
+	// 第一条：占住闸（CONNECT 成功后挂住不动）
+	c1, err := net.Dial("tcp", ln.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c1.Close()
+	br1 := bufio.NewReader(c1)
+	if err := WriteConnect(c1, "127.0.0.1", uint16(targetLn.Addr().(*net.TCPAddr).Port)); err != nil {
+		t.Fatal(err)
+	}
+	if err := ReadResponse(br1); err != nil {
+		t.Fatalf("第一条应建立：%v", err)
+	}
+	select {
+	case <-accepted:
+	case <-time.After(3 * time.Second):
+		t.Fatal("目标端未收到连接")
+	}
+	// 等闸里确实坐着一条（flows 计数 = 1）
+	waitStats(t, st, "flows", 1, 2*time.Second)
+
+	// 第二条：应被并发闸就地拒绝（连上即被关，读不到任何东西就 EOF）
+	c2, err := net.Dial("tcp", ln.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c2.Close()
+	_ = c2.SetReadDeadline(time.Now().Add(2 * time.Second))
+	if _, err := bufio.NewReader(c2).ReadByte(); err == nil {
+		t.Fatal("超限连接应被拒绝（不应有数据）")
+	}
+	if got := st.Snapshot()["rejected"]; got != 1 {
+		t.Fatalf("rejected 计数=%d 期望 1", got)
+	}
+
+	// 空闲回收：c1 静默超过 idle ⇒ 服务端断开，c1 读到 EOF
+	_ = c1.SetReadDeadline(time.Now().Add(5 * time.Second))
+	if _, err := br1.ReadByte(); err == nil {
+		t.Fatal("空闲流应被回收（不应有数据）")
+	}
+	waitStats(t, st, "flows", 0, 5*time.Second)
+}
+
+func waitStats(t *testing.T, st *Stats, key string, want uint64, d time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(d)
+	for time.Now().Before(deadline) {
+		if st.Snapshot()[key] == want {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("统计 %s 未到 %d：%v", key, want, st.Snapshot())
+}

@@ -6,9 +6,11 @@ import (
 	"fmt"
 	"net"
 	"net/netip"
+	"time"
 
 	"github.com/zhaoyswd/homeway/pkg/files"
 	"github.com/zhaoyswd/homeway/pkg/flows"
+	"github.com/zhaoyswd/homeway/pkg/term"
 	"github.com/zhaoyswd/homeway/pkg/wgnet"
 	"golang.zx2c4.com/wireguard/device"
 	"golang.zx2c4.com/wireguard/wgctrl/wgtypes"
@@ -20,17 +22,21 @@ const (
 	DefaultFlowPort   = uint16(7800) // TCP CONNECT 流
 	DefaultUDPFlowPrt = uint16(7801) // UDP 数据报（DNS 等）
 	DefaultFilesPort  = uint16(7802) // files 原生协议（后端本机 127.0.0.1）
+	DefaultTermPort   = uint16(7724) // 终端会话 / agent gateway（与旧栈 tunnel 内虚拟端口同号）
 )
 
 type ServeConfig struct {
-	StateDir    string
-	ListenPort  uint16
-	TunnelIP    netip.Addr
-	FlowPort    uint16
-	UDPFlowPort uint16
-	FilesPort   uint16 // files 服务在本机的监听端口（客户端经流协议 CONNECT 到它）
-	FilesRoot   string // files 根（空 = 用户主目录；协议恒读写）
-	Verbose     bool
+	StateDir     string
+	ListenPort   uint16
+	TunnelIP     netip.Addr
+	FlowPort     uint16
+	UDPFlowPort  uint16
+	FilesPort    uint16        // files 服务在本机的监听端口（客户端经流协议 CONNECT 到它）
+	FilesRoot    string        // files 根（空 = 用户主目录；协议恒读写）
+	TermPort     uint16        // 终端会话 / agent gateway 在本机的监听端口
+	FlowMaxConns int           // 内部流并发上限（0 = 默认 64）
+	FlowIdle     time.Duration // 内部流空闲回收（0 = 默认 30 分钟；终端会话腿也走这里，别设太短）
+	Verbose      bool
 }
 
 func (c *ServeConfig) fill() {
@@ -49,6 +55,15 @@ func (c *ServeConfig) fill() {
 	if c.FilesPort == 0 {
 		c.FilesPort = DefaultFilesPort
 	}
+	if c.TermPort == 0 {
+		c.TermPort = DefaultTermPort
+	}
+	if c.FlowMaxConns <= 0 {
+		c.FlowMaxConns = 64
+	}
+	if c.FlowIdle <= 0 {
+		c.FlowIdle = 30 * time.Minute
+	}
 }
 
 // Server：homewayd 的完整数据面装配（netstack + WG device + ServerBind + PeerTable + flows）。
@@ -62,6 +77,8 @@ type Server struct {
 	stopUDP func()
 	filesLn net.Listener
 	files   *files.Server
+	termLn  net.Listener
+	termSrv *term.TermService
 }
 
 // Start 装配并启动（非阻塞）。
@@ -104,7 +121,8 @@ func Start(cfg ServeConfig) (*Server, error) {
 		s.dev.Close()
 		return nil, err
 	}
-	s.stopTCP, err = flows.ServeTCP(tcpLn, flows.DefaultDial, s.Stats)
+	s.stopTCP, err = flows.ServeTCP(tcpLn, flows.DefaultDial, s.Stats,
+		flows.WithMaxConns(cfg.FlowMaxConns), flows.WithIdleTimeout(cfg.FlowIdle))
 	if err != nil {
 		s.dev.Close()
 		return nil, err
@@ -140,6 +158,32 @@ func Start(cfg ServeConfig) (*Server, error) {
 	rootDir := fsrv.RootDir()
 	logf("files 就绪：root=%s (rw) listen=127.0.0.1:%d", rootDir, cfg.FilesPort)
 
+	// 终端会话 / agent gateway：只监听本机回环，客户端经内部流 CONNECT 到 127.0.0.1:<TermPort>。
+	// 会话由后端持有（客户端断开只摘泵，不杀进程）；开关 TAILCAT_TERM=off，调参 TAILCAT_TERM_*。
+	if term.Disabled() {
+		logf("term 服务被 TAILCAT_TERM=off 关闭")
+	} else {
+		tsrv := term.New(logf)
+		tln, terr := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", cfg.TermPort))
+		if terr != nil {
+			s.Close()
+			return nil, fmt.Errorf("term 监听 %d 失败：%w", cfg.TermPort, terr)
+		}
+		s.termLn, s.termSrv = tln, tsrv
+		go func() {
+			for {
+				conn, aerr := tln.Accept()
+				if aerr != nil {
+					return
+				}
+				go tsrv.ServeConn(conn)
+			}
+		}()
+		// 就绪行（判据）：终端会话端口 + shell + 历史窗口 + 能力位
+		logf("# Serving terminal sessions on port %d (shell=%s, history=%s, features=%s)",
+			cfg.TermPort, tsrv.ShellText(), tsrv.HistoryText(), term.FeaturesText())
+	}
+
 	if err := s.dev.Up(); err != nil { // FINDINGS 0.1-1
 		s.Close()
 		return nil, err
@@ -166,6 +210,12 @@ func (s *Server) Close() {
 	}
 	if s.files != nil {
 		s.files.Close()
+	}
+	if s.termLn != nil {
+		s.termLn.Close()
+	}
+	if s.termSrv != nil {
+		s.termSrv.Close()
 	}
 }
 

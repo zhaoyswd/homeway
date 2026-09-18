@@ -118,19 +118,75 @@ func readLine(r *bufio.Reader) (string, error) {
 // ---------- 计数（契约：与旧栈 stats 键对齐） ----------
 
 type Stats struct {
-	dialOK, dialFail, flows uint64
+	dialOK, dialFail, flows, rejected uint64
 }
 
 func (s *Stats) IncrOK()   { atomic.AddUint64(&s.dialOK, 1) }
 func (s *Stats) IncrFail() { atomic.AddUint64(&s.dialFail, 1) }
 func (s *Stats) IncrFlow() { atomic.AddUint64(&s.flows, 1) }
 func (s *Stats) DecrFlow() { atomic.AddUint64(&s.flows, ^uint64(0)) }
+
+// IncrReject 计一次「并发闸拒绝」（连接在建立流量前被拒）。
+func (s *Stats) IncrReject() { atomic.AddUint64(&s.rejected, 1) }
 func (s *Stats) Snapshot() map[string]uint64 {
 	return map[string]uint64{
 		"dialok":   atomic.LoadUint64(&s.dialOK),
 		"dialfail": atomic.LoadUint64(&s.dialFail),
 		"flows":    atomic.LoadUint64(&s.flows),
+		"rejected": atomic.LoadUint64(&s.rejected),
 	}
+}
+
+// 并发闸与空闲回收默认值（旧栈桥接闸的教训：对端半死时不能让 handler 无限堆积）。
+const (
+	DefaultMaxConns = 32
+	DefaultIdleTime = 5 * time.Minute
+)
+
+// Option 服务端可选项（不改既有调用签名）。
+type Option func(*limits)
+
+type limits struct {
+	maxConns int
+	idle     time.Duration
+}
+
+// WithMaxConns 每监听端口的并发流上限（超限的连接直接被关，不排队）。
+func WithMaxConns(n int) Option { return func(l *limits) { l.maxConns = n } }
+
+// WithIdleTimeout 空闲回收：双向都没有字节流动超过该时长就断开。
+func WithIdleTimeout(d time.Duration) Option { return func(l *limits) { l.idle = d } }
+
+// idleConn 给每次读写挂上空闲期限（无需旁观 goroutine）。
+type idleConn struct {
+	net.Conn
+	idle time.Duration
+}
+
+func (c *idleConn) Read(p []byte) (int, error) {
+	_ = c.Conn.SetReadDeadline(time.Now().Add(c.idle))
+	return c.Conn.Read(p)
+}
+
+func (c *idleConn) Write(p []byte) (int, error) {
+	_ = c.Conn.SetWriteDeadline(time.Now().Add(c.idle))
+	return c.Conn.Write(p)
+}
+
+// CloseWrite / CloseRead：包装不能把底层能力吞掉——`closeWrite()` 靠类型断言传播半关闭，
+// 少了这两个转发方法，半关闭就会在包装层静默失效（对端永远等不到 EOF）。
+func (c *idleConn) CloseWrite() error {
+	if cw, ok := c.Conn.(interface{ CloseWrite() error }); ok {
+		return cw.CloseWrite()
+	}
+	return nil
+}
+
+func (c *idleConn) CloseRead() error {
+	if cr, ok := c.Conn.(interface{ CloseRead() error }); ok {
+		return cr.CloseRead()
+	}
+	return nil
 }
 
 // ---------- TCP 流服务 ----------
@@ -145,15 +201,23 @@ func DefaultDial(ctx context.Context, network, addr string) (net.Conn, error) {
 	return DefaultDialer.DialContext(ctx, network, addr)
 }
 
-// ServeTCP 在内部流 listener 上服务 CONNECT（accept 循环 + 双向管道）。
+// ServeTCP 在内部流 listener 上服务 CONNECT（accept 循环 + 双向管道 + 并发闸/空闲回收）。
 // 返回停止函数。
-func ServeTCP(ln net.Listener, dial DialFunc, st *Stats) (stop func(), err error) {
+func ServeTCP(ln net.Listener, dial DialFunc, st *Stats, opts ...Option) (stop func(), err error) {
 	if dial == nil {
 		dial = DefaultDial
 	}
 	if st == nil {
 		st = &Stats{}
 	}
+	lim := limits{maxConns: DefaultMaxConns, idle: DefaultIdleTime}
+	for _, o := range opts {
+		o(&lim)
+	}
+	if lim.maxConns <= 0 {
+		lim.maxConns = DefaultMaxConns
+	}
+	sem := make(chan struct{}, lim.maxConns)
 	var wg sync.WaitGroup
 	done := make(chan struct{})
 	go func() {
@@ -167,10 +231,19 @@ func ServeTCP(ln net.Listener, dial DialFunc, st *Stats) (stop func(), err error
 					continue
 				}
 			}
+			select {
+			case sem <- struct{}{}:
+			default:
+				// 并发闸：对端半死时不能无限堆积 handler（旧栈桥接闸教训）
+				st.IncrReject()
+				conn.Close()
+				continue
+			}
 			wg.Add(1)
 			go func() {
 				defer wg.Done()
-				handleConn(conn, dial, st)
+				defer func() { <-sem }()
+				handleConn(conn, dial, st, lim.idle)
 			}()
 		}
 	}()
@@ -181,8 +254,11 @@ func ServeTCP(ln net.Listener, dial DialFunc, st *Stats) (stop func(), err error
 	}, nil
 }
 
-func handleConn(conn net.Conn, dial DialFunc, st *Stats) {
+func handleConn(conn net.Conn, dial DialFunc, st *Stats, idle time.Duration) {
 	defer conn.Close()
+	if idle > 0 {
+		conn = &idleConn{Conn: conn, idle: idle}
+	}
 	if err := conn.SetReadDeadline(time.Now().Add(10 * time.Second)); err != nil {
 		return
 	}
@@ -203,6 +279,9 @@ func handleConn(conn net.Conn, dial DialFunc, st *Stats) {
 		return
 	}
 	defer target.Close()
+	if idle > 0 {
+		target = &idleConn{Conn: target, idle: idle}
+	}
 	if err := WriteResponse(conn, ""); err != nil {
 		return
 	}
