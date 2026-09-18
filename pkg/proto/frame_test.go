@@ -4,6 +4,7 @@ import (
 	"encoding/base64"
 	"errors"
 	"testing"
+	"time"
 )
 
 func b64url(b []byte) string { return base64.RawURLEncoding.EncodeToString(b) }
@@ -22,6 +23,10 @@ func TestFrameRoundTrip(t *testing.T) {
 	typ, payload, err := DecodeFrame(f)
 	if err != nil || typ != FrameTypeData || len(payload) != 2 {
 		t.Fatalf("typ=%d payload=%v err=%v", typ, payload, err)
+	}
+	// 首字节非 0xBB（如裸 WG initiation，type=1）必须判畸形——直连路径的判别依据
+	if _, _, err := DecodeFrame([]byte{1, 0, 0, 0}); !errors.Is(err, ErrFrameMalformed) {
+		t.Fatalf("裸 WG 包误判为合法帧: %v", err)
 	}
 }
 
@@ -64,6 +69,28 @@ func TestHintRoundTrip(t *testing.T) {
 	// 非 control 帧必须拒绝
 	if _, err := DecodeHint(EncodeFrame(FrameTypeData, nil)); !errors.Is(err, ErrFrameMalformed) {
 		t.Fatalf("err = %v, want ErrFrameMalformed", err)
+	}
+	if _, err := DecodeHintPayload([]byte{0, 3, 'a', 'b'}); !errors.Is(err, ErrFrameMalformed) {
+		t.Fatalf("长度不符的 payload 必须报错: %v", err)
+	}
+}
+
+func TestSplitDirectReg(t *testing.T) {
+	var secret, pubkey [32]byte
+	pubkey[0] = 7
+	reg := EncodeReg(secret, pubkey, time.Now())
+	wgPkt := []byte{1, 0, 0, 0, 0x5a, 0x5a}
+	joined := append(append([]byte{}, reg...), wgPkt...)
+
+	gotReg, rest, ok := SplitDirectReg(joined)
+	if !ok || len(gotReg) != len(reg) || string(rest) != string(wgPkt) {
+		t.Fatalf("ok=%v reg=%d rest=%v", ok, len(gotReg), rest)
+	}
+	if _, err := VerifyReg(secret, gotReg, time.Now(), 0); err != nil {
+		t.Fatalf("拆出的 reg 校验失败: %v", err)
+	}
+	if _, _, ok := SplitDirectReg(wgPkt); ok {
+		t.Fatal("裸 WG 包被误判为 reg 搭车")
 	}
 }
 
