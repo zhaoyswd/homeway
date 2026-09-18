@@ -1,0 +1,71 @@
+name: release
+
+# 发版 = 推 tag：git tag v0.x.y && git push origin v0.x.y
+# 纯 Go 静态交叉编译，单 ubuntu runner 出全平台产物；linux/amd64 上冒烟。
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { goos: darwin, goarch: arm64 }
+          - { goos: darwin, goarch: amd64 }
+          - { goos: linux,  goarch: amd64 }
+          - { goos: linux,  goarch: arm64 }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: Build
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          CGO_ENABLED: 0
+        run: |
+          VERSION="${GITHUB_REF##*/}"
+          LDFLAGS="-s -w -X main.version=${VERSION}"
+          mkdir -p dist/homewayd dist/homeway-relay
+          go build -trimpath -ldflags "${LDFLAGS}" -o dist/homewayd/homewayd ./cmd/homewayd
+          go build -trimpath -ldflags "${LDFLAGS}" -o dist/homeway-relay/homeway-relay ./cmd/homeway-relay
+          cd dist && tar czf "homeway_${VERSION#v}_${GOOS}_${GOARCH}.tar.gz" homewayd homeway-relay
+          sha256sum homeway_*.tar.gz > "homeway_${VERSION#v}_${GOOS}_${GOARCH}.tar.gz.sha256"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: homeway-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: dist/*.tar.gz*
+
+  smoke:
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: homeway-linux-amd64
+      - run: |
+          tar xzf homeway_*_linux_amd64.tar.gz
+          ./homewayd/homewayd --version
+          ./homeway-relay/homeway-relay --version
+
+  release:
+    runs-on: ubuntu-latest
+    needs: smoke
+    if: startsWith(github.ref, 'refs/tags/')
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*.tar.gz*
+          generate_release_notes: true

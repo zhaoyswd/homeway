@@ -1,0 +1,7 @@
+# 3.11 / 阿里云出口的容器形态（对应 tailcat 时代的 scratch 镜像）。
+# 用法（在仓库根，先在宿主编出 linux 二进制）：
+#   GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -trimpath -ldflags "-s -w" -o build/homewayd ./cmd/homewayd
+#   docker build -f Dockerfile.scratch -t homeway:<tag> .
+FROM scratch
+COPY build/homewayd /homewayd
+ENTRYPOINT ["/homewayd"]
