@@ -50,22 +50,23 @@ func DecodeFrame(b []byte) (typ byte, payload []byte, err error) {
 	return b[1], b[2:], nil
 }
 
-// EncodeTagged 生成客户端→中继 listener 帧（带 peerId 路由标签）。
+// EncodeTagged 生成客户端→中继 listener 帧：[0xAA][peerId(8B)]‖腿帧。
+// 中继剥掉前 9 字节路由头后原样转发，后端收到的即无歧义腿帧。
 func EncodeTagged(peerID [8]byte, typ byte, payload []byte) []byte {
-	buf := make([]byte, 0, 1+8+1+len(payload))
+	buf := make([]byte, 0, 1+8+2+len(payload))
 	buf = append(buf, relayTagMagic)
 	buf = append(buf, peerID[:]...)
-	buf = append(buf, typ)
+	buf = append(buf, legFrameMagic, typ)
 	return append(buf, payload...)
 }
 
 // DecodeTagged 解析 listener 收到的帧。
 func DecodeTagged(b []byte) (peerID [8]byte, typ byte, payload []byte, err error) {
-	if len(b) < 10 || b[0] != relayTagMagic {
+	if len(b) < 11 || b[0] != relayTagMagic || b[9] != legFrameMagic {
 		return peerID, 0, nil, ErrFrameMalformed
 	}
 	copy(peerID[:], b[1:9])
-	return peerID, b[9], b[10:], nil
+	return peerID, b[10], b[11:], nil
 }
 
 // SplitDirectReg 拆直连路径的「reg‖WG」同数据报搭车。非 reg 前缀原样返回 ok=false。

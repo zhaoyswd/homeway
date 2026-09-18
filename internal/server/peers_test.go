@@ -1,0 +1,153 @@
+package server
+
+import (
+	"net/netip"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/zhaoyswd/homeway/pkg/proto"
+)
+
+type fakeCfg struct {
+	mu      sync.Mutex
+	added   map[[32]byte]PeerConfig
+	order   [][32]byte
+	removed [][32]byte
+}
+
+func newFakeCfg() *fakeCfg { return &fakeCfg{added: map[[32]byte]PeerConfig{}} }
+
+func (f *fakeCfg) AddPeer(pc PeerConfig) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if _, ok := f.added[pc.Pubkey]; !ok {
+		f.order = append(f.order, pc.Pubkey)
+	}
+	f.added[pc.Pubkey] = pc
+	return nil
+}
+
+func (f *fakeCfg) RemovePeer(pub [32]byte) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if _, ok := f.added[pub]; ok {
+		delete(f.added, pub)
+		f.removed = append(f.removed, pub)
+	}
+	return nil
+}
+
+var testSecret = [32]byte{9, 9, 9}
+
+func regFor(pub [32]byte, ts time.Time) []byte { return proto.EncodeReg(testSecret, pub, ts) }
+
+func pubN(n byte) [32]byte {
+	var k [32]byte
+	k[0] = n
+	return k
+}
+
+func TestPeerTableRegisterAndIdempotent(t *testing.T) {
+	fc := newFakeCfg()
+	tb := NewPeerTable(fc, [][32]byte{testSecret}, 4, time.Hour)
+	now := time.Now()
+
+	if _, err := tb.Register(regFor(pubN(1), now), now); err != nil {
+		t.Fatal(err)
+	}
+	// 重放同一 reg：无错、表不膨胀（重放无害）
+	if _, err := tb.Register(regFor(pubN(1), now), now); err != nil {
+		t.Fatalf("重放应无害：%v", err)
+	}
+	if tb.Len() != 1 || len(fc.order) != 1 {
+		t.Fatalf("表膨胀：len=%d added=%d", tb.Len(), len(fc.order))
+	}
+	ip, found := tb.TunnelIP(pubN(1))
+	if !found || !ip.IsValid() {
+		t.Fatalf("TunnelIP found=%v ip=%v", found, ip)
+	}
+	// PSK 正确派生
+	if fc.added[pubN(1)].PSK != proto.DerivePSK(testSecret) {
+		t.Fatal("PSK 派生不匹配")
+	}
+}
+
+func TestPeerTableUnknownSecretRejected(t *testing.T) {
+	fc := newFakeCfg()
+	tb := NewPeerTable(fc, [][32]byte{testSecret}, 4, time.Hour)
+	var wrong [32]byte
+	wrong[0] = 1
+	reg := proto.EncodeReg(wrong, pubN(5), time.Now())
+	if _, err := tb.Register(reg, time.Now()); err == nil {
+		t.Fatal("未知 secret 的 reg 必须被拒")
+	}
+}
+
+func TestPeerTableCapLRU(t *testing.T) {
+	fc := newFakeCfg()
+	tb := NewPeerTable(fc, [][32]byte{testSecret}, 2, time.Hour)
+	now := time.Now()
+
+	tb.Register(regFor(pubN(1), now), now)
+	time.Sleep(time.Millisecond)
+	tb.Register(regFor(pubN(2), now), now)
+	time.Sleep(time.Millisecond)
+	// 刷新 pubN(1)（成为最新）→ pubN(2) 变 LRU
+	tb.Register(regFor(pubN(1), now), now)
+	time.Sleep(time.Millisecond)
+	// 第三个进来应淘汰 pubN(2)
+	if _, err := tb.Register(regFor(pubN(3), now), now); err != nil {
+		t.Fatal(err)
+	}
+	if len(fc.removed) != 1 || fc.removed[0] != pubN(2) {
+		t.Fatalf("LRU 淘汰错误：%v", fc.removed)
+	}
+	if tb.Len() != 2 {
+		t.Fatalf("len=%d", tb.Len())
+	}
+	if _, found := tb.TunnelIP(pubN(2)); found {
+		t.Fatal("被淘汰的 peer 不应还能查到")
+	}
+}
+
+func TestPeerTableTTLGC(t *testing.T) {
+	fc := newFakeCfg()
+	tb := NewPeerTable(fc, [][32]byte{testSecret}, 8, time.Hour)
+	t0 := time.Now()
+	tb.Register(regFor(pubN(1), t0), t0)
+	tb.Register(regFor(pubN(2), t0), t0)
+
+	// t0+2h：两个都过期
+	if n := tb.GC(t0.Add(2 * time.Hour)); n != 2 {
+		t.Fatalf("GC 清理数=%d", n)
+	}
+	if len(fc.removed) != 2 || tb.Len() != 0 {
+		t.Fatalf("removed=%v len=%d", fc.removed, tb.Len())
+	}
+}
+
+// netip 零值哨兵回归（lazyPeers 前科）：分配/回收全走显式标志，
+// 「释放后的地址被复用」若被零值哨兵吞掉会静默 no-op。
+func TestIPPoolZeroValueSentinelRegression(t *testing.T) {
+	p := newIPPool(netip.MustParseAddr(tunnelBase))
+	ip1 := p.Acquire()
+	ip2 := p.Acquire()
+	if !ip1.IsValid() || !ip2.IsValid() || ip1 == ip2 {
+		t.Fatalf("分配非法：%v %v", ip1, ip2)
+	}
+	if !ip1.Is4() || ip1.String() != "100.64.0.0" {
+		t.Fatalf("首个分配应为基址：%v", ip1)
+	}
+	p.Release(ip1)
+	// 回收的地址应优先复用（而非继续顺序分配）
+	if got := p.Acquire(); got != ip1 {
+		t.Fatalf("回收地址未被复用：got=%v want=%v", got, ip1)
+	}
+	// 幂等释放不应污染池
+	p.Release(ip1)
+	p.Release(ip1)
+	if got := p.Acquire(); got != ip1 {
+		t.Fatalf("重复释放后池状态被污染：got=%v", got)
+	}
+}
