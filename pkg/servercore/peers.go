@@ -41,6 +41,12 @@ type PeerTable struct {
 	mu      sync.Mutex
 	cfg     Configurer
 	secrets [][32]byte
+	// reload 可选：reg 验证失败时重新读一次 token 台账。
+	// 为什么要有它：`homewayd issue` 只是往 tokens.jsonl 追加一行，而服务进程只在启动时读过；
+	// 「升级出口 → issue → 粘贴到手机」这条日常路径如果必须重启出口才能生效，真机上极其别扭
+	//（2026-09-19 实测：新 token 的 REG 被拒，日志 `reg 验证失败（无匹配 token）`）。
+	// 只在**失败路径**调用 ⇒ 热路径零开销。
+	reload func() ([][32]byte, error)
 	cap     int
 	ttl     time.Duration
 
@@ -70,18 +76,48 @@ func NewPeerTable(cfg Configurer, secrets [][32]byte, maxPeers int, ttl time.Dur
 	}
 }
 
+// SetSecretsReloader 注入「重读 token 台账」的回调（见字段注释）。传 nil = 关闭热加载。
+func (t *PeerTable) SetSecretsReloader(fn func() ([][32]byte, error)) {
+	t.mu.Lock()
+	t.reload = fn
+	t.mu.Unlock()
+}
+
+// currentSecrets 取一份当前 secret 快照（注册路径用；调用方不加锁）。
+func (t *PeerTable) currentSecrets() [][32]byte {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.secrets
+}
+
 // Register 验证 reg 报文并确保 peer 在表内。返回登记的公钥。
 func (t *PeerTable) Register(reg []byte, now time.Time) ([32]byte, error) {
 	var pubkey [32]byte
 	var secret [32]byte
-	matched := false
-	for _, sec := range t.secrets {
-		if pk, err := proto.VerifyReg(sec, reg, now, 0); err == nil {
-			pubkey, secret, matched = pk, sec, true
-			break
+	match := func(secs [][32]byte) bool {
+		for _, sec := range secs {
+			if pk, err := proto.VerifyReg(sec, reg, now, 0); err == nil {
+				pubkey, secret = pk, sec
+				return true
+			}
+		}
+		return false
+	}
+	ok := match(t.currentSecrets())
+	if !ok {
+		t.mu.Lock()
+		reload := t.reload
+		t.mu.Unlock()
+		if reload != nil {
+			if secs, err := reload(); err == nil && len(secs) > 0 {
+				t.mu.Lock()
+				t.secrets = secs
+				t.mu.Unlock()
+				ok = match(secs)
+			}
 		}
 	}
-	if !matched {
+	if !ok {
 		return pubkey, fmt.Errorf("peers: reg 验证失败（无匹配 token）")
 	}
 	psk := proto.DerivePSK(secret)

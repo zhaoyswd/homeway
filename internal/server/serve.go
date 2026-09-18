@@ -115,6 +115,8 @@ func Start(cfg ServeConfig) (*Server, error) {
 	sbind := &servercore.ServerBind{Logf: logf, Build: buildTag}
 	s.dev = device.NewDevice(tunDev, sbind, device.NewLogger(level, "homewayd"))
 	s.Table = servercore.NewPeerTable(servercore.NewIPCConfigurer(s.dev), secrets, 8, 0)
+	// token 台账热加载：`homewayd issue` 之后不需要重启出口（见 PeerTable.reload 的注释）。
+	s.Table.SetSecretsReloader(st.Secrets)
 	sbind.Table = s.Table
 
 	if err := s.dev.IpcSet(fmt.Sprintf("private_key=%s\nlisten_port=%d\n", hex.EncodeToString(priv[:]), cfg.ListenPort)); err != nil {

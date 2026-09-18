@@ -92,6 +92,40 @@ func TestPeerTableUnknownSecretRejected(t *testing.T) {
 	}
 }
 
+// 热加载：出口运行中新 `issue` 出来的 token（tokens.jsonl 追加）不改重启即可注册。
+// 背景（2026-09-19 真机）：issue → 粘贴到手机 → REG 被拒「无匹配 token」，因为服务只在启动时读过台账。
+func TestPeerTableReloadsSecretsOnMiss(t *testing.T) {
+	fc := newFakeCfg()
+	tb := NewPeerTable(fc, [][32]byte{testSecret}, 4, time.Hour)
+	now := time.Now()
+
+	var fresh [32]byte
+	fresh[0] = 7
+	reg := proto.EncodeReg(fresh, pubN(6), now)
+	if _, err := tb.Register(reg, now); err == nil {
+		t.Fatal("未经 reload 的新 secret 不应通过")
+	}
+
+	reloads := 0
+	tb.SetSecretsReloader(func() ([][32]byte, error) {
+		reloads++
+		return [][32]byte{testSecret, fresh}, nil
+	})
+	if _, err := tb.Register(reg, now); err != nil {
+		t.Fatalf("reload 后应通过：%v", err)
+	}
+	if reloads != 1 {
+		t.Fatalf("reload 次数 = %d，want 1", reloads)
+	}
+	// 命中已加载的 secret 时不再触发 reload（热路径零开销）
+	if _, err := tb.Register(regFor(pubN(7), now), now); err != nil {
+		t.Fatal(err)
+	}
+	if reloads != 1 {
+		t.Fatalf("命中路径不该 reload：%d", reloads)
+	}
+}
+
 func TestPeerTableCapLRU(t *testing.T) {
 	fc := newFakeCfg()
 	tb := NewPeerTable(fc, [][32]byte{testSecret}, 2, time.Hour)
