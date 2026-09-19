@@ -8,6 +8,7 @@ import (
 	"net/netip"
 	"time"
 
+	"github.com/zhaoyswd/homeway/pkg/egress"
 	"github.com/zhaoyswd/homeway/pkg/files"
 	"github.com/zhaoyswd/homeway/pkg/flows"
 	"github.com/zhaoyswd/homeway/pkg/servercore"
@@ -141,7 +142,16 @@ func Start(cfg ServeConfig) (*Server, error) {
 		s.dev.Close()
 		return nil, err
 	}
-	s.stopTCP, err = flows.ServeTCP(tcpLn, flows.DefaultDial, s.Stats,
+	// 转发出站流量也要钉在同一张物理网卡上（bind-interface）：
+	// 不钉的话，TUN 型代理抢走默认路由后，转发的 TCP/UDP 会走代理 —— QUIC 这类被代理丢弃的
+	// UDP 就变成"手机上行很多包、目标零应答"（真机实测）。回环目标自动豁免（见 pkg/egress）。
+	eg := egress.FromInterface(cfg.BindIface)
+	dial := flows.DialFunc(flows.DefaultDial)
+	if eg.Enabled() {
+		dial = eg.DialContext
+		logf("Egress：转发出站流量钉在网卡 %s（回环目标除外）", cfg.BindIface.Name)
+	}
+	s.stopTCP, err = flows.ServeTCP(tcpLn, dial, s.Stats,
 		flows.WithMaxConns(cfg.FlowMaxConns), flows.WithIdleTimeout(cfg.FlowIdle))
 	if err != nil {
 		s.dev.Close()
@@ -155,7 +165,11 @@ func Start(cfg ServeConfig) (*Server, error) {
 	}
 	// UDP 中继：长会话（QUIC/游戏）+ 会话级日志（建立/关闭各一行，含双向包数——
 	// 真机判断「QUIC 到底通没通」就靠这一行，逐包细节不在这里）。
-	s.stopUDP, _ = flows.ServeUDP(udpPC, s.Stats, flows.WithUDPLog(logf))
+	udpOpts := []flows.UDPOption{flows.WithUDPLog(logf)}
+	if eg.Enabled() {
+		udpOpts = append(udpOpts, flows.WithUDPSocket(eg.ListenUDPFor))
+	}
+	s.stopUDP, _ = flows.ServeUDP(udpPC, s.Stats, udpOpts...)
 
 	// files 原生协议服务：只监听本机回环（客户端经内部流的 CONNECT 让后端按本机网络重拨到这里）。
 	// 根 = 用户主目录、恒读写（协议无参数）；启动打一行根目录判据。

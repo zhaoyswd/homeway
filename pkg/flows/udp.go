@@ -63,9 +63,20 @@ func DecodeDgram(b []byte) (netip.AddrPort, []byte, error) {
 // UDPOption：UDP 中继的可选项。
 type UDPOption func(*udpRelay)
 
+// sockNetworkFor：目标家族 → socket 网络（"udp4"/"udp6"）。
+func sockNetworkFor(dst netip.AddrPort) string {
+	if dst.IsValid() && dst.Addr().Unmap().Is6() {
+		return "udp6"
+	}
+	return "udp4"
+}
+
 type udpRelay struct {
 	// targetMap：目标地址映射（测试/特殊部署用；把逻辑目标换成本机可达地址）。
 	targetMap func(netip.AddrPort) netip.AddrPort
+	// newSock：给每个会话开真实 UDP socket（出口用 = 钉到物理网卡的工厂；nil = 系统默认）。
+	// 入参是该会话的目标地址（工厂按家族建 udp4/udp6）。
+	newSock func(netip.AddrPort) (*net.UDPConn, error)
 	idle      time.Duration
 	st        *Stats
 	pc        net.PacketConn
@@ -74,6 +85,12 @@ type udpRelay struct {
 
 	mu       sync.Mutex
 	sessions map[string]*udpSession
+}
+
+// WithUDPSocket 注入「按目标开真实 UDP socket」的工厂（出口 = 绑物理网卡）。
+// 不注入时按目标家族用 net.ListenUDP("udp4"/"udp6", nil)（系统默认路由）。
+func WithUDPSocket(f func(netip.AddrPort) (*net.UDPConn, error)) UDPOption {
+	return func(r *udpRelay) { r.newSock = f }
 }
 
 // WithTargetMap 注入目标地址映射（nil = 原样使用；embedding/测试用）。
@@ -162,11 +179,20 @@ func (r *udpRelay) handle(from net.Addr, dst netip.AddrPort, payload []byte) {
 		s = nil
 	}
 	if s == nil {
-		// 双栈：目标可能是 v4 也可能是 v6。
-		conn, err := net.ListenUDP("udp", nil)
+		// 家族按目标定（v4 → udp4，v6 → udp6）。
+		var conn *net.UDPConn
+		var err error
+		if r.newSock != nil {
+			conn, err = r.newSock(dst)
+		} else {
+			conn, err = net.ListenUDP(sockNetworkFor(dst), nil)
+		}
 		if err != nil {
 			r.mu.Unlock()
 			r.st.IncrFail()
+			if r.logf != nil {
+				r.logf("udp relay: 开会话 socket 失败（→ %v）：%v", dst, err)
+			}
 			return
 		}
 		s = &udpSession{conn: conn, dst: dst, backTo: from}
