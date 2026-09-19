@@ -406,10 +406,16 @@ func (g *igd) CleanMappings(ctx context.Context, descPrefix string, onlyPort uin
 	return n, kept, nil
 }
 
-// ensurePortMapping 为 internalPort 申请一个外部端口（优先同号），返回实际拿到的外部端口与所用内网地址。
+// ensurePortMapping 为 internalPort 申请一个外部端口，返回实际拿到的外部端口与所用内网地址。
+//
+// 端口选择顺序（**优先沿用历史上成功过的那个**）：
+//  1. prefer：上次成功申请到的外部端口（state 里记着；端口稳定 ⇒ 路由器规则/DDNS/token 里的公网端点都不用改）；
+//  2. internalPort：与监听端口同号（最直观，也是绝大多数家用路由器的默认行为）；
+//  3. internalPort+1：同号被占时的回退（日志会明确写出来）。
+//
 // candidates 是本机的内网 IPv4 候选：逐个发 SSDP 试，谁能找到 IGD 就用谁 —— 一台机器上常有多张
 // 网卡（虚拟网卡、代理的 utun），只有与路由器同网段的那张能用。
-func ensurePortMapping(ctx context.Context, candidates []netip.Addr, internalPort uint16,
+func ensurePortMapping(ctx context.Context, candidates []netip.Addr, internalPort uint16, prefer uint16,
 	logf func(string, ...any)) (uint16, netip.Addr, error) {
 	var g *igd
 	var localIP netip.Addr
@@ -434,15 +440,38 @@ func ensurePortMapping(ctx context.Context, candidates []netip.Addr, internalPor
 	if n, _, err := g.CleanMappings(ctx, upnpMapDesc, 0); err == nil && n > 0 {
 		logf("UPnP：清掉 %d 条同前缀的旧映射（换端口或上次退出的遗留）", n)
 	}
-	if err := g.addPortMapping(ctx, internalPort, localIP, internalPort); err == nil {
-		return internalPort, localIP, nil
-	} else {
-		logf("UPnP：外部端口 %d 申请失败（%v），改用相邻端口", internalPort, err)
+	ext, err := selectExternalPort(ctx, g, internalPort, prefer, localIP, logf)
+	if err != nil {
+		return 0, localIP, err
 	}
-	if err := g.addPortMapping(ctx, internalPort+1, localIP, internalPort); err == nil {
-		return internalPort + 1, localIP, nil
+	return ext, localIP, nil
+}
+
+// portMapper：端口选择只依赖这两件事，抽出来便于单测（真实实现 = *igd）。
+type portMapper interface {
+	addPortMapping(ctx context.Context, externalPort uint16, internalIP netip.Addr, internalPort uint16) error
+	CleanMappings(ctx context.Context, descPrefix string, onlyPort uint16) (int, []string, error)
+}
+
+// selectExternalPort：按「上次成功的端口 → 监听端口 → 监听端口+1」的顺序申请，返回成功的外部端口。
+func selectExternalPort(ctx context.Context, g portMapper, internalPort, prefer uint16, localIP netip.Addr,
+	logf func(string, ...any)) (uint16, error) {
+	tried := map[uint16]bool{}
+	for _, ext := range []uint16{prefer, internalPort, internalPort + 1} {
+		if ext == 0 || tried[ext] {
+			continue
+		}
+		tried[ext] = true
+		if err := g.addPortMapping(ctx, ext, localIP, internalPort); err == nil {
+			if ext == prefer && prefer != internalPort {
+				logf("UPnP：沿用上次成功的外部端口 %d → 内网 %d", ext, internalPort)
+			}
+			return ext, nil
+		} else {
+			logf("UPnP：外部端口 %d 申请失败（%v），换下一个候选", ext, err)
+		}
 	}
-	return 0, localIP, fmt.Errorf("AddPortMapping 失败（外部端口 %d/%d 都被拒）", internalPort, internalPort+1)
+	return 0, fmt.Errorf("AddPortMapping 失败（外部端口 %v 都被拒）", []uint16{prefer, internalPort, internalPort + 1})
 }
 
 // localIPv4Candidates 列出本机可能用于 UPnP 的内网 IPv4 候选。

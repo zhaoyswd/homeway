@@ -18,6 +18,7 @@ import (
 	"net/netip"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -28,6 +29,7 @@ const (
 	publicRefreshOK   = 10 * time.Minute
 	publicRefreshFail = 2 * time.Minute
 	publicFile        = "public_endpoint.txt"
+	upnpPortFile      = "upnp_port.txt"
 )
 
 // PublicOpts 公网端点探测的开关（都来自 serve 的 flag）。
@@ -36,6 +38,10 @@ type PublicOpts struct {
 	UPnP     bool
 	STUN     string // "" = 不做 STUN 观测；否则是 host:port
 	Bind     *servercore.ServerBind
+	// Pinned：WG socket 已绑物理网卡（--bind-interface）。钉住之后 STUN 观测到的 IP 必然是
+	// 这台机器在路由器 WAN 侧的地址（不会是被代理改写过的），所以「外口 != 监听口」时也敢用
+	// STUN 的 IP + UPnP 的外口拼端点；没钉住时保守起见要求两者端口一致。
+	Pinned bool
 	Logf     func(format string, args ...any)
 }
 
@@ -49,6 +55,26 @@ func ReadPublicEndpoint(stateDir string) string {
 		return ""
 	}
 	return strings.TrimSpace(string(b))
+}
+
+// readRememberedPort / writeRememberedPort：记住「上次成功申请到的外部端口」。
+// 为什么需要：端口选择若纯按「监听端口 → 监听端口+1」重试，上次因为 41641 被占而退到 41642/41643 的出口，
+// 重启后**不会**沿用那个端口（会先去抢 41641）—— 而公网端口变了意味着路由器上已配的防火墙规则、
+// DDNS+固定端口、以及已经烤进 token 的公网端点全都要跟着改。记住它并在启动时优先沿用，才是稳的。
+func readRememberedPort(stateDir string) uint16 {
+	b, err := os.ReadFile(filepath.Join(stateDir, upnpPortFile))
+	if err != nil {
+		return 0
+	}
+	n, err := strconv.Atoi(strings.TrimSpace(string(b)))
+	if err != nil || n <= 0 || n > 65535 {
+		return 0
+	}
+	return uint16(n)
+}
+
+func writeRememberedPort(stateDir string, port uint16) error {
+	return os.WriteFile(filepath.Join(stateDir, upnpPortFile), []byte(strconv.Itoa(int(port))+"\n"), 0o600)
 }
 
 // StartPublicEndpoint 起后台循环（非阻塞）。
@@ -91,11 +117,14 @@ func (s *Server) refreshPublicEndpoint(ctx context.Context, opts PublicOpts) boo
 		cands := localIPv4Candidates()
 		if len(cands) == 0 {
 			logf("UPnP：找不到内网 IPv4 候选，跳过端口映射")
-		} else if p, used, err := ensurePortMapping(ctx, cands, port, logf); err != nil {
+		} else if p, used, err := ensurePortMapping(ctx, cands, port, readRememberedPort(opts.StateDir), logf); err != nil {
 			logf("UPnP：未取得端口映射（%v）；出口在 NAT 后时可在路由器上手动把 UDP %d 转发到本机（候选 %v）", err, port, cands)
 		} else {
 			extPort = p
-			logf("UPnP：已建立端口映射 外部 UDP %d → %v:%d", extPort, used, port)
+			if err := writeRememberedPort(opts.StateDir, extPort); err != nil {
+				logf("UPnP：记住外部端口 %d 失败（%v）", extPort, err)
+			}
+			logf("UPnP：已建立端口映射 外部 UDP %d → %v:%d（下次重启优先沿用 %d）", extPort, used, port, extPort)
 			// 路由器自报的 WAN 地址（有些家用路由器返回空值，那就只当没拿到）。
 			if g, err := discoverIGD(ctx, used); err == nil {
 				if ip, err := g.externalIP(ctx); err == nil && ip.IsValid() && !ip.IsPrivate() {
@@ -116,12 +145,19 @@ func (s *Server) refreshPublicEndpoint(ctx context.Context, opts PublicOpts) boo
 		}
 	}
 
-	// 证据合流：优先用「同 socket 的 STUN 观测」，它的端口必须与 UPnP 外口一致；
-	// 没有 UPnP 时要求观测端口 == 监听端口（说明路由器做了同号映射/1:1 NAT）。
+	// 证据合流：
+	//   - UPnP 给「外部端口」（我们亲手建的，可信）；
+	//   - STUN 给「公网 IP」（同一个 socket 问出来的，钉了网卡就必然是真 WAN 地址）。
+	// 两者一致（同号映射）当然最好；**外口 != 监听口**时（沿用历史端口或 +1 回退）端点应为
+	// 「STUN 的 IP + UPnP 的外口」—— 出站源端口保持的是监听口，与转发口本来就不一样。
+	// 只有没钉网卡时才要求端口一致（防代理把 STUN 观测污染成假的）。
 	var pub netip.AddrPort
 	switch {
 	case observed.IsValid() && extPort != 0 && observed.Port() == extPort && publicAddr(observed.Addr()):
 		pub = observed
+	case observed.IsValid() && extPort != 0 && opts.Pinned && publicAddr(observed.Addr()):
+		pub = netip.AddrPortFrom(observed.Addr(), extPort)
+		logf("公网端点：外口 %d ≠ 监听口 %d（沿用历史端口/回退），用 STUN 的 IP + UPnP 的外口公布", extPort, port)
 	case observed.IsValid() && extPort == 0 && observed.Port() == port && publicAddr(observed.Addr()):
 		pub = observed
 	case extPort != 0 && wanIP.IsValid():

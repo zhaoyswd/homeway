@@ -130,7 +130,8 @@ func Start(cfg ServeConfig) (*Server, error) {
 	// 公网端点自动公布（UPnP 映射 + 同 socket STUN 观测；两条证据一致才写 public_endpoint.txt）。
 	// 必须放在 IpcSet 之后：device 到这一刻才打开 Bind（socket 有了端口，STUN 才有意义）。
 	s.StartPublicEndpoint(context.Background(), PublicOpts{
-		StateDir: cfg.StateDir, UPnP: cfg.UPnP, STUN: cfg.STUN, Bind: sbind, Logf: logf,
+		StateDir: cfg.StateDir, UPnP: cfg.UPnP, STUN: cfg.STUN, Bind: sbind,
+		Pinned: cfg.BindAddr.IsValid(), Logf: logf,
 	})
 
 	tcpLn, err := ns.ListenTCPAddrPort(netip.AddrPortFrom(cfg.TunnelIP, cfg.FlowPort))
