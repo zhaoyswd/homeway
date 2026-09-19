@@ -75,7 +75,7 @@ func TestRelayLegEndToEnd(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	startRelayLeg(ctx, sbind, relayAddr, priv, pub, func(f string, a ...any) { t.Logf("[leg] "+f, a...) })
+	startRelayLeg(ctx, sbind, relayAddr, priv, pub, [32]byte{}, func(f string, a ...any) { t.Logf("[leg] "+f, a...) })
 
 	deadline := time.Now().Add(5 * time.Second)
 	for {
@@ -144,5 +144,96 @@ func TestRelayLegEndToEnd(t *testing.T) {
 	}
 	if st := rl.Stats(); st.ForwardedUp == 0 || st.ForwardedDown == 0 {
 		t.Fatalf("中继计数不对：%+v", st)
+	}
+}
+
+// token 模式端到端：中继签发 rl1 token → 后端用 `--relay 'rl1…'` 解析并注册成功；
+// 不带 token 的后端被拒。这就是"中继启动即发凭据，后端拿来就用"的完整链路。
+func TestRelayTokenModeEndToEnd(t *testing.T) {
+	var secret [32]byte
+	if _, err := rand.Read(secret[:]); err != nil {
+		t.Fatal(err)
+	}
+	rl := relay.New(relay.Config{Addr: "127.0.0.1:0", Secret: secret,
+		Logf: func(f string, a ...any) { t.Logf("[relay] "+f, a...) }})
+	rctx, rcancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() { defer close(done); _ = rl.Run(rctx) }()
+	t.Cleanup(func() { rcancel(); <-done })
+	for i := 0; i < 100 && !rl.LocalAddr().IsValid(); i++ {
+		time.Sleep(10 * time.Millisecond)
+	}
+	addr := netip.AddrPortFrom(netip.MustParseAddr("127.0.0.1"), rl.LocalAddr().Port())
+	tok, err := proto.EncodeRelayToken(secret, []proto.Endpoint{{Addr: addr.String()}})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// 后端侧：CLI 参数解析（rl1 token → 地址 + 鉴权密钥）
+	gotAddr, gotSecret, err := ParseRelayArg(tok)
+	if err != nil {
+		t.Fatalf("--relay 应当接受 rl1 token：%v", err)
+	}
+	if gotAddr != addr || gotSecret != secret {
+		t.Fatalf("token 解析结果不符：%v / %x", gotAddr, gotSecret[:4])
+	}
+
+	var priv [32]byte
+	rand.Read(priv[:])
+	pub := wgPub(priv)
+	sbind := &servercore.ServerBind{Logf: func(string, ...any) {}}
+	fns, _, err := sbind.Open(0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sbind.Close()
+	go func() {
+		packets := [][]byte{make([]byte, 65535)}
+		sizes := make([]int, 1)
+		eps := make([]conn.Endpoint, 1)
+		for {
+			if _, err := fns[0](packets, sizes, eps); err != nil {
+				return
+			}
+		}
+	}()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	startRelayLeg(ctx, sbind, gotAddr, priv, pub, gotSecret, func(f string, a ...any) { t.Logf("[leg] "+f, a...) })
+
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if _, ok := rl.RegisterLeg(proto.RelayID(pub)); ok {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("带 token 的后端应当注册成功：%+v", rl.Stats())
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	// 不带 token：另一个身份（用零密钥启动注册腿）应当被拒
+	var priv2 [32]byte
+	rand.Read(priv2[:])
+	pub2 := wgPub(priv2)
+	sbind2 := &servercore.ServerBind{Logf: func(string, ...any) {}}
+	fns2, _, err := sbind2.Open(0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sbind2.Close()
+	go func() {
+		packets := [][]byte{make([]byte, 65535)}
+		sizes := make([]int, 1)
+		eps := make([]conn.Endpoint, 1)
+		for {
+			if _, err := fns2[0](packets, sizes, eps); err != nil {
+				return
+			}
+		}
+	}()
+	startRelayLeg(ctx, sbind2, gotAddr, priv2, pub2, [32]byte{}, func(string, ...any) {})
+	time.Sleep(2 * time.Second)
+	if _, ok := rl.RegisterLeg(proto.RelayID(pub2)); ok {
+		t.Fatal("没带 token 的后端不该注册成功")
 	}
 }

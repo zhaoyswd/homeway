@@ -62,6 +62,12 @@ func (t *Token) endpoints(relay bool) []Endpoint {
 
 // EncodeToken 编码并 base64url（无填充，剪贴板/截图安全字符集）。
 func EncodeToken(t Token) (string, error) {
+	return encodeBody(tokenPrefix, t)
+}
+
+// encodeBody：两个 token 类型（后端 hmw1 / 中继 rl1）共用同一套载荷布局——
+// peerId(32) ‖ secret(32) ‖ epCount(1) ‖ [type+len+addr]* ‖ crc4。
+func encodeBody(prefix string, t Token) (string, error) {
 	for _, e := range t.Endpoints {
 		if _, _, err := net.SplitHostPort(e.Addr); err != nil {
 			return "", fmt.Errorf("%w: 端点 %q 不是 host:port", ErrMalformed, e.Addr)
@@ -88,7 +94,7 @@ func EncodeToken(t Token) (string, error) {
 	}
 	sum := sha256.Sum256(buf)
 	buf = append(buf, sum[0], sum[1], sum[2], sum[3])
-	return tokenPrefix + base64.RawURLEncoding.EncodeToString(buf), nil
+	return prefix + base64.RawURLEncoding.EncodeToString(buf), nil
 }
 
 // DecodeToken 解析并分类报错。深解析只应在 Go 侧发生（NAPI probe）；
@@ -101,7 +107,11 @@ func DecodeToken(s string) (Token, error) {
 	if !strings.HasPrefix(s, tokenPrefix) {
 		return Token{}, fmt.Errorf("%w: 缺少 %s 前缀", ErrMalformed, tokenPrefix)
 	}
-	raw, err := base64.RawURLEncoding.DecodeString(strings.TrimRight(s[len(tokenPrefix):], "="))
+	return decodePrefixed(tokenPrefix, s)
+}
+
+func decodePrefixed(prefix, s string) (Token, error) {
+	raw, err := base64.RawURLEncoding.DecodeString(strings.TrimRight(s[len(prefix):], "="))
 	if err != nil {
 		return Token{}, fmt.Errorf("%w: %v", ErrMalformed, err)
 	}

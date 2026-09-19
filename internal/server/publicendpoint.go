@@ -15,6 +15,7 @@ package server
 import (
 	"context"
 	"fmt"
+	"net"
 	"net/netip"
 	"os"
 	"strconv"
@@ -22,6 +23,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/zhaoyswd/homeway/pkg/egress"
+	"github.com/zhaoyswd/homeway/pkg/proto"
 	"github.com/zhaoyswd/homeway/pkg/servercore"
 )
 
@@ -215,7 +218,75 @@ func (s *Server) refreshPublicEndpoint(ctx context.Context, opts PublicOpts) boo
 		return false
 	}
 	logf("公网端点：已公布 %v（写进 %s；issue 会把它一并烤进 token）", lines, publicFile)
+	s.printClientToken(opts, lines, logf)
 	return true
+}
+
+// printClientToken：把"客户端要粘的 token"直接打出来 —— 出口零参数启动即可用，
+// 不用再跑 `issue`。内容 = LAN 端点 + 已公布公网端点 + serve --relay 给的中继端点；
+// 只有在 token 变化时才重打（公网 IP 变了会自然重打一次）。
+func (s *Server) printClientToken(opts PublicOpts, published []string, logf func(string, ...any)) {
+	var eps []proto.Endpoint
+	seen := map[string]bool{}
+	add := func(e proto.Endpoint) {
+		if e.Addr == "" || seen[e.Addr] {
+			return
+		}
+		seen[e.Addr] = true
+		eps = append(eps, e)
+	}
+	for _, a := range localV4Addrs(opts.Bind.LocalPort()) {
+		add(proto.Endpoint{Addr: a})
+	}
+	for _, a := range published {
+		add(proto.Endpoint{Addr: a})
+	}
+	if s.relayEp.Addr != "" {
+		add(s.relayEp)
+	}
+	if len(eps) == 0 {
+		return
+	}
+	tok, err := proto.EncodeToken(proto.Token{
+		PeerID:    PubFromPriv(s.priv),
+		Secret:    s.secret,
+		Endpoints: eps,
+	})
+	if err != nil {
+		logf("客户端 token 生成失败（%v）", err)
+		return
+	}
+	s.tokMu.Lock()
+	if tok == s.lastToken {
+		s.tokMu.Unlock()
+		return
+	}
+	s.lastToken = tok
+	s.tokMu.Unlock()
+	logf("客户端 token（粘进 App 的「添加主机」即可；%d 个端点）：%s", len(eps), tok)
+}
+
+// localV4Addrs：本机物理网卡 IPv4 + 实际监听端口（LAN 候选）。
+func localV4Addrs(port uint16) []string {
+	var out []string
+	for _, ifi := range egress.PhysicalCandidates() {
+		addrs, err := ifi.Addrs()
+		if err != nil {
+			continue
+		}
+		for _, a := range addrs {
+			ipn, ok := a.(*net.IPNet)
+			if !ok {
+				continue
+			}
+			ip, ok := netip.AddrFromSlice(ipn.IP)
+			if !ok || !ip.Unmap().Is4() {
+				continue
+			}
+			out = append(out, netip.AddrPortFrom(ip.Unmap(), port).String())
+		}
+	}
+	return out
 }
 
 // pinnedNow：当前是否真的钉住了网卡（每次刷新都重读，钉卡失败降级后自动变保守）。

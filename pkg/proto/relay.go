@@ -29,7 +29,9 @@ const (
 
 	RelaySubHello     = byte(0x01) // 后端→中继：pubkey(32)
 	RelaySubChallenge = byte(0x02) // 中继→后端：ephPub(32) ‖ nonce(16)
-	RelaySubProof     = byte(0x03) // 后端→中继：nonce(16) ‖ mac(16)
+	RelaySubProof     = byte(0x03) // 后端→中继：nonce(16) ‖ macDH(16) ‖ macPSK(16)
+	//   macDH  = X25519(后端静态私钥, 中继临时公钥) 的 HMAC（开放模式用）
+	//   macPSK = HMAC(中继鉴权密钥, nonce‖pubkey)（token 模式用；没有 token 时全 0）
 	RelaySubOK        = byte(0x04) // 中继→后端：注册成功（此后才开始分配转发）
 	RelaySubKeepalive = byte(0x05) // 后端→中继：保活（无 payload）
 	RelaySubAgain     = byte(0x06) // 中继→后端：腿不在了（中继重启/过期），请重新注册
@@ -83,22 +85,32 @@ func RelayProofMAC(dh []byte, nonce [16]byte, pubkey [32]byte) []byte {
 	return mac.Sum(nil)[:16]
 }
 
-// EncodeRelayProof：后端回证明。
-func EncodeRelayProof(nonce [16]byte, dh []byte, pubkey [32]byte) []byte {
-	out := make([]byte, 0, 1+16+16)
+// EncodeRelayProof：后端回证明（macPSK 为 nil = 开放模式，填 0）。
+func EncodeRelayProof(nonce [16]byte, dh []byte, pubkey [32]byte, psk []byte) []byte {
+	out := make([]byte, 0, 1+16+16+16)
 	out = append(out, RelaySubProof)
 	out = append(out, nonce[:]...)
 	out = append(out, RelayProofMAC(dh, nonce, pubkey)...)
+	if len(psk) == 16 {
+		out = append(out, psk...)
+	} else {
+		out = append(out, make([]byte, 16)...)
+	}
 	return out
 }
 
-// DecodeRelayProof：解析证明（校验留给调用方：它才知道 DH）。
-func DecodeRelayProof(p []byte) (nonce [16]byte, mac []byte, err error) {
-	if len(p) != 33 || p[0] != RelaySubProof {
-		return nonce, nil, ErrFrameMalformed
+// DecodeRelayProof：解析证明（校验留给调用方：它才知道 DH / 鉴权密钥）。
+// 兼容老的 33B 版本（只有 macDH）——老中继/老后端混跑时不至于死。
+func DecodeRelayProof(p []byte) (nonce [16]byte, macDH, macPSK []byte, err error) {
+	if len(p) != 49 && len(p) != 33 || p[0] != RelaySubProof {
+		return nonce, nil, nil, ErrFrameMalformed
 	}
 	copy(nonce[:], p[1:17])
-	return nonce, p[17:33], nil
+	macDH = p[17:33]
+	if len(p) == 49 {
+		macPSK = p[33:49]
+	}
+	return nonce, macDH, macPSK, nil
 }
 
 // EncodeRelayOK / EncodeRelayKeepalive：小消息。

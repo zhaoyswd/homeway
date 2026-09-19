@@ -53,6 +53,9 @@ type Config struct {
 	// Allow：**后端白名单**（空 = 开放注册，任何人都能拿本中继当中转）。
 	// 每项可以是 8 字节标签 hex（日志里 "后端 xxxx" 的那个，如 39638668）或完整 64 hex 公钥。
 	Allow []string
+	// Secret：中继**鉴权密钥**（非零 = token 模式：只接受持有 rl1 token 的后端）。
+	// 零值 = 开放模式（谁都能注册，靠 --allow 兜底）。密钥由 cmd 从 --state 加载/生成。
+	Secret [32]byte
 	// MaxLegs：注册腿总数上限（0 = 默认 256）—— 防"匿名 Hello 洪水"把表撑爆（腿不注册成功也占位）。
 	MaxLegs int
 	Logf    func(format string, args ...any)
@@ -63,7 +66,8 @@ type Relay struct {
 	cfg Config
 	pc  *net.UDPConn
 
-	mu     sync.Mutex
+	onReady func(netip.AddrPort)
+	mu      sync.Mutex
 	legs   map[[8]byte]*leg
 	assocs map[assocKey]*assoc
 	rates  map[netip.Addr]*rateBucket
@@ -172,15 +176,31 @@ func (r *Relay) Stats() Stats {
 	return r.stats
 }
 
+// RunWithReady：同 Run，但绑定成功后回调一次（实际地址）—— token 必须在**实际端口**确定后生成。
+func (r *Relay) RunWithReady(ctx context.Context, onReady func(actual netip.AddrPort)) error {
+	r.onReady = onReady
+	return r.Run(ctx)
+}
+
 // Run 监听并服务直到 ctx 结束。
+//
+// 端口冲突自动退让（配置口 → +1…+9 → 随机）：中继也要"零参数就能起"，
+// 撞车时把实际端口打出来并写进 token（token 里的端口必须是我们真正在听的）。
 func (r *Relay) Run(ctx context.Context) error {
-	pc, err := net.ListenUDP("udp", mustResolve(r.cfg.Addr))
+	pc, err := r.listen()
 	if err != nil {
 		return err
 	}
 	r.pc = pc
-	who := "⚠️ 开放注册：任何知道本地址的后端都能用它中转（要锁就加 --allow <后端标签>）"
-	if len(r.allow) > 0 {
+	if r.onReady != nil {
+		r.onReady(netip.AddrPortFrom(netip.Addr{}, uint16(pc.LocalAddr().(*net.UDPAddr).Port)))
+	}
+	who := "⚠️ 开放注册：任何知道本地址的后端都能用它中转（要锁就加 --token/--allow）"
+	switch {
+	case r.cfg.Secret != ([32]byte{}):
+		rid := proto.RelaySecretID(r.cfg.Secret)
+		who = fmt.Sprintf("token 模式（中继 ID %x）", rid[:6])
+	case len(r.allow) > 0:
 		who = fmt.Sprintf("白名单 %d 个后端", len(r.allow))
 	}
 	r.cfg.Logf("中继就绪：%v（%s；分配回收 %v，注册腿过期 %v，每源限速 %d pps，每后端最多 %d 条分配，腿总数上限 %d）",
@@ -194,6 +214,32 @@ func (r *Relay) Run(ctx context.Context) error {
 	}()
 	r.readLoop(ctx)
 	return nil
+}
+
+// listen：按配置口监听，被占用就 +1…+9，再不行随机。
+func (r *Relay) listen() (*net.UDPConn, error) {
+	laddr := mustResolve(r.cfg.Addr)
+	want := laddr.Port
+	pc, err := net.ListenUDP("udp", laddr)
+	if err == nil {
+		return pc, nil
+	}
+	r.cfg.Logf("⚠️ 监听端口 %d 被占用（%v）—— 自动往后找", want, err)
+	for p := want + 1; want != 0 && p <= want+9; p++ {
+		la := *laddr
+		la.Port = p
+		if c, e := net.ListenUDP("udp", &la); e == nil {
+			r.cfg.Logf("中继改用端口 %d（token 里写的就是它）", p)
+			return c, nil
+		}
+	}
+	la := *laddr
+	la.Port = 0
+	c, e := net.ListenUDP("udp", &la)
+	if e != nil {
+		return nil, e
+	}
+	return c, nil
 }
 
 func mustResolve(addr string) *net.UDPAddr {
@@ -297,7 +343,7 @@ func (r *Relay) handleControl(src netip.AddrPort, label [8]byte, lg *leg, payloa
 			r.bump(func(s *Stats) { s.Forged++ })
 			return
 		}
-		gotNonce, mac, err := proto.DecodeRelayProof(payload)
+		gotNonce, macDH, macPSK, err := proto.DecodeRelayProof(payload)
 		if err != nil {
 			r.bump(func(s *Stats) { s.Forged++ })
 			return
@@ -308,17 +354,31 @@ func (r *Relay) handleControl(src netip.AddrPort, label [8]byte, lg *leg, payloa
 			r.bump(func(s *Stats) { s.Forged++ })
 			return
 		}
-		dh, err := curve25519.X25519(lg.ephPriv[:], lg.pubkey[:])
-		if err != nil {
-			r.mu.Unlock()
-			r.bump(func(s *Stats) { s.Forged++ })
-			return
+		var dh []byte
+		if r.cfg.Secret == ([32]byte{}) {
+			dh, err = curve25519.X25519(lg.ephPriv[:], lg.pubkey[:])
+			if err != nil {
+				r.mu.Unlock()
+				r.bump(func(s *Stats) { s.Forged++ })
+				return
+			}
 		}
-		want := proto.RelayProofMAC(dh, lg.nonce, lg.pubkey)
-		if subtle.ConstantTimeCompare(want, mac) != 1 {
-			r.mu.Unlock()
-			r.bump(func(s *Stats) { s.Forged++ })
-			return
+		// token 模式只认鉴权 MAC（DH 谁都算得出来，不能当准入）；开放模式看 DH。
+		if r.cfg.Secret != ([32]byte{}) {
+			want := proto.RelayAuthMAC(r.cfg.Secret, lg.nonce, lg.pubkey)
+			if len(macPSK) != 16 || subtle.ConstantTimeCompare(want, macPSK) != 1 {
+				r.mu.Unlock()
+				r.bump(func(s *Stats) { s.Forged++ })
+				r.cfg.Logf("中继：后端 %x 的 token 校验不过（密钥不对/没带 token）—— 拒绝", label[:])
+				return
+			}
+		} else {
+			want := proto.RelayProofMAC(dh, lg.nonce, lg.pubkey)
+			if subtle.ConstantTimeCompare(want, macDH) != 1 {
+				r.mu.Unlock()
+				r.bump(func(s *Stats) { s.Forged++ })
+				return
+			}
 		}
 		moved := lg.addr.IsValid() && lg.addr != src
 		lg.verified, lg.addr, lg.last = true, src, time.Now()

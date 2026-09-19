@@ -8,6 +8,8 @@ import (
 	"net/netip"
 	"os"
 	"strconv"
+	"sync"
+	"strings"
 	"time"
 
 	"github.com/zhaoyswd/homeway/pkg/egress"
@@ -105,6 +107,10 @@ type Server struct {
 	bind    *servercore.ServerBind
 	bindIface *net.Interface     // 本轮实际钉住的网卡（auto 挑出来的或显式给的；nil = 不绑）
 	priv      [32]byte           // WG 静态私钥（中继注册腿要用它做挑战响应）
+	secret    [32]byte           // token 凭证种子（打客户端 token 用）
+	relayEp   proto.Endpoint     // serve --relay 给的中继端点（打客户端 token 时带上）
+	tokMu     sync.Mutex
+	lastToken string             // 上次打印过的客户端 token（变了才重打）
 	udpCap    *udpCapState       // 默认路径的 UDP 能力（周期探测；探测应答里回报）
 	stopTCP func()
 	stopUDP func()
@@ -155,6 +161,9 @@ func Start(cfg ServeConfig) (*Server, error) {
 	s := &Server{cfg: cfg, Stats: &flows.Stats{}}
 	s.bindIface = resolvedIf
 	s.priv = priv
+	if len(secrets) > 0 {
+		s.secret = secrets[0] // 与 `issue` 同一份凭证种子（见 state.Secrets）
+	}
 	level := device.LogLevelError
 	if cfg.Verbose {
 		level = device.LogLevelVerbose
@@ -328,11 +337,14 @@ func Run(ctx context.Context, cfg ServeConfig) error {
 	logf("后端身份：标签 %x（中继 --allow 填这个）｜公钥 %x…", label, pub6[:6])
 
 	// 中继注册腿（--relay）：从 WG socket 出站注册，NAT 后的出口由此可被客户端到达。
+	// 参数可以是 **中继 token（rl1…，含地址 + 鉴权密钥）** 或裸 host:port（开放模式）。
 	if cfg.Relay != "" {
-		if ra, rerr := netip.ParseAddrPort(cfg.Relay); rerr == nil {
-			startRelayLeg(ctx, s.bind, ra, s.priv, wgPub(s.priv), logf)
+		relayAddr, relaySecret, rerr := ParseRelayArg(cfg.Relay)
+		if rerr == nil {
+			s.relayEp = proto.Endpoint{Addr: relayAddr.String(), Relay: true}
+			startRelayLeg(ctx, s.bind, relayAddr, s.priv, wgPub(s.priv), relaySecret, logf)
 		} else {
-			logf("⚠️ --relay %q 不是合法的 host:port（%v）—— 跳过中继注册", cfg.Relay, rerr)
+			logf("⚠️ --relay 解析失败（%v）—— 跳过中继注册", rerr)
 		}
 	}
 	// 默认路径能不能承载 UDP：周期探测 + 探测应答里回报（转发流量一律走默认路由，这是它的属性）。
@@ -376,6 +388,35 @@ func Run(ctx context.Context, cfg ServeConfig) error {
 }
 
 // ipcConfigurer：PeerTable 表项 → device IpcSet。
+// ParseRelayArg：`--relay` 的取值 —— 中继 token（rl1…，地址 + 鉴权密钥）或裸 host:port（开放模式）。
+func ParseRelayArg(v string) (netip.AddrPort, [32]byte, error) {
+	var secret [32]byte
+	v = strings.TrimSpace(v)
+	if strings.HasPrefix(v, "rl1") {
+		tok, err := proto.DecodeRelayToken(v)
+		if err != nil {
+			return netip.AddrPort{}, secret, fmt.Errorf("中继 token 解析失败: %w", err)
+		}
+		eps := tok.DirectEndpoints()
+		if len(eps) == 0 {
+			eps = tok.Endpoints
+		}
+		if len(eps) == 0 {
+			return netip.AddrPort{}, secret, fmt.Errorf("中继 token 里没有端点")
+		}
+		ap, err := netip.ParseAddrPort(eps[0].Addr)
+		if err != nil {
+			return netip.AddrPort{}, secret, fmt.Errorf("中继 token 端点 %q 不是 IP:port（先用带 IP 的 token）: %w", eps[0].Addr, err)
+		}
+		return ap, tok.Secret, nil
+	}
+	ap, err := netip.ParseAddrPort(v)
+	if err != nil {
+		return netip.AddrPort{}, secret, fmt.Errorf("%q 既不是 host:port 也不是 rl1 token（%v）", v, err)
+	}
+	return ap, secret, nil
+}
+
 // PubFromPriv：从 WG 私钥导出公钥（Curve25519 basepoint 乘法）。
 func PubFromPriv(priv [32]byte) [32]byte { return wgPub(priv) }
 

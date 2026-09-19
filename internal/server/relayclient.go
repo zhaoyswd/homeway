@@ -37,6 +37,8 @@ type relayClient struct {
 	priv  [32]byte
 	pub   [32]byte
 	label [8]byte // 中继路由键 = RelayID(pub)；发往中继的包都要带这层标签
+	// secret：中继 token（rl1…）里的鉴权密钥；非零 = token 模式（中继会校验 PSK MAC）。
+	secret [32]byte
 	bind  *servercore.ServerBind
 	logf  func(string, ...any)
 
@@ -50,7 +52,7 @@ type relayClient struct {
 
 // startRelayLeg：起注册腿（非阻塞）。relayAddr 为 token/CLI 里的 relay 端点。
 func startRelayLeg(ctx context.Context, bind *servercore.ServerBind, relayAddr netip.AddrPort,
-	priv [32]byte, pub [32]byte, logf func(string, ...any)) {
+	priv [32]byte, pub [32]byte, relaySecret [32]byte, logf func(string, ...any)) {
 	if !relayAddr.IsValid() {
 		return
 	}
@@ -59,7 +61,7 @@ func startRelayLeg(ctx context.Context, bind *servercore.ServerBind, relayAddr n
 	}
 	rc := &relayClient{
 		relay: relayAddr, priv: priv, pub: pub, label: proto.RelayID(pub), bind: bind, logf: logf,
-		lastPunch: map[netip.Addr]time.Time{},
+		secret: relaySecret, lastPunch: map[netip.Addr]time.Time{},
 	}
 	// 腿上帧钩子：中继控制帧（type=3）由这里消费，不进 device。
 	bind.OnLegFrame = func(typ byte, payload []byte, src netip.AddrPort) bool {
@@ -78,7 +80,11 @@ func startRelayLeg(ctx context.Context, bind *servercore.ServerBind, relayAddr n
 		rc.punch(ap)
 	}
 	go rc.loop(ctx)
-	logf("中继：注册腿开跑（中继 %v）", relayAddr)
+	mode := "开放模式（无 token）"
+	if rc.secret != ([32]byte{}) {
+		mode = "token 模式（rl1 凭据）"
+	}
+	logf("中继：注册腿开跑（中继 %v，%s）", relayAddr, mode)
 }
 
 // loop：Hello → Challenge → Proof → OK，之后周期保活；断了就重来。
@@ -151,7 +157,11 @@ func (rc *relayClient) handleControl(src netip.AddrPort, payload []byte) {
 			rc.logf("中继：挑战 DH 计算失败（%v）", err)
 			return
 		}
-		proof := proto.EncodeRelayProof(nonce, dh, rc.pub)
+		var psk []byte
+		if rc.secret != ([32]byte{}) {
+			psk = proto.RelayAuthMAC(rc.secret, nonce, rc.pub)
+		}
+		proof := proto.EncodeRelayProof(nonce, dh, rc.pub, psk)
 		frame := proto.EncodeTagged(rc.label, proto.FrameTypeRelayReg, proof)
 		if err := rc.bind.SendRawTo(rc.relay, frame); err != nil {
 			rc.logf("中继：注册证明发送失败（%v）", err)

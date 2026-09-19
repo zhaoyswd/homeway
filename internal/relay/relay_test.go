@@ -17,6 +17,7 @@ import (
 type fakeBackend struct {
 	priv  [32]byte
 	pub   [32]byte
+	psk   [32]byte // 非零 = token 模式（用中继鉴权密钥算 PSK MAC）
 	label [8]byte
 	pc    *net.UDPConn
 	relay netip.AddrPort
@@ -69,7 +70,7 @@ func (b *fakeBackend) register() bool {
 		return false
 	}
 	_, _ = b.pc.WriteToUDPAddrPort(proto.EncodeTagged(b.label, proto.FrameTypeRelayReg,
-		proto.EncodeRelayProof(nonce, dh, b.pub)), b.relay)
+		proto.EncodeRelayProof(nonce, dh, b.pub, b.pskF(nonce))), b.relay)
 	n, _, err = b.pc.ReadFromUDPAddrPort(buf)
 	if err != nil {
 		return false
@@ -80,6 +81,14 @@ func (b *fakeBackend) register() bool {
 	}
 	sub, _ := proto.RelaySubtype(payload)
 	return sub == proto.RelaySubOK
+}
+
+// pskF：该后端在本次挑战里的 PSK MAC（没有 token 时返回 nil）。
+func (b *fakeBackend) pskF(nonce [16]byte) []byte {
+	if b.psk == ([32]byte{}) {
+		return nil
+	}
+	return proto.RelayAuthMAC(b.psk, nonce, b.pub)
 }
 
 // keepalive 发一次保活。
