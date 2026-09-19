@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net"
 	"net/netip"
+	"strings"
 	"time"
 
 	"github.com/zhaoyswd/homeway/pkg/egress"
@@ -28,6 +29,80 @@ const (
 	DefaultTermPort   = uint16(7724) // 终端会话 / agent gateway（与旧栈 tunnel 内虚拟端口同号）
 )
 
+// EgressMode：某类转发流量走哪条路。
+//
+//	bind：钉在 --bind-interface 的物理网卡上（不经 TUN 型代理）；
+//	default：走系统默认路由 —— TUN 型代理（Surge 等）按自己的规则处理。
+type EgressMode string
+
+const (
+	EgressBind    EgressMode = "bind"
+	EgressDefault EgressMode = "default"
+)
+
+// ForwardEgress：TCP/UDP 各自的去向。两者可以不同 —— 实测（2026-09-19）：
+// TUN 型代理会按规则处理 TCP（境外走代理能通），但**不中继 UDP**（QUIC 有去无回），
+// 所以 Mac 出口最合适的配置常是 `tcp=default,udp=bind`：TCP 交给代理策略，UDP 直出物理网卡。
+type ForwardEgress struct {
+	TCP EgressMode
+	UDP EgressMode
+}
+
+// ParseForwardEgress 解析 --forward-egress：
+//
+//	bind / default            —— 同时作用于 TCP 与 UDP
+//	tcp=default,udp=bind      —— 分开指定（可只写一项，另一项默认 bind）
+//	（空 = bind）
+func ParseForwardEgress(v string) (ForwardEgress, error) {
+	out := ForwardEgress{TCP: EgressBind, UDP: EgressBind}
+	v = strings.TrimSpace(v)
+	if v == "" {
+		return out, nil
+	}
+	if !strings.Contains(v, "=") {
+		m, err := parseEgressMode(v)
+		if err != nil {
+			return out, err
+		}
+		out.TCP, out.UDP = m, m
+		return out, nil
+	}
+	for _, part := range strings.Split(v, ",") {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		key, val, ok := strings.Cut(part, "=")
+		if !ok {
+			return out, fmt.Errorf("--forward-egress %q：%q 应为 tcp=… 或 udp=…", v, part)
+		}
+		m, err := parseEgressMode(val)
+		if err != nil {
+			return out, err
+		}
+		switch strings.TrimSpace(key) {
+		case "tcp":
+			out.TCP = m
+		case "udp":
+			out.UDP = m
+		default:
+			return out, fmt.Errorf("--forward-egress %q：只认 tcp / udp（收到 %q）", v, key)
+		}
+	}
+	return out, nil
+}
+
+func parseEgressMode(v string) (EgressMode, error) {
+	switch strings.TrimSpace(v) {
+	case string(EgressBind):
+		return EgressBind, nil
+	case string(EgressDefault):
+		return EgressDefault, nil
+	default:
+		return "", fmt.Errorf("--forward-egress %q：只支持 bind、default", v)
+	}
+}
+
 type ServeConfig struct {
 	StateDir     string
 	ListenPort   uint16
@@ -42,6 +117,7 @@ type ServeConfig struct {
 	BuildTag     string        // 探测应答里回报的构建标记（空 = 用内置默认）
 	BindAddr     netip.Addr    // 非零 = 把 WG UDP socket 绑到该地址（该网卡出站；STUN 观测同 socket）
 	BindIface    *net.Interface // 非空 = 双栈监听并整条 socket 钉在该网卡（同时支持 v4/v6 客户端）
+	ForwardEgress ForwardEgress // 转发出站走哪条路（TCP/UDP 可分开）：bind（默认，钉网卡）/ default（系统默认路由 = TUN 型代理）
 	ForwardProxy string        // 非空 = 被转发的 TCP/UDP 经该 SOCKS5 代理出网（出口自身 socket 仍直连）
 	ForwardUDPMode proxy.UDPMode // UDP 是否经代理：auto（探测）/on（必须）/off（不经）
 	ForwardUDPProbe []netip.AddrPort // UDP 能力探测用的 STUN 目标（字面 IP；空 = 内置兜底）
@@ -146,13 +222,23 @@ func Start(cfg ServeConfig) (*Server, error) {
 		s.dev.Close()
 		return nil, err
 	}
-	// 转发出站流量的三条路（优先级见下）：经上游代理 → 钉物理网卡 → 系统默认。
+	// 转发出站流量怎么出去，三选一（优先级见下）：经上游代理 → 钉物理网卡 → 系统默认路由。
 	//
-	//   - 经代理（--forward-via-proxy）：境内直连、境外走代理这类诉求全交给代理自己的规则；
-	//   - 钉物理网卡（--bind-interface）：TUN 型代理抢走默认路由时，不让转发的 TCP/UDP 被它劫走
-	//     （真机实测：不钉时 QUIC 变成"手机上行很多包、目标零应答"）。回环目标自动豁免；
-	//   - 都没有 = 系统默认（与改动前一致）。
-	eg := egress.FromInterface(cfg.BindIface)
+	//   - 经代理（--forward-via-proxy）：境内直连、境外走代理这类诉求显式交给某个 SOCKS5；
+	//   - 钉物理网卡（--forward-egress=bind，默认）：不经 TUN 型代理（Surge 等）；
+	//   - 系统默认路由（--forward-egress=default）：让 TUN 型代理按它自己的规则处理；
+	//   - **两者可以分开**（--forward-egress=tcp=default,udp=bind）：实测 TUN 型代理会按规则
+	//     处理 TCP（境外能通），但不中继 UDP（QUIC 有去无回）—— 这类机器上这就是最优解。
+	// 无论怎么选，**WG socket（打洞/STUN）始终钉在物理网卡上**：NAT 映射必须是我们自己的那个。
+	// 回环目标自动豁免（出口自己的 files/终端就在 127.0.0.1）。
+	ifaceFor := func(m EgressMode) *net.Interface {
+		if m == EgressDefault {
+			return nil
+		}
+		return cfg.BindIface
+	}
+	eg := egress.FromInterface(ifaceFor(cfg.ForwardEgress.TCP))
+	egUDP := egress.FromInterface(ifaceFor(cfg.ForwardEgress.UDP))
 	px, err := proxy.New(cfg.ForwardProxy, cfg.ForwardUDPMode, cfg.ForwardUDPProbe, 10*time.Second)
 	if err != nil {
 		return nil, err
@@ -165,6 +251,16 @@ func Start(cfg ServeConfig) (*Server, error) {
 	case eg.Enabled():
 		dial = eg.DialContext
 		logf("Egress：转发出站流量钉在网卡 %s（回环目标除外）", cfg.BindIface.Name)
+	case cfg.BindIface != nil:
+		logf("Egress：转发的 TCP 走**系统默认路由**（TUN 型代理按自己的规则处理）")
+	}
+	if cfg.BindIface != nil {
+		udpPath := "走**系统默认路由**（TUN 型代理按自己的规则处理）"
+		if egUDP.Enabled() {
+			udpPath = "钉在网卡 " + cfg.BindIface.Name
+		}
+		logf("Egress：转发的 UDP %s；WG socket（端口 %d）始终钉在 %s 上（打洞/STUN 的映射必须是我们自己的）",
+			udpPath, cfg.ListenPort, cfg.BindIface.Name)
 	}
 	s.stopTCP, err = flows.ServeTCP(tcpLn, dial, s.Stats,
 		flows.WithMaxConns(cfg.FlowMaxConns), flows.WithIdleTimeout(cfg.FlowIdle))
@@ -181,8 +277,8 @@ func Start(cfg ServeConfig) (*Server, error) {
 	// UDP 中继：长会话（QUIC/游戏）+ 会话级日志（建立/关闭各一行，含双向包数——
 	// 真机判断「QUIC 到底通没通」就靠这一行，逐包细节不在这里）。
 	udpOpts := []flows.UDPOption{flows.WithUDPLog(logf)}
-	if px != nil || eg.Enabled() {
-		udpOpts = append(udpOpts, flows.WithUDPSocket(udpFactory(logf, px, eg)))
+	if px != nil || egUDP.Enabled() {
+		udpOpts = append(udpOpts, flows.WithUDPSocket(udpFactory(logf, px, egUDP)))
 	}
 	s.stopUDP, _ = flows.ServeUDP(udpPC, s.Stats, udpOpts...)
 

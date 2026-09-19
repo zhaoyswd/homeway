@@ -240,6 +240,7 @@ func cmdServe(args []string) error {
 	forwardProxy := fs.String("forward-via-proxy", "", "被转发的用户流量经该 SOCKS5 代理出网（socks5://host:port；出口自身 socket 仍直连）")
 	forwardUDP := fs.String("forward-udp", "auto", "UDP 是否经代理：auto（探测 UDP ASSOCIATE 能力）/on（必须）/off（不经）")
 	forwardProbe := fs.String("forward-udp-probe", "", "UDP 能力探测的 STUN 目标（逗号分隔的字面 IP:port；默认 Cloudflare+Google）")
+	forwardEgress := fs.String("forward-egress", "bind", "转发流量走哪条路：bind（钉物理网卡，默认）/ default（系统默认路由 = TUN 型代理按自己的规则处理）；可分开写 tcp=default,udp=bind")
 	fs.Parse(args)
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -256,12 +257,17 @@ func cmdServe(args []string) error {
 	if err != nil {
 		return err
 	}
+	egressMode, err := server.ParseForwardEgress(*forwardEgress)
+	if err != nil {
+		return err
+	}
 	return server.Run(ctx, server.ServeConfig{
 		StateDir:        *stateDir,
 		ListenPort:      uint16(*listen),
 		Verbose:         *verbose,
 		BindAddr:        bindAddr,
 		BindIface:       bindIf,
+		ForwardEgress:   egressMode,
 		ForwardProxy:    *forwardProxy,
 		ForwardUDPMode:  udpMode,
 		ForwardUDPProbe: probeTargets,
