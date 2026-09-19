@@ -318,16 +318,9 @@ func waitLocalPort(ctx context.Context, b *servercore.ServerBind, d time.Duratio
 // publicAddr：只接受全局可路由的 IPv4（私网/CGNAT/回环/链路的都不算公网证据）。
 func publicAddr(ip netip.Addr) bool {
 	if !ip.IsValid() || !ip.Is4() {
-		return false
+		return false // 出口公布端点这条路径保持只认 v4（v6 另有 STUN6 校验）
 	}
-	if ip.IsPrivate() || ip.IsLoopback() || ip.IsLinkLocalUnicast() || ip.IsUnspecified() {
-		return false
-	}
-	// 100.64/10（CGNAT）也不是公网
-	if netip.MustParsePrefix("100.64.0.0/10").Contains(ip) {
-		return false
-	}
-	return true
+	return egress.IsPublicAddr(ip)
 }
 
 // externalIP：IGD 的 GetExternalIPAddress（部分路由器返回空，调用方自己兜底）。

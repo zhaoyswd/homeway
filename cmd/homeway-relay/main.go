@@ -153,7 +153,10 @@ func buildToken(secret [32]byte, advertise string, port uint16) (string, []strin
 		}
 		addrs = append(addrs, net.JoinHostPort(host, p))
 	}
+	var skipped []string
+	prefixes := map[string]struct{}{}
 	if len(addrs) == 0 {
+		// 自动探测**只取公网地址**（永远不把非公网 IP 写进 token）。
 		for _, ifi := range egress.PhysicalCandidates() {
 			as, err := ifi.Addrs()
 			if err != nil {
@@ -165,14 +168,36 @@ func buildToken(secret [32]byte, advertise string, port uint16) (string, []strin
 					continue
 				}
 				ip, ok := netip.AddrFromSlice(ipn.IP)
-				if !ok || ip.IsLinkLocalUnicast() {
+				if !ok {
 					continue
 				}
-				addrs = append(addrs, netip.AddrPortFrom(ip.Unmap(), port).String())
+				ip = ip.Unmap()
+				if !egress.IsPublicAddr(ip) {
+					skipped = append(skipped, netip.AddrPortFrom(ip, port).String())
+					continue
+				}
+				// 同一 /64 只留一个：macOS 的 IPv6 临时地址（privacy extensions）会轮换，
+				// 同一前缀下往往挂着 7–8 个，全写进 token 既长又容易过期。
+				if ip.Is6() {
+					pfx, perr := ip.Prefix(64)
+					if perr != nil {
+						continue
+					}
+					if _, seen := prefixes[pfx.String()]; seen {
+						continue
+					}
+					prefixes[pfx.String()] = struct{}{}
+				}
+				addrs = append(addrs, netip.AddrPortFrom(ip, port).String())
 			}
 		}
 	}
 	if len(addrs) == 0 {
+		if len(skipped) > 0 {
+			return "", nil, fmt.Errorf("本机只有非公网地址（%v）—— token 里不放非公网 IP："+
+				"公网中继请加 --advertise <公网IP:端口>；局域网内使用也请显式 --advertise <局域网IP:端口>",
+				skipped)
+		}
 		return "", nil, fmt.Errorf("没找到可公布的地址（用 --advertise 指定）")
 	}
 	for _, a := range addrs {

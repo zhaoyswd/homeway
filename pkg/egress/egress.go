@@ -31,6 +31,32 @@ var virtualIfacePrefixes = []string{
 	"bridge", "vmnet", "vmenet", "tap", "tun", "tailscale", "docker", "br-", "veth", "virbr",
 }
 
+// IsPublicAddr：公网单播地址吗（v4/v6 都判）。**token 里只放公网地址**用这个判据：
+// 私网（RFC1918）、CGNAT(100.64/10)、回环、链路本地、ULA(fc00::/7)、未指定、组播一律不算。
+func IsPublicAddr(ip netip.Addr) bool {
+	if !ip.IsValid() {
+		return false
+	}
+	ip = ip.Unmap()
+	switch {
+	case ip.IsLoopback(), ip.IsPrivate(), ip.IsLinkLocalUnicast(), ip.IsLinkLocalMulticast(),
+		ip.IsUnspecified(), ip.IsMulticast(), ip.IsInterfaceLocalMulticast():
+		return false
+	}
+	if ip.Is4() {
+		// 100.64/10（CGNAT，运营商大内网）也不是公网
+		if netip.MustParsePrefix("100.64.0.0/10").Contains(ip) {
+			return false
+		}
+		return true
+	}
+	// IPv6：ULA(fc00::/7) 不算；其余全局单播（含 2408:… 这类）算
+	if netip.MustParsePrefix("fc00::/7").Contains(ip) {
+		return false
+	}
+	return true
+}
+
 // IsVirtualIface：名字像隧道/虚拟网卡吗（纯函数，单测覆盖）。
 func IsVirtualIface(name string) bool {
 	l := strings.ToLower(name)
