@@ -36,6 +36,9 @@ type ServerBind struct {
 	// ① 出站走该接口（绕开 TUN 型代理抢默认路由，旧栈的 `--bind-interface=physical`）；
 	// ② STUN 观测到的才是**这个 socket** 在路由器上的真实映射。
 	BindAddr netip.Addr
+	// BindIface 非空时**双栈**监听并整条 socket 钉在该网卡上（v4+v6 一起）：
+	// 这就是出口同时服务 IPv4/IPv6 客户端的形态；比只绑一个地址更通用（v6 地址会轮换）。
+	BindIface *net.Interface
 
 	c        *net.UDPConn
 	stunMu   sync.Mutex
@@ -63,15 +66,28 @@ func (e srvEP) DstIP() netip.Addr { return e.ap.Addr() }
 func (e srvEP) SrcIP() netip.Addr { return netip.Addr{} }
 
 func (b *ServerBind) Open(port uint16) ([]conn.ReceiveFunc, uint16, error) {
+	// 网络族：默认**双栈**（v4 + v6），这样出口既能被 IPv4 客户端连，也能被 IPv6 客户端连，
+	// 且同一个 socket 上做 STUN 观测对两族都成立。显式绑地址时按该地址的族走单栈。
+	network := "udp"
 	laddr := &net.UDPAddr{Port: int(port)}
-	if b.BindAddr.IsValid() && b.BindAddr.Is4() {
+	if b.BindAddr.IsValid() {
 		laddr.IP = b.BindAddr.AsSlice()
+		if b.BindAddr.Is4() {
+			network = "udp4"
+		} else {
+			network = "udp6"
+		}
 	}
-	c, err := net.ListenUDP("udp4", laddr)
+	c, err := net.ListenUDP(network, laddr)
 	if err != nil {
 		return nil, 0, err
 	}
-	if laddr.IP != nil {
+	if b.BindIface != nil {
+		if err := pinSocketToIface(c, b.BindIface); err != nil {
+			_ = c.Close()
+			return nil, 0, fmt.Errorf("server: 绑定网卡 %s 失败: %w", b.BindIface.Name, err)
+		}
+	} else if laddr.IP != nil {
 		// 绑了源地址还要把 socket 钉在该网卡上（见 pinSocketToIface 的注释）：
 		// 否则默认路由被 TUN 型代理抢走时，STUN 观测到的是代理的映射而不是路由器上的真实映射。
 		if ip, ok := netip.AddrFromSlice(laddr.IP); ok {
@@ -193,23 +209,49 @@ func (b *ServerBind) LocalPort() uint16 {
 	return uint16(b.c.LocalAddr().(*net.UDPAddr).Port)
 }
 
-// STUNQuery 在**本 Bind 的 UDP socket** 上问一次 STUN 服务器「你看到的我是什么地址」。
+// STUNQuery 在**本 Bind 的 UDP socket** 上问一次 STUN 服务器「你看到的我是什么地址」（IPv4 路径）。
 // 拿到的是「监听端口这个 socket」的 NAT 映射（同一 socket 收发，端口不受源端口改写影响）。
 func (b *ServerBind) STUNQuery(ctx context.Context, server string) (netip.AddrPort, error) {
+	return b.stunQuery(ctx, server, false)
+}
+
+// STUNQueryV6 同 STUNQuery，但走 IPv6：用来确认「双栈 socket 的 v6 路径可用」，
+// 并拿到服务器看到的 v6 地址（v6 无 NAT，应当等于本机全局地址）。
+func (b *ServerBind) STUNQueryV6(ctx context.Context, server string) (netip.AddrPort, error) {
+	return b.stunQuery(ctx, server, true)
+}
+
+func (b *ServerBind) stunQuery(ctx context.Context, server string, want6 bool) (netip.AddrPort, error) {
 	if b.c == nil {
 		return netip.AddrPort{}, fmt.Errorf("server: bind 尚未 Open")
 	}
-	raddr, err := net.ResolveUDPAddr("udp4", server)
+	host, portStr, err := net.SplitHostPort(server)
 	if err != nil {
 		return netip.AddrPort{}, fmt.Errorf("解析 STUN 服务器 %q: %w", server, err)
 	}
-	rap, ok := netip.AddrFromSlice(raddr.IP)
-	if !ok || !rap.Is4() {
+	port, err := net.LookupPort("udp", portStr)
+	if err != nil {
+		return netip.AddrPort{}, fmt.Errorf("STUN 服务器端口 %q: %w", portStr, err)
+	}
+	network := "ip4"
+	if want6 {
+		network = "ip6"
+	}
+	ips, err := net.DefaultResolver.LookupNetIP(ctx, network, host)
+	if err != nil || len(ips) == 0 {
+		return netip.AddrPort{}, fmt.Errorf("解析 STUN 服务器 %q 的 %s: %w", server, network, err)
+	}
+	rap := ips[0]
+	if want6 {
+		if !rap.Is6() || rap.Is4In6() {
+			return netip.AddrPort{}, fmt.Errorf("STUN 服务器 %q 没有可用的 IPv6 地址", server)
+		}
+	} else {
 		if rap = rap.Unmap(); !rap.Is4() {
-			return netip.AddrPort{}, fmt.Errorf("STUN 服务器 %q 不是 IPv4", server)
+			return netip.AddrPort{}, fmt.Errorf("STUN 服务器 %q 没有可用的 IPv4 地址", server)
 		}
 	}
-	target := netip.AddrPortFrom(rap, uint16(raddr.Port))
+	target := netip.AddrPortFrom(rap, uint16(port))
 
 	var txid [12]byte
 	if _, err := rand.Read(txid[:]); err != nil {

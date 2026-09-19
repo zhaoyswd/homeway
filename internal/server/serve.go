@@ -39,8 +39,10 @@ type ServeConfig struct {
 	FlowIdle     time.Duration // 内部流空闲回收（0 = 默认 30 分钟；终端会话腿也走这里，别设太短）
 	BuildTag     string        // 探测应答里回报的构建标记（空 = 用内置默认）
 	BindAddr     netip.Addr    // 非零 = 把 WG UDP socket 绑到该地址（该网卡出站；STUN 观测同 socket）
+	BindIface    *net.Interface // 非空 = 双栈监听并整条 socket 钉在该网卡（同时支持 v4/v6 客户端）
 	UPnP         bool          // 启动后向路由器申请 UDP 端口映射并 30 分钟续期
 	STUN         string        // 非空 = 在监听 socket 上向该 STUN 服务器观测公网映射（如 stun.miwifi.com:3478）
+	STUN6        string        // 非空 = 用该服务器做 **IPv6** 路径校验（要有 AAAA，如 stun.cloudflare.com:3478）
 	Verbose      bool
 }
 
@@ -115,7 +117,7 @@ func Start(cfg ServeConfig) (*Server, error) {
 	if buildTag == "" {
 		buildTag = "homewayd-dev"
 	}
-	sbind := &servercore.ServerBind{Logf: logf, Build: buildTag, BindAddr: cfg.BindAddr}
+	sbind := &servercore.ServerBind{Logf: logf, Build: buildTag, BindAddr: cfg.BindAddr, BindIface: cfg.BindIface}
 	s.dev = device.NewDevice(tunDev, sbind, device.NewLogger(level, "homewayd"))
 	s.Table = servercore.NewPeerTable(servercore.NewIPCConfigurer(s.dev), secrets, 8, 0)
 	// token 台账热加载：`homewayd issue` 之后不需要重启出口（见 PeerTable.reload 的注释）。
@@ -130,8 +132,8 @@ func Start(cfg ServeConfig) (*Server, error) {
 	// 公网端点自动公布（UPnP 映射 + 同 socket STUN 观测；两条证据一致才写 public_endpoint.txt）。
 	// 必须放在 IpcSet 之后：device 到这一刻才打开 Bind（socket 有了端口，STUN 才有意义）。
 	s.StartPublicEndpoint(context.Background(), PublicOpts{
-		StateDir: cfg.StateDir, UPnP: cfg.UPnP, STUN: cfg.STUN, Bind: sbind,
-		Pinned: cfg.BindAddr.IsValid(), Logf: logf,
+		StateDir: cfg.StateDir, UPnP: cfg.UPnP, STUN: cfg.STUN, STUN6: cfg.STUN6, Bind: sbind,
+		Pinned: cfg.BindAddr.IsValid() || cfg.BindIface != nil, Logf: logf,
 	})
 
 	tcpLn, err := ns.ListenTCPAddrPort(netip.AddrPortFrom(cfg.TunnelIP, cfg.FlowPort))

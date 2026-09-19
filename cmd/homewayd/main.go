@@ -55,42 +55,29 @@ func main() {
 func usage() {
 	fmt.Fprintln(os.Stderr, `用法：
   homewayd issue --state <dir> --direct host:port[,host:port...] [--relay host:port...]
-  homewayd serve --state <dir> [--listen 41641] [--upnp] [--stun host:3478] [--bind-interface <网卡|IPv4>]
+  homewayd serve --state <dir> [--listen 41641] [--upnp] [--stun host:3478] [--stun6 host:3478] [--bind-interface <网卡|IPv4>]
   homewayd upnp list | clean [--port N] [--desc 前缀]
   homewayd upnp probe --port N              # 试申请该外部端口（判断是否被占用；成功即删）
   homewayd version`)
 }
 
-// resolveBindAddr：--bind-interface 支持「网卡名」或「IPv4 字面量」（空 = 不绑）。
-func resolveBindAddr(v string) (netip.Addr, error) {
+// resolveBind：--bind-interface 支持三种写法（空 = 不绑）：
+//   - 网卡名（如 en0）：**双栈监听 + 整条 socket 钉在该网卡**（同时服务 v4/v6 客户端；v6 走物理网卡）；
+//   - IPv4 字面量：单栈绑该地址（历史上用于绕开 Surge 抢路由）；
+//   - IPv6 字面量：单栈绑该地址。
+func resolveBind(v string) (netip.Addr, *net.Interface, error) {
 	v = strings.TrimSpace(v)
 	if v == "" {
-		return netip.Addr{}, nil
+		return netip.Addr{}, nil, nil
 	}
 	if ip, err := netip.ParseAddr(v); err == nil {
-		if !ip.Is4() {
-			return netip.Addr{}, fmt.Errorf("bind-interface %q 不是 IPv4", v)
-		}
-		return ip, nil
+		return ip, nil, nil
 	}
 	ifi, err := net.InterfaceByName(v)
 	if err != nil {
-		return netip.Addr{}, fmt.Errorf("找不到网卡 %q（可传网卡名或 IPv4）: %w", v, err)
+		return netip.Addr{}, nil, fmt.Errorf("找不到网卡 %q（可传网卡名或 IP 字面量）: %w", v, err)
 	}
-	addrs, err := ifi.Addrs()
-	if err != nil {
-		return netip.Addr{}, err
-	}
-	for _, a := range addrs {
-		ipn, ok := a.(*net.IPNet)
-		if !ok {
-			continue
-		}
-		if ip, ok := netip.AddrFromSlice(ipn.IP); ok && ip.Unmap().Is4() {
-			return ip.Unmap(), nil
-		}
-	}
-	return netip.Addr{}, fmt.Errorf("网卡 %q 上没有 IPv4 地址", v)
+	return netip.Addr{}, ifi, nil
 }
 
 func parseEndpoints(comma string, relay bool) ([]proto.Endpoint, error) {
@@ -207,7 +194,7 @@ func cmdIssue(args []string) error {
 	// 出口若已自动公布公网端点（UPnP + 同 socket STUN 一致才写），自动拼进直连候选：
 	// 家里/外面都能连。--no-public 可关掉。
 	if !*noPublic {
-		if pub := server.ReadPublicEndpoint(*stateDir); pub != "" {
+		for _, pub := range server.ReadPublicEndpoints(*stateDir) {
 			eps = append(eps, proto.Endpoint{Addr: pub})
 			fmt.Fprintf(os.Stderr, "homewayd: 已附上自动公布的公网端点 %s（--no-public 可关）\n", pub)
 		}
@@ -246,13 +233,14 @@ func cmdServe(args []string) error {
 	listen := fs.Uint("listen", 41641, "WG 监听端口")
 	verbose := fs.Bool("verbose", false, "打印 wireguard-go 详细日志")
 	upnp := fs.Bool("upnp", false, "启动后向路由器申请 UDP 端口映射（30 分钟续期）")
-	stunServer := fs.String("stun", "", "STUN 服务器（在监听 socket 上观测公网映射，如 stun.miwifi.com:3478）")
+	stunServer := fs.String("stun", "", "STUN 服务器（在监听 socket 上观测 IPv4 公网映射，如 stun.miwifi.com:3478）")
+	stun6Server := fs.String("stun6", "", "做 IPv6 路径校验用的 STUN 服务器（要有 AAAA，如 stun.cloudflare.com:3478）")
 	bindIface := fs.String("bind-interface", "", "把 WG socket 绑到该网卡/地址（物理网卡名或 IPv4；绕开 TUN 型代理）")
 	fs.Parse(args)
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
-	bindAddr, err := resolveBindAddr(*bindIface)
+	bindAddr, bindIf, err := resolveBind(*bindIface)
 	if err != nil {
 		return err
 	}
@@ -261,8 +249,10 @@ func cmdServe(args []string) error {
 		ListenPort: uint16(*listen),
 		Verbose:    *verbose,
 		BindAddr:   bindAddr,
+		BindIface:  bindIf,
 		UPnP:       *upnp,
 		STUN:       *stunServer,
+		STUN6:      *stun6Server,
 	})
 }
 

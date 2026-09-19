@@ -34,7 +34,8 @@ const (
 type PublicOpts struct {
 	StateDir string
 	UPnP     bool
-	STUN     string // "" = 不做 STUN 观测；否则是 host:port
+	STUN     string // "" = 不做 STUN 观测；否则是 host:port（IPv4 映射）
+	STUN6    string // "" = 跳过 IPv6 校验；否则是有 AAAA 的 STUN 服务器
 	Bind     *servercore.ServerBind
 	// Pinned：WG socket 已绑物理网卡（--bind-interface）。钉住之后 STUN 观测到的 IP 必然是
 	// 这台机器在路由器 WAN 侧的地址（不会是被代理改写过的），所以「外口 != 监听口」时也敢用
@@ -46,13 +47,19 @@ type PublicOpts struct {
 // PublicEndpointPath：公布文件路径（issue 读它）。
 func PublicEndpointPath(stateDir string) string { return filepath.Join(stateDir, publicFile) }
 
-// ReadPublicEndpoint 读回上次公布的公网端点（空 = 还没有）。
-func ReadPublicEndpoint(stateDir string) string {
+// ReadPublicEndpoints 读回上次公布的公网端点（可能有多行：IPv4 + 若干 IPv6；空 = 还没有）。
+func ReadPublicEndpoints(stateDir string) []string {
 	b, err := os.ReadFile(PublicEndpointPath(stateDir))
 	if err != nil {
-		return ""
+		return nil
 	}
-	return strings.TrimSpace(string(b))
+	var out []string
+	for _, line := range strings.Split(string(b), "\n") {
+		if s := strings.TrimSpace(line); s != "" {
+			out = append(out, s)
+		}
+	}
+	return out
 }
 
 
@@ -151,11 +158,31 @@ func (s *Server) refreshPublicEndpoint(ctx context.Context, opts PublicOpts) boo
 	if !pub.IsValid() {
 		return false
 	}
-	if err := os.WriteFile(PublicEndpointPath(opts.StateDir), []byte(pub.String()+"\n"), 0o600); err != nil {
+	// IPv6 端点：v6 无 NAT，"公网地址"就是本机在该网卡上的全局地址 + 监听端口。
+	// 先用同一个 socket 做一次 v6 STUN（验证 v6 路径真的可用、并拿到服务器看到的地址），
+	// 失败就不公布 v6 —— 宁可不给，也不给一个发不出去的候选。
+	var lines []string
+	lines = append(lines, pub.String())
+	if opts.STUN6 != "" {
+		v6ctx, v6cancel := context.WithTimeout(ctx, 8*time.Second)
+		if ap6, err := opts.Bind.STUNQueryV6(v6ctx, opts.STUN6); err == nil {
+			if ap6.Addr().Is6() && !ap6.Addr().Is4In6() && !ap6.Addr().IsLinkLocalUnicast() {
+				lines = append(lines, netip.AddrPortFrom(ap6.Addr(), pub.Port()).String())
+				logf("公网端点：IPv6 路径可用（STUN 看到 %v），公布 [%v]:%d", ap6.Addr(), ap6.Addr(), pub.Port())
+			}
+		} else {
+			logf("公网端点：IPv6 不可用（%v），本轮只公布 IPv4", err)
+		}
+		v6cancel()
+	} else {
+		logf("公网端点：未配置 --stun6（需要有 AAAA 的 STUN 服务器），跳过 IPv6 公布")
+	}
+
+	if err := os.WriteFile(PublicEndpointPath(opts.StateDir), []byte(strings.Join(lines, "\n")+"\n"), 0o600); err != nil {
 		logf("公网端点：写 %s 失败（%v）", PublicEndpointPath(opts.StateDir), err)
 		return false
 	}
-	logf("公网端点：已公布 %v（写进 %s；issue 会把它一并烤进 token）", pub, publicFile)
+	logf("公网端点：已公布 %v（写进 %s；issue 会把它一并烤进 token）", lines, publicFile)
 	return true
 }
 

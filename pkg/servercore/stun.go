@@ -62,25 +62,58 @@ func stunParseBindingResponse(b []byte, txid [12]byte) (netip.AddrPort, bool) {
 		}
 		val := b[off : off+al]
 		off += (al + 3) / 4 * 4 // 属性 4 字节对齐
-		if len(val) < 8 || val[0] != 0 { // family 必须 IPv4（本出口只用 udp4）
+		if len(val) < 8 {
+			continue
+		}
+		family := val[1]
+		// family=1 IPv4（8 字节属性）/ family=2 IPv6（20 字节属性）；其它忽略。
+		if (family == 1 && (len(val) != 8 || val[0] != 0)) || (family == 2 && (len(val) != 20 || val[0] != 0)) {
 			continue
 		}
 		port := binary.BigEndian.Uint16(val[2:4])
-		var ip4 [4]byte
-		copy(ip4[:], val[4:8])
+		var ap netip.AddrPort
 		switch at {
 		case attrXORMappedAddress:
 			port ^= uint16(stunMagicCookie >> 16)
 			cookie := make([]byte, 4)
 			binary.BigEndian.PutUint32(cookie, stunMagicCookie)
-			for i := 0; i < 4; i++ {
-				ip4[i] ^= cookie[i]
+			switch family {
+			case 1:
+				var ip4 [4]byte
+				copy(ip4[:], val[4:8])
+				for i := 0; i < 4; i++ {
+					ip4[i] ^= cookie[i]
+				}
+				ap = netip.AddrPortFrom(netip.AddrFrom4(ip4), port)
+			case 2:
+				// IPv6 的 XOR：前 4 字节异或 magic cookie，后 12 字节异或事务 ID。
+				var raw [16]byte
+				copy(raw[:], val[4:20])
+				for i := 0; i < 4; i++ {
+					raw[i] ^= cookie[i]
+				}
+				for i := 0; i < 12; i++ {
+					raw[4+i] ^= txid[i]
+				}
+				ap = netip.AddrPortFrom(netip.AddrFrom16(raw), port)
 			}
-			xor = netip.AddrPortFrom(netip.AddrFrom4(ip4), port)
-			haveXOR = true
+			if ap.IsValid() {
+				xor, haveXOR = ap, true
+			}
 		case attrMappedAddress:
-			plain = netip.AddrPortFrom(netip.AddrFrom4(ip4), port)
-			havePlain = true
+			switch family {
+			case 1:
+				var ip4 [4]byte
+				copy(ip4[:], val[4:8])
+				plain = netip.AddrPortFrom(netip.AddrFrom4(ip4), port)
+			case 2:
+				var raw [16]byte
+				copy(raw[:], val[4:20])
+				plain = netip.AddrPortFrom(netip.AddrFrom16(raw), port)
+			}
+			if plain.IsValid() {
+				havePlain = true
+			}
 		}
 	}
 	if haveXOR {

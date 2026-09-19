@@ -19,14 +19,17 @@ func pinSocketToIface(conn *net.UDPConn, ifi *net.Interface) error {
 	if err != nil {
 		return err
 	}
-	var serr error
+	var serr4, serr6 error
 	if err := raw.Control(func(fd uintptr) {
-		serr = unix.SetsockoptInt(int(fd), unix.IPPROTO_IP, unix.IP_BOUND_IF, ifi.Index)
+		// 双栈 socket 上两族都要钉：IP_BOUND_IF 管 v4（含 v4-mapped），IPV6_BOUND_IF 管真 v6。
+		// 单栈 socket 上对另一族设置会报 EINVAL/ENOPROTOOPT —— 忽略它，只要有一族成功即可。
+		serr4 = unix.SetsockoptInt(int(fd), unix.IPPROTO_IP, unix.IP_BOUND_IF, ifi.Index)
+		serr6 = unix.SetsockoptInt(int(fd), unix.IPPROTO_IPV6, unix.IPV6_BOUND_IF, ifi.Index)
 	}); err != nil {
 		return err
 	}
-	if serr != nil {
-		return fmt.Errorf("IP_BOUND_IF: %w", serr)
+	if serr4 != nil && serr6 != nil {
+		return fmt.Errorf("IP_BOUND_IF/IPV6_BOUND_IF: %v / %v", serr4, serr6)
 	}
 	return nil
 }
