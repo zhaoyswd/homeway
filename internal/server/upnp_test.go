@@ -137,7 +137,7 @@ func TestListAndCleanMappings(t *testing.T) {
 	defer srv.Close()
 	g := &igd{controlURL: srv.URL, serviceType: "urn:x:WANIPConnection:1"}
 
-	list, err := g.ListMappings(context.Background(), 10)
+	list, err := g.listMappings(context.Background(), 10)
 	if err != nil || len(list) != len(table) {
 		t.Fatalf("list = %d 条 err=%v，want %d", len(list), err, len(table))
 	}

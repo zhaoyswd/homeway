@@ -2,51 +2,12 @@ package relay
 
 import (
 	"crypto/rand"
-	"encoding/hex"
 	"net/netip"
 	"testing"
 	"time"
 
 	"github.com/zhaoyswd/homeway/pkg/proto"
 )
-
-// 白名单：列了的后端能注册，没列的连挑战都拿不到（防"知道地址就能蹭"）。
-func TestAllowListBlocksStrangers(t *testing.T) {
-	// 先起一个开放中继，拿两个真后端的标签
-	open := startRelay(t, Config{})
-	openAddr := netip.AddrPortFrom(netip.MustParseAddr("127.0.0.1"), open.LocalAddr().Port())
-	mine := newFakeBackend(t, openAddr)
-	stranger := newFakeBackend(t, openAddr)
-
-	// 用「我的标签」起一个白名单中继
-	r := startRelay(t, Config{Allow: []string{hex.EncodeToString(mine.label[:])}})
-	relayAddr := netip.AddrPortFrom(netip.MustParseAddr("127.0.0.1"), r.LocalAddr().Port())
-
-	mine.relay = relayAddr
-	if !mine.register() {
-		t.Fatal("白名单里的后端应当注册成功")
-	}
-	stranger.relay = relayAddr
-	if stranger.register() {
-		t.Fatal("不在白名单里的后端不该注册成功")
-	}
-	if st := r.Stats(); st.Denied == 0 {
-		t.Fatalf("拒绝计数没记上：%+v", st)
-	}
-}
-
-// 完整公钥写法也能用（自动派生标签）。
-func TestAllowListAcceptsFullPubkey(t *testing.T) {
-	open := startRelay(t, Config{})
-	openAddr := netip.AddrPortFrom(netip.MustParseAddr("127.0.0.1"), open.LocalAddr().Port())
-	be := newFakeBackend(t, openAddr)
-	r := startRelay(t, Config{Allow: []string{hex.EncodeToString(be.pub[:])}})
-	relayAddr := netip.AddrPortFrom(netip.MustParseAddr("127.0.0.1"), r.LocalAddr().Port())
-	be.relay = relayAddr
-	if !be.register() {
-		t.Fatal("用完整公钥配白名单时应当注册成功")
-	}
-}
 
 // 腿总数上限：匿名 Hello 洪水不能把表无限撑大。
 func TestMaxLegsCapsTable(t *testing.T) {

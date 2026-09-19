@@ -42,8 +42,8 @@ type PeerTable struct {
 	cfg     Configurer
 	secrets [][32]byte
 	// reload 可选：reg 验证失败时重新读一次 token 台账。
-	// 为什么要有它：`homewayd issue` 只是往 tokens.jsonl 追加一行，而服务进程只在启动时读过；
-	// 「升级出口 → issue → 粘贴到手机」这条日常路径如果必须重启出口才能生效，真机上极其别扭
+	// 为什么要有它：serve 重签 token（端点/公网映射变化时）只是往 tokens.jsonl 追加一行，
+	// 而服务进程只在启动时读过；「重签 → 粘贴到手机」这条日常路径如果必须重启出口才能生效，真机上极其别扭
 	//（2026-09-19 实测：新 token 的 REG 被拒，日志 `reg 验证失败（无匹配 token）`）。
 	// 只在**失败路径**调用 ⇒ 热路径零开销。
 	reload func() ([][32]byte, error)

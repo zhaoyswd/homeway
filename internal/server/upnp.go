@@ -344,7 +344,7 @@ func atoiOr0(s string) int {
 	return n
 }
 
-// FindIGD：按内网候选找路由器（CLI 的 upnp list/clean 用）。
+// FindIGD：按内网候选找路由器（serve 启动时申请/续用端口映射用）。
 func FindIGD(ctx context.Context) (*igd, netip.Addr, error) {
 	cands := localIPv4Candidates()
 	if len(cands) == 0 {
@@ -362,30 +362,12 @@ func FindIGD(ctx context.Context) (*igd, netip.Addr, error) {
 	return nil, netip.Addr{}, lastErr
 }
 
-// ControlURL：给 CLI 打印用的只读访问器。
-func (g *igd) ControlURL() string { return g.controlURL }
-
-// ListMappings / DeleteMapping / CleanMappings：给 CLI 用的薄封装。
-func (g *igd) ListMappings(ctx context.Context, max int) ([]upnpMapping, error) {
-	return g.listMappings(ctx, max)
-}
-
 // ReAddShortLease：用很短的租期重建同一条映射（退出时调；够一次快速重启沿用，之后自动过期）。
 func (g *igd) ReAddShortLease(ctx context.Context, extPort uint16, internalIP netip.Addr,
 	internalPort uint16, lease uint32) error {
 	_ = g.deleteMapping(ctx, extPort, "UDP")
 	_, err := g.addWithLease(ctx, extPort, internalIP, internalPort, lease)
 	return err
-}
-
-// ProbeAdd 试申请一条映射（**不先删同名**，用于排障"这个端口是不是被占了"）。
-// 调用方通常随后删掉它（或给很短租期让它自己过期）。
-func (g *igd) ProbeAdd(ctx context.Context, port uint16, internalIP netip.Addr, lease uint32) (string, error) {
-	return g.addWithLease(ctx, port, internalIP, port, lease)
-}
-
-func (g *igd) DeleteMapping(ctx context.Context, externalPort uint16, proto string) error {
-	return g.deleteMapping(ctx, externalPort, proto)
 }
 
 // CleanMappings 删掉**我们自己的**映射：描述以 descPrefix 开头 **且** 内网客户端是本机地址

@@ -20,10 +20,8 @@ package relay
 import (
 	"context"
 	"crypto/rand"
-	"encoding/hex"
-	"fmt"
-	"strings"
 	"crypto/subtle"
+	"fmt"
 	"net"
 	"net/netip"
 	"sync"
@@ -35,12 +33,12 @@ import (
 
 // 默认参数（可用 Config 覆盖）。
 const (
-	defaultIdleTimeout = 90 * time.Second  // 分配腿空闲回收
-	defaultLegTimeout  = 90 * time.Second  // 注册腿过期（后端 keepalive 间隔的 3 倍）
-	defaultMaxPerPeer  = 32                // 每个后端最多并发的客户端分配
-	defaultRateLimit   = 200               // 每个源地址每秒允许的包数（准入限流）
-	defaultMaxLegs     = 256               // 注册腿总数上限（白名单为空时的兜底）
-	challengeTTL       = 15 * time.Second  // 挑战有效期
+	defaultIdleTimeout = 90 * time.Second // 分配腿空闲回收
+	defaultLegTimeout  = 90 * time.Second // 注册腿过期（后端 keepalive 间隔的 3 倍）
+	defaultMaxPerPeer  = 32               // 每个后端最多并发的客户端分配
+	defaultRateLimit   = 200              // 每个源地址每秒允许的包数（准入限流）
+	defaultMaxLegs     = 256              // 注册腿总数上限（白名单为空时的兜底）
+	challengeTTL       = 15 * time.Second // 挑战有效期
 )
 
 // Config 中继参数。
@@ -50,11 +48,8 @@ type Config struct {
 	LegTimeout  time.Duration // 注册腿过期（0 = 默认 90s）
 	MaxPerPeer  int           // 每个后端的最大并发分配（0 = 默认 32）
 	RateLimit   int           // 每源每秒包数上限（0 = 默认 200）
-	// Allow：**后端白名单**（空 = 开放注册，任何人都能拿本中继当中转）。
-	// 每项可以是 8 字节标签 hex（日志里 "后端 xxxx" 的那个，如 39638668）或完整 64 hex 公钥。
-	Allow []string
 	// Secret：中继**鉴权密钥**（非零 = token 模式：只接受持有 rl1 token 的后端）。
-	// 零值 = 开放模式（谁都能注册，靠 --allow 兜底）。密钥由 cmd 从 --state 加载/生成。
+	// 零值 = 开放模式（谁都能注册，仅测试用）。密钥由 cmd 从 --state 加载/生成。
 	Secret [32]byte
 	// MaxLegs：注册腿总数上限（0 = 默认 256）—— 防"匿名 Hello 洪水"把表撑爆（腿不注册成功也占位）。
 	MaxLegs int
@@ -68,10 +63,9 @@ type Relay struct {
 
 	onReady func(netip.AddrPort)
 	mu      sync.Mutex
-	legs   map[[8]byte]*leg
-	assocs map[assocKey]*assoc
-	rates  map[netip.Addr]*rateBucket
-	allow  map[[8]byte]bool // 空 = 不限制
+	legs    map[[8]byte]*leg
+	assocs  map[assocKey]*assoc
+	rates   map[netip.Addr]*rateBucket
 
 	stats Stats
 }
@@ -136,25 +130,11 @@ func New(cfg Config) *Relay {
 	if cfg.Logf == nil {
 		cfg.Logf = func(string, ...any) {}
 	}
-	allow := map[[8]byte]bool{}
-	for _, raw := range cfg.Allow {
-		raw = strings.TrimSpace(raw)
-		if raw == "" {
-			continue
-		}
-		lb, err := parseAllowEntry(raw)
-		if err != nil {
-			cfg.Logf("⚠️ --allow %q 解析失败（%v）—— 忽略该项", raw, err)
-			continue
-		}
-		allow[lb] = true
-	}
 	return &Relay{
 		cfg:    cfg,
 		legs:   map[[8]byte]*leg{},
 		assocs: map[assocKey]*assoc{},
 		rates:  map[netip.Addr]*rateBucket{},
-		allow:  allow,
 	}
 }
 
@@ -195,13 +175,10 @@ func (r *Relay) Run(ctx context.Context) error {
 	if r.onReady != nil {
 		r.onReady(netip.AddrPortFrom(netip.Addr{}, uint16(pc.LocalAddr().(*net.UDPAddr).Port)))
 	}
-	who := "⚠️ 开放注册：任何知道本地址的后端都能用它中转（要锁就加 --token/--allow）"
-	switch {
-	case r.cfg.Secret != ([32]byte{}):
+	who := "⚠️ 开放注册：任何知道本地址的后端都能用它中转（正常路径下不会出现）"
+	if r.cfg.Secret != ([32]byte{}) {
 		rid := proto.RelaySecretID(r.cfg.Secret)
 		who = fmt.Sprintf("token 模式（中继 ID %x）", rid[:6])
-	case len(r.allow) > 0:
-		who = fmt.Sprintf("白名单 %d 个后端", len(r.allow))
 	}
 	r.cfg.Logf("中继就绪：%v（%s；分配回收 %v，注册腿过期 %v，每源限速 %d pps，每后端最多 %d 条分配，腿总数上限 %d）",
 		pc.LocalAddr(), who, r.cfg.IdleTimeout, r.cfg.LegTimeout, r.cfg.RateLimit, r.cfg.MaxPerPeer, r.cfg.MaxLegs)
@@ -300,11 +277,6 @@ func (r *Relay) handleControl(src netip.AddrPort, label [8]byte, lg *leg, payloa
 		pubkey, err := proto.DecodeRelayHello(payload)
 		if err != nil || proto.RelayID(pubkey) != label {
 			r.bump(func(s *Stats) { s.Forged++ })
-			return
-		}
-		if len(r.allow) > 0 && !r.allow[label] {
-			r.bump(func(s *Stats) { s.Denied++ })
-			r.cfg.Logf("中继：拒绝未在白名单里的后端 %x（--allow 可加）", label[:])
 			return
 		}
 		// 出题：临时 X25519 密钥对 + 随机数
@@ -620,31 +592,6 @@ func (r *Relay) bump(f func(*Stats)) {
 	r.mu.Lock()
 	f(&r.stats)
 	r.mu.Unlock()
-}
-
-// parseAllowEntry：白名单项 = 8 字节标签 hex（"39638668"）或完整 64 hex 公钥（自动派生标签）。
-func parseAllowEntry(s string) ([8]byte, error) {
-	var lb [8]byte
-	s = strings.TrimPrefix(strings.ToLower(strings.TrimSpace(s)), "0x")
-	switch len(s) {
-	case 16:
-		b, err := hex.DecodeString(s)
-		if err != nil {
-			return lb, err
-		}
-		copy(lb[:], b)
-		return lb, nil
-	case 64:
-		b, err := hex.DecodeString(s)
-		if err != nil {
-			return lb, err
-		}
-		var pub [32]byte
-		copy(pub[:], b)
-		return proto.RelayID(pub), nil
-	default:
-		return lb, fmt.Errorf("要 16 位标签 hex 或 64 位公钥 hex，收到 %d 位", len(s))
-	}
 }
 
 func unmap(ap netip.AddrPort) netip.AddrPort {

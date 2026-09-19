@@ -177,7 +177,8 @@ func Start(cfg ServeConfig) (*Server, error) {
 	s.bind = sbind
 	s.dev = device.NewDevice(tunDev, sbind, device.NewLogger(level, "homewayd"))
 	s.Table = servercore.NewPeerTable(servercore.NewIPCConfigurer(s.dev), secrets, 8, 0)
-	// token 台账热加载：`homewayd issue` 之后不需要重启出口（见 PeerTable.reload 的注释）。
+	// token 台账热加载：serve 自己重签 token（端点变化时）后，新 secret 立刻可用，
+	// 不需要重启出口（见 PeerTable.reload 的注释）。
 	s.Table.SetSecretsReloader(st.Secrets)
 	sbind.Table = s.Table
 
@@ -328,13 +329,13 @@ func Run(ctx context.Context, cfg ServeConfig) error {
 			logf("⚠️ 实际监听端口 %d（配置的 %d 被占用，已自动退让）—— token 里的端口以公布/签发为准", p, cfg.ListenPort)
 		}
 		if werr := os.WriteFile(ListenPortPath(cfg.StateDir), []byte(strconv.Itoa(int(p))+"\n"), 0o600); werr != nil {
-			logf("监听端口落盘失败（%v）—— issue 会回落到 41641", werr)
+			logf("监听端口落盘失败（%v）—— 只是少了给人看的记录，不影响隧道", werr)
 		}
 	}()
-	// 身份标签：中继 `--allow` 白名单填这个（从 token 或 `homewayd id` 也能取到）。
+	// 身份标签：中继日志里的「后端 <label> 注册成功」就是它（排障时对得上号）。
 	label := BackendLabel(s.priv)
 	pub6 := PubFromPriv(s.priv)
-	logf("后端身份：标签 %x（中继 --allow 填这个）｜公钥 %x…", label, pub6[:6])
+	logf("后端身份：标签 %x ｜公钥 %x…", label, pub6[:6])
 
 	// 中继注册腿（--relay）：从 WG socket 出站注册，NAT 后的出口由此可被客户端到达。
 	// 参数可以是 **中继 token（rl1…，含地址 + 鉴权密钥）** 或裸 host:port（开放模式）。
@@ -421,7 +422,7 @@ func ParseRelayArg(v string) (netip.AddrPort, [32]byte, error) {
 func PubFromPriv(priv [32]byte) [32]byte { return wgPub(priv) }
 
 // BackendLabel：出口的**中继标签** = SHA-256(静态公钥)[:8]（16 位 hex）。
-// 中继 `--allow` 填的就是它；中继日志 `中继：后端 <label> 注册成功` 也是它。
+// 中继日志 `中继：后端 <label> 注册成功` 用的就是它。
 func BackendLabel(priv [32]byte) [8]byte { return proto.RelayID(PubFromPriv(priv)) }
 
 // BackendLabelFromState：从 state 目录里的身份密钥算标签（`homewayd id` 用）。
@@ -454,6 +455,4 @@ func logf(format string, args ...any) {
 }
 
 var _ = wgtypes.Key{} // 保留引用
-
-
 

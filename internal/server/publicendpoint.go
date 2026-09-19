@@ -3,7 +3,7 @@ package server
 // 出口的「公网端点自动公布」（从旧 tailcat fork 的 endpoint-hint 机制移植的等价物）。
 //
 // 目标：出口在 NAT 后面时，把**路由器上真实可达的 公网IP:端口**写进 state 目录，
-// 让 `homewayd issue` 能把它一并烤进 token（客户端就能直连，不必只靠局域网地址）。
+// serve 签发 token 时会把它一并烤进去（客户端就能直连，不必只靠局域网地址）。
 //
 // 两条证据必须一致才公布（旧栈踩过的坑）：
 //   - UPnP：向路由器申请的外口（优先与监听端口同号）；
@@ -18,7 +18,6 @@ import (
 	"net"
 	"net/netip"
 	"os"
-	"strconv"
 	"path/filepath"
 	"strings"
 	"time"
@@ -46,43 +45,14 @@ type PublicOpts struct {
 	// STUN 的 IP + UPnP 的外口拼端点；没钉住时保守起见要求两者端口一致。
 	// ⚠️ 判据是**运行期事实**（Bind.PinnedIface()）——钉卡失败会自动降级，这里不能拿配置当真。
 	Pinned bool
-	Logf     func(format string, args ...any)
+	Logf   func(format string, args ...any)
 }
 
-// ListenPortPath：实际监听端口落盘路径（端口冲突会退让，issue 读它拼 LAN 端点）。
+// ListenPortPath：实际监听端口落盘路径（端口冲突会退让；文件供人查，token 里的端口以签发时为准）。
 func ListenPortPath(stateDir string) string { return filepath.Join(stateDir, "listen_port.txt") }
 
-// ReadListenPort：读回实际监听端口（没有/不合法 → 0，调用方回落默认）。
-func ReadListenPort(stateDir string) uint16 {
-	b, err := os.ReadFile(ListenPortPath(stateDir))
-	if err != nil {
-		return 0
-	}
-	n, err := strconv.ParseUint(strings.TrimSpace(string(b)), 10, 16)
-	if err != nil {
-		return 0
-	}
-	return uint16(n)
-}
-
-// PublicEndpointPath：公布文件路径（issue 读它）。
+// PublicEndpointPath：公布文件路径（内容 = 已公布的公网端点，供人查）。
 func PublicEndpointPath(stateDir string) string { return filepath.Join(stateDir, publicFile) }
-
-// ReadPublicEndpoints 读回上次公布的公网端点（可能有多行：IPv4 + 若干 IPv6；空 = 还没有）。
-func ReadPublicEndpoints(stateDir string) []string {
-	b, err := os.ReadFile(PublicEndpointPath(stateDir))
-	if err != nil {
-		return nil
-	}
-	var out []string
-	for _, line := range strings.Split(string(b), "\n") {
-		if s := strings.TrimSpace(line); s != "" {
-			out = append(out, s)
-		}
-	}
-	return out
-}
-
 
 // StartPublicEndpoint 起后台循环（非阻塞）。
 func (s *Server) StartPublicEndpoint(ctx context.Context, opts PublicOpts) {
@@ -217,7 +187,7 @@ func (s *Server) refreshPublicEndpoint(ctx context.Context, opts PublicOpts) boo
 		logf("公网端点：写 %s 失败（%v）", PublicEndpointPath(opts.StateDir), err)
 		return false
 	}
-	logf("公网端点：已公布 %v（写进 %s；issue 会把它一并烤进 token）", lines, publicFile)
+	logf("公网端点：已公布 %v（写进 %s；下次签发 token 会带上它）", lines, publicFile)
 	s.printClientToken(opts, lines, logf)
 	return true
 }
