@@ -219,6 +219,7 @@ func cmdIssue(args []string) error {
 	relay := fs.String("relay", "", "中继端点，逗号分隔 host:port")
 	noPublic := fs.Bool("no-public", false, "不自动附加出口公布的公网端点")
 	noLAN := fs.Bool("no-lan", false, "不自动附加本机 LAN 端点（做「只经中继」的 token 时用）")
+	noRelay := fs.Bool("no-relay", false, "不自动附加 serve 配置的中继端点")
 	fs.Parse(args)
 
 	var eps []proto.Endpoint
@@ -242,6 +243,13 @@ func cmdIssue(args []string) error {
 		for _, pub := range server.ReadPublicEndpoints(*stateDir) {
 			eps = append(eps, proto.Endpoint{Addr: pub})
 			fmt.Fprintf(os.Stderr, "homewayd: 已附上自动公布的公网端点 %s（--no-public 可关）\n", pub)
+		}
+	}
+	// serve --relay 配过的中继自动带上（只配一处；--no-relay 可关，--relay 显式给时以显式为准）。
+	if strings.TrimSpace(*relay) == "" && !*noRelay {
+		for _, r := range server.ReadRelays(*stateDir) {
+			eps = append(eps, proto.Endpoint{Addr: r, Relay: true})
+			fmt.Fprintf(os.Stderr, "homewayd: 已附上 serve 配置的中继端点 %s（--no-relay 可关）\n", r)
 		}
 	}
 	eps = append(eps, mustEps(parseEndpoints(*relay, true))...)

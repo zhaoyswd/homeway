@@ -325,6 +325,10 @@ func Run(ctx context.Context, cfg ServeConfig) error {
 	if cfg.Relay != "" {
 		if ra, rerr := netip.ParseAddrPort(cfg.Relay); rerr == nil {
 			startRelayLeg(ctx, s.bind, ra, s.priv, wgPub(s.priv), logf)
+			// 记到 state：`issue` 自动把它写进 token（中继只需在这里配一次）
+			if werr := os.WriteFile(RelayPath(cfg.StateDir), []byte(cfg.Relay+"\n"), 0o600); werr != nil {
+				logf("⚠️ 中继端点落盘失败（%v）—— issue 时需要显式 --relay", werr)
+			}
 		} else {
 			logf("⚠️ --relay %q 不是合法的 host:port（%v）—— 跳过中继注册", cfg.Relay, rerr)
 		}
