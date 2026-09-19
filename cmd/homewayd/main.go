@@ -56,7 +56,8 @@ func usage() {
 	fmt.Fprintln(os.Stderr, `用法：
   homewayd issue --state <dir> --direct host:port[,host:port...] [--relay host:port...]
   homewayd serve --state <dir> [--listen 41641] [--upnp] [--stun host:3478] [--bind-interface <网卡|IPv4>]
-  homewayd upnp list | clean [--port N]     # 列/清路由器上属于我们的 UPnP 映射
+  homewayd upnp list | clean [--port N] [--desc 前缀]
+  homewayd upnp probe --port N              # 试申请该外部端口（判断是否被占用；成功即删）
   homewayd version`)
 }
 
@@ -114,6 +115,7 @@ func cmdUPnP(args []string) error {
 	fs := flag.NewFlagSet("upnp", flag.ExitOnError)
 	port := fs.Uint("port", 0, "只处理这个外部端口（0 = 全部）")
 	desc := fs.String("desc", "homeway-exit", "只清理描述以该前缀开头的映射")
+	probeIP := fs.String("ip", "", "probe 用：内网目标地址（默认本机）")
 	fs.Parse(args[1:])
 
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
@@ -141,6 +143,35 @@ func cmdUPnP(args []string) error {
 			fmt.Printf("[%3d] %s %5d → %-15s %5d  租期=%ds  描述=%q%s\n",
 				m.Index, m.Protocol, m.ExternalPort, m.InternalClient, m.InternalPort,
 				m.LeaseDuration, m.Description, mine)
+		}
+		return nil
+	case "probe":
+		// 排障：试着申请一条映射（不删同名），成功就立刻删掉；用来回答"这个外部端口是不是被占了"。
+		if *port == 0 {
+			return fmt.Errorf("probe 需要 --port")
+		}
+		ip := local
+		if *probeIP != "" {
+			parsed, err := netip.ParseAddr(*probeIP)
+			if err != nil {
+				return fmt.Errorf("--ip %q 不是 IPv4: %w", *probeIP, err)
+			}
+			ip = parsed
+		}
+		body, err := g.ProbeAdd(ctx, uint16(*port), ip, 60)
+		if err != nil {
+			frag := strings.Join(strings.Fields(body), " ")
+			if len(frag) > 600 {
+				frag = frag[:600]
+			}
+			fmt.Printf("申请 外部 UDP %d → %s:%d 失败：%v\n%s\n", *port, ip, *port, err, frag)
+			return nil // 排障命令：失败不是"命令失败"
+		}
+		fmt.Printf("申请成功（说明该外部端口当前空闲）：外部 UDP %d → %s:%d\n", *port, ip, *port)
+		if derr := g.DeleteMapping(ctx, uint16(*port), "UDP"); derr != nil {
+			fmt.Printf("（清理失败：%v —— 60s 租期后会自己过期）\n", derr)
+		} else {
+			fmt.Println("（已立刻删除，不留痕迹）")
 		}
 		return nil
 	case "clean":

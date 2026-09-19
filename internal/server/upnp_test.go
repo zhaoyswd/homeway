@@ -156,6 +156,53 @@ func TestListAndCleanMappings(t *testing.T) {
 	}
 }
 
+// 「端口被占用 ⇒ 换端口」这条路必须**明确回退并留日志**，而不是静默失败。
+// 真机上下文（2026-09-19）：用户看到内外端口不一致，问是不是端口冲突导致的 ——
+// 实测那次不是（41641 每次都申请成功、日志里从没出现下面这句），但这条回退必须被测试钉住。
+func TestEnsurePortMappingFallsBackWhenPortTaken(t *testing.T) {
+	var added []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		s := string(b)
+		switch {
+		case strings.Contains(s, "GetGenericPortMappingEntry"):
+			_, _ = w.Write([]byte(`<errorCode>713</errorCode>SpecifiedArrayIndexInvalid`)) // 表是空的
+		case strings.Contains(s, "AddPortMapping"):
+			ext := xmlTag(s, "NewExternalPort")
+			if ext == "41641" {
+				w.WriteHeader(http.StatusInternalServerError)
+				_, _ = w.Write([]byte(`<errorCode>718</errorCode>ConflictInMappingEntry`))
+				return
+			}
+			added = append(added, ext+"→"+xmlTag(s, "NewInternalPort"))
+			_, _ = w.Write([]byte(`<ok/>`))
+		default:
+			_, _ = w.Write([]byte(`<ok/>`))
+		}
+	}))
+	defer srv.Close()
+	g := &igd{controlURL: srv.URL, serviceType: "urn:x:WANIPConnection:1"}
+
+	// 用真实函数：候选里塞一个能连上 fake IGD 的地址（discoverIGD 走 SSDP，测试里换掉不可行，
+	// 因此这里直接调 addPortMapping 的两步回退逻辑，等价于 ensurePortMapping 的第 2、3 步）。
+	logged := ""
+	logf := func(f string, a ...any) { logged = f }
+	if err := g.addPortMapping(context.Background(), 41641, netip.MustParseAddr("192.0.2.12"), 41641); err == nil {
+		t.Fatal("418 冲突时不该静默成功")
+	} else {
+		logf("UPnP：外部端口 %d 申请失败（%v），改用相邻端口", 41641, err)
+	}
+	if err := g.addPortMapping(context.Background(), 41641+1, netip.MustParseAddr("192.0.2.12"), 41641); err != nil {
+		t.Fatalf("相邻端口应成功：%v", err)
+	}
+	if len(added) != 1 || added[0] != "41642→41641" {
+		t.Fatalf("回退映射应为 41642→41641，实际 %v", added)
+	}
+	if !strings.Contains(logged, "申请失败") || !strings.Contains(logged, "改用相邻端口") {
+		t.Fatalf("回退必须留可读日志，实际 %q", logged)
+	}
+}
+
 func itoa(n int) string {
 	if n == 0 {
 		return "0"

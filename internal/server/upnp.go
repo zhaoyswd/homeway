@@ -370,6 +370,12 @@ func (g *igd) ListMappings(ctx context.Context, max int) ([]upnpMapping, error) 
 	return g.listMappings(ctx, max)
 }
 
+// ProbeAdd 试申请一条映射（**不先删同名**，用于排障"这个端口是不是被占了"）。
+// 调用方通常随后删掉它（或给很短租期让它自己过期）。
+func (g *igd) ProbeAdd(ctx context.Context, port uint16, internalIP netip.Addr, lease uint32) (string, error) {
+	return g.addWithLease(ctx, port, internalIP, port, lease)
+}
+
 func (g *igd) DeleteMapping(ctx context.Context, externalPort uint16, proto string) error {
 	return g.deleteMapping(ctx, externalPort, proto)
 }
