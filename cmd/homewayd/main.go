@@ -11,10 +11,13 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"net"
+	"net/netip"
 	"os"
 	"os/signal"
 	"strings"
 	"syscall"
+	"time"
 
 	"github.com/zhaoyswd/homeway/internal/server"
 	"github.com/zhaoyswd/homeway/pkg/proto"
@@ -37,6 +40,8 @@ func main() {
 		err = cmdIssue(os.Args[2:])
 	case "serve":
 		err = cmdServe(os.Args[2:])
+	case "upnp":
+		err = cmdUPnP(os.Args[2:])
 	default:
 		usage()
 		os.Exit(2)
@@ -50,8 +55,41 @@ func main() {
 func usage() {
 	fmt.Fprintln(os.Stderr, `用法：
   homewayd issue --state <dir> --direct host:port[,host:port...] [--relay host:port...]
-  homewayd serve --state <dir> [--listen :41641]
+  homewayd serve --state <dir> [--listen 41641] [--upnp] [--stun host:3478] [--bind-interface <网卡|IPv4>]
+  homewayd upnp list | clean [--port N]     # 列/清路由器上属于我们的 UPnP 映射
   homewayd version`)
+}
+
+// resolveBindAddr：--bind-interface 支持「网卡名」或「IPv4 字面量」（空 = 不绑）。
+func resolveBindAddr(v string) (netip.Addr, error) {
+	v = strings.TrimSpace(v)
+	if v == "" {
+		return netip.Addr{}, nil
+	}
+	if ip, err := netip.ParseAddr(v); err == nil {
+		if !ip.Is4() {
+			return netip.Addr{}, fmt.Errorf("bind-interface %q 不是 IPv4", v)
+		}
+		return ip, nil
+	}
+	ifi, err := net.InterfaceByName(v)
+	if err != nil {
+		return netip.Addr{}, fmt.Errorf("找不到网卡 %q（可传网卡名或 IPv4）: %w", v, err)
+	}
+	addrs, err := ifi.Addrs()
+	if err != nil {
+		return netip.Addr{}, err
+	}
+	for _, a := range addrs {
+		ipn, ok := a.(*net.IPNet)
+		if !ok {
+			continue
+		}
+		if ip, ok := netip.AddrFromSlice(ipn.IP); ok && ip.Unmap().Is4() {
+			return ip.Unmap(), nil
+		}
+	}
+	return netip.Addr{}, fmt.Errorf("网卡 %q 上没有 IPv4 地址", v)
 }
 
 func parseEndpoints(comma string, relay bool) ([]proto.Endpoint, error) {
@@ -66,15 +104,78 @@ func parseEndpoints(comma string, relay bool) ([]proto.Endpoint, error) {
 	return out, nil
 }
 
+// cmdUPnP：路由器 UPnP 映射的运维口（list 看现状、clean 清掉我们建的）。
+// 为什么需要：映射是路由器上的持久状态，出口重启/换端口会留下旧的 —— 有这条命令才能查清/收拾干净。
+func cmdUPnP(args []string) error {
+	if len(args) < 1 {
+		return fmt.Errorf("用法：homewayd upnp list | clean [--port N]")
+	}
+	sub := args[0]
+	fs := flag.NewFlagSet("upnp", flag.ExitOnError)
+	port := fs.Uint("port", 0, "只处理这个外部端口（0 = 全部）")
+	desc := fs.String("desc", "homeway-exit", "只清理描述以该前缀开头的映射")
+	fs.Parse(args[1:])
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	g, local, err := server.FindIGD(ctx)
+	if err != nil {
+		return fmt.Errorf("找路由器（SSDP）：%w", err)
+	}
+	fmt.Printf("路由器 IGD：%s（本机 %s）\n", g.ControlURL(), local)
+	switch sub {
+	case "list":
+		list, err := g.ListMappings(ctx, 200)
+		if err != nil {
+			return err
+		}
+		if len(list) == 0 {
+			fmt.Println("（没有任何端口映射）")
+			return nil
+		}
+		for _, m := range list {
+			mine := ""
+			if strings.HasPrefix(m.Description, *desc) {
+				mine = "  ← 我们的"
+			}
+			fmt.Printf("[%3d] %s %5d → %-15s %5d  租期=%ds  描述=%q%s\n",
+				m.Index, m.Protocol, m.ExternalPort, m.InternalClient, m.InternalPort,
+				m.LeaseDuration, m.Description, mine)
+		}
+		return nil
+	case "clean":
+		n, kept, err := g.CleanMappings(ctx, *desc, uint16(*port))
+		if err != nil {
+			return err
+		}
+		fmt.Printf("已删除 %d 条「%s」映射；保留 %d 条：\n", n, *desc, len(kept))
+		for _, k := range kept {
+			fmt.Println("  ", k)
+		}
+		return nil
+	default:
+		return fmt.Errorf("未知子命令 %q（用法：homewayd upnp list | clean）", sub)
+	}
+}
+
 func cmdIssue(args []string) error {
 	fs := flag.NewFlagSet("issue", flag.ExitOnError)
 	stateDir := fs.String("state", defaultStateDir(), "state 目录（身份密钥+token 台账）")
 	direct := fs.String("direct", "", "直连端点，逗号分隔 host:port（可含域名/LAN 地址）")
 	relay := fs.String("relay", "", "中继端点，逗号分隔 host:port")
+	noPublic := fs.Bool("no-public", false, "不自动附加出口公布的公网端点")
 	fs.Parse(args)
 
 	var eps []proto.Endpoint
 	eps = append(eps, mustEps(parseEndpoints(*direct, false))...)
+	// 出口若已自动公布公网端点（UPnP + 同 socket STUN 一致才写），自动拼进直连候选：
+	// 家里/外面都能连。--no-public 可关掉。
+	if !*noPublic {
+		if pub := server.ReadPublicEndpoint(*stateDir); pub != "" {
+			eps = append(eps, proto.Endpoint{Addr: pub})
+			fmt.Fprintf(os.Stderr, "homewayd: 已附上自动公布的公网端点 %s（--no-public 可关）\n", pub)
+		}
+	}
 	eps = append(eps, mustEps(parseEndpoints(*relay, true))...)
 	if len(eps) == 0 {
 		return fmt.Errorf("至少需要一个 --direct 或 --relay 端点")
@@ -108,14 +209,24 @@ func cmdServe(args []string) error {
 	stateDir := fs.String("state", defaultStateDir(), "state 目录（身份密钥+token 台账）")
 	listen := fs.Uint("listen", 41641, "WG 监听端口")
 	verbose := fs.Bool("verbose", false, "打印 wireguard-go 详细日志")
+	upnp := fs.Bool("upnp", false, "启动后向路由器申请 UDP 端口映射（30 分钟续期）")
+	stunServer := fs.String("stun", "", "STUN 服务器（在监听 socket 上观测公网映射，如 stun.miwifi.com:3478）")
+	bindIface := fs.String("bind-interface", "", "把 WG socket 绑到该网卡/地址（物理网卡名或 IPv4；绕开 TUN 型代理）")
 	fs.Parse(args)
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+	bindAddr, err := resolveBindAddr(*bindIface)
+	if err != nil {
+		return err
+	}
 	return server.Run(ctx, server.ServeConfig{
 		StateDir:   *stateDir,
 		ListenPort: uint16(*listen),
 		Verbose:    *verbose,
+		BindAddr:   bindAddr,
+		UPnP:       *upnp,
+		STUN:       *stunServer,
 	})
 }
 

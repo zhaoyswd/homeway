@@ -1,0 +1,200 @@
+package server
+
+// 出口的「公网端点自动公布」（从旧 tailcat fork 的 endpoint-hint 机制移植的等价物）。
+//
+// 目标：出口在 NAT 后面时，把**路由器上真实可达的 公网IP:端口**写进 state 目录，
+// 让 `homewayd issue` 能把它一并烤进 token（客户端就能直连，不必只靠局域网地址）。
+//
+// 两条证据必须一致才公布（旧栈踩过的坑）：
+//   - UPnP：向路由器申请的外口（优先与监听端口同号）；
+//   - STUN：在**同一个 WG socket** 上问「你看到的我是什么」——得到该 socket 的真实映射。
+//
+// 若两者端口不一致（路由器改写端口 / 对称 NAT / 出口套了 TUN 型代理），说明这个组合不可达，
+// **拒绝公布**并打一行明确日志（宁可不给候选，也不要给一个连不上的假候选）。
+
+import (
+	"context"
+	"fmt"
+	"net/netip"
+	"os"
+	"path/filepath"
+	"strings"
+	"time"
+
+	"github.com/zhaoyswd/homeway/pkg/servercore"
+)
+
+const (
+	publicRefreshOK   = 10 * time.Minute
+	publicRefreshFail = 2 * time.Minute
+	publicFile        = "public_endpoint.txt"
+)
+
+// PublicOpts 公网端点探测的开关（都来自 serve 的 flag）。
+type PublicOpts struct {
+	StateDir string
+	UPnP     bool
+	STUN     string // "" = 不做 STUN 观测；否则是 host:port
+	Bind     *servercore.ServerBind
+	Logf     func(format string, args ...any)
+}
+
+// PublicEndpointPath：公布文件路径（issue 读它）。
+func PublicEndpointPath(stateDir string) string { return filepath.Join(stateDir, publicFile) }
+
+// ReadPublicEndpoint 读回上次公布的公网端点（空 = 还没有）。
+func ReadPublicEndpoint(stateDir string) string {
+	b, err := os.ReadFile(PublicEndpointPath(stateDir))
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(b))
+}
+
+// StartPublicEndpoint 起后台循环（非阻塞）。
+func (s *Server) StartPublicEndpoint(ctx context.Context, opts PublicOpts) {
+	if !opts.UPnP && opts.STUN == "" {
+		return
+	}
+	if opts.Logf == nil {
+		opts.Logf = func(string, ...any) {}
+	}
+	go func() {
+		for {
+			wait := publicRefreshOK
+			if !s.refreshPublicEndpoint(ctx, opts) {
+				wait = publicRefreshFail
+			}
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(wait):
+			}
+		}
+	}()
+}
+
+// refreshPublicEndpoint 跑一轮探测；返回是否成功公布。
+func (s *Server) refreshPublicEndpoint(ctx context.Context, opts PublicOpts) bool {
+	logf := opts.Logf
+	port := waitLocalPort(ctx, opts.Bind, 30*time.Second)
+	if port == 0 {
+		logf("公网端点：WG socket 30s 内还没开，跳过本轮")
+		return false
+	}
+	ctx, cancel := context.WithTimeout(ctx, 40*time.Second)
+	defer cancel()
+
+	var extPort uint16
+	var wanIP netip.Addr
+	if opts.UPnP {
+		cands := localIPv4Candidates()
+		if len(cands) == 0 {
+			logf("UPnP：找不到内网 IPv4 候选，跳过端口映射")
+		} else if p, used, err := ensurePortMapping(ctx, cands, port, logf); err != nil {
+			logf("UPnP：未取得端口映射（%v）；出口在 NAT 后时可在路由器上手动把 UDP %d 转发到本机（候选 %v）", err, port, cands)
+		} else {
+			extPort = p
+			logf("UPnP：已建立端口映射 外部 UDP %d → %v:%d", extPort, used, port)
+			// 路由器自报的 WAN 地址（有些家用路由器返回空值，那就只当没拿到）。
+			if g, err := discoverIGD(ctx, used); err == nil {
+				if ip, err := g.externalIP(ctx); err == nil && ip.IsValid() && !ip.IsPrivate() {
+					wanIP = ip
+				}
+			}
+		}
+	}
+
+	var observed netip.AddrPort
+	if opts.STUN != "" {
+		ap, err := opts.Bind.STUNQuery(ctx, opts.STUN)
+		if err != nil {
+			logf("STUN：从监听 socket 问 %s 失败（%v）", opts.STUN, err)
+		} else {
+			observed = ap
+			logf("STUN：监听 socket（本地 %d）在 %s 眼里是 %v", port, opts.STUN, ap)
+		}
+	}
+
+	// 证据合流：优先用「同 socket 的 STUN 观测」，它的端口必须与 UPnP 外口一致；
+	// 没有 UPnP 时要求观测端口 == 监听端口（说明路由器做了同号映射/1:1 NAT）。
+	var pub netip.AddrPort
+	switch {
+	case observed.IsValid() && extPort != 0 && observed.Port() == extPort && publicAddr(observed.Addr()):
+		pub = observed
+	case observed.IsValid() && extPort == 0 && observed.Port() == port && publicAddr(observed.Addr()):
+		pub = observed
+	case extPort != 0 && wanIP.IsValid():
+		pub = netip.AddrPortFrom(wanIP, extPort)
+		logf("公网端点：用路由器自报 WAN 地址 + UPnP 外口公布（没有同 socket STUN 证据）")
+	case observed.IsValid() && publicAddr(observed.Addr()):
+		logf("公网端点：暂不公布 —— STUN 观测到 %v，但外部端口与监听/UPnP 不一致（%d vs upnp=%d）, "+
+			"说明路由器改写端口或有代理抢路由", observed, observed.Port(), extPort)
+		return false
+	default:
+		logf("公网端点：暂不公布（UPnP=%v STUN=%v；两者都没拿到可用证据）", extPort != 0, observed)
+		return false
+	}
+
+	if !pub.IsValid() {
+		return false
+	}
+	if err := os.WriteFile(PublicEndpointPath(opts.StateDir), []byte(pub.String()+"\n"), 0o600); err != nil {
+		logf("公网端点：写 %s 失败（%v）", PublicEndpointPath(opts.StateDir), err)
+		return false
+	}
+	logf("公网端点：已公布 %v（写进 %s；issue 会把它一并烤进 token）", pub, publicFile)
+	return true
+}
+
+// waitLocalPort：device 打开 Bind 是异步的（IpcSet 之后由 wireguard-go 拉起），这里等一小会儿。
+func waitLocalPort(ctx context.Context, b *servercore.ServerBind, d time.Duration) uint16 {
+	deadline := time.Now().Add(d)
+	for {
+		if p := b.LocalPort(); p != 0 {
+			return p
+		}
+		if time.Now().After(deadline) || ctx.Err() != nil {
+			return 0
+		}
+		select {
+		case <-ctx.Done():
+			return 0
+		case <-time.After(200 * time.Millisecond):
+		}
+	}
+}
+
+// publicAddr：只接受全局可路由的 IPv4（私网/CGNAT/回环/链路的都不算公网证据）。
+func publicAddr(ip netip.Addr) bool {
+	if !ip.IsValid() || !ip.Is4() {
+		return false
+	}
+	if ip.IsPrivate() || ip.IsLoopback() || ip.IsLinkLocalUnicast() || ip.IsUnspecified() {
+		return false
+	}
+	// 100.64/10（CGNAT）也不是公网
+	if netip.MustParsePrefix("100.64.0.0/10").Contains(ip) {
+		return false
+	}
+	return true
+}
+
+// externalIP：IGD 的 GetExternalIPAddress（部分路由器返回空，调用方自己兜底）。
+func (g *igd) externalIP(ctx context.Context) (netip.Addr, error) {
+	body, err := g.soap(ctx, "GetExternalIPAddress")
+	if err != nil {
+		return netip.Addr{}, err
+	}
+	const tag = "NewExternalIPAddress"
+	i := strings.Index(body, "<"+tag+">")
+	j := strings.Index(body, "</"+tag+">")
+	if i < 0 || j <= i {
+		return netip.Addr{}, fmt.Errorf("响应里没有 %s", tag)
+	}
+	raw := strings.TrimSpace(body[i+len(tag)+2 : j])
+	if raw == "" {
+		return netip.Addr{}, fmt.Errorf("路由器返回空的外部地址")
+	}
+	return netip.ParseAddr(raw)
+}
