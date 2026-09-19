@@ -20,6 +20,9 @@ package relay
 import (
 	"context"
 	"crypto/rand"
+	"encoding/hex"
+	"fmt"
+	"strings"
 	"crypto/subtle"
 	"net"
 	"net/netip"
@@ -36,6 +39,7 @@ const (
 	defaultLegTimeout  = 90 * time.Second  // 注册腿过期（后端 keepalive 间隔的 3 倍）
 	defaultMaxPerPeer  = 32                // 每个后端最多并发的客户端分配
 	defaultRateLimit   = 200               // 每个源地址每秒允许的包数（准入限流）
+	defaultMaxLegs     = 256               // 注册腿总数上限（白名单为空时的兜底）
 	challengeTTL       = 15 * time.Second  // 挑战有效期
 )
 
@@ -46,7 +50,12 @@ type Config struct {
 	LegTimeout  time.Duration // 注册腿过期（0 = 默认 90s）
 	MaxPerPeer  int           // 每个后端的最大并发分配（0 = 默认 32）
 	RateLimit   int           // 每源每秒包数上限（0 = 默认 200）
-	Logf        func(format string, args ...any)
+	// Allow：**后端白名单**（空 = 开放注册，任何人都能拿本中继当中转）。
+	// 每项可以是 8 字节标签 hex（日志里 "后端 xxxx" 的那个，如 39638668）或完整 64 hex 公钥。
+	Allow []string
+	// MaxLegs：注册腿总数上限（0 = 默认 256）—— 防"匿名 Hello 洪水"把表撑爆（腿不注册成功也占位）。
+	MaxLegs int
+	Logf    func(format string, args ...any)
 }
 
 // Relay 中继实例。
@@ -58,6 +67,7 @@ type Relay struct {
 	legs   map[[8]byte]*leg
 	assocs map[assocKey]*assoc
 	rates  map[netip.Addr]*rateBucket
+	allow  map[[8]byte]bool // 空 = 不限制
 
 	stats Stats
 }
@@ -66,6 +76,7 @@ type Relay struct {
 type Stats struct {
 	Registered    uint64 // 成功注册的后端腿次数
 	Forged        uint64 // 注册挑战/证明失败次数
+	Denied        uint64 // 被白名单/腿数上限拒绝的注册
 	Assigned      uint64 // 新建的客户端分配数
 	Reclaimed     uint64 // 回收的分配数
 	Dropped       uint64 // 被丢弃的包（未知 peerId/超限/畸形）
@@ -115,14 +126,31 @@ func New(cfg Config) *Relay {
 	if cfg.RateLimit <= 0 {
 		cfg.RateLimit = defaultRateLimit
 	}
+	if cfg.MaxLegs <= 0 {
+		cfg.MaxLegs = defaultMaxLegs
+	}
 	if cfg.Logf == nil {
 		cfg.Logf = func(string, ...any) {}
+	}
+	allow := map[[8]byte]bool{}
+	for _, raw := range cfg.Allow {
+		raw = strings.TrimSpace(raw)
+		if raw == "" {
+			continue
+		}
+		lb, err := parseAllowEntry(raw)
+		if err != nil {
+			cfg.Logf("⚠️ --allow %q 解析失败（%v）—— 忽略该项", raw, err)
+			continue
+		}
+		allow[lb] = true
 	}
 	return &Relay{
 		cfg:    cfg,
 		legs:   map[[8]byte]*leg{},
 		assocs: map[assocKey]*assoc{},
 		rates:  map[netip.Addr]*rateBucket{},
+		allow:  allow,
 	}
 }
 
@@ -151,8 +179,12 @@ func (r *Relay) Run(ctx context.Context) error {
 		return err
 	}
 	r.pc = pc
-	r.cfg.Logf("中继就绪：%v（分配回收 %v，注册腿过期 %v，每源限速 %d pps，每后端最多 %d 条分配）",
-		pc.LocalAddr(), r.cfg.IdleTimeout, r.cfg.LegTimeout, r.cfg.RateLimit, r.cfg.MaxPerPeer)
+	who := "⚠️ 开放注册：任何知道本地址的后端都能用它中转（要锁就加 --allow <后端标签>）"
+	if len(r.allow) > 0 {
+		who = fmt.Sprintf("白名单 %d 个后端", len(r.allow))
+	}
+	r.cfg.Logf("中继就绪：%v（%s；分配回收 %v，注册腿过期 %v，每源限速 %d pps，每后端最多 %d 条分配，腿总数上限 %d）",
+		pc.LocalAddr(), who, r.cfg.IdleTimeout, r.cfg.LegTimeout, r.cfg.RateLimit, r.cfg.MaxPerPeer, r.cfg.MaxLegs)
 	go r.reapLoop(ctx)
 	go r.statsLoop(ctx)
 	go func() {
@@ -181,7 +213,7 @@ func (r *Relay) readLoop(ctx context.Context) {
 			return // ctx 结束或 socket 关闭
 		}
 		src = unmap(src)
-		if !r.allow(src.Addr()) {
+		if !r.rateOK(src.Addr()) {
 			r.bump(func(s *Stats) { s.Dropped++ })
 			continue
 		}
@@ -224,6 +256,11 @@ func (r *Relay) handleControl(src netip.AddrPort, label [8]byte, lg *leg, payloa
 			r.bump(func(s *Stats) { s.Forged++ })
 			return
 		}
+		if len(r.allow) > 0 && !r.allow[label] {
+			r.bump(func(s *Stats) { s.Denied++ })
+			r.cfg.Logf("中继：拒绝未在白名单里的后端 %x（--allow 可加）", label[:])
+			return
+		}
 		// 出题：临时 X25519 密钥对 + 随机数
 		var ephPriv [32]byte
 		if _, err := rand.Read(ephPriv[:]); err != nil {
@@ -242,6 +279,12 @@ func (r *Relay) handleControl(src netip.AddrPort, label [8]byte, lg *leg, payloa
 		r.mu.Lock()
 		cur := r.legs[label]
 		if cur == nil || !cur.verified {
+			if cur == nil && len(r.legs) >= r.cfg.MaxLegs {
+				r.mu.Unlock()
+				r.bump(func(s *Stats) { s.Denied++ })
+				r.cfg.Logf("中继：注册腿总数已达上限 %d，拒绝新的 %x（防匿名洪水）", r.cfg.MaxLegs, label[:])
+				return
+			}
 			cur = &leg{label: label, pubkey: pubkey}
 			r.legs[label] = cur
 		}
@@ -298,9 +341,9 @@ func (r *Relay) handleControl(src netip.AddrPort, label [8]byte, lg *leg, payloa
 		r.mu.Unlock()
 		if moved {
 			r.cfg.Logf("中继：后端 %x 注册腿地址变化 → %v（旧分配 %d 条已作废，等客户端重建）",
-				label[:4], src, len(stale))
+				label[:], src, len(stale))
 		} else {
-			r.cfg.Logf("中继：后端 %x 注册成功（腿 %v）", label[:4], src)
+			r.cfg.Logf("中继：后端 %x 注册成功（腿 %v）", label[:], src)
 		}
 		_, _ = r.pc.WriteToUDPAddrPort(proto.EncodeFrame(proto.FrameTypeRelayReg, proto.EncodeRelayOK()), src)
 	case proto.RelaySubKeepalive:
@@ -338,7 +381,7 @@ func (r *Relay) forwardUp(client netip.AddrPort, lg *leg, typ byte, payload []by
 		if r.countAssocsLocked(lg.label) >= r.cfg.MaxPerPeer {
 			r.mu.Unlock()
 			r.bump(func(s *Stats) { s.Dropped++ })
-			r.cfg.Logf("中继：后端 %x 的分配腿已达上限 %d，丢弃新客户端 %v", lg.label[:4], r.cfg.MaxPerPeer, client)
+			r.cfg.Logf("中继：后端 %x 的分配腿已达上限 %d，丢弃新客户端 %v", lg.label[:], r.cfg.MaxPerPeer, client)
 			return
 		}
 		sock, err := net.ListenUDP("udp", nil)
@@ -356,7 +399,7 @@ func (r *Relay) forwardUp(client netip.AddrPort, lg *leg, typ byte, payload []by
 		r.sendHintToClient(a, lg)
 		r.sendHintToBackend(a, client)
 		r.cfg.Logf("中继：客户端 %v 起一条分配腿 → 后端 %x（中继侧出口 %v）",
-			client, lg.label[:4], a.sock.LocalAddr())
+			client, lg.label[:], a.sock.LocalAddr())
 	} else {
 		a.last = time.Now()
 		r.mu.Unlock()
@@ -431,7 +474,7 @@ func (r *Relay) reapLoop(ctx context.Context) {
 		r.stats.Reclaimed += uint64(reclaim)
 		for label, lg := range r.legs {
 			if lg.verified && now.Sub(lg.last) > r.cfg.LegTimeout {
-				r.cfg.Logf("中继：后端 %x 注册腿过期（%v 无保活）—— 摘掉", label[:4], now.Sub(lg.last).Round(time.Second))
+				r.cfg.Logf("中继：后端 %x 注册腿过期（%v 无保活）—— 摘掉", label[:], now.Sub(lg.last).Round(time.Second))
 				for k, a := range r.assocs {
 					if k.label == label {
 						_ = a.sock.Close()
@@ -499,8 +542,8 @@ func (r *Relay) countAssocsLocked(label [8]byte) int {
 	return n
 }
 
-// allow：每源每秒包数限流（准入闸：防蹭转发资源/放大器）。
-func (r *Relay) allow(ip netip.Addr) bool {
+// rateOK：每源每秒包数限流（准入闸：防蹭转发资源/放大器）。
+func (r *Relay) rateOK(ip netip.Addr) bool {
 	now := time.Now()
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -517,6 +560,31 @@ func (r *Relay) bump(f func(*Stats)) {
 	r.mu.Lock()
 	f(&r.stats)
 	r.mu.Unlock()
+}
+
+// parseAllowEntry：白名单项 = 8 字节标签 hex（"39638668"）或完整 64 hex 公钥（自动派生标签）。
+func parseAllowEntry(s string) ([8]byte, error) {
+	var lb [8]byte
+	s = strings.TrimPrefix(strings.ToLower(strings.TrimSpace(s)), "0x")
+	switch len(s) {
+	case 16:
+		b, err := hex.DecodeString(s)
+		if err != nil {
+			return lb, err
+		}
+		copy(lb[:], b)
+		return lb, nil
+	case 64:
+		b, err := hex.DecodeString(s)
+		if err != nil {
+			return lb, err
+		}
+		var pub [32]byte
+		copy(pub[:], b)
+		return proto.RelayID(pub), nil
+	default:
+		return lb, fmt.Errorf("要 16 位标签 hex 或 64 位公钥 hex，收到 %d 位", len(s))
+	}
 }
 
 func unmap(ap netip.AddrPort) netip.AddrPort {

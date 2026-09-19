@@ -10,6 +10,7 @@ package main
 import (
 	"context"
 	"flag"
+	"strings"
 	"fmt"
 	"os"
 	"os/signal"
@@ -32,9 +33,11 @@ func main() {
 	legTimeout := fs.Duration("leg-timeout", 90*time.Second, "后端注册腿过期（不保活即摘掉）")
 	rate := fs.Int("rate", 200, "每源地址每秒包数上限（准入限流）")
 	maxPerPeer := fs.Int("max-per-peer", 32, "每个后端最多并发的客户端分配腿")
+	allow := fs.String("allow", "", "后端白名单（逗号分隔：8 位标签 hex 或 64 位公钥 hex）；空 = 开放注册，任何知道本地址的后端都能用它中转")
+	maxLegs := fs.Int("max-legs", 256, "注册腿总数上限（防匿名 Hello 洪水）")
 	fs.Usage = func() {
 		fmt.Fprintln(os.Stderr, "用法：")
-		fmt.Fprintln(os.Stderr, "  homeway-relay [--listen :41641] [--idle 90s] [--leg-timeout 90s] [--rate 200] [--max-per-peer 32]")
+		fmt.Fprintln(os.Stderr, "  homeway-relay [--listen :41641] [--allow 39638668,<hex>] [--max-legs 256] [--idle 90s] [--leg-timeout 90s]")
 		fs.PrintDefaults()
 	}
 	_ = fs.Parse(os.Args[1:])
@@ -47,12 +50,25 @@ func main() {
 		LegTimeout:  *legTimeout,
 		RateLimit:   *rate,
 		MaxPerPeer:  *maxPerPeer,
+		Allow:       splitList(*allow),
+		MaxLegs:     *maxLegs,
 		Logf:        logf,
 	})
 	if err := r.Run(ctx); err != nil {
 		fmt.Fprintln(os.Stderr, "homeway-relay:", err)
 		os.Exit(1)
 	}
+}
+
+// splitList：逗号分隔 → 列表（空白项丢掉）。
+func splitList(v string) []string {
+	var out []string
+	for _, p := range strings.Split(v, ",") {
+		if p = strings.TrimSpace(p); p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
 }
 
 func logf(format string, args ...any) {
