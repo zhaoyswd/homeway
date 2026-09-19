@@ -15,6 +15,7 @@ import (
 	"github.com/zhaoyswd/homeway/pkg/flows"
 	"github.com/zhaoyswd/homeway/pkg/servercore"
 	"github.com/zhaoyswd/homeway/pkg/term"
+	"golang.org/x/crypto/curve25519"
 	"github.com/zhaoyswd/homeway/pkg/wgnet"
 	"golang.zx2c4.com/wireguard/device"
 	"golang.zx2c4.com/wireguard/wgctrl/wgtypes"
@@ -62,6 +63,7 @@ type ServeConfig struct {
 	UPnP         bool          // 启动后向路由器申请 UDP 端口映射并 30 分钟续期
 	STUN         string        // 非空 = 在监听 socket 上向该 STUN 服务器观测公网映射（如 stun.miwifi.com:3478）
 	STUN6        string        // 非空 = 用该服务器做 **IPv6** 路径校验（要有 AAAA，如 stun.cloudflare.com:3478）
+	Relay        string        // 非空 = 向该中继注册一条反向注册腿（host:port），NAT 后的出口由此可被客户端到达
 	Verbose      bool
 }
 
@@ -101,6 +103,7 @@ type Server struct {
 	dev     *device.Device
 	bind    *servercore.ServerBind
 	bindIface *net.Interface     // 本轮实际钉住的网卡（auto 挑出来的或显式给的；nil = 不绑）
+	priv      [32]byte           // WG 静态私钥（中继注册腿要用它做挑战响应）
 	udpCap    *udpCapState       // 默认路径的 UDP 能力（周期探测；探测应答里回报）
 	stopTCP func()
 	stopUDP func()
@@ -150,6 +153,7 @@ func Start(cfg ServeConfig) (*Server, error) {
 	}
 	s := &Server{cfg: cfg, Stats: &flows.Stats{}}
 	s.bindIface = resolvedIf
+	s.priv = priv
 	level := device.LogLevelError
 	if cfg.Verbose {
 		level = device.LogLevelVerbose
@@ -317,6 +321,14 @@ func Run(ctx context.Context, cfg ServeConfig) error {
 			logf("监听端口落盘失败（%v）—— issue 会回落到 41641", werr)
 		}
 	}()
+	// 中继注册腿（--relay）：从 WG socket 出站注册，NAT 后的出口由此可被客户端到达。
+	if cfg.Relay != "" {
+		if ra, rerr := netip.ParseAddrPort(cfg.Relay); rerr == nil {
+			startRelayLeg(ctx, s.bind, ra, s.priv, wgPub(s.priv), logf)
+		} else {
+			logf("⚠️ --relay %q 不是合法的 host:port（%v）—— 跳过中继注册", cfg.Relay, rerr)
+		}
+	}
 	// 默认路径能不能承载 UDP：周期探测 + 探测应答里回报（转发流量一律走默认路由，这是它的属性）。
 	s.startUDPCapProbe(ctx, logf)
 	// 换网自愈：绑了物理网卡时，网卡索引/地址变化后重钉 socket 并立刻重测公网端点
@@ -358,6 +370,17 @@ func Run(ctx context.Context, cfg ServeConfig) error {
 }
 
 // ipcConfigurer：PeerTable 表项 → device IpcSet。
+// wgPub：从 WG 私钥导出公钥（Curve25519 basepoint 乘法）；中继注册要用它作 peerId。
+func wgPub(priv [32]byte) [32]byte {
+	pub, err := curve25519.X25519(priv[:], curve25519.Basepoint)
+	var out [32]byte
+	if err != nil {
+		return out
+	}
+	copy(out[:], pub)
+	return out
+}
+
 func logf(format string, args ...any) {
 	fmt.Printf("[homewayd] "+format+"\n", args...)
 }

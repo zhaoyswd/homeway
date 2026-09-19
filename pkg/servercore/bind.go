@@ -33,6 +33,9 @@ type ServerBind struct {
 	// Caps：探测应答里回报的能力位（bit0 = 出口默认路径可承载 UDP；nil 或未探过 = 0）。
 	// 用函数而不是值：UDP 能力是**周期性探测**的结论，运行期会变（换网/代理开关）。
 	Caps   func() byte
+	// OnLegFrame：腿上帧的**额外**分派钩子（中继控制帧走这里；返回 true = 已消费，不进 device）。
+	// 已有的固定处理（data/reg/control-hint）在内，钩子只收 type ≥ 3 的帧与显式未处理的分支。
+	OnLegFrame func(typ byte, payload []byte, src netip.AddrPort) bool
 	OnHint func(addr string) // 中继观察到的客户端公网地址（打洞用，阶段 6）
 	Logf   func(format string, args ...any)
 	// BindAddr 非零时把 UDP socket 绑到这张网卡的地址上：
@@ -84,6 +87,17 @@ func (b *ServerBind) RepinTo(ifi *net.Interface) (*net.Interface, error) {
 	}
 	b.pinned = ifi
 	return ifi, nil
+}
+
+// SendRawTo：从**同一个 WG socket** 直接发给 addr（中继注册/保活/盲打都用它 ——
+// 注册腿必须与数据面同端口，NAT 映射才会一致，见 design D4）。
+func (b *ServerBind) SendRawTo(addr netip.AddrPort, payload []byte) error {
+	c := b.c
+	if c == nil {
+		return fmt.Errorf("server: socket 还没打开")
+	}
+	_, err := c.WriteToUDPAddrPort(payload, addr)
+	return err
 }
 
 // PinnedIface 当前钉住的网卡（没绑卡时 nil）。
@@ -249,7 +263,11 @@ func (b *ServerBind) Open(port uint16) ([]conn.ReceiveFunc, uint16, error) {
 				}
 				return 0, nil
 			default:
-				return 0, nil // 未知类型：忽略（前向兼容）
+				// 中继控制帧（type≥3）等留给钩子；没钩子就按前向兼容忽略。
+				if b.OnLegFrame != nil && b.OnLegFrame(typ, payload, src) {
+					return 0, nil
+				}
+				return 0, nil
 			}
 		}
 

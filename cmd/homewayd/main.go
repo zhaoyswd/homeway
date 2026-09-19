@@ -218,13 +218,14 @@ func cmdIssue(args []string) error {
 	direct := fs.String("direct", "", "直连端点，逗号分隔 host:port（可含域名/LAN 地址）")
 	relay := fs.String("relay", "", "中继端点，逗号分隔 host:port")
 	noPublic := fs.Bool("no-public", false, "不自动附加出口公布的公网端点")
+	noLAN := fs.Bool("no-lan", false, "不自动附加本机 LAN 端点（做「只经中继」的 token 时用）")
 	fs.Parse(args)
 
 	var eps []proto.Endpoint
 	eps = append(eps, mustEps(parseEndpoints(*direct, false))...)
 	// 没给 --direct 时**自动带上本机 LAN 端点**（物理网卡的 IPv4 + 实际监听端口）：
 	// 手机在同一局域网时优先走它（最快），出了门才用公网端点。
-	if strings.TrimSpace(*direct) == "" {
+	if strings.TrimSpace(*direct) == "" && !*noLAN {
 		port := server.ReadListenPort(*stateDir)
 		if port == 0 {
 			port = 41641
@@ -279,6 +280,7 @@ func cmdServe(args []string) error {
 	upnp := fs.Bool("upnp", true, "向路由器申请 UDP 端口映射（默认开，30 分钟续期；--upnp=false 关）")
 	stunServer := fs.String("stun", "stun.cloudflare.com:3478", "STUN 服务器（在监听 socket 上观测 IPv4 公网映射；空 = 关）")
 	stun6Server := fs.String("stun6", "stun.cloudflare.com:3478", "做 IPv6 路径校验用的 STUN（要有 AAAA；空 = 关）")
+	relayServer := fs.String("relay", "", "向该中继注册反向注册腿（host:port；NAT 后的出口由此可被客户端到达）")
 	bindIface := fs.String("bind-interface", "auto", "WG socket 钉哪张卡：auto（默认，探针自动挑能出网的物理网卡）/ none（不绑，走系统默认路由）/ 网卡名 / IP 字面量")
 	fs.Parse(args)
 
@@ -298,6 +300,7 @@ func cmdServe(args []string) error {
 		UPnP:            *upnp,
 		STUN:            *stunServer,
 		STUN6:           *stun6Server,
+		Relay:           *relayServer,
 	})
 }
 
