@@ -21,7 +21,7 @@ func (f *fakeMapper) addPortMapping(_ context.Context, ext uint16, _ netip.Addr,
 	return nil
 }
 
-func (f *fakeMapper) CleanMappings(context.Context, string, uint16) (int, []string, error) {
+func (f *fakeMapper) CleanMappings(context.Context, string, uint16, netip.Addr) (int, []string, error) {
 	return 0, nil, nil
 }
 
@@ -77,26 +77,5 @@ func TestSelectExternalPortOrder(t *testing.T) {
 	m = &fakeMapper{reject: map[uint16]bool{41641: true, 41642: true, 41643: true}}
 	if _, err := selectExternalPort(context.Background(), m, 41641, 41643, ip, noop); err == nil {
 		t.Fatal("全部被拒应报错")
-	}
-}
-
-// 记忆文件读写（upnp_port.txt）。
-func TestRememberedPortFile(t *testing.T) {
-	dir := t.TempDir()
-	if p := readRememberedPort(dir); p != 0 {
-		t.Fatalf("文件不存在应返回 0，得到 %d", p)
-	}
-	if err := writeRememberedPort(dir, 41643); err != nil {
-		t.Fatal(err)
-	}
-	if p := readRememberedPort(dir); p != 41643 {
-		t.Fatalf("读回 %d，want 41643", p)
-	}
-	// 坏内容 ⇒ 当作没记忆，而不是崩/乱用
-	if err := writeRememberedPort(dir, 0); err != nil {
-		t.Fatal(err)
-	}
-	if p := readRememberedPort(dir); p != 0 {
-		t.Fatalf("0 应视为无记忆，得到 %d", p)
 	}
 }

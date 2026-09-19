@@ -244,13 +244,16 @@ func Run(ctx context.Context, cfg ServeConfig) error {
 		return err
 	}
 	<-ctx.Done()
-	// 退出时把自己建的 UPnP 映射删掉（尽力而为）：路由器上的映射是持久状态，
-	// 出口不在了就不该继续占着公网端口。异常退出（kill -9）删不掉，靠租期自动过期兜底。
+	// 退出时把映射**租期缩短**（而不是删除）：路由器表就是我们"上次用的外口"的记忆 ——
+	// 快速重启（升级/换二进制）能沿用同一个公网端口；出口真退休了，5 分钟后映射自动消失，
+	// 不会像旧栈那样在路由器里留一堆永久的。异常退出（kill -9）保持原租期（≤1 小时）后过期。
 	if cfg.UPnP {
 		ctx2, cancel := context.WithTimeout(context.Background(), 8*time.Second)
-		if g, _, err := FindIGD(ctx2); err == nil {
-			if n, _, err := g.CleanMappings(ctx2, upnpMapDesc, 0); err == nil && n > 0 {
-				logf("UPnP：退出前已删除 %d 条自己的映射", n)
+		if g, local, err := FindIGD(ctx2); err == nil {
+			if ext, internal, ok := g.FindOurMapping(ctx2, upnpMapDesc, local, cfg.ListenPort); ok {
+				if err := g.ReAddShortLease(ctx2, ext, local, internal, 300); err == nil {
+					logf("UPnP：退出前把映射 外部 %d 的租期缩到 5 分钟（快速重启仍会沿用这个端口）", ext)
+				}
 			}
 		}
 		cancel()

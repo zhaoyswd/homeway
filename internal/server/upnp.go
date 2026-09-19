@@ -370,6 +370,14 @@ func (g *igd) ListMappings(ctx context.Context, max int) ([]upnpMapping, error) 
 	return g.listMappings(ctx, max)
 }
 
+// ReAddShortLease：用很短的租期重建同一条映射（退出时调；够一次快速重启沿用，之后自动过期）。
+func (g *igd) ReAddShortLease(ctx context.Context, extPort uint16, internalIP netip.Addr,
+	internalPort uint16, lease uint32) error {
+	_ = g.deleteMapping(ctx, extPort, "UDP")
+	_, err := g.addWithLease(ctx, extPort, internalIP, internalPort, lease)
+	return err
+}
+
 // ProbeAdd 试申请一条映射（**不先删同名**，用于排障"这个端口是不是被占了"）。
 // 调用方通常随后删掉它（或给很短租期让它自己过期）。
 func (g *igd) ProbeAdd(ctx context.Context, port uint16, internalIP netip.Addr, lease uint32) (string, error) {
@@ -380,8 +388,11 @@ func (g *igd) DeleteMapping(ctx context.Context, externalPort uint16, proto stri
 	return g.deleteMapping(ctx, externalPort, proto)
 }
 
-// CleanMappings 删掉所有「描述以 descPrefix 开头」的映射（我们自己的）。返回删除条数。
-func (g *igd) CleanMappings(ctx context.Context, descPrefix string, onlyPort uint16) (int, []string, error) {
+// CleanMappings 删掉**我们自己的**映射：描述以 descPrefix 开头 **且** 内网客户端是本机地址
+// （onlyClient 有效时）。只按描述前缀删是危险的 —— 同一个局域网里另一台 homewayd 出口
+// （同默认描述）会被误删。
+func (g *igd) CleanMappings(ctx context.Context, descPrefix string, onlyPort uint16,
+	onlyClient netip.Addr) (int, []string, error) {
 	list, err := g.listMappings(ctx, 200)
 	if err != nil {
 		return 0, nil, err
@@ -390,6 +401,12 @@ func (g *igd) CleanMappings(ctx context.Context, descPrefix string, onlyPort uin
 	var kept []string
 	for _, m := range list {
 		ours := strings.HasPrefix(m.Description, descPrefix)
+		if onlyClient.IsValid() {
+			ip, err := netip.ParseAddr(m.InternalClient)
+			if err != nil || ip.Unmap() != onlyClient.Unmap() {
+				ours = false
+			}
+		}
 		if onlyPort != 0 && m.ExternalPort != onlyPort {
 			ours = false
 		}
@@ -406,6 +423,38 @@ func (g *igd) CleanMappings(ctx context.Context, descPrefix string, onlyPort uin
 	return n, kept, nil
 }
 
+// FindOurMapping 在路由器表里找「我们自己的」映射（同描述前缀 + 同内网客户端地址）。
+// 为什么不用本地文件记端口：这条映射本来就写着我们的名字和内网地址，**路由器表就是权威记忆** ——
+// 本地文件只会在"文件没了/端口改了/映射被删了"时与事实打架。
+// 返回顺序偏好：① 外部端口 == 当前监听端口（本来就对得上）；② 否则取表里第一条我们的（大概率是上次沿用/回退的那个）。
+func (g *igd) FindOurMapping(ctx context.Context, descPrefix string, client netip.Addr,
+	listenPort uint16) (uint16, uint16, bool) {
+	list, err := g.listMappings(ctx, 200)
+	if err != nil {
+		return 0, 0, false
+	}
+	var fallbackExt, fallbackInt uint16
+	for _, m := range list {
+		if !strings.HasPrefix(m.Description, descPrefix) || m.Protocol != "UDP" {
+			continue
+		}
+		ip, err := netip.ParseAddr(m.InternalClient)
+		if err != nil || ip.Unmap() != client.Unmap() {
+			continue
+		}
+		if m.ExternalPort == listenPort {
+			return m.ExternalPort, m.InternalPort, true
+		}
+		if fallbackExt == 0 {
+			fallbackExt, fallbackInt = m.ExternalPort, m.InternalPort
+		}
+	}
+	if fallbackExt != 0 {
+		return fallbackExt, fallbackInt, true
+	}
+	return 0, 0, false
+}
+
 // ensurePortMapping 为 internalPort 申请一个外部端口，返回实际拿到的外部端口与所用内网地址。
 //
 // 端口选择顺序（**优先沿用历史上成功过的那个**）：
@@ -415,7 +464,7 @@ func (g *igd) CleanMappings(ctx context.Context, descPrefix string, onlyPort uin
 //
 // candidates 是本机的内网 IPv4 候选：逐个发 SSDP 试，谁能找到 IGD 就用谁 —— 一台机器上常有多张
 // 网卡（虚拟网卡、代理的 utun），只有与路由器同网段的那张能用。
-func ensurePortMapping(ctx context.Context, candidates []netip.Addr, internalPort uint16, prefer uint16,
+func ensurePortMapping(ctx context.Context, candidates []netip.Addr, internalPort uint16,
 	logf func(string, ...any)) (uint16, netip.Addr, error) {
 	var g *igd
 	var localIP netip.Addr
@@ -435,10 +484,20 @@ func ensurePortMapping(ctx context.Context, candidates []netip.Addr, internalPor
 		}
 		return 0, netip.Addr{}, lastErr
 	}
-	// 先扫一遍路由器：把我们自己**同前缀但端口不同**的历史映射清掉（换监听端口/崩溃重启的遗留），
-	// 保证 30 分钟一轮的续期不会在路由器里越积越多。
-	if n, _, err := g.CleanMappings(ctx, upnpMapDesc, 0); err == nil && n > 0 {
-		logf("UPnP：清掉 %d 条同前缀的旧映射（换端口或上次退出的遗留）", n)
+	// ① 先从路由器表里认领自己的映射（**这就是"上次用的端口"的权威来源**，不需要本地文件）：
+	//    描述前缀 + 内网客户端地址都匹配才算我们的。
+	prefer, prevInternal, found := g.FindOurMapping(ctx, upnpMapDesc, localIP, internalPort)
+	if found {
+		if prefer != internalPort {
+			logf("UPnP：路由器上已有我们的映射（外部 %d → 内网 %d），优先沿用外部端口 %d", prefer, prevInternal, prefer)
+		} else {
+			logf("UPnP：路由器上已有我们的映射 外部 %d → 内网 %d，直接续用", prefer, prevInternal)
+		}
+	}
+	// ② 把我们**多余**的历史映射清掉（只清同前缀 + 同内网地址的，别动同局域网其它出口），
+	//    保证 30 分钟一轮的续期不会在路由器里越积越多。
+	if n, _, err := g.CleanMappings(ctx, upnpMapDesc, 0, localIP); err == nil && n > 0 {
+		logf("UPnP：清掉 %d 条本机同前缀的旧映射（换端口或上次退出的遗留）", n)
 	}
 	ext, err := selectExternalPort(ctx, g, internalPort, prefer, localIP, logf)
 	if err != nil {
@@ -450,7 +509,7 @@ func ensurePortMapping(ctx context.Context, candidates []netip.Addr, internalPor
 // portMapper：端口选择只依赖这两件事，抽出来便于单测（真实实现 = *igd）。
 type portMapper interface {
 	addPortMapping(ctx context.Context, externalPort uint16, internalIP netip.Addr, internalPort uint16) error
-	CleanMappings(ctx context.Context, descPrefix string, onlyPort uint16) (int, []string, error)
+	CleanMappings(ctx context.Context, descPrefix string, onlyPort uint16, onlyClient netip.Addr) (int, []string, error)
 }
 
 // selectExternalPort：按「上次成功的端口 → 监听端口 → 监听端口+1」的顺序申请，返回成功的外部端口。

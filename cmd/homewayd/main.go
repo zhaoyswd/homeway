@@ -116,6 +116,7 @@ func cmdUPnP(args []string) error {
 	port := fs.Uint("port", 0, "只处理这个外部端口（0 = 全部）")
 	desc := fs.String("desc", "homeway-exit", "只清理描述以该前缀开头的映射")
 	probeIP := fs.String("ip", "", "probe 用：内网目标地址（默认本机）")
+	cleanAny := fs.Bool("any-client", false, "clean 用：连别的内网地址上的同前缀映射也一起清（默认只清本机）")
 	fs.Parse(args[1:])
 
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
@@ -175,7 +176,11 @@ func cmdUPnP(args []string) error {
 		}
 		return nil
 	case "clean":
-		n, kept, err := g.CleanMappings(ctx, *desc, uint16(*port))
+		client := local
+		if *cleanAny {
+			client = netip.Addr{}
+		}
+		n, kept, err := g.CleanMappings(ctx, *desc, uint16(*port), client)
 		if err != nil {
 			return err
 		}

@@ -18,7 +18,6 @@ import (
 	"net/netip"
 	"os"
 	"path/filepath"
-	"strconv"
 	"strings"
 	"time"
 
@@ -29,7 +28,6 @@ const (
 	publicRefreshOK   = 10 * time.Minute
 	publicRefreshFail = 2 * time.Minute
 	publicFile        = "public_endpoint.txt"
-	upnpPortFile      = "upnp_port.txt"
 )
 
 // PublicOpts 公网端点探测的开关（都来自 serve 的 flag）。
@@ -57,25 +55,6 @@ func ReadPublicEndpoint(stateDir string) string {
 	return strings.TrimSpace(string(b))
 }
 
-// readRememberedPort / writeRememberedPort：记住「上次成功申请到的外部端口」。
-// 为什么需要：端口选择若纯按「监听端口 → 监听端口+1」重试，上次因为 41641 被占而退到 41642/41643 的出口，
-// 重启后**不会**沿用那个端口（会先去抢 41641）—— 而公网端口变了意味着路由器上已配的防火墙规则、
-// DDNS+固定端口、以及已经烤进 token 的公网端点全都要跟着改。记住它并在启动时优先沿用，才是稳的。
-func readRememberedPort(stateDir string) uint16 {
-	b, err := os.ReadFile(filepath.Join(stateDir, upnpPortFile))
-	if err != nil {
-		return 0
-	}
-	n, err := strconv.Atoi(strings.TrimSpace(string(b)))
-	if err != nil || n <= 0 || n > 65535 {
-		return 0
-	}
-	return uint16(n)
-}
-
-func writeRememberedPort(stateDir string, port uint16) error {
-	return os.WriteFile(filepath.Join(stateDir, upnpPortFile), []byte(strconv.Itoa(int(port))+"\n"), 0o600)
-}
 
 // StartPublicEndpoint 起后台循环（非阻塞）。
 func (s *Server) StartPublicEndpoint(ctx context.Context, opts PublicOpts) {
@@ -117,14 +96,11 @@ func (s *Server) refreshPublicEndpoint(ctx context.Context, opts PublicOpts) boo
 		cands := localIPv4Candidates()
 		if len(cands) == 0 {
 			logf("UPnP：找不到内网 IPv4 候选，跳过端口映射")
-		} else if p, used, err := ensurePortMapping(ctx, cands, port, readRememberedPort(opts.StateDir), logf); err != nil {
+		} else if p, used, err := ensurePortMapping(ctx, cands, port, logf); err != nil {
 			logf("UPnP：未取得端口映射（%v）；出口在 NAT 后时可在路由器上手动把 UDP %d 转发到本机（候选 %v）", err, port, cands)
 		} else {
 			extPort = p
-			if err := writeRememberedPort(opts.StateDir, extPort); err != nil {
-				logf("UPnP：记住外部端口 %d 失败（%v）", extPort, err)
-			}
-			logf("UPnP：已建立端口映射 外部 UDP %d → %v:%d（下次重启优先沿用 %d）", extPort, used, port, extPort)
+			logf("UPnP：已建立端口映射 外部 UDP %d → %v:%d（重启时从路由器表认领，不需本地文件）", extPort, used, port)
 			// 路由器自报的 WAN 地址（有些家用路由器返回空值，那就只当没拿到）。
 			if g, err := discoverIGD(ctx, used); err == nil {
 				if ip, err := g.externalIP(ctx); err == nil && ip.IsValid() && !ip.IsPrivate() {
