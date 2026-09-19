@@ -6,7 +6,7 @@ import (
 	"testing"
 )
 
-var goldenToken = "hmw1AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyD__v38-_r5-Pf29fTz8vHw7-7t7Ovq6ejn5uXk4-Lh4AMAEjE5Mi4xNjguMy4xMjo0MTY0MQAWZXhpdC5leGFtcGxlLm5ldDo0MTY0MQETMTIzLjU2LjIxOC4yMTI6NDQzMKbgCFU"
+var goldenToken = "hmw1AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyD__v38-_r5-Pf29fTz8vHw7-7t7Ovq6ejn5uXk4-Lh4AMAEDE5Mi4wLjIuMTI6NDE2NDEAFmV4aXQuZXhhbXBsZS5uZXQ6NDE2NDEBEDIwMy4wLjExMy45OjQ0MzAIhj7v"
 
 var goldenFields = Token{
 	PeerID: func() [32]byte {

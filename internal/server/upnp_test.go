@@ -238,9 +238,9 @@ func TestExternalIPParse(t *testing.T) {
 
 func TestPublicAddrFilter(t *testing.T) {
 	cases := map[string]bool{
-		"203.0.113.9":  true,
-		"10.0.0.1":     false,
-		"192.168.1.10":  false, // RFC1918（脱敏后不再用真实局域网地址）,
+		"203.0.113.9":   true,
+		"10.0.0.1":      false,
+		"192.168.1.10":  false, // RFC1918 私网（脱敏后不要用真实局域网地址当用例）
 		"100.64.1.1":   false, // CGNAT
 		"127.0.0.1":    false,
 		"169.254.1.1":  false,
