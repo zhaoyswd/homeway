@@ -1,3 +1,5 @@
+//go:build !windows
+
 // 终端服务的客户端半边（tasks 3.5；手机核 NAPI 侧在 4.2 用它）。
 //
 // 与 service.go 同包：帧协议一处定义。拨流以函数注入（生产 = flows.Client.Connect
