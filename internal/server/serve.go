@@ -161,8 +161,10 @@ type Server struct {
 	Table *servercore.PeerTable
 
 	dev     *device.Device
+	bind    *servercore.ServerBind
 	stopTCP func()
 	stopUDP func()
+	pubKick chan struct{} // 公网端点探测的"立即重测"信号（换网事件踢）
 	filesLn net.Listener
 	files   *files.Server
 	termLn  net.Listener
@@ -199,6 +201,7 @@ func Start(cfg ServeConfig) (*Server, error) {
 		buildTag = "homewayd-dev"
 	}
 	sbind := &servercore.ServerBind{Logf: logf, Build: buildTag, BindAddr: cfg.BindAddr, BindIface: cfg.BindIface}
+	s.bind = sbind
 	s.dev = device.NewDevice(tunDev, sbind, device.NewLogger(level, "homewayd"))
 	s.Table = servercore.NewPeerTable(servercore.NewIPCConfigurer(s.dev), secrets, 8, 0)
 	// token 台账热加载：`homewayd issue` 之后不需要重启出口（见 PeerTable.reload 的注释）。
@@ -372,6 +375,11 @@ func Run(ctx context.Context, cfg ServeConfig) error {
 	if err != nil {
 		return err
 	}
+	// 换网自愈：绑了物理网卡时，网卡索引/地址变化后重钉 socket 并立刻重测公网端点
+	// （否则接口索引一变，socket 就钉在一个不存在的网卡上；端点也会 stale 到下一轮 10 分钟）。
+	if cfg.BindIface != nil {
+		WatchNetwork(ctx, cfg.BindIface.Name, s.bindRepin, s.KickPublicEndpoint, logf)
+	}
 	<-ctx.Done()
 	// 退出时把映射**租期缩短**（而不是删除）：路由器表就是我们"上次用的外口"的记忆 ——
 	// 快速重启（升级/换二进制）能沿用同一个公网端口；出口真退休了，5 分钟后映射自动消失，
@@ -394,6 +402,14 @@ func Run(ctx context.Context, cfg ServeConfig) error {
 // ipcConfigurer：PeerTable 表项 → device IpcSet。
 func logf(format string, args ...any) {
 	fmt.Printf("[homewayd] "+format+"\n", args...)
+}
+
+// bindRepin：把当前 WG socket 重新钉到配置的网卡上（换网监视用）。
+func (s *Server) bindRepin() (*net.Interface, error) {
+	if s == nil || s.bind == nil {
+		return nil, nil
+	}
+	return s.bind.Repin()
 }
 
 // udpFactory 给每条 UDP 中继会话开通道：代理优先（按探测结论），其次是绑卡直连。

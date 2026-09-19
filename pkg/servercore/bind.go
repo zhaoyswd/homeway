@@ -43,6 +43,42 @@ type ServerBind struct {
 	c        *net.UDPConn
 	stunMu   sync.Mutex
 	stunWait *stunPending
+	pinMu    sync.Mutex
+	pinned   *net.Interface // 当前实际钉住的网卡（Open 时设置，Repin 时更新）
+}
+
+// Repin 按**名字**重新解析网卡并把它重新钉到当前 socket 上（换网/接口索引变化后调用）。
+// 没配 BindIface 时是 no-op（返回 nil, nil）。
+//
+// 为什么按名字重解析：接口索引会变（Wi-Fi 关开、换网），老的 index 会让 socket 钉在一个
+// 不存在的网卡上 —— 表现是"隧道还在、包发不出去"。名字是稳定的。
+func (b *ServerBind) Repin() (*net.Interface, error) {
+	cfg := b.BindIface
+	if cfg == nil {
+		return nil, nil
+	}
+	ifi, err := net.InterfaceByName(cfg.Name)
+	if err != nil {
+		return nil, fmt.Errorf("server: 网卡 %s 当前不可用: %w", cfg.Name, err)
+	}
+	c := b.c
+	if c == nil {
+		return nil, fmt.Errorf("server: socket 还没打开")
+	}
+	b.pinMu.Lock()
+	defer b.pinMu.Unlock()
+	if err := pinSocketToIface(c, ifi); err != nil {
+		return nil, err
+	}
+	b.pinned = ifi
+	return ifi, nil
+}
+
+// PinnedIface 当前钉住的网卡（没绑卡时 nil）。
+func (b *ServerBind) PinnedIface() *net.Interface {
+	b.pinMu.Lock()
+	defer b.pinMu.Unlock()
+	return b.pinned
 }
 
 // stunPending 一次在飞的 STUN 查询（接收路径匹配事务 ID 后把结果投给它）。
@@ -87,6 +123,9 @@ func (b *ServerBind) Open(port uint16) ([]conn.ReceiveFunc, uint16, error) {
 			_ = c.Close()
 			return nil, 0, fmt.Errorf("server: 绑定网卡 %s 失败: %w", b.BindIface.Name, err)
 		}
+		b.pinMu.Lock()
+		b.pinned = b.BindIface
+		b.pinMu.Unlock()
 	} else if laddr.IP != nil {
 		// 绑了源地址还要把 socket 钉在该网卡上（见 pinSocketToIface 的注释）：
 		// 否则默认路由被 TUN 型代理抢走时，STUN 观测到的是代理的映射而不是路由器上的真实映射。

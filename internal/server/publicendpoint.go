@@ -71,6 +71,7 @@ func (s *Server) StartPublicEndpoint(ctx context.Context, opts PublicOpts) {
 	if opts.Logf == nil {
 		opts.Logf = func(string, ...any) {}
 	}
+	s.pubKick = make(chan struct{}, 1)
 	go func() {
 		for {
 			wait := publicRefreshOK
@@ -80,10 +81,23 @@ func (s *Server) StartPublicEndpoint(ctx context.Context, opts PublicOpts) {
 			select {
 			case <-ctx.Done():
 				return
+			case <-s.pubKick: // 换网事件：别等下一个 10 分钟窗口，立刻重测
+				opts.Logf("公网端点：收到换网事件，立即重测")
 			case <-time.After(wait):
 			}
 		}
 	}()
+}
+
+// KickPublicEndpoint 让公网端点探测立刻跑一轮（换网后调用；非阻塞、可重复）。
+func (s *Server) KickPublicEndpoint() {
+	if s == nil || s.pubKick == nil {
+		return
+	}
+	select {
+	case s.pubKick <- struct{}{}:
+	default: // 已经有一次待处理
+	}
 }
 
 // refreshPublicEndpoint 跑一轮探测；返回是否成功公布。
