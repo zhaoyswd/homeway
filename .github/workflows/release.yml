@@ -1,7 +1,8 @@
 name: release
 
-# 发版 = 推 tag：git tag v0.x.y && git push origin v0.x.y
-# 纯 Go 静态交叉编译，单 ubuntu runner 出全平台产物；linux/amd64 上冒烟。
+# 发版 = 推 tag：`git tag v0.x.y && git push origin v0.x.y`
+# 纯 Go 静态交叉编译（CGO_ENABLED=0），单 ubuntu runner 出全部平台产物；linux/amd64 上冒烟后再发 Release。
+# 手动试跑：Actions 页点 "Run workflow"（只跑构建+冒烟，不发 Release）。
 on:
   push:
     tags: ['v*']
@@ -11,16 +12,29 @@ permissions:
   contents: write
 
 jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - run: go vet ./...
+      - run: go test ./...
+
   build:
+    needs: test
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
         include:
-          - { goos: darwin, goarch: arm64 }
-          - { goos: darwin, goarch: amd64 }
-          - { goos: linux,  goarch: amd64 }
-          - { goos: linux,  goarch: arm64 }
+          - { goos: darwin,  goarch: arm64 }
+          - { goos: darwin,  goarch: amd64 }
+          - { goos: linux,   goarch: arm64 }
+          - { goos: linux,   goarch: amd64 }
+          - { goos: linux,   goarch: arm,   goarm: '7' }
+          - { goos: windows, goarch: amd64 }
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
@@ -30,36 +44,57 @@ jobs:
         env:
           GOOS: ${{ matrix.goos }}
           GOARCH: ${{ matrix.goarch }}
+          GOARM: ${{ matrix.goarm }}
           CGO_ENABLED: 0
         run: |
-          VERSION="${GITHUB_REF##*/}"
+          set -euo pipefail
+          VERSION="${GITHUB_REF##*/}"          # tag 名；手动试跑时是分支名
           LDFLAGS="-s -w -X main.version=${VERSION}"
           mkdir -p dist/homewayd dist/homeway-relay
           go build -trimpath -ldflags "${LDFLAGS}" -o dist/homewayd/homewayd ./cmd/homewayd
           go build -trimpath -ldflags "${LDFLAGS}" -o dist/homeway-relay/homeway-relay ./cmd/homeway-relay
-          cd dist && tar czf "homeway_${VERSION#v}_${GOOS}_${GOARCH}.tar.gz" homewayd homeway-relay
-          sha256sum homeway_*.tar.gz > "homeway_${VERSION#v}_${GOOS}_${GOARCH}.tar.gz.sha256"
+          cd dist
+          ARCH="${GOARCH}${GOARM}"
+          BASE="homeway_${VERSION#v}_${GOOS}_${ARCH}"
+          if [ "${GOOS}" = "windows" ]; then
+            zip -q "${BASE}.zip" homewayd/homewayd.exe homeway-relay/homeway-relay.exe
+            sha256sum "${BASE}.zip" > "${BASE}.zip.sha256"
+          else
+            tar czf "${BASE}.tar.gz" homewayd homeway-relay
+            sha256sum "${BASE}.tar.gz" > "${BASE}.tar.gz.sha256"
+          fi
+          ls -l
       - uses: actions/upload-artifact@v4
         with:
-          name: homeway-${{ matrix.goos }}-${{ matrix.goarch }}
+          name: homeway-${{ matrix.goos }}-${{ matrix.goarch }}${{ matrix.goarm }}
           path: dist/*.tar.gz*
+          if-no-files-found: error
+      - uses: actions/upload-artifact@v4
+        if: matrix.goos == 'windows'
+        with:
+          name: homeway-windows-zip
+          path: dist/*.zip*
 
   smoke:
-    runs-on: ubuntu-latest
     needs: build
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v4
         with:
           name: homeway-linux-amd64
-      - run: |
+      - name: 冒烟（产物真能跑）
+        run: |
+          set -euo pipefail
           tar xzf homeway_*_linux_amd64.tar.gz
           ./homewayd/homewayd --version
           ./homeway-relay/homeway-relay --version
+          ./homewayd/homewayd --help >/dev/null 2>&1 || true
+          ./homeway-relay/homeway-relay --version | grep -q '^homeway-relay '
 
   release:
-    runs-on: ubuntu-latest
     needs: smoke
     if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v4
         with:
@@ -67,5 +102,9 @@ jobs:
           merge-multiple: true
       - uses: softprops/action-gh-release@v2
         with:
-          files: dist/*.tar.gz*
+          files: |
+            dist/*.tar.gz
+            dist/*.tar.gz.sha256
+            dist/*.zip
+            dist/*.zip.sha256
           generate_release_notes: true

@@ -24,7 +24,8 @@ import (
 	"github.com/zhaoyswd/homeway/pkg/proto"
 )
 
-const version = "0.0.0-dev"
+// version 由 CI 用 -ldflags "-X main.version=<tag>" 注入（必须是 var：-X 对 const 无效）。
+var version = "0.0.0-dev"
 
 func main() {
 	if len(os.Args) > 1 && (os.Args[1] == "--version" || os.Args[1] == "version") {
