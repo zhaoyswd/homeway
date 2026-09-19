@@ -87,6 +87,8 @@ func (rc *relayClient) loop(ctx context.Context) {
 	defer t.Stop()
 	rc.sendHello()
 	lastKeepalive := time.Now()
+	started := time.Now()
+	warned := false
 	for {
 		select {
 		case <-ctx.Done():
@@ -98,6 +100,12 @@ func (rc *relayClient) loop(ctx context.Context) {
 		rc.mu.Unlock()
 		if !ok {
 			rc.sendHello()
+			// 中继现在是**纯启动参数**（不落盘），地址写错/中继没起时给一条明确告警，
+			// 别让运维对着"没反应"猜。
+			if !warned && time.Since(started) > 30*time.Second {
+				warned = true
+				rc.logf("⚠️ 中继 %v 30s 未确认注册：检查地址是否正确、中继是否在跑、UDP 是否通（本机 → 中继）", rc.relay)
+			}
 			continue
 		}
 		if time.Since(lastKeepalive) >= relayKeepaliveEvery {

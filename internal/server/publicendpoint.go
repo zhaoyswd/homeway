@@ -46,26 +46,6 @@ type PublicOpts struct {
 	Logf     func(format string, args ...any)
 }
 
-// RelayPath：中继端点落盘路径（serve --relay 写，issue 读）。
-// 为什么要落盘：中继要配两处（出口注册 + 写进 token），只配一处就永远用不上 ——
-// 落盘后 `issue` 自动带上，运维只记住一个地方。
-func RelayPath(stateDir string) string { return filepath.Join(stateDir, "relay.txt") }
-
-// ReadRelays：读回 serve 配置的中继端点（可能多行；空 = 没配）。
-func ReadRelays(stateDir string) []string {
-	b, err := os.ReadFile(RelayPath(stateDir))
-	if err != nil {
-		return nil
-	}
-	var out []string
-	for _, line := range strings.Split(string(b), "\n") {
-		if s := strings.TrimSpace(line); s != "" {
-			out = append(out, s)
-		}
-	}
-	return out
-}
-
 // ListenPortPath：实际监听端口落盘路径（端口冲突会退让，issue 读它拼 LAN 端点）。
 func ListenPortPath(stateDir string) string { return filepath.Join(stateDir, "listen_port.txt") }
 
