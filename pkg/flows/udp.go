@@ -63,8 +63,8 @@ func DecodeDgram(b []byte) (netip.AddrPort, []byte, error) {
 // UDPOption：UDP 中继的可选项。
 type UDPOption func(*udpRelay)
 
-// UDPConn：中继里"到真实目标"的那条通道。直连 = *net.UDPConn（可绑物理网卡），
-// 经代理 = SOCKS5 UDP 关联（pkg/proxy 的实现）。两者接口一致，中继本体不感知差别。
+// UDPConn：中继里"到真实目标"的那条通道（直连 = *net.UDPConn，可绑物理网卡）。
+// 抽成接口是为了给出口留注入口（绑卡工厂）；中继本体不感知差别。
 type UDPConn interface {
 	WriteToUDPAddrPort(p []byte, dst netip.AddrPort) (int, error)
 	ReadFromUDPAddrPort(p []byte) (int, netip.AddrPort, error)
@@ -96,7 +96,7 @@ type udpRelay struct {
 	sessions map[string]*udpSession
 }
 
-// WithUDPSocket 注入「按目标开一条通道」的工厂（出口 = 绑物理网卡 / 经 SOCKS5 代理）。
+// WithUDPSocket 注入「按目标开一条通道」的工厂（出口 = 绑物理网卡）。
 // 不注入时按目标家族用 net.ListenUDP("udp4"/"udp6", nil)（系统默认路由）。
 func WithUDPSocket(f func(netip.AddrPort) (UDPConn, error)) UDPOption {
 	return func(r *udpRelay) { r.newSock = f }
