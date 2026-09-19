@@ -61,12 +61,21 @@ func (b *ServerBind) Repin() (*net.Interface, error) {
 	if err != nil {
 		return nil, fmt.Errorf("server: 网卡 %s 当前不可用: %w", cfg.Name, err)
 	}
+	return b.RepinTo(ifi)
+}
+
+// RepinTo 把当前 socket 钉到**指定的**网卡上（自动挑卡/换网切换时用；传 nil = 不绑）。
+func (b *ServerBind) RepinTo(ifi *net.Interface) (*net.Interface, error) {
 	c := b.c
 	if c == nil {
 		return nil, fmt.Errorf("server: socket 还没打开")
 	}
 	b.pinMu.Lock()
 	defer b.pinMu.Unlock()
+	if ifi == nil {
+		b.pinned = nil
+		return nil, nil
+	}
 	if err := pinSocketToIface(c, ifi); err != nil {
 		return nil, err
 	}

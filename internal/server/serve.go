@@ -48,6 +48,21 @@ type ForwardEgress struct {
 	UDP EgressMode
 }
 
+// BindMode：WG socket（打洞/STUN）钉哪张物理网卡。
+//
+//	BindAuto（默认）：候选物理网卡逐个探针，挑最快探通的那张（见 pkg/egress.SelectBest）；
+//	                  挑不到就不绑（退回系统默认路由）并打日志，绝不因此拒绝启动。
+//	BindExplicit：--bind-interface <网卡名>，只按名字重解析（换网/索引变化时跟上）。
+//	BindOff：不绑（--bind-interface none）。TUN 型代理抢默认路由的机器上**不要用**：
+//	         STUN 观测到的会是代理的映射，打洞与端点公布都不成立。
+type BindMode string
+
+const (
+	BindAuto     BindMode = "auto"
+	BindExplicit BindMode = "explicit"
+	BindOff      BindMode = "off"
+)
+
 // ParseForwardEgress 解析 --forward-egress：
 //
 //	bind / default            —— 同时作用于 TCP 与 UDP
@@ -117,6 +132,7 @@ type ServeConfig struct {
 	BuildTag     string        // 探测应答里回报的构建标记（空 = 用内置默认）
 	BindAddr     netip.Addr    // 非零 = 把 WG UDP socket 绑到该地址（该网卡出站；STUN 观测同 socket）
 	BindIface    *net.Interface // 非空 = 双栈监听并整条 socket 钉在该网卡（同时支持 v4/v6 客户端）
+	BindMode     BindMode       // WG socket 钉哪张卡：auto（默认，自动挑）/explicit（用 BindIface）/off（不绑）
 	ForwardEgress ForwardEgress // 转发出站走哪条路（TCP/UDP 可分开）：bind（默认，钉网卡）/ default（系统默认路由 = TUN 型代理）
 	ForwardProxy string        // 非空 = 被转发的 TCP/UDP 经该 SOCKS5 代理出网（出口自身 socket 仍直连）
 	ForwardUDPMode proxy.UDPMode // UDP 是否经代理：auto（探测）/on（必须）/off（不经）
@@ -162,6 +178,9 @@ type Server struct {
 
 	dev     *device.Device
 	bind    *servercore.ServerBind
+	bindIface *net.Interface     // 本轮实际钉住的网卡（auto 挑出来的或显式给的；nil = 不绑）
+	fwdTCP    *egress.Binder     // 转发 TCP 用的绑定器（跟着换卡走）
+	fwdUDP    *egress.Binder     // 转发 UDP 用的绑定器（跟着换卡走）
 	stopTCP func()
 	stopUDP func()
 	pubKick chan struct{} // 公网端点探测的"立即重测"信号（换网事件踢）
@@ -191,7 +210,25 @@ func Start(cfg ServeConfig) (*Server, error) {
 	if err != nil {
 		return nil, err
 	}
+	// WG socket 钉哪张卡：auto 先探针挑一张（挑不到就不绑，绝不因此拒绝启动）。
+	resolvedIf := cfg.BindIface
+	switch cfg.BindMode {
+	case BindOff:
+		resolvedIf = nil
+	case BindAuto:
+		selCtx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+		best, serr := egress.SelectBest(selCtx, egress.PhysicalCandidates(), nil, 2*time.Second, logf)
+		cancel()
+		if serr != nil {
+			logf("绑卡：自动挑卡失败（%v）—— 本轮不绑，走系统默认路由（TUN 型代理机器上请用 --bind-interface <网卡>）", serr)
+			resolvedIf = nil
+		} else {
+			resolvedIf = best
+			logf("绑卡：自动挑到 %s（%s）", best.Name, stateOf(best))
+		}
+	}
 	s := &Server{cfg: cfg, Stats: &flows.Stats{}}
+	s.bindIface = resolvedIf
 	level := device.LogLevelError
 	if cfg.Verbose {
 		level = device.LogLevelVerbose
@@ -200,7 +237,7 @@ func Start(cfg ServeConfig) (*Server, error) {
 	if buildTag == "" {
 		buildTag = "homewayd-dev"
 	}
-	sbind := &servercore.ServerBind{Logf: logf, Build: buildTag, BindAddr: cfg.BindAddr, BindIface: cfg.BindIface}
+	sbind := &servercore.ServerBind{Logf: logf, Build: buildTag, BindAddr: cfg.BindAddr, BindIface: resolvedIf}
 	s.bind = sbind
 	s.dev = device.NewDevice(tunDev, sbind, device.NewLogger(level, "homewayd"))
 	s.Table = servercore.NewPeerTable(servercore.NewIPCConfigurer(s.dev), secrets, 8, 0)
@@ -217,7 +254,7 @@ func Start(cfg ServeConfig) (*Server, error) {
 	// 必须放在 IpcSet 之后：device 到这一刻才打开 Bind（socket 有了端口，STUN 才有意义）。
 	s.StartPublicEndpoint(context.Background(), PublicOpts{
 		StateDir: cfg.StateDir, UPnP: cfg.UPnP, STUN: cfg.STUN, STUN6: cfg.STUN6, Bind: sbind,
-		Pinned: cfg.BindAddr.IsValid() || cfg.BindIface != nil, Logf: logf,
+		Pinned: cfg.BindAddr.IsValid() || resolvedIf != nil, Logf: logf,
 	})
 
 	tcpLn, err := ns.ListenTCPAddrPort(netip.AddrPortFrom(cfg.TunnelIP, cfg.FlowPort))
@@ -238,10 +275,11 @@ func Start(cfg ServeConfig) (*Server, error) {
 		if m == EgressDefault {
 			return nil
 		}
-		return cfg.BindIface
+		return resolvedIf // 用**实际钉住的那张**（auto 模式也一样），换卡时一起换
 	}
 	eg := egress.FromInterface(ifaceFor(cfg.ForwardEgress.TCP))
 	egUDP := egress.FromInterface(ifaceFor(cfg.ForwardEgress.UDP))
+	s.fwdTCP, s.fwdUDP = eg, egUDP
 	px, err := proxy.New(cfg.ForwardProxy, cfg.ForwardUDPMode, cfg.ForwardUDPProbe, 10*time.Second)
 	if err != nil {
 		return nil, err
@@ -253,17 +291,17 @@ func Start(cfg ServeConfig) (*Server, error) {
 		logf("Forward proxy：转发的 TCP 经 %s；UDP 模式 %s", px.Host(), px.Mode())
 	case eg.Enabled():
 		dial = eg.DialContext
-		logf("Egress：转发出站流量钉在网卡 %s（回环目标除外）", cfg.BindIface.Name)
-	case cfg.BindIface != nil:
+		logf("Egress：转发出站流量钉在网卡 %s（回环目标除外）", resolvedIf.Name)
+	case resolvedIf != nil:
 		logf("Egress：转发的 TCP 走**系统默认路由**（TUN 型代理按自己的规则处理）")
 	}
-	if cfg.BindIface != nil {
+	if resolvedIf != nil {
 		udpPath := "走**系统默认路由**（TUN 型代理按自己的规则处理）"
 		if egUDP.Enabled() {
-			udpPath = "钉在网卡 " + cfg.BindIface.Name
+			udpPath = "钉在网卡 " + resolvedIf.Name
 		}
 		logf("Egress：转发的 UDP %s；WG socket（端口 %d）始终钉在 %s 上（打洞/STUN 的映射必须是我们自己的）",
-			udpPath, cfg.ListenPort, cfg.BindIface.Name)
+			udpPath, cfg.ListenPort, resolvedIf.Name)
 	}
 	s.stopTCP, err = flows.ServeTCP(tcpLn, dial, s.Stats,
 		flows.WithMaxConns(cfg.FlowMaxConns), flows.WithIdleTimeout(cfg.FlowIdle))
@@ -377,8 +415,25 @@ func Run(ctx context.Context, cfg ServeConfig) error {
 	}
 	// 换网自愈：绑了物理网卡时，网卡索引/地址变化后重钉 socket 并立刻重测公网端点
 	// （否则接口索引一变，socket 就钉在一个不存在的网卡上；端点也会 stale 到下一轮 10 分钟）。
-	if cfg.BindIface != nil {
-		WatchNetwork(ctx, cfg.BindIface.Name, s.bindRepin, s.KickPublicEndpoint, logf)
+	if s.bindIface != nil && cfg.BindAddr.IsValid() == false {
+		WatchBind(ctx, BindWatchOpts{
+			Explicit: cfg.BindIface, // auto 模式传 nil（每次重新挑）
+			Repin: func(ifi *net.Interface) error {
+				if _, err := s.bind.RepinTo(ifi); err != nil {
+					return err
+				}
+				s.bindIface = ifi
+				if s.fwdTCP != nil {
+					s.fwdTCP.SetIface(ifi)
+				}
+				if s.fwdUDP != nil {
+					s.fwdUDP.SetIface(ifi)
+				}
+				return nil
+			},
+			OnChange: s.KickPublicEndpoint,
+			Logf:     logf,
+		})
 	}
 	<-ctx.Done()
 	// 退出时把映射**租期缩短**（而不是删除）：路由器表就是我们"上次用的外口"的记忆 ——
@@ -402,14 +457,6 @@ func Run(ctx context.Context, cfg ServeConfig) error {
 // ipcConfigurer：PeerTable 表项 → device IpcSet。
 func logf(format string, args ...any) {
 	fmt.Printf("[homewayd] "+format+"\n", args...)
-}
-
-// bindRepin：把当前 WG socket 重新钉到配置的网卡上（换网监视用）。
-func (s *Server) bindRepin() (*net.Interface, error) {
-	if s == nil || s.bind == nil {
-		return nil, nil
-	}
-	return s.bind.Repin()
 }
 
 // udpFactory 给每条 UDP 中继会话开通道：代理优先（按探测结论），其次是绑卡直连。

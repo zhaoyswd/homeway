@@ -18,20 +18,42 @@ import (
 	"fmt"
 	"net"
 	"net/netip"
+	"sync"
 	"syscall"
 	"time"
 )
 
 // Binder 出站绑定器。零值（或 iface == nil）表示不绑，等价于系统默认路由。
+// 网卡可以在运行期更换（SetIface）：出口自动挑卡/换网切换后，转发路径要跟着走同一张卡。
 type Binder struct {
+	mu    sync.RWMutex
 	iface *net.Interface
 }
 
 // FromInterface 给一个已解析的网卡（CLI 的 --bind-interface 已解析过；nil = 不绑）。
 func FromInterface(ifi *net.Interface) *Binder { return &Binder{iface: ifi} }
 
+// SetIface 换一张网卡（nil = 变成不绑）。运行期可调用（自动挑卡/换网时用）。
+func (b *Binder) SetIface(ifi *net.Interface) {
+	if b == nil {
+		return
+	}
+	b.mu.Lock()
+	b.iface = ifi
+	b.mu.Unlock()
+}
+
+func (b *Binder) curIface() *net.Interface {
+	if b == nil {
+		return nil
+	}
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+	return b.iface
+}
+
 // Enabled 是否真的会绑。
-func (b *Binder) Enabled() bool { return b != nil && b.iface != nil }
+func (b *Binder) Enabled() bool { return b.curIface() != nil }
 
 // shouldBind 判定这条 (network, address) 要不要绑（纯函数，单测覆盖）。
 // 不绑：未启用、非 inet、回环目标。
@@ -70,15 +92,16 @@ func (b *Binder) Control(network, address string, c syscall.RawConn) error {
 	if !b.shouldBind(network, address) {
 		return nil
 	}
+	ifi := b.curIface()
 	var serr error
 	cerr := c.Control(func(fd uintptr) {
-		serr = bindSocketToIface(int(fd), b.iface)
+		serr = bindSocketToIface(int(fd), ifi)
 	})
 	if cerr != nil {
 		return cerr
 	}
 	if serr != nil {
-		return fmt.Errorf("egress: 绑定网卡 %s 失败: %w", b.iface.Name, serr)
+		return fmt.Errorf("egress: 绑定网卡 %s 失败: %w", ifi.Name, serr)
 	}
 	return nil
 }

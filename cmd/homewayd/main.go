@@ -62,23 +62,28 @@ func usage() {
   homewayd version`)
 }
 
-// resolveBind：--bind-interface 支持三种写法（空 = 不绑）：
-//   - 网卡名（如 en0）：**双栈监听 + 整条 socket 钉在该网卡**（同时服务 v4/v6 客户端；v6 走物理网卡）；
-//   - IPv4 字面量：单栈绑该地址（历史上用于绕开 Surge 抢路由）；
-//   - IPv6 字面量：单栈绑该地址。
-func resolveBind(v string) (netip.Addr, *net.Interface, error) {
+// resolveBind：--bind-interface 的取值（WG socket 钉哪张卡）。
+//
+//	auto / 空（默认）：候选物理网卡逐个探针，自动挑**能出网**的那张（换网自动重挑）；
+//	none / off：不绑（走系统默认路由）。TUN 型代理抢默认路由的机器上不要用；
+//	网卡名（如 en0）：显式钉这张，换网时按名字重解析；
+//	IPv4/IPv6 字面量：单栈绑该地址（历史上用于绕开 Surge 抢路由）。
+func resolveBind(v string) (netip.Addr, *net.Interface, server.BindMode, error) {
 	v = strings.TrimSpace(v)
-	if v == "" {
-		return netip.Addr{}, nil, nil
+	switch strings.ToLower(v) {
+	case "", "auto":
+		return netip.Addr{}, nil, server.BindAuto, nil
+	case "none", "off", "no":
+		return netip.Addr{}, nil, server.BindOff, nil
 	}
 	if ip, err := netip.ParseAddr(v); err == nil {
-		return ip, nil, nil
+		return ip, nil, server.BindOff, nil
 	}
 	ifi, err := net.InterfaceByName(v)
 	if err != nil {
-		return netip.Addr{}, nil, fmt.Errorf("找不到网卡 %q（可传网卡名或 IP 字面量）: %w", v, err)
+		return netip.Addr{}, nil, "", fmt.Errorf("找不到网卡 %q（可传 auto / none / 网卡名 / IP 字面量）: %w", v, err)
 	}
-	return netip.Addr{}, ifi, nil
+	return netip.Addr{}, ifi, server.BindExplicit, nil
 }
 
 func parseEndpoints(comma string, relay bool) ([]proto.Endpoint, error) {
@@ -236,7 +241,7 @@ func cmdServe(args []string) error {
 	upnp := fs.Bool("upnp", false, "启动后向路由器申请 UDP 端口映射（30 分钟续期）")
 	stunServer := fs.String("stun", "", "STUN 服务器（在监听 socket 上观测 IPv4 公网映射，如 stun.miwifi.com:3478）")
 	stun6Server := fs.String("stun6", "", "做 IPv6 路径校验用的 STUN 服务器（要有 AAAA，如 stun.cloudflare.com:3478）")
-	bindIface := fs.String("bind-interface", "", "把 WG socket 绑到该网卡/地址（物理网卡名或 IPv4；绕开 TUN 型代理）")
+	bindIface := fs.String("bind-interface", "auto", "WG socket 钉哪张卡：auto（默认，探针自动挑能出网的物理网卡）/ none（不绑，走系统默认路由）/ 网卡名 / IP 字面量")
 	forwardProxy := fs.String("forward-via-proxy", "", "被转发的用户流量经该 SOCKS5 代理出网（socks5://host:port；出口自身 socket 仍直连）")
 	forwardUDP := fs.String("forward-udp", "auto", "UDP 是否经代理：auto（探测 UDP ASSOCIATE 能力）/on（必须）/off（不经）")
 	forwardProbe := fs.String("forward-udp-probe", "", "UDP 能力探测的 STUN 目标（逗号分隔的字面 IP:port；默认 Cloudflare+Google）")
@@ -245,7 +250,7 @@ func cmdServe(args []string) error {
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
-	bindAddr, bindIf, err := resolveBind(*bindIface)
+	bindAddr, bindIf, bindMode, err := resolveBind(*bindIface)
 	if err != nil {
 		return err
 	}
@@ -267,6 +272,7 @@ func cmdServe(args []string) error {
 		Verbose:         *verbose,
 		BindAddr:        bindAddr,
 		BindIface:       bindIf,
+		BindMode:        bindMode,
 		ForwardEgress:   egressMode,
 		ForwardProxy:    *forwardProxy,
 		ForwardUDPMode:  udpMode,
