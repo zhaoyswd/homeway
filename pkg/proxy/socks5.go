@@ -42,11 +42,11 @@ var errSocksProto = errors.New("proxy: SOCKS5 协议错误")
 // Reply 码中文（日志用；便于一眼看出"代理不支持 UDP"）。
 func repString(rep byte) string {
 	switch rep {
-	case 0x00:
+	case repSuccess:
 		return "成功"
 	case 0x01:
 		return "代理内部错误"
-	case 0x02:
+	case repNotAllowed:
 		return "规则不允许"
 	case 0x03:
 		return "网络不可达"
@@ -56,7 +56,7 @@ func repString(rep byte) string {
 		return "连接被拒"
 	case 0x06:
 		return "TTL 过期"
-	case 0x07:
+	case repCommandNotSupprt:
 		return "不支持该命令（UDP ASSOCIATE）"
 	case 0x08:
 		return "地址类型不支持"
@@ -280,11 +280,6 @@ func (c *Client) OpenUDPConn(ctx context.Context, _ netip.AddrPort) (*UDPConn, e
 type ReplyError struct{ Rep byte }
 
 func (e *ReplyError) Error() string { return "proxy: 代理拒绝：" + repString(e.Rep) }
-
-// Unsupported 是"确定性否定"（不支持该命令 / 规则不允许）吗。
-func (e *ReplyError) Unsupported() bool {
-	return e.Rep == repCommandNotSupprt || e.Rep == repNotAllowed
-}
 
 // WriteToUDPAddrPort 组一条 SOCKS5 UDP 数据报（RSV RSV FRAG ATYP ADDR PORT DATA）。
 func (u *UDPConn) WriteToUDPAddrPort(p []byte, dst netip.AddrPort) (int, error) {

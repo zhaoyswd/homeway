@@ -27,32 +27,11 @@ type Binder struct {
 	iface *net.Interface
 }
 
-// New 按网卡名构造绑定器；空串 = 不绑（返回的 Binder 可用且 Enabled()==false）。
-// 网卡名不存在直接报错（宁可在启动时炸掉，也不要静默地没绑上）。
-func New(ifName string) (*Binder, error) {
-	if ifName == "" {
-		return &Binder{}, nil
-	}
-	ifi, err := net.InterfaceByName(ifName)
-	if err != nil {
-		return nil, fmt.Errorf("egress: 找不到网卡 %q（--bind-interface 需要网卡名，如 en0/eth0）: %w", ifName, err)
-	}
-	return &Binder{iface: ifi}, nil
-}
-
-// FromInterface 直接给一个已解析的网卡（CLI 的 --bind-interface 已解析过时用）。
+// FromInterface 给一个已解析的网卡（CLI 的 --bind-interface 已解析过；nil = 不绑）。
 func FromInterface(ifi *net.Interface) *Binder { return &Binder{iface: ifi} }
 
 // Enabled 是否真的会绑。
 func (b *Binder) Enabled() bool { return b != nil && b.iface != nil }
-
-// Iface 当前绑定的网卡（未绑时 nil）。
-func (b *Binder) Iface() *net.Interface {
-	if b == nil {
-		return nil
-	}
-	return b.iface
-}
 
 // shouldBind 判定这条 (network, address) 要不要绑（纯函数，单测覆盖）。
 // 不绑：未启用、非 inet、回环目标。
