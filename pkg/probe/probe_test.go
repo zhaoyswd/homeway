@@ -28,7 +28,7 @@ func TestCodecAndUnknownType(t *testing.T) {
 	if len(req) != 29 {
 		t.Fatalf("ping 请求长度=%d", len(req))
 	}
-	resp := Respond(req, netip.MustParseAddrPort("203.0.113.5:1234"), "v0.6.0-test")
+	resp := Respond(req, netip.MustParseAddrPort("203.0.113.5:1234"), "v0.6.0-test", 0x01)
 	if resp == nil {
 		t.Fatal("ping 应被应答")
 	}
@@ -36,8 +36,18 @@ func TestCodecAndUnknownType(t *testing.T) {
 	if err != nil || got.Build != "v0.6.0-test" {
 		t.Fatalf("ping 响应解析失败：%+v err=%v", got, err)
 	}
+	if got.Flags != 0x01 {
+		t.Fatalf("出口能力位没解析出来：%+v", got)
+	}
+	// 老出口（不带 flags 段）解析成 0，不能报错
+	legacy := append([]byte{}, resp[:13]...)
+	legacy = append(legacy, byte(len("v0.6.0-test")))
+	legacy = append(legacy, "v0.6.0-test"...)
+	if lg, err := DecodeResponse(legacy, TypePing, nonce); err != nil || lg.Flags != 0 || lg.Build != "v0.6.0-test" {
+		t.Fatalf("老格式应兼容解析：%+v err=%v", lg, err)
+	}
 	// 未知类型不应答
-	if resp := Respond(EncodeRequest(0x77, nonce, 16), netip.AddrPort{}, "x"); resp != nil {
+	if resp := Respond(EncodeRequest(0x77, nonce, 16), netip.AddrPort{}, "x", 0); resp != nil {
 		t.Fatal("未知类型不应答")
 	}
 	// nonce 不匹配要拒
@@ -52,7 +62,7 @@ func TestHintReportsObservedAddress(t *testing.T) {
 	var nonce [8]byte
 	copy(nonce[:], "abcdefgh")
 	src := netip.MustParseAddrPort("198.51.100.7:41641")
-	resp := Respond(EncodeRequest(TypeHint, nonce, 16), src, "")
+	resp := Respond(EncodeRequest(TypeHint, nonce, 16), src, "", 0)
 	if resp == nil {
 		t.Fatal("hint 应被应答")
 	}
@@ -61,12 +71,12 @@ func TestHintReportsObservedAddress(t *testing.T) {
 		t.Fatalf("hint 观察地址=%v err=%v（期望 %v）", got.Seen, err, src)
 	}
 	// 无来源地址（内部调用）时不应答
-	if resp := Respond(EncodeRequest(TypeHint, nonce, 16), netip.AddrPort{}, ""); resp != nil {
+	if resp := Respond(EncodeRequest(TypeHint, nonce, 16), netip.AddrPort{}, "", 0); resp != nil {
 		t.Fatal("无来源地址不应答 hint")
 	}
 	// 4in6 形式也要归一成 IPv4
 	mapped := netip.AddrPortFrom(netip.AddrFrom16(netip.MustParseAddr("198.51.100.9").As16()), 5000)
-	resp = Respond(EncodeRequest(TypeHint, nonce, 16), mapped, "")
+	resp = Respond(EncodeRequest(TypeHint, nonce, 16), mapped, "", 0)
 	if got, err := DecodeResponse(resp, TypeHint, nonce); err != nil || !got.Seen.Addr().Is4() {
 		t.Fatalf("4in6 应归一成 IPv4：%v err=%v", got.Seen, err)
 	}
@@ -87,7 +97,7 @@ func TestPingAndHintOverUDP(t *testing.T) {
 			if err != nil {
 				return
 			}
-			if resp := Respond(buf[:n], src, "v9-test"); resp != nil {
+			if resp := Respond(buf[:n], src, "v9-test", 0); resp != nil {
 				srv.WriteToUDPAddrPort(resp, src)
 			}
 		}
@@ -102,13 +112,14 @@ func TestPingAndHintOverUDP(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
 
-	rtt, build, err := Ping(ctx, cli, target, "")
+	rtt, build, flags, err := Ping(ctx, cli, target, "")
 	if err != nil {
 		t.Fatalf("ping 失败：%v", err)
 	}
 	if build != "v9-test" || rtt <= 0 || rtt > 2*time.Second {
 		t.Fatalf("ping 结果异常：rtt=%v build=%q", rtt, build)
 	}
+	_ = flags
 	seen, _, err := Hint(ctx, cli, target)
 	if err != nil {
 		t.Fatalf("hint 失败：%v", err)

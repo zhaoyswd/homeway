@@ -241,16 +241,11 @@ func cmdServe(args []string) error {
 	stunServer := fs.String("stun", "", "STUN 服务器（在监听 socket 上观测 IPv4 公网映射，如 stun.miwifi.com:3478）")
 	stun6Server := fs.String("stun6", "", "做 IPv6 路径校验用的 STUN 服务器（要有 AAAA，如 stun.cloudflare.com:3478）")
 	bindIface := fs.String("bind-interface", "auto", "WG socket 钉哪张卡：auto（默认，探针自动挑能出网的物理网卡）/ none（不绑，走系统默认路由）/ 网卡名 / IP 字面量")
-	forwardEgress := fs.String("forward-egress", "auto", "转发流量走哪条路：auto（默认，按默认路由是不是隧道型网卡自动判定）/ bind（钉物理网卡）/ default（系统默认路由）；可分开写 tcp=default,udp=bind")
 	fs.Parse(args)
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	bindAddr, bindIf, bindMode, err := resolveBind(*bindIface)
-	if err != nil {
-		return err
-	}
-	egressMode, err := server.ParseForwardEgress(*forwardEgress)
 	if err != nil {
 		return err
 	}
@@ -261,7 +256,6 @@ func cmdServe(args []string) error {
 		BindAddr:        bindAddr,
 		BindIface:       bindIf,
 		BindMode:        bindMode,
-		ForwardEgress:   egressMode,
 		UPnP:            *upnp,
 		STUN:            *stunServer,
 		STUN6:           *stun6Server,

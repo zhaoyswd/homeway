@@ -284,6 +284,10 @@ func (r *udpRelay) closeLocked(key string, s *udpSession) {
 	if s.closed.CompareAndSwap(false, true) {
 		_ = s.conn.Close()
 		r.st.DecrFlow()
+		// 实测归宿：有上行才有意义（空会话不算），不看下行包数 =0 就判"这条路的 UDP 不回包"
+		if s.upPkts.Load() > 0 {
+			r.st.IncrUDPSession(s.downPkts.Load() > 0)
+		}
 		if r.logf != nil {
 			r.logf("udp relay: 会话 #%d 关闭 %v → %v（上行 %d 包/%dB，下行 %d 包/%dB，存活 %v）",
 				s.id, s.backTo, s.dst, s.upPkts.Load(), s.upBytes.Load(),

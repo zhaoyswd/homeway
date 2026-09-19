@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"net"
 	"net/netip"
-	"strings"
 	"time"
 
 	"github.com/zhaoyswd/homeway/pkg/egress"
@@ -28,27 +27,6 @@ const (
 	DefaultTermPort   = uint16(7724) // 终端会话 / agent gateway（与旧栈 tunnel 内虚拟端口同号）
 )
 
-// EgressMode：某类转发流量走哪条路。
-//
-//	bind：钉在 --bind-interface 的物理网卡上（不经 TUN 型代理）；
-//	default：走系统默认路由 —— TUN 型代理（Surge 等）按自己的规则处理。
-type EgressMode string
-
-const (
-	EgressBind    EgressMode = "bind"
-	EgressDefault EgressMode = "default"
-	// EgressAuto：按机器当前状态自动判定（默认值，见 resolveEgressPolicy）。
-	EgressAuto EgressMode = "auto"
-)
-
-// ForwardEgress：TCP/UDP 各自的去向。两者可以不同 —— 实测（2026-09-19）：
-// TUN 型代理会按规则处理 TCP（境外走代理能通），但**不中继 UDP**（QUIC 有去无回），
-// 所以 Mac 出口最合适的配置常是 `tcp=default,udp=bind`：TCP 交给代理策略，UDP 直出物理网卡。
-type ForwardEgress struct {
-	TCP EgressMode
-	UDP EgressMode
-}
-
 // BindMode：WG socket（打洞/STUN）钉哪张物理网卡。
 //
 //	BindAuto（默认）：候选物理网卡逐个探针，挑最快探通的那张（见 pkg/egress.SelectBest）；
@@ -63,95 +41,6 @@ const (
 	BindExplicit BindMode = "explicit"
 	BindOff      BindMode = "off"
 )
-
-// ParseForwardEgress 解析 --forward-egress：
-//
-//	auto（默认）/ bind / default —— 同时作用于 TCP 与 UDP（auto 的判据见 resolveEgressPolicy）
-//	tcp=default,udp=bind        —— 分开指定（可只写一项，另一项默认 auto）
-//	（空 = auto）
-func ParseForwardEgress(v string) (ForwardEgress, error) {
-	out := ForwardEgress{TCP: EgressAuto, UDP: EgressAuto}
-	v = strings.TrimSpace(v)
-	if v == "" {
-		return out, nil
-	}
-	if !strings.Contains(v, "=") {
-		m, err := parseEgressMode(v)
-		if err != nil {
-			return out, err
-		}
-		out.TCP, out.UDP = m, m
-		return out, nil
-	}
-	for _, part := range strings.Split(v, ",") {
-		part = strings.TrimSpace(part)
-		if part == "" {
-			continue
-		}
-		key, val, ok := strings.Cut(part, "=")
-		if !ok {
-			return out, fmt.Errorf("--forward-egress %q：%q 应为 tcp=… 或 udp=…", v, part)
-		}
-		m, err := parseEgressMode(val)
-		if err != nil {
-			return out, err
-		}
-		switch strings.TrimSpace(key) {
-		case "tcp":
-			out.TCP = m
-		case "udp":
-			out.UDP = m
-		default:
-			return out, fmt.Errorf("--forward-egress %q：只认 tcp / udp（收到 %q）", v, key)
-		}
-	}
-	return out, nil
-}
-
-func parseEgressMode(v string) (EgressMode, error) {
-	switch strings.TrimSpace(v) {
-	case string(EgressAuto):
-		return EgressAuto, nil
-	case string(EgressBind):
-		return EgressBind, nil
-	case string(EgressDefault):
-		return EgressDefault, nil
-	default:
-		return "", fmt.Errorf("--forward-egress %q：只支持 auto、bind、default", v)
-	}
-}
-
-// resolveEgressPolicy：把 auto 落成具体模式（纯函数，便于单测）。
-//
-// 判据只有一条：**默认路由那张卡是不是隧道型网卡**（utun/bridge/wg… 见 egress.IsVirtualIface）。
-//
-//	是 → 有 TUN 型代理（Surge 等）在抢默认路由：
-//	     TCP 交给它（用户跑这个代理就是要它的规则：境内直连、境外走代理）；
-//	     UDP 钉物理网卡（实测这类代理不中继 UDP：同会话"上行 5 包、下行 0 包"，钉卡直出才通）。
-//	否 → 默认路由本来就是物理网卡：两块都钉该卡（与走默认路由等价，但更确定；
-//	     也防"以后又冒出个代理"时不声不响地改道）。
-func resolveEgressPolicy(cfg ForwardEgress, prefer *net.Interface) (tcp, udp EgressMode) {
-	tcp, udp = cfg.TCP, cfg.UDP
-	tunProxy := prefer != nil && egress.IsVirtualIface(prefer.Name)
-	apply := func(m EgressMode) EgressMode {
-		if m != EgressAuto {
-			return m
-		}
-		if tunProxy {
-			return EgressDefault
-		}
-		return EgressBind
-	}
-	tcp = apply(tcp)
-	if udp == EgressAuto {
-		if tunProxy {
-			udp = EgressBind // UDP 一律不交给 TUN 型代理
-		} else {
-			udp = EgressBind
-		}
-	}
-	return tcp, udp
-}
 
 type ServeConfig struct {
 	StateDir     string
@@ -168,7 +57,6 @@ type ServeConfig struct {
 	BindAddr     netip.Addr    // 非零 = 把 WG UDP socket 绑到该地址（该网卡出站；STUN 观测同 socket）
 	BindIface    *net.Interface // 非空 = 双栈监听并整条 socket 钉在该网卡（同时支持 v4/v6 客户端）
 	BindMode     BindMode       // WG socket 钉哪张卡：auto（默认，自动挑）/explicit（用 BindIface）/off（不绑）
-	ForwardEgress ForwardEgress // 转发出站走哪条路（TCP/UDP 可分开）：bind（默认，钉网卡）/ default（系统默认路由 = TUN 型代理）
 	UPnP         bool          // 启动后向路由器申请 UDP 端口映射并 30 分钟续期
 	STUN         string        // 非空 = 在监听 socket 上向该 STUN 服务器观测公网映射（如 stun.miwifi.com:3478）
 	STUN6        string        // 非空 = 用该服务器做 **IPv6** 路径校验（要有 AAAA，如 stun.cloudflare.com:3478）
@@ -211,9 +99,7 @@ type Server struct {
 	dev     *device.Device
 	bind    *servercore.ServerBind
 	bindIface *net.Interface     // 本轮实际钉住的网卡（auto 挑出来的或显式给的；nil = 不绑）
-	fwdTCP    *egress.Binder     // 转发 TCP 用的绑定器（跟着换卡走）
-	fwdUDP    *egress.Binder     // 转发 UDP 用的绑定器（跟着换卡走）
-	fwdEgress ForwardEgress      // --forward-egress 原始取值（auto 需要周期重算）
+	udpCap    *udpCapState       // 默认路径的 UDP 能力（周期探测；探测应答里回报）
 	stopTCP func()
 	stopUDP func()
 	pubKick chan struct{} // 公网端点探测的"立即重测"信号（换网事件踢）
@@ -270,7 +156,8 @@ func Start(cfg ServeConfig) (*Server, error) {
 	if buildTag == "" {
 		buildTag = "homewayd-dev"
 	}
-	sbind := &servercore.ServerBind{Logf: logf, Build: buildTag, BindAddr: cfg.BindAddr, BindIface: resolvedIf}
+	sbind := &servercore.ServerBind{Logf: logf, Build: buildTag, BindAddr: cfg.BindAddr, BindIface: resolvedIf,
+		Caps: func() byte { return s.UDPCapFlags() }}
 	s.bind = sbind
 	s.dev = device.NewDevice(tunDev, sbind, device.NewLogger(level, "homewayd"))
 	s.Table = servercore.NewPeerTable(servercore.NewIPCConfigurer(s.dev), secrets, 8, 0)
@@ -295,28 +182,13 @@ func Start(cfg ServeConfig) (*Server, error) {
 		s.dev.Close()
 		return nil, err
 	}
-	// 转发出站流量怎么出去，三选一（优先级见下）：经上游代理 → 钉物理网卡 → 系统默认路由。
-	//
-	//   - 钉物理网卡（--forward-egress=bind，默认）：不经 TUN 型代理（Surge 等）；
-	//   - 系统默认路由（--forward-egress=default）：让 TUN 型代理按它自己的规则处理；
-	//   - **两者可以分开**（--forward-egress=tcp=default,udp=bind）：实测 TUN 型代理会按规则
-	//     处理 TCP（境外能通），但不中继 UDP（QUIC 有去无回）—— 这类机器上这就是最优解。
-	// 无论怎么选，**WG socket（打洞/STUN）始终钉在物理网卡上**：NAT 映射必须是我们自己的那个。
-	// 回环目标自动豁免（出口自己的 files/终端就在 127.0.0.1）。
-	tcpMode, udpMode := resolveEgressPolicy(cfg.ForwardEgress, egress.PreferredIface())
-	eg := egress.FromInterface(ifaceForMode(tcpMode, resolvedIf))
-	egUDP := egress.FromInterface(ifaceForMode(udpMode, resolvedIf))
-	s.fwdTCP, s.fwdUDP = eg, egUDP
-	s.fwdEgress = cfg.ForwardEgress // auto 时看护会周期性重算
-	logf("Egress：转发的 TCP %s / UDP %s（--forward-egress=%s/%s ⇒ %s/%s）",
-		egressPathName(tcpMode), egressPathName(udpMode),
-		dash(cfg.ForwardEgress.TCP), dash(cfg.ForwardEgress.UDP), tcpMode, udpMode)
-	// TCP 走哪条路由 dialer 自己判（绑定器 Enabled() 是动态的：auto 模式会在运行期切换）。
-	dial := eg.DialContext
-	if resolvedIf != nil {
-		logf("Egress：WG socket（端口 %d）钉在 %s 上（打洞/STUN 的映射必须是我们自己的）",
-			cfg.ListenPort, resolvedIf.Name)
-	}
+	// 转发出站流量**一律走系统默认路由**（2026-09-19 定稿）：
+	// 出口机器上装了什么代理/网关就由它按自己的规则处理，我们不做路径判断 ——
+	// 但要**把"这条路能不能承载 UDP"测出来暴露**（见 udpcap.go）：
+	// 这类 TUN 型代理通常不中继 UDP（实测同会话"上行 5 包、下行 0 包"），
+	// 所以转发出去的 UDP（QUIC 等）能不能通是这条路的属性，而不是我们能选的。
+	// 回环目标不受影响（出口自己的 files/终端就在 127.0.0.1）。
+	dial := flows.DialFunc(flows.DefaultDial)
 	s.stopTCP, err = flows.ServeTCP(tcpLn, dial, s.Stats,
 		flows.WithMaxConns(cfg.FlowMaxConns), flows.WithIdleTimeout(cfg.FlowIdle))
 	if err != nil {
@@ -331,14 +203,7 @@ func Start(cfg ServeConfig) (*Server, error) {
 	}
 	// UDP 中继：长会话（QUIC/游戏）+ 会话级日志（建立/关闭各一行，含双向包数——
 	// 真机判断「QUIC 到底通没通」就靠这一行，逐包细节不在这里）。
-	udpOpts := []flows.UDPOption{flows.WithUDPLog(logf),
-		// 工厂常驻：auto 模式会在运行期把"走默认路由/钉网卡"来回切（见 EgressWatch）。
-		flows.WithUDPSocket(func(dst netip.AddrPort) (flows.UDPConn, error) {
-			if egUDP.Enabled() {
-				return egUDP.ListenUDPFor(dst)
-			}
-			return net.ListenUDP(egress.NetworkFor(dst), nil)
-		})}
+	udpOpts := []flows.UDPOption{flows.WithUDPLog(logf)}
 	s.stopUDP, _ = flows.ServeUDP(udpPC, s.Stats, udpOpts...)
 
 	// files 原生协议服务：只监听本机回环（客户端经内部流的 CONNECT 让后端按本机网络重拨到这里）。
@@ -431,15 +296,10 @@ func Run(ctx context.Context, cfg ServeConfig) error {
 	if err != nil {
 		return err
 	}
+	// 默认路径能不能承载 UDP：周期探测 + 探测应答里回报（转发流量一律走默认路由，这是它的属性）。
+	s.startUDPCapProbe(ctx, logf)
 	// 换网自愈：绑了物理网卡时，网卡索引/地址变化后重钉 socket 并立刻重测公网端点
 	// （否则接口索引一变，socket 就钉在一个不存在的网卡上；端点也会 stale 到下一轮 10 分钟）。
-	// --forward-egress=auto：默认路由变成/变回隧道型网卡时跟着切（30s 一次，开销一次 UDP dial）。
-	watchEgressPolicy(ctx, cfg.ForwardEgress, egressRecheck, logf,
-		func() (EgressMode, EgressMode) { return resolveEgressPolicy(cfg.ForwardEgress, egress.PreferredIface()) },
-		func(tcp, udp EgressMode) {
-			s.fwdTCP.SetIface(ifaceForMode(tcp, s.bindIface))
-			s.fwdUDP.SetIface(ifaceForMode(udp, s.bindIface))
-		})
 	if s.bindIface != nil && cfg.BindAddr.IsValid() == false {
 		WatchBind(ctx, BindWatchOpts{
 			Explicit: cfg.BindIface, // auto 模式传 nil（每次重新挑）
@@ -448,10 +308,12 @@ func Run(ctx context.Context, cfg ServeConfig) error {
 					return err
 				}
 				s.bindIface = ifi
-				s.applyForwardEgress() // 换卡后转发路径跟着走（auto 的 default 侧仍保持不绑）
 				return nil
 			},
-			OnChange: s.KickPublicEndpoint,
+			OnChange: func() {
+				s.KickPublicEndpoint() // 端点要重测（可能换网/换 IP）
+				s.KickUDPCapProbe()    // UDP 能力也要重测（换了条路）
+			},
 			Logf:     logf,
 		})
 	}
@@ -482,27 +344,4 @@ func logf(format string, args ...any) {
 var _ = wgtypes.Key{} // 保留引用
 
 
-// applyForwardEgress：把当前 --forward-egress 策略应用到两个绑定器上（换卡/重算时调用）。
-func (s *Server) applyForwardEgress() {
-	tcp, udp := resolveEgressPolicy(s.fwdEgress, egress.PreferredIface())
-	if s.fwdTCP != nil {
-		s.fwdTCP.SetIface(ifaceForMode(tcp, s.bindIface))
-	}
-	if s.fwdUDP != nil {
-		s.fwdUDP.SetIface(ifaceForMode(udp, s.bindIface))
-	}
-}
 
-func egressPathName(m EgressMode) string {
-	if m == EgressDefault {
-		return "走系统默认路由（TUN 型代理按自己的规则处理）"
-	}
-	return "钉物理网卡"
-}
-
-func dash(m EgressMode) string {
-	if m == "" {
-		return "auto"
-	}
-	return string(m)
-}

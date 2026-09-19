@@ -30,6 +30,9 @@ type ServerBind struct {
 	Port   uint16
 	Table  *PeerTable
 	Build  string            // 探测应答里回报的构建标记（就绪行/排障用）
+	// Caps：探测应答里回报的能力位（bit0 = 出口默认路径可承载 UDP；nil 或未探过 = 0）。
+	// 用函数而不是值：UDP 能力是**周期性探测**的结论，运行期会变（换网/代理开关）。
+	Caps   func() byte
 	OnHint func(addr string) // 中继观察到的客户端公网地址（打洞用，阶段 6）
 	Logf   func(format string, args ...any)
 	// BindAddr 非零时把 UDP socket 绑到这张网卡的地址上：
@@ -168,7 +171,11 @@ func (b *ServerBind) Open(port uint16) ([]conn.ReceiveFunc, uint16, error) {
 
 		// 参照点探测（tasks 3.6）：明文一问一答，不进 WG、不登记 peer、不碰会话状态。
 		// 客户端在「全部候选失败」时用它做三档归因（本机 / 链路 / 后端）。
-		if resp := probe.Respond(buf, src, b.Build); resp != nil {
+		caps := byte(0)
+			if b.Caps != nil {
+				caps = b.Caps()
+			}
+			if resp := probe.Respond(buf, src, b.Build, caps); resp != nil {
 			_, _ = c.WriteToUDPAddrPort(resp, src)
 			return 0, nil
 		}

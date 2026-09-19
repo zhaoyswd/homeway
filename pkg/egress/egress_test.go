@@ -1,129 +1,100 @@
 package egress
 
 import (
+	"context"
 	"net"
 	"net/netip"
+	"strings"
 	"testing"
 	"time"
 )
 
-func TestIsLoopbackTarget(t *testing.T) {
-	cases := []struct {
-		addr string
-		want bool
-	}{
-		{"127.0.0.1:7802", true},
-		{"127.0.0.1:53", true},
-		{"[::1]:443", true},
-		{"localhost:8080", true},
-		{"127.0.0.2:1", true},
-		{"1.1.1.1:53", false},
-		{"[2606:4700::1111]:443", false},
-		{"example.com:443", false},
-		{"", false}, // 空地址（监听/未指定）按"要绑"处理
+func TestIsVirtualIface(t *testing.T) {
+	cases := map[string]bool{
+		"en0": false, "eth0": false, "eno1": false, "enp3s0": false,
+		"utun3": true, "utun0": true, "lo0": true, "bridge100": true,
+		"awdl0": true, "llw0": true, "gif0": true, "stf0": true,
+		"docker0": true, "veth1234": true, "br-abc": true, "tailscale0": true,
+		"TUN0": true, // 大小写不敏感
 	}
-	for _, c := range cases {
-		if got := IsLoopbackTarget(c.addr); got != c.want {
-			t.Errorf("IsLoopbackTarget(%q) = %v，want %v", c.addr, got, c.want)
+	for name, want := range cases {
+		if got := IsVirtualIface(name); got != want {
+			t.Errorf("IsVirtualIface(%q) = %v，want %v", name, got, want)
 		}
 	}
 }
 
-func TestShouldBind(t *testing.T) {
-	off := &Binder{} // 未启用
-	on := FromInterface(&net.Interface{Name: "en0", Index: 1})
-	cases := []struct {
-		b       *Binder
-		network string
-		address string
-		want    bool
-	}{
-		{off, "tcp", "1.1.1.1:443", false},
-		{on, "tcp4", "1.1.1.1:443", true},
-		{on, "tcp6", "[2606:4700::1111]:443", true},
-		{on, "udp", "223.5.5.5:53", true},
-		{on, "udp", "", true},                // 出口 UDP 中继：源地址未指定
-		{on, "tcp", "127.0.0.1:7802", false}, // 回环豁免
-		{on, "tcp", "[::1]:7724", false},
-		{on, "unix", "/tmp/x.sock", false},
-		{on, "unixgram", "/tmp/x.sock", false},
-	}
-	for _, c := range cases {
-		if got := c.b.shouldBind(c.network, c.address); got != c.want {
-			t.Errorf("shouldBind(%v, %q, %q) = %v，want %v", c.b.Enabled(), c.network, c.address, got, c.want)
+// 候选枚举只做「结构性过滤」，能不能出网由探针决定。
+func TestPhysicalCandidatesExcludeVirtual(t *testing.T) {
+	cands := PhysicalCandidates()
+	for _, c := range cands {
+		if IsVirtualIface(c.Name) {
+			t.Fatalf("候选里出现了虚拟网卡 %s", c.Name)
 		}
+		if c.Flags&net.FlagLoopback != 0 || c.Flags&net.FlagUp == 0 {
+			t.Fatalf("候选里出现了 down/回环网卡 %s", c.Name)
+		}
+	}
+	t.Logf("候选：%d 张", len(cands))
+}
+
+// SelectBest：全不通要报错并给出每张卡的结论；有通的要挑最快的那张。
+func TestSelectBestPicksFastest(t *testing.T) {
+	cands := []net.Interface{{Name: "en0", Index: 1}, {Name: "en1", Index: 2}}
+	probe := func(_ context.Context, ifi *net.Interface, _ []netip.AddrPort, _ time.Duration) (time.Duration, error) {
+		switch ifi.Name {
+		case "en0":
+			return 50 * time.Millisecond, nil
+		case "en1":
+			return 5 * time.Millisecond, nil
+		}
+		return 0, nil
+	}
+	best, err := selectBestWith(context.Background(), cands, nil, nil, time.Second, nil, probe)
+	if err != nil {
+		t.Fatalf("SelectBest: %v", err)
+	}
+	if best == nil || best.Name != "en1" {
+		t.Fatalf("应挑最快探通的 en1，实际 %v", best)
 	}
 }
 
-// 回环豁免的行为判据：绑着物理网卡也能拨通本机回环服务
-// （出口自己的 files/终端就在回环上；绑卡后如果这里失败，等于把出口自己打瘸）。
-func TestLoopbackDialSucceedsWhenBound(t *testing.T) {
-	ifi := testIface(t)
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
+// 默认路由那张卡优先：即使另一张探得更快（典型：docker 网桥探得通但收不到入向包）。
+func TestSelectBestPrefersDefaultRouteIface(t *testing.T) {
+	cands := []net.Interface{{Name: "eth0", Index: 1}, {Name: "docker0", Index: 2}}
+	prefer := &net.Interface{Name: "eth0", Index: 1}
+	probe := func(_ context.Context, ifi *net.Interface, _ []netip.AddrPort, _ time.Duration) (time.Duration, error) {
+		if ifi.Name == "docker0" {
+			return time.Millisecond, nil // 更快
+		}
+		return 30 * time.Millisecond, nil
+	}
+	best, err := selectBestWith(context.Background(), cands, prefer, nil, time.Second, nil, probe)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer ln.Close()
-	go func() {
-		for {
-			c, aerr := ln.Accept()
-			if aerr != nil {
-				return
-			}
-			_ = c.Close()
-		}
-	}()
-	b := FromInterface(ifi)
-	conn, err := b.Dialer(time.Second).Dial("tcp", ln.Addr().String())
-	if err != nil {
-		t.Fatalf("绑卡后拨回环失败（回环必须豁免）：%v", err)
-	}
-	_ = conn.Close()
-}
-
-// 真实 socket 上确实设上了选项（平台实现各自校验，见 bind_*_test.go）。
-// v4/v6 两侧都验：家族选错时绑卡会**静默失效**（darwin 上 udp6 socket 设 IP_BOUND_IF 直接 EINVAL）。
-func TestListenUDPBindsSocket(t *testing.T) {
-	ifi := testIface(t)
-	b := FromInterface(ifi)
-	for _, target := range []netip.AddrPort{
-		netip.MustParseAddrPort("1.1.1.1:53"),
-		netip.MustParseAddrPort("[2606:4700:4700::1111]:53"),
-	} {
-		conn, err := b.ListenUDPFor(target)
-		if err != nil {
-			t.Fatalf("ListenUDPFor(%v): %v", target, err)
-		}
-		checkSocketBound(t, conn, ifi, target)
-		_ = conn.Close()
+	if best == nil || best.Name != "eth0" {
+		t.Fatalf("默认路由卡探得通时应优先它，实际 %v", best)
 	}
 }
 
-func TestNetworkFor(t *testing.T) {
-	if got := NetworkFor(netip.MustParseAddrPort("1.1.1.1:53")); got != "udp4" {
-		t.Errorf("v4 目标 = %q，want udp4", got)
+func TestSelectBestAllFail(t *testing.T) {
+	cands := []net.Interface{{Name: "en0", Index: 1}}
+	probe := func(_ context.Context, _ *net.Interface, _ []netip.AddrPort, _ time.Duration) (time.Duration, error) {
+		return 0, context.DeadlineExceeded
 	}
-	if got := NetworkFor(netip.MustParseAddrPort("[2001:db8::1]:443")); got != "udp6" {
-		t.Errorf("v6 目标 = %q，want udp6", got)
+	_, err := selectBestWith(context.Background(), cands, nil, nil, time.Second, nil, probe)
+	if err == nil || !strings.Contains(err.Error(), "都探不通") {
+		t.Fatalf("全不通应报错并说清：%v", err)
 	}
 }
 
-// testIface 挑一张真实（非回环、已 up、有地址）的网卡；没有就跳过。
-func testIface(t *testing.T) *net.Interface {
-	t.Helper()
-	ifis, err := net.Interfaces()
-	if err != nil {
-		t.Fatal(err)
+// 默认路径探针：拿一个不存在的目标（黑洞地址）应当失败而不是误判成"可用"。
+func TestProbeDefaultFailsOnDeadTarget(t *testing.T) {
+	dead := []netip.AddrPort{netip.MustParseAddrPort("127.0.0.1:1")}
+	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+	defer cancel()
+	if _, err := ProbeDefault(ctx, dead, 400*time.Millisecond); err == nil {
+		t.Fatal("死目标不应判成探通")
 	}
-	for i := range ifis {
-		ifi := ifis[i]
-		if ifi.Flags&net.FlagUp == 0 || ifi.Flags&net.FlagLoopback != 0 {
-			continue
-		}
-		if addrs, err := ifi.Addrs(); err == nil && len(addrs) > 0 {
-			return &ifi
-		}
-	}
-	t.Skip("没有可用的非回环网卡")
-	return nil
 }

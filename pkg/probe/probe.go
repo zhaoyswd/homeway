@@ -6,7 +6,9 @@
 //
 //	请求:  "HWQ" ‖ ver(1) ‖ type(1) ‖ nonce(8) ‖ 填充…        （≥16B）
 //	响应:  "HWR" ‖ ver(1) ‖ type(1) ‖ nonce(8) ‖ payload
-//	type=1 ping：payload = buildLen(1) ‖ build（长度 ≤32；空 = 未提供）——纯回声 + 构建标记
+//	type=1 ping：payload = buildLen(1) ‖ build（长度 ≤32；空 = 未提供）‖ flags(1，可省)
+//	             ——纯回声 + 构建标记 + **出口能力位**（bit0 = 出口默认路径可承载 UDP，
+//	             见 server.UDPCapFlag）。flags 追加在最后 ⇒ 老客户端只读前段，不受影响。
 //	type=2 hint：payload = 16B v6(4in6) 地址 ‖ 2B BE 端口 = **后端看到的客户端源地址**
 //
 // 语义要点：
@@ -56,6 +58,7 @@ type Response struct {
 	Type  byte
 	Nonce [8]byte
 	Build string
+	Flags byte            // 出口能力位（type=ping；老出口不回这一段 ⇒ 0）
 	Seen  netip.AddrPort // type=hint：后端看到的客户端源地址
 }
 
@@ -89,8 +92,8 @@ func DecodeRequest(b []byte) (Request, error) {
 }
 
 // Respond 处理一个可能为探测包的数据报：是探测且可应答 ⇒ 返回响应字节；否则 nil。
-// src = 后端看到的来源地址（type=hint 回给客户端自己的 NAT 映射）。
-func Respond(req []byte, src netip.AddrPort, build string) []byte {
+// src = 后端看到的来源地址（type=hint 回给客户端自己的 NAT 映射）；flags 见 Response.Flags。
+func Respond(req []byte, src netip.AddrPort, build string, flags byte) []byte {
 	r, err := DecodeRequest(req)
 	if err != nil {
 		return nil
@@ -102,7 +105,7 @@ func Respond(req []byte, src netip.AddrPort, build string) []byte {
 	switch r.Type {
 	case TypePing:
 		if build == "" {
-			out = append(out, 0)
+			out = append(out, 0, flags)
 			return out
 		}
 		if len(build) > maxBuild {
@@ -110,6 +113,7 @@ func Respond(req []byte, src netip.AddrPort, build string) []byte {
 		}
 		out = append(out, byte(len(build)))
 		out = append(out, build...)
+		out = append(out, flags)
 		return out
 	case TypeHint:
 		if !src.IsValid() {
@@ -153,6 +157,10 @@ func DecodeResponse(b []byte, wantType byte, nonce [8]byte) (Response, error) {
 				return Response{}, ErrProbeShort
 			}
 			resp.Build = string(payload[1 : 1+n])
+			// flags 追加在 build 之后（老出口没有这一段 ⇒ 保持 0）
+			if rest := payload[1+n:]; len(rest) > 0 {
+				resp.Flags = rest[0]
+			}
 		}
 	case TypeHint:
 		if len(payload) < 18 {
@@ -171,19 +179,19 @@ func DecodeResponse(b []byte, wantType byte, nonce [8]byte) (Response, error) {
 }
 
 // Ping 一问一答（可达性 + RTT + 对端构建标记）。
-func Ping(ctx context.Context, pc net.PacketConn, target netip.AddrPort, build string) (time.Duration, string, error) {
+func Ping(ctx context.Context, pc net.PacketConn, target netip.AddrPort, build string) (time.Duration, string, byte, error) {
 	nonce := randomNonce()
 	req := EncodeRequest(TypePing, nonce, 16)
 	start := time.Now()
 	raw, err := roundTrip(ctx, pc, target, req, TypePing, nonce)
 	if err != nil {
-		return 0, "", err
+		return 0, "", 0, err
 	}
 	resp, err := DecodeResponse(raw, TypePing, nonce)
 	if err != nil {
-		return 0, "", err
+		return 0, "", 0, err
 	}
-	return time.Since(start), resp.Build, nil
+	return time.Since(start), resp.Build, resp.Flags, nil
 }
 
 // Hint 问「我在你眼里是哪个地址」（NAT 映射观察；打洞与三档归因共用）。
