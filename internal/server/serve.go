@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"net"
 	"net/netip"
+	"os"
+	"strconv"
 	"time"
 
 	"github.com/zhaoyswd/homeway/pkg/egress"
@@ -208,26 +210,28 @@ func Start(cfg ServeConfig) (*Server, error) {
 
 	// files 原生协议服务：只监听本机回环（客户端经内部流的 CONNECT 让后端按本机网络重拨到这里）。
 	// 根 = 用户主目录、恒读写（协议无参数）；启动打一行根目录判据。
+	// ⚠️ 可选服务失败**不致命**：端口被别的程序占用（或同机跑了第二个实例）时，
+	// 隧道/转发照常工作，只把这条服务摘掉并说清后果 —— 整机因为 7802 起不来是最糟的取舍。
 	fsrv, err := files.Open(cfg.FilesRoot)
 	if err != nil {
-		s.Close()
-		return nil, fmt.Errorf("files 根目录不可用：%w", err)
-	}
-	fsrv.SetLogger(logf)
-	fln, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", cfg.FilesPort))
-	if err != nil {
-		fsrv.Close()
-		s.Close()
-		return nil, fmt.Errorf("files 监听 %d 失败：%w", cfg.FilesPort, err)
-	}
-	s.filesLn, s.files = fln, fsrv
-	go func() {
-		if err := fsrv.Serve(fln); err != nil {
-			logf("files 服务收工：%v", err)
+		logf("⚠️ files 根目录不可用（%v）—— 文件管理会报错，其余功能不受影响", err)
+	} else {
+		fsrv.SetLogger(logf)
+		fln, lerr := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", cfg.FilesPort))
+		if lerr != nil {
+			fsrv.Close()
+			logf("⚠️ files 监听 127.0.0.1:%d 失败（%v）—— 文件管理会报错（别的程序占用或同机跑了第二个实例），"+
+				"其余功能不受影响", cfg.FilesPort, lerr)
+		} else {
+			s.filesLn, s.files = fln, fsrv
+			go func() {
+				if serr := fsrv.Serve(fln); serr != nil {
+					logf("files 服务收工：%v", serr)
+				}
+			}()
+			logf("files 就绪：root=%s (rw) listen=127.0.0.1:%d", fsrv.RootDir(), cfg.FilesPort)
 		}
-	}()
-	rootDir := fsrv.RootDir()
-	logf("files 就绪：root=%s (rw) listen=127.0.0.1:%d", rootDir, cfg.FilesPort)
+	}
 
 	// 终端会话 / agent gateway：只监听本机回环，客户端经内部流 CONNECT 到 127.0.0.1:<TermPort>。
 	// 会话由后端持有（客户端断开只摘泵，不杀进程）；开关 HOMEWAY_TERM=off，调参 HOMEWAY_TERM_*。
@@ -237,22 +241,24 @@ func Start(cfg ServeConfig) (*Server, error) {
 		tsrv := term.New(logf)
 		tln, terr := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", cfg.TermPort))
 		if terr != nil {
-			s.Close()
-			return nil, fmt.Errorf("term 监听 %d 失败：%w", cfg.TermPort, terr)
-		}
-		s.termLn, s.termSrv = tln, tsrv
-		go func() {
-			for {
-				conn, aerr := tln.Accept()
-				if aerr != nil {
-					return
+			// 与 files 同一取舍：可选服务起不来不影响隧道/转发。
+			logf("⚠️ term 监听 127.0.0.1:%d 失败（%v）—— 终端功能会报错，其余功能不受影响", cfg.TermPort, terr)
+			tsrv.Close()
+		} else {
+			s.termLn, s.termSrv = tln, tsrv
+			go func() {
+				for {
+					conn, aerr := tln.Accept()
+					if aerr != nil {
+						return
+					}
+					go tsrv.ServeConn(conn)
 				}
-				go tsrv.ServeConn(conn)
-			}
-		}()
-		// 就绪行（判据）：终端会话端口 + shell + 历史窗口 + 能力位
-		logf("# Serving terminal sessions on port %d (shell=%s, history=%s, features=%s)",
-			cfg.TermPort, tsrv.ShellText(), tsrv.HistoryText(), term.FeaturesText())
+			}()
+			// 就绪行（判据）：终端会话端口 + shell + 历史窗口 + 能力位
+			logf("# Serving terminal sessions on port %d (shell=%s, history=%s, features=%s)",
+				cfg.TermPort, tsrv.ShellText(), tsrv.HistoryText(), term.FeaturesText())
+		}
 	}
 
 	if err := s.dev.Up(); err != nil { // FINDINGS 0.1-1
@@ -260,7 +266,8 @@ func Start(cfg ServeConfig) (*Server, error) {
 		return nil, err
 	}
 	pub := priv.PublicKey()
-	logf("serve 就绪：wg=:%d tunnel=%v flow=tcp:%d,udp:%d tokens=%d key=%x…",
+	// 注意：这里是**配置端口**；端口被占用会自动退让，实际端口在下面异步落盘时打（见 listen_port.txt）。
+	logf("serve 就绪：wg=:%d（配置端口；被占用会自动退让）tunnel=%v flow=tcp:%d,udp:%d tokens=%d key=%x…",
 		cfg.ListenPort, cfg.TunnelIP, cfg.FlowPort, cfg.UDPFlowPort, len(secrets), pub[:6])
 	return s, nil
 }
@@ -296,6 +303,20 @@ func Run(ctx context.Context, cfg ServeConfig) error {
 	if err != nil {
 		return err
 	}
+	// 把**实际**监听端口落盘：端口冲突会自动退让（见 ServerBind.Open），`issue` 需要知道真实端口
+	// 才能把 LAN 端点写对（不写这个文件的话，回退端口后 token 里的端口就是错的）。
+	go func() {
+		p := waitLocalPort(context.Background(), s.bind, 30*time.Second)
+		if p == 0 {
+			return
+		}
+		if p != cfg.ListenPort {
+			logf("⚠️ 实际监听端口 %d（配置的 %d 被占用，已自动退让）—— token 里的端口以公布/签发为准", p, cfg.ListenPort)
+		}
+		if werr := os.WriteFile(ListenPortPath(cfg.StateDir), []byte(strconv.Itoa(int(p))+"\n"), 0o600); werr != nil {
+			logf("监听端口落盘失败（%v）—— issue 会回落到 41641", werr)
+		}
+	}()
 	// 默认路径能不能承载 UDP：周期探测 + 探测应答里回报（转发流量一律走默认路由，这是它的属性）。
 	s.startUDPCapProbe(ctx, logf)
 	// 换网自愈：绑了物理网卡时，网卡索引/地址变化后重钉 socket 并立刻重测公网端点

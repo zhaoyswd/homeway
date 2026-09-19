@@ -20,6 +20,7 @@ import (
 	"time"
 
 	"github.com/zhaoyswd/homeway/internal/server"
+	"github.com/zhaoyswd/homeway/pkg/egress"
 	"github.com/zhaoyswd/homeway/pkg/proto"
 )
 
@@ -54,8 +55,9 @@ func main() {
 
 func usage() {
 	fmt.Fprintln(os.Stderr, `用法：
-  homewayd issue --state <dir> --direct host:port[,host:port...] [--relay host:port...]
-  homewayd serve --state <dir> [--listen 41641] [--upnp] [--stun host:3478] [--stun6 host:3478] [--bind-interface <网卡|IPv4>]
+  homewayd serve [--state <dir>]      # 零参数即可：UPnP/STUN 默认开、WG socket 自动挑卡（端口冲突自动退让）
+  homewayd issue [--state <dir>]      # 零参数：自动带 LAN 端点 + 已公布的公网端点
+  homewayd serve [--listen 41641] [--upnp=false] [--stun host:3478|空] [--bind-interface auto|none|网卡|IP]
   homewayd upnp list | clean [--port N] [--desc 前缀]
   homewayd upnp probe --port N              # 试申请该外部端口（判断是否被占用；成功即删）
   homewayd version`)
@@ -80,9 +82,33 @@ func resolveBind(v string) (netip.Addr, *net.Interface, server.BindMode, error) 
 	}
 	ifi, err := net.InterfaceByName(v)
 	if err != nil {
-		return netip.Addr{}, nil, "", fmt.Errorf("找不到网卡 %q（可传 auto / none / 网卡名 / IP 字面量）: %w", v, err)
+		// 名字写错/网卡暂时不在：**告警后退回 auto**（探针挑一张能出网的），不让出口起不来。
+		logf("⚠️ --bind-interface %q 找不到（%v）—— 退回 auto（自动挑卡）", v, err)
+		return netip.Addr{}, nil, server.BindAuto, nil
 	}
 	return netip.Addr{}, ifi, server.BindExplicit, nil
+}
+
+// localV4s：本机物理网卡的 IPv4 地址（非回环/非虚拟，按 egress 的口径）。
+func localV4s() []netip.Addr {
+	var out []netip.Addr
+	for _, ifi := range egress.PhysicalCandidates() {
+		addrs, err := ifi.Addrs()
+		if err != nil {
+			continue
+		}
+		for _, a := range addrs {
+			ipn, ok := a.(*net.IPNet)
+			if !ok {
+				continue
+			}
+			ip, ok := netip.AddrFromSlice(ipn.IP)
+			if ok && ip.Unmap().Is4() {
+				out = append(out, ip.Unmap())
+			}
+		}
+	}
+	return out
 }
 
 func parseEndpoints(comma string, relay bool) ([]proto.Endpoint, error) {
@@ -196,6 +222,19 @@ func cmdIssue(args []string) error {
 
 	var eps []proto.Endpoint
 	eps = append(eps, mustEps(parseEndpoints(*direct, false))...)
+	// 没给 --direct 时**自动带上本机 LAN 端点**（物理网卡的 IPv4 + 实际监听端口）：
+	// 手机在同一局域网时优先走它（最快），出了门才用公网端点。
+	if strings.TrimSpace(*direct) == "" {
+		port := server.ReadListenPort(*stateDir)
+		if port == 0 {
+			port = 41641
+		}
+		for _, ip := range localV4s() {
+			ep := proto.Endpoint{Addr: netip.AddrPortFrom(ip, port).String()}
+			eps = append(eps, ep)
+			fmt.Fprintf(os.Stderr, "homewayd: 已附上本机 LAN 端点 %s（--direct 可覆盖）\n", ep.Addr)
+		}
+	}
 	// 出口若已自动公布公网端点（UPnP + 同 socket STUN 一致才写），自动拼进直连候选：
 	// 家里/外面都能连。--no-public 可关掉。
 	if !*noPublic {
@@ -206,7 +245,7 @@ func cmdIssue(args []string) error {
 	}
 	eps = append(eps, mustEps(parseEndpoints(*relay, true))...)
 	if len(eps) == 0 {
-		return fmt.Errorf("至少需要一个 --direct 或 --relay 端点")
+		return fmt.Errorf("没有可用端点：既没有 --direct/--relay，也没能自动发现 LAN 地址或已公布的公网端点")
 	}
 
 	st, err := server.OpenState(*stateDir)
@@ -237,9 +276,9 @@ func cmdServe(args []string) error {
 	stateDir := fs.String("state", defaultStateDir(), "state 目录（身份密钥+token 台账）")
 	listen := fs.Uint("listen", 41641, "WG 监听端口")
 	verbose := fs.Bool("verbose", false, "打印 wireguard-go 详细日志")
-	upnp := fs.Bool("upnp", false, "启动后向路由器申请 UDP 端口映射（30 分钟续期）")
-	stunServer := fs.String("stun", "", "STUN 服务器（在监听 socket 上观测 IPv4 公网映射，如 stun.miwifi.com:3478）")
-	stun6Server := fs.String("stun6", "", "做 IPv6 路径校验用的 STUN 服务器（要有 AAAA，如 stun.cloudflare.com:3478）")
+	upnp := fs.Bool("upnp", true, "向路由器申请 UDP 端口映射（默认开，30 分钟续期；--upnp=false 关）")
+	stunServer := fs.String("stun", "stun.cloudflare.com:3478", "STUN 服务器（在监听 socket 上观测 IPv4 公网映射；空 = 关）")
+	stun6Server := fs.String("stun6", "stun.cloudflare.com:3478", "做 IPv6 路径校验用的 STUN（要有 AAAA；空 = 关）")
 	bindIface := fs.String("bind-interface", "auto", "WG socket 钉哪张卡：auto（默认，探针自动挑能出网的物理网卡）/ none（不绑，走系统默认路由）/ 网卡名 / IP 字面量")
 	fs.Parse(args)
 

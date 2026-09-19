@@ -93,6 +93,31 @@ func (b *ServerBind) PinnedIface() *net.Interface {
 	return b.pinned
 }
 
+// listenWithFallback：监听口被占用时的退让顺序 —— +1…+9，最后随机。
+// 返回已监听的 socket；全失败返回最后的错误。
+func listenWithFallback(network string, laddr *net.UDPAddr, port uint16) (*net.UDPConn, error) {
+	var lastErr error
+	for p := int(port) + 1; p <= int(port)+9; p++ {
+		la := *laddr
+		la.Port = p
+		c, err := net.ListenUDP(network, &la)
+		if err == nil {
+			return c, nil
+		}
+		lastErr = err
+	}
+	la := *laddr
+	la.Port = 0
+	c, err := net.ListenUDP(network, &la)
+	if err == nil {
+		return c, nil
+	}
+	if err != nil {
+		lastErr = err
+	}
+	return nil, lastErr
+}
+
 // stunPending 一次在飞的 STUN 查询（接收路径匹配事务 ID 后把结果投给它）。
 type stunPending struct {
 	txid [12]byte
@@ -128,24 +153,44 @@ func (b *ServerBind) Open(port uint16) ([]conn.ReceiveFunc, uint16, error) {
 	}
 	c, err := net.ListenUDP(network, laddr)
 	if err != nil {
-		return nil, 0, err
+		// 端口被占用**不能**让出口起不来（旧实例没退干净、别的服务抢先、快速重启撞 TIME_WAIT…）。
+		// 按 监听口 → +1…+9 → 随机 的顺序退让，并把实际端口打出来（UPnP/STUN/公布/token 全按实际端口走）。
+		if port != 0 {
+			if alt, aerr := listenWithFallback(network, laddr, port); aerr == nil {
+				altPort := uint16(0)
+				if ua, ok := alt.LocalAddr().(*net.UDPAddr); ok {
+					altPort = uint16(ua.Port)
+				}
+				b.logf("⚠️ 监听端口 %d 被占用（%v）—— 改用 %d；token 里的端口以公布/签发为准", port, err, altPort)
+				c, err = alt, nil
+			}
+		}
+		if err != nil {
+			return nil, 0, err
+		}
 	}
 	if b.BindIface != nil {
 		if err := pinSocketToIface(c, b.BindIface); err != nil {
-			_ = c.Close()
-			return nil, 0, fmt.Errorf("server: 绑定网卡 %s 失败: %w", b.BindIface.Name, err)
+			// 钉不上卡**不致命**：继续按未绑卡运行，并把后果说清楚（公网端点公布会自动变保守：
+			// 只有 PinnedIface()!=nil 时才允许"外口≠监听口"的拼法）。
+			b.logf("⚠️ 钉网卡 %s 失败（%v）—— 继续以未绑卡运行：STUN 观测可能被 TUN 型代理污染，"+
+				"公网端点公布会因此变保守", b.BindIface.Name, err)
+		} else {
+			b.pinMu.Lock()
+			b.pinned = b.BindIface
+			b.pinMu.Unlock()
 		}
-		b.pinMu.Lock()
-		b.pinned = b.BindIface
-		b.pinMu.Unlock()
 	} else if laddr.IP != nil {
 		// 绑了源地址还要把 socket 钉在该网卡上（见 pinSocketToIface 的注释）：
 		// 否则默认路由被 TUN 型代理抢走时，STUN 观测到的是代理的映射而不是路由器上的真实映射。
 		if ip, ok := netip.AddrFromSlice(laddr.IP); ok {
 			if ifi := ifaceForAddr(ip.Unmap()); ifi != nil {
 				if err := pinSocketToIface(c, ifi); err != nil {
-					_ = c.Close()
-					return nil, 0, fmt.Errorf("server: 绑定网卡 %s 失败: %w", ifi.Name, err)
+					b.logf("⚠️ 钉网卡 %s 失败（%v）—— 继续以未绑卡运行（公网端点公布变保守）", ifi.Name, err)
+				} else {
+					b.pinMu.Lock()
+					b.pinned = ifi
+					b.pinMu.Unlock()
 				}
 			}
 		}

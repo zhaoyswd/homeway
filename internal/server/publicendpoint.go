@@ -17,6 +17,7 @@ import (
 	"fmt"
 	"net/netip"
 	"os"
+	"strconv"
 	"path/filepath"
 	"strings"
 	"time"
@@ -40,8 +41,25 @@ type PublicOpts struct {
 	// Pinned：WG socket 已绑物理网卡（--bind-interface）。钉住之后 STUN 观测到的 IP 必然是
 	// 这台机器在路由器 WAN 侧的地址（不会是被代理改写过的），所以「外口 != 监听口」时也敢用
 	// STUN 的 IP + UPnP 的外口拼端点；没钉住时保守起见要求两者端口一致。
+	// ⚠️ 判据是**运行期事实**（Bind.PinnedIface()）——钉卡失败会自动降级，这里不能拿配置当真。
 	Pinned bool
 	Logf     func(format string, args ...any)
+}
+
+// ListenPortPath：实际监听端口落盘路径（端口冲突会退让，issue 读它拼 LAN 端点）。
+func ListenPortPath(stateDir string) string { return filepath.Join(stateDir, "listen_port.txt") }
+
+// ReadListenPort：读回实际监听端口（没有/不合法 → 0，调用方回落默认）。
+func ReadListenPort(stateDir string) uint16 {
+	b, err := os.ReadFile(ListenPortPath(stateDir))
+	if err != nil {
+		return 0
+	}
+	n, err := strconv.ParseUint(strings.TrimSpace(string(b)), 10, 16)
+	if err != nil {
+		return 0
+	}
+	return uint16(n)
 }
 
 // PublicEndpointPath：公布文件路径（issue 读它）。
@@ -152,7 +170,7 @@ func (s *Server) refreshPublicEndpoint(ctx context.Context, opts PublicOpts) boo
 	switch {
 	case observed.IsValid() && extPort != 0 && observed.Port() == extPort && publicAddr(observed.Addr()):
 		pub = observed
-	case observed.IsValid() && extPort != 0 && opts.Pinned && publicAddr(observed.Addr()):
+	case observed.IsValid() && extPort != 0 && pinnedNow(opts) && publicAddr(observed.Addr()):
 		pub = netip.AddrPortFrom(observed.Addr(), extPort)
 		logf("公网端点：外口 %d ≠ 监听口 %d（沿用历史端口/回退），用 STUN 的 IP + UPnP 的外口公布", extPort, port)
 	case observed.IsValid() && extPort == 0 && observed.Port() == port && publicAddr(observed.Addr()):
@@ -198,6 +216,14 @@ func (s *Server) refreshPublicEndpoint(ctx context.Context, opts PublicOpts) boo
 	}
 	logf("公网端点：已公布 %v（写进 %s；issue 会把它一并烤进 token）", lines, publicFile)
 	return true
+}
+
+// pinnedNow：当前是否真的钉住了网卡（每次刷新都重读，钉卡失败降级后自动变保守）。
+func pinnedNow(opts PublicOpts) bool {
+	if opts.Bind != nil && opts.Bind.PinnedIface() != nil {
+		return true
+	}
+	return opts.Pinned
 }
 
 // waitLocalPort：device 打开 Bind 是异步的（IpcSet 之后由 wireguard-go 拉起），这里等一小会儿。
