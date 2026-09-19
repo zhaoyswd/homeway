@@ -13,6 +13,7 @@ import (
 	"github.com/zhaoyswd/homeway/pkg/egress"
 	"github.com/zhaoyswd/homeway/pkg/files"
 	"github.com/zhaoyswd/homeway/pkg/flows"
+	"github.com/zhaoyswd/homeway/pkg/proto"
 	"github.com/zhaoyswd/homeway/pkg/servercore"
 	"github.com/zhaoyswd/homeway/pkg/term"
 	"golang.org/x/crypto/curve25519"
@@ -321,6 +322,11 @@ func Run(ctx context.Context, cfg ServeConfig) error {
 			logf("监听端口落盘失败（%v）—— issue 会回落到 41641", werr)
 		}
 	}()
+	// 身份标签：中继 `--allow` 白名单填这个（从 token 或 `homewayd id` 也能取到）。
+	label := BackendLabel(s.priv)
+	pub6 := PubFromPriv(s.priv)
+	logf("后端身份：标签 %x（中继 --allow 填这个）｜公钥 %x…", label, pub6[:6])
+
 	// 中继注册腿（--relay）：从 WG socket 出站注册，NAT 后的出口由此可被客户端到达。
 	if cfg.Relay != "" {
 		if ra, rerr := netip.ParseAddrPort(cfg.Relay); rerr == nil {
@@ -370,6 +376,27 @@ func Run(ctx context.Context, cfg ServeConfig) error {
 }
 
 // ipcConfigurer：PeerTable 表项 → device IpcSet。
+// PubFromPriv：从 WG 私钥导出公钥（Curve25519 basepoint 乘法）。
+func PubFromPriv(priv [32]byte) [32]byte { return wgPub(priv) }
+
+// BackendLabel：出口的**中继标签** = SHA-256(静态公钥)[:8]（16 位 hex）。
+// 中继 `--allow` 填的就是它；中继日志 `中继：后端 <label> 注册成功` 也是它。
+func BackendLabel(priv [32]byte) [8]byte { return proto.RelayID(PubFromPriv(priv)) }
+
+// BackendLabelFromState：从 state 目录里的身份密钥算标签（`homewayd id` 用）。
+func BackendLabelFromState(stateDir string) ([8]byte, [32]byte, error) {
+	st, err := OpenState(stateDir)
+	if err != nil {
+		return [8]byte{}, [32]byte{}, err
+	}
+	priv, err := st.PrivateKey()
+	if err != nil {
+		return [8]byte{}, [32]byte{}, err
+	}
+	pub := PubFromPriv(priv)
+	return proto.RelayID(pub), pub, nil
+}
+
 // wgPub：从 WG 私钥导出公钥（Curve25519 basepoint 乘法）；中继注册要用它作 peerId。
 func wgPub(priv [32]byte) [32]byte {
 	pub, err := curve25519.X25519(priv[:], curve25519.Basepoint)

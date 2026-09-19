@@ -37,6 +37,8 @@ func main() {
 	}
 	var err error
 	switch os.Args[1] {
+	case "id":
+		err = cmdID(os.Args[2:])
 	case "issue":
 		err = cmdIssue(os.Args[2:])
 	case "serve":
@@ -56,7 +58,8 @@ func main() {
 func usage() {
 	fmt.Fprintln(os.Stderr, `用法：
   homewayd serve [--state <dir>]      # 零参数即可：UPnP/STUN 默认开、WG socket 自动挑卡（端口冲突自动退让）
-  homewayd issue [--state <dir>]      # 零参数：自动带 LAN 端点 + 已公布的公网端点
+  homewayd id [--state <dir>]         # 打印后端身份：peerID（公钥）+ label（中继 --allow 填这个）
+  homewayd issue [--state <dir>]      # 零参数：自动带 LAN 端点 + 已公布的公网端点 + 已配的中继（--relay 显式给）
   homewayd serve [--listen 41641] [--upnp=false] [--stun host:3478|空] [--bind-interface auto|none|网卡|IP]
   homewayd upnp list | clean [--port N] [--desc 前缀]
   homewayd upnp probe --port N              # 试申请该外部端口（判断是否被占用；成功即删）
@@ -210,6 +213,21 @@ func cmdUPnP(args []string) error {
 	default:
 		return fmt.Errorf("未知子命令 %q（用法：homewayd upnp list | clean）", sub)
 	}
+}
+
+// cmdID：打印后端身份（中继白名单要用标签，排障要用公钥指纹）。
+func cmdID(args []string) error {
+	fs := flag.NewFlagSet("id", flag.ExitOnError)
+	stateDir := fs.String("state", defaultStateDir(), "state 目录（身份密钥）")
+	fs.Parse(args)
+	label, pub, err := server.BackendLabelFromState(*stateDir)
+	if err != nil {
+		return err
+	}
+	fmt.Printf("state    %s\n", *stateDir)
+	fmt.Printf("peerID   %x（WG 静态公钥，token 里就是这个）\n", pub)
+	fmt.Printf("label    %x（中继 --allow 填这个；中继日志「后端 … 注册成功」也是它）\n", label)
+	return nil
 }
 
 func cmdIssue(args []string) error {
