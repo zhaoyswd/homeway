@@ -38,8 +38,11 @@ const (
 	// UDPCapObserved：**实测证据** —— 最近一轮窗口里有转发的 UDP 会话收到过回包。
 	// 探针只能证明"某一类端口可达"，这一位来自真实流量，才对应"QUIC 这类到底能不能用"。
 	UDPCapObserved = byte(1 << 2)
-	// UDPCapProbed：出口至少完成过一轮探测（用来区分"未知"与"明确实测无回包"）。
+	// UDPCapProbed：出口至少完成过一轮探测（用来区分"未知"与"明确探测过"）。
 	UDPCapProbed = byte(1 << 3)
+	// UDPCapSeen：本轮窗口内有**真实转发**的 UDP 会话（不论有没有回包）——
+	// 有它 + 没有 UDPCapObserved = "实测过、确实无回包"，比"没样本"强得多。
+	UDPCapSeen = byte(1 << 4)
 )
 
 // udpCapState：当前结论（原子读，探测循环写）+ 立刻重探的信号。
@@ -107,20 +110,29 @@ func (s *Server) startUDPCapProbe(ctx context.Context, logf func(string, ...any)
 			dNoReply := noReply - prevNoReply
 			prevReplied, prevNoReply = replied, noReply
 			flags |= UDPCapProbed
+			if dReplied+dNoReply > 0 {
+				flags |= UDPCapSeen
+			}
 			if dReplied > 0 {
 				flags |= UDPCapObserved
 			}
 			s.udpCap.flags.Store(uint32(flags))
 			s.udpCap.done.Store(true)
 			cur := fmt.Sprintf("0x%02x", flags)
-			if cur != last {
+			// 打印时机：能力位变化，或者**本轮有真实转发的 UDP 会话**（后者才是用户最关心的证据，
+			// 且"只有上行"这种失败并不改变能力位，不能因此不报）。
+			if cur != last || dReplied+dNoReply > 0 {
 				saw := fmt.Sprintf("本轮 %d 条有回包 / %d 条只有上行", dReplied, dNoReply)
-				if dReplied == 0 && dNoReply == 0 {
+				hint := ""
+				switch {
+				case dReplied == 0 && dNoReply == 0:
 					saw = "本轮没有转发的 UDP 会话"
+				case dReplied == 0:
+					hint = " —— 转发出去的 UDP 全都只有上行没有回包：这条路（多半是 TUN 型代理）不回这类 UDP，" +
+						"对应到应用就是 QUIC 会超时回落 TCP"
 				}
-				logf("UDP 默认路径：DNS:53 %s；通用 UDP（STUN:3478）%s；实测 %s"+
-					"（实测那条才对应 QUIC 这类真实流量；探测应答 flags=0x%02x 也会这么报）",
-					dnsNote, genNote, saw, flags)
+				logf("UDP 默认路径：DNS:53 %s；通用 UDP（STUN:3478）%s；实测 %s%s"+
+					"（探测应答 flags=0x%02x 也会这么报）", dnsNote, genNote, saw, hint, flags)
 				last = cur
 			}
 		}
