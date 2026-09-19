@@ -10,6 +10,7 @@ import (
 
 	"github.com/zhaoyswd/homeway/pkg/egress"
 	"github.com/zhaoyswd/homeway/pkg/files"
+	"github.com/zhaoyswd/homeway/pkg/proxy"
 	"github.com/zhaoyswd/homeway/pkg/flows"
 	"github.com/zhaoyswd/homeway/pkg/servercore"
 	"github.com/zhaoyswd/homeway/pkg/term"
@@ -41,6 +42,9 @@ type ServeConfig struct {
 	BuildTag     string        // 探测应答里回报的构建标记（空 = 用内置默认）
 	BindAddr     netip.Addr    // 非零 = 把 WG UDP socket 绑到该地址（该网卡出站；STUN 观测同 socket）
 	BindIface    *net.Interface // 非空 = 双栈监听并整条 socket 钉在该网卡（同时支持 v4/v6 客户端）
+	ForwardProxy string        // 非空 = 被转发的 TCP/UDP 经该 SOCKS5 代理出网（出口自身 socket 仍直连）
+	ForwardUDPMode proxy.UDPMode // UDP 是否经代理：auto（探测）/on（必须）/off（不经）
+	ForwardUDPProbe []netip.AddrPort // UDP 能力探测用的 STUN 目标（字面 IP；空 = 内置兜底）
 	UPnP         bool          // 启动后向路由器申请 UDP 端口映射并 30 分钟续期
 	STUN         string        // 非空 = 在监听 socket 上向该 STUN 服务器观测公网映射（如 stun.miwifi.com:3478）
 	STUN6        string        // 非空 = 用该服务器做 **IPv6** 路径校验（要有 AAAA，如 stun.cloudflare.com:3478）
@@ -142,12 +146,23 @@ func Start(cfg ServeConfig) (*Server, error) {
 		s.dev.Close()
 		return nil, err
 	}
-	// 转发出站流量也要钉在同一张物理网卡上（bind-interface）：
-	// 不钉的话，TUN 型代理抢走默认路由后，转发的 TCP/UDP 会走代理 —— QUIC 这类被代理丢弃的
-	// UDP 就变成"手机上行很多包、目标零应答"（真机实测）。回环目标自动豁免（见 pkg/egress）。
+	// 转发出站流量的三条路（优先级见下）：经上游代理 → 钉物理网卡 → 系统默认。
+	//
+	//   - 经代理（--forward-via-proxy）：境内直连、境外走代理这类诉求全交给代理自己的规则；
+	//   - 钉物理网卡（--bind-interface）：TUN 型代理抢走默认路由时，不让转发的 TCP/UDP 被它劫走
+	//     （真机实测：不钉时 QUIC 变成"手机上行很多包、目标零应答"）。回环目标自动豁免；
+	//   - 都没有 = 系统默认（与改动前一致）。
 	eg := egress.FromInterface(cfg.BindIface)
+	px, err := proxy.New(cfg.ForwardProxy, cfg.ForwardUDPMode, cfg.ForwardUDPProbe, 10*time.Second)
+	if err != nil {
+		return nil, err
+	}
 	dial := flows.DialFunc(flows.DefaultDial)
-	if eg.Enabled() {
+	switch {
+	case px != nil:
+		dial = px.DialContext
+		logf("Forward proxy：转发的 TCP 经 %s；UDP 模式 %s", px.Host(), px.Mode())
+	case eg.Enabled():
 		dial = eg.DialContext
 		logf("Egress：转发出站流量钉在网卡 %s（回环目标除外）", cfg.BindIface.Name)
 	}
@@ -166,8 +181,8 @@ func Start(cfg ServeConfig) (*Server, error) {
 	// UDP 中继：长会话（QUIC/游戏）+ 会话级日志（建立/关闭各一行，含双向包数——
 	// 真机判断「QUIC 到底通没通」就靠这一行，逐包细节不在这里）。
 	udpOpts := []flows.UDPOption{flows.WithUDPLog(logf)}
-	if eg.Enabled() {
-		udpOpts = append(udpOpts, flows.WithUDPSocket(eg.ListenUDPFor))
+	if px != nil || eg.Enabled() {
+		udpOpts = append(udpOpts, flows.WithUDPSocket(udpFactory(logf, px, eg)))
 	}
 	s.stopUDP, _ = flows.ServeUDP(udpPC, s.Stats, udpOpts...)
 
@@ -283,6 +298,40 @@ func Run(ctx context.Context, cfg ServeConfig) error {
 // ipcConfigurer：PeerTable 表项 → device IpcSet。
 func logf(format string, args ...any) {
 	fmt.Printf("[homewayd] "+format+"\n", args...)
+}
+
+// udpFactory 给每条 UDP 中继会话开通道：代理优先（按探测结论），其次是绑卡直连。
+// 裁决结论只在**变化时**打一行（否则每条会话一行会淹掉日志）。
+func udpFactory(logf func(string, ...any), px *proxy.Client, eg *egress.Binder) func(netip.AddrPort) (flows.UDPConn, error) {
+	var lastDecision string
+	return func(dst netip.AddrPort) (flows.UDPConn, error) {
+		if px != nil {
+			ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+			d := px.DecideUDP(ctx)
+			cancel()
+			if d.Reason != lastDecision {
+				lastDecision = d.Reason
+				logf("forward-udp: 代理 %s —— %s", px.Host(), d.Reason)
+			}
+			if d.Via == "proxy" {
+				ctx2, cancel2 := context.WithTimeout(context.Background(), 8*time.Second)
+				conn, err := px.OpenUDPConn(ctx2, dst)
+				cancel2()
+				if err != nil {
+					px.NoteUDPFailure(logf)
+					return nil, err
+				}
+				return conn, nil
+			}
+			if d.Err != nil {
+				return nil, d.Err
+			}
+		}
+		if eg.Enabled() {
+			return eg.ListenUDPFor(dst)
+		}
+		return net.ListenUDP(egress.NetworkFor(dst), nil)
+	}
 }
 
 var _ = wgtypes.Key{} // 保留引用

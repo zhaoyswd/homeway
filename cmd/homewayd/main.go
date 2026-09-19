@@ -21,6 +21,7 @@ import (
 
 	"github.com/zhaoyswd/homeway/internal/server"
 	"github.com/zhaoyswd/homeway/pkg/proto"
+	"github.com/zhaoyswd/homeway/pkg/proxy"
 )
 
 const version = "0.0.0-dev"
@@ -236,6 +237,9 @@ func cmdServe(args []string) error {
 	stunServer := fs.String("stun", "", "STUN 服务器（在监听 socket 上观测 IPv4 公网映射，如 stun.miwifi.com:3478）")
 	stun6Server := fs.String("stun6", "", "做 IPv6 路径校验用的 STUN 服务器（要有 AAAA，如 stun.cloudflare.com:3478）")
 	bindIface := fs.String("bind-interface", "", "把 WG socket 绑到该网卡/地址（物理网卡名或 IPv4；绕开 TUN 型代理）")
+	forwardProxy := fs.String("forward-via-proxy", "", "被转发的用户流量经该 SOCKS5 代理出网（socks5://host:port；出口自身 socket 仍直连）")
+	forwardUDP := fs.String("forward-udp", "auto", "UDP 是否经代理：auto（探测 UDP ASSOCIATE 能力）/on（必须）/off（不经）")
+	forwardProbe := fs.String("forward-udp-probe", "", "UDP 能力探测的 STUN 目标（逗号分隔的字面 IP:port；默认 Cloudflare+Google）")
 	fs.Parse(args)
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -244,16 +248,49 @@ func cmdServe(args []string) error {
 	if err != nil {
 		return err
 	}
+	udpMode, err := proxy.ParseUDPMode(*forwardUDP)
+	if err != nil {
+		return err
+	}
+	probeTargets, err := parseProbeTargets(*forwardProbe)
+	if err != nil {
+		return err
+	}
 	return server.Run(ctx, server.ServeConfig{
-		StateDir:   *stateDir,
-		ListenPort: uint16(*listen),
-		Verbose:    *verbose,
-		BindAddr:   bindAddr,
-		BindIface:  bindIf,
-		UPnP:       *upnp,
-		STUN:       *stunServer,
-		STUN6:      *stun6Server,
+		StateDir:        *stateDir,
+		ListenPort:      uint16(*listen),
+		Verbose:         *verbose,
+		BindAddr:        bindAddr,
+		BindIface:       bindIf,
+		ForwardProxy:    *forwardProxy,
+		ForwardUDPMode:  udpMode,
+		ForwardUDPProbe: probeTargets,
+		UPnP:            *upnp,
+		STUN:            *stunServer,
+		STUN6:           *stun6Server,
 	})
+}
+
+// parseProbeTargets 解析 --forward-udp-probe（逗号分隔的字面 IP:port；空 = 用内置兜底）。
+// 只收字面 IP：规则型代理会把域名解析成 fake-IP，域名探针根本测不到真实服务。
+func parseProbeTargets(v string) ([]netip.AddrPort, error) {
+	v = strings.TrimSpace(v)
+	if v == "" {
+		return nil, nil
+	}
+	var out []netip.AddrPort
+	for _, part := range strings.Split(v, ",") {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		ap, err := netip.ParseAddrPort(part)
+		if err != nil {
+			return nil, fmt.Errorf("--forward-udp-probe %q：%q 不是字面 IP:port（%w）", v, part, err)
+		}
+		out = append(out, ap)
+	}
+	return out, nil
 }
 
 func defaultStateDir() string {
@@ -277,4 +314,3 @@ func shortB64(b []byte) string {
 	}
 	return fmt.Sprintf("%x", b)
 }
-

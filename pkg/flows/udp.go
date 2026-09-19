@@ -63,6 +63,15 @@ func DecodeDgram(b []byte) (netip.AddrPort, []byte, error) {
 // UDPOption：UDP 中继的可选项。
 type UDPOption func(*udpRelay)
 
+// UDPConn：中继里"到真实目标"的那条通道。直连 = *net.UDPConn（可绑物理网卡），
+// 经代理 = SOCKS5 UDP 关联（pkg/proxy 的实现）。两者接口一致，中继本体不感知差别。
+type UDPConn interface {
+	WriteToUDPAddrPort(p []byte, dst netip.AddrPort) (int, error)
+	ReadFromUDPAddrPort(p []byte) (int, netip.AddrPort, error)
+	SetReadDeadline(t time.Time) error
+	Close() error
+}
+
 // sockNetworkFor：目标家族 → socket 网络（"udp4"/"udp6"）。
 func sockNetworkFor(dst netip.AddrPort) string {
 	if dst.IsValid() && dst.Addr().Unmap().Is6() {
@@ -74,9 +83,9 @@ func sockNetworkFor(dst netip.AddrPort) string {
 type udpRelay struct {
 	// targetMap：目标地址映射（测试/特殊部署用；把逻辑目标换成本机可达地址）。
 	targetMap func(netip.AddrPort) netip.AddrPort
-	// newSock：给每个会话开真实 UDP socket（出口用 = 钉到物理网卡的工厂；nil = 系统默认）。
+	// newSock：给每个会话开一条到目标的通道（出口用 = 绑卡直连或经代理；nil = 系统默认直连）。
 	// 入参是该会话的目标地址（工厂按家族建 udp4/udp6）。
-	newSock func(netip.AddrPort) (*net.UDPConn, error)
+	newSock func(netip.AddrPort) (UDPConn, error)
 	idle      time.Duration
 	st        *Stats
 	pc        net.PacketConn
@@ -87,9 +96,9 @@ type udpRelay struct {
 	sessions map[string]*udpSession
 }
 
-// WithUDPSocket 注入「按目标开真实 UDP socket」的工厂（出口 = 绑物理网卡）。
+// WithUDPSocket 注入「按目标开一条通道」的工厂（出口 = 绑物理网卡 / 经 SOCKS5 代理）。
 // 不注入时按目标家族用 net.ListenUDP("udp4"/"udp6", nil)（系统默认路由）。
-func WithUDPSocket(f func(netip.AddrPort) (*net.UDPConn, error)) UDPOption {
+func WithUDPSocket(f func(netip.AddrPort) (UDPConn, error)) UDPOption {
 	return func(r *udpRelay) { r.newSock = f }
 }
 
@@ -115,7 +124,7 @@ func WithUDPLog(f func(format string, args ...any)) UDPOption {
 
 // udpSession 一条已固定的中继会话：客户端来源地址 → 真实 UDP socket。
 type udpSession struct {
-	conn      *net.UDPConn
+	conn      UDPConn
 	dst       netip.AddrPort
 	backTo    net.Addr // 隧道内的客户端来源地址（回投用）
 	last      atomic.Int64
@@ -180,7 +189,7 @@ func (r *udpRelay) handle(from net.Addr, dst netip.AddrPort, payload []byte) {
 	}
 	if s == nil {
 		// 家族按目标定（v4 → udp4，v6 → udp6）。
-		var conn *net.UDPConn
+		var conn UDPConn
 		var err error
 		if r.newSock != nil {
 			conn, err = r.newSock(dst)
