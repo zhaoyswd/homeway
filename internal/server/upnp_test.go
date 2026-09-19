@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/netip"
@@ -103,7 +104,10 @@ func TestAddPortMappingLeaseFallback(t *testing.T) {
 
 // 列映射 + 只清我们自己的（描述前缀匹配）。
 func TestListAndCleanMappings(t *testing.T) {
-	type entry struct{ ext, in int; client, desc string }
+	type entry struct {
+		ext, in      int
+		client, desc string
+	}
 	table := []entry{
 		{41641, 41641, "192.0.2.12", "homeway-exit"},
 		{50000, 8080, "192.168.3.5", "other-app"},
@@ -144,7 +148,8 @@ func TestListAndCleanMappings(t *testing.T) {
 	if list[0].ExternalPort != 41641 || list[0].InternalClient != "192.0.2.12" || list[0].LeaseDuration != 3600 {
 		t.Fatalf("首条解析不对：%+v", list[0])
 	}
-	n, kept, err := g.CleanMappings(context.Background(), "homeway-exit", 0, netip.MustParseAddr("192.0.2.12"))
+	n, kept, err := g.CleanMappings(context.Background(), "homeway-exit", 0,
+		netip.MustParseAddr("192.0.2.12"), 41641)
 	if err != nil || n != 1 {
 		t.Fatalf("clean 删除 %d 条 err=%v，want 1", n, err)
 	}
@@ -238,9 +243,9 @@ func TestExternalIPParse(t *testing.T) {
 
 func TestPublicAddrFilter(t *testing.T) {
 	cases := map[string]bool{
-		"203.0.113.9":   true,
-		"10.0.0.1":      false,
-		"192.168.1.10":  false, // RFC1918 私网（脱敏后不要用真实局域网地址当用例）
+		"203.0.113.9":  true,
+		"10.0.0.1":     false,
+		"192.168.1.10": false, // RFC1918 私网（脱敏后不要用真实局域网地址当用例）
 		"100.64.1.1":   false, // CGNAT
 		"127.0.0.1":    false,
 		"169.254.1.1":  false,
@@ -256,10 +261,26 @@ func TestPublicAddrFilter(t *testing.T) {
 
 // FindOurMapping：从路由器表里认领自己的映射（这就是"上次用的端口"的权威来源，不需要本地文件）。
 func TestFindOurMapping(t *testing.T) {
-	rows := []struct{ ext, in int; client, desc string }{
+	// 端口用**动态挑的空闲口**，不用 41641 之类：本机可能真的跑着出口（那就"有人在听"），
+	// 而"有人在听"会让新加的"别抢活实例映射"判据把条目跳过 —— 测试必须与环境无关。
+	free := func() int {
+		c, err := net.ListenUDP("udp", &net.UDPAddr{Port: 0})
+		if err != nil {
+			t.Fatal(err)
+		}
+		p := c.LocalAddr().(*net.UDPAddr).Port
+		_ = c.Close()
+		return p
+	}
+	ourIn := free() // 我们自己的内网端口（没人在听）
+	ourExt := free()
+	rows := []struct {
+		ext, in      int
+		client, desc string
+	}{
 		{38029, 38029, "192.168.3.9", "orvgr2fvfrbxlfxyuncg54zx72ehgamp"}, // 别人家的，忽略
-		{41643, 41641, "192.0.2.12", "homeway-exit"},                    // 我们的（上次沿用的外口）
-		{41641, 41641, "192.0.2.12", "homeway-exit"},                    // 我们的（与监听同号，优先）
+		{ourExt, ourIn, "192.0.2.12", "homeway-exit"},                     // 我们的（上次沿用的外口）
+		{ourIn, ourIn, "192.0.2.12", "homeway-exit"},                      // 我们的（与监听同号，优先）
 		{41642, 41642, "192.168.3.11", "homeway-exit"},                    // 同局域网另一台 homewayd：不是我们的
 	}
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -282,18 +303,42 @@ func TestFindOurMapping(t *testing.T) {
 	g := &igd{controlURL: srv.URL, serviceType: "urn:x:WANIPConnection:1"}
 
 	// 与监听端口同号的那条优先
-	if ext, in, ok := g.FindOurMapping(context.Background(), "homeway-exit", netip.MustParseAddr("192.0.2.12"), 41641); !ok || ext != 41641 || in != 41641 {
-		t.Fatalf("应认领 41641→41641，得到 ext=%d in=%d ok=%v", ext, in, ok)
+	if ext, in, ok := g.FindOurMapping(context.Background(), "homeway-exit",
+		netip.MustParseAddr("192.0.2.12"), uint16(ourIn)); !ok || ext != uint16(ourIn) || in != uint16(ourIn) {
+		t.Fatalf("应认领 %d→%d，得到 ext=%d in=%d ok=%v", ourIn, ourIn, ext, in, ok)
 	}
-	// 监听端口变了（41645）时：沿用我们自己的外口 41643（表里第一条属于我们的非精确匹配）
-	if ext, in, ok := g.FindOurMapping(context.Background(), "homeway-exit", netip.MustParseAddr("192.0.2.12"), 41645); !ok || ext != 41643 || in != 41641 {
-		t.Fatalf("换监听端口后应沿用 41643，得到 ext=%d in=%d ok=%v", ext, in, ok)
+	// 监听端口变了时：沿用我们自己的外口（表里第一条属于我们的非精确匹配）
+	if ext, in, ok := g.FindOurMapping(context.Background(), "homeway-exit",
+		netip.MustParseAddr("192.0.2.12"), uint16(free())); !ok || ext != uint16(ourExt) || in != uint16(ourIn) {
+		t.Fatalf("换监听端口后应沿用 %d，得到 ext=%d in=%d ok=%v", ourExt, ext, in, ok)
 	}
 	// 别人的前缀 / 别人的 IP 都不算我们的
-	if _, _, ok := g.FindOurMapping(context.Background(), "tailcat-exit", netip.MustParseAddr("192.0.2.12"), 41641); ok {
+	if _, _, ok := g.FindOurMapping(context.Background(), "tailcat-exit",
+		netip.MustParseAddr("192.0.2.12"), uint16(ourIn)); ok {
 		t.Fatal("别的描述前缀不该被认领")
 	}
-	if _, _, ok := g.FindOurMapping(context.Background(), "homeway-exit", netip.MustParseAddr("192.168.3.99"), 41641); ok {
+	if _, _, ok := g.FindOurMapping(context.Background(), "homeway-exit",
+		netip.MustParseAddr("192.168.3.99"), uint16(ourIn)); ok {
 		t.Fatal("别的内网地址的映射不该被认领")
+	}
+	// 同机器**另一个活出口**的映射（内网端口正在监听、且不是我们的）不能被认领 ——
+	// 认领的下一步就是 AddPortMapping 覆盖它，那会把它的外部端口抢走（实测踩过）。
+	live, err := net.ListenUDP("udp", &net.UDPAddr{Port: 0})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer live.Close()
+	livePort := uint16(live.LocalAddr().(*net.UDPAddr).Port)
+	rows[1] = struct {
+		ext, in      int
+		client, desc string
+	}{int(free()), int(livePort), "192.0.2.12", "homeway-exit"}
+	rows[2] = struct {
+		ext, in      int
+		client, desc string
+	}{int(livePort), int(livePort), "192.0.2.12", "homeway-exit"}
+	if ext, in, ok := g.FindOurMapping(context.Background(), "homeway-exit",
+		netip.MustParseAddr("192.0.2.12"), uint16(free())); ok {
+		t.Fatalf("活实例的映射不该被认领，得到 ext=%d in=%d", ext, in)
 	}
 }

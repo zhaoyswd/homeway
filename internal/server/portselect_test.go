@@ -21,7 +21,7 @@ func (f *fakeMapper) addPortMapping(_ context.Context, ext uint16, _ netip.Addr,
 	return nil
 }
 
-func (f *fakeMapper) CleanMappings(context.Context, string, uint16, netip.Addr) (int, []string, error) {
+func (f *fakeMapper) CleanMappings(context.Context, string, uint16, netip.Addr, uint16) (int, []string, error) {
 	return 0, nil, nil
 }
 

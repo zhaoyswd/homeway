@@ -373,8 +373,11 @@ func (g *igd) ReAddShortLease(ctx context.Context, extPort uint16, internalIP ne
 // CleanMappings 删掉**我们自己的**映射：描述以 descPrefix 开头 **且** 内网客户端是本机地址
 // （onlyClient 有效时）。只按描述前缀删是危险的 —— 同一个局域网里另一台 homewayd 出口
 // （同默认描述）会被误删。
+//
+// keepInternalPort = 我们自己的内网端口：**内网端口指着别的活实例**的条目不删
+// （判据见 portInUse；同机器跑第二个出口时，这是唯一能把两者分开的东西）。
 func (g *igd) CleanMappings(ctx context.Context, descPrefix string, onlyPort uint16,
-	onlyClient netip.Addr) (int, []string, error) {
+	onlyClient netip.Addr, keepInternalPort uint16) (int, []string, error) {
 	list, err := g.listMappings(ctx, 200)
 	if err != nil {
 		return 0, nil, err
@@ -397,6 +400,12 @@ func (g *igd) CleanMappings(ctx context.Context, descPrefix string, onlyPort uin
 				m.InternalClient, m.InternalPort, m.Description))
 			continue
 		}
+		// 同机器另一个活出口的映射不能当"遗留"清掉（见 portInUse 的注释）。
+		if m.InternalPort != keepInternalPort && portInUse(m.InternalPort) {
+			kept = append(kept, fmt.Sprintf("%s/%d → %s:%d (%s，内网端口仍在监听，视为别的活实例)",
+				m.Protocol, m.ExternalPort, m.InternalClient, m.InternalPort, m.Description))
+			continue
+		}
 		if err := g.deleteMapping(ctx, m.ExternalPort, m.Protocol); err != nil {
 			return n, kept, err
 		}
@@ -405,7 +414,27 @@ func (g *igd) CleanMappings(ctx context.Context, descPrefix string, onlyPort uin
 	return n, kept, nil
 }
 
+// portInUse：这台机器的这个 UDP 端口现在有人监听吗。
+//
+// 用途：区分「我们自己的陈旧映射」和「**同一台机器上另一个活着的出口**的映射」——
+// 两者的描述前缀、内网客户端地址**完全一样**（默认描述固定、内网 IP 同一张网卡），
+// 只有内网端口能分开。判法就是试着绑同一个端口：绑不上 ⇒ 有人在听 ⇒ 那是活实例的，别动。
+// （2026-09-19 实测：在本机裸跑一次 `homewayd` 就把它当成"上次退出的遗留"清掉并抢走了
+// 真出口的 41641 映射，手机直连路径当场断掉。）
+func portInUse(port uint16) bool {
+	if port == 0 {
+		return false
+	}
+	c, err := net.ListenUDP("udp", &net.UDPAddr{Port: int(port)})
+	if err != nil {
+		return true
+	}
+	_ = c.Close()
+	return false
+}
+
 // FindOurMapping 在路由器表里找「我们自己的」映射（同描述前缀 + 同内网客户端地址）。
+// 内网端口指着**别的活实例**的条目不算我们的，跳过（否则下一步 AddPortMapping 会把它的映射覆盖掉）。
 // 为什么不用本地文件记端口：这条映射本来就写着我们的名字和内网地址，**路由器表就是权威记忆** ——
 // 本地文件只会在"文件没了/端口改了/映射被删了"时与事实打架。
 // 返回顺序偏好：① 外部端口 == 当前监听端口（本来就对得上）；② 否则取表里第一条我们的（大概率是上次沿用/回退的那个）。
@@ -425,9 +454,15 @@ func (g *igd) FindOurMapping(ctx context.Context, descPrefix string, client neti
 			continue
 		}
 		if m.ExternalPort == listenPort {
+			if m.InternalPort != listenPort && portInUse(m.InternalPort) {
+				continue // 同机器另一个活出口占着这个外部端口
+			}
 			return m.ExternalPort, m.InternalPort, true
 		}
 		if fallbackExt == 0 {
+			if m.InternalPort != listenPort && portInUse(m.InternalPort) {
+				continue
+			}
 			fallbackExt, fallbackInt = m.ExternalPort, m.InternalPort
 		}
 	}
@@ -478,7 +513,7 @@ func ensurePortMapping(ctx context.Context, candidates []netip.Addr, internalPor
 	}
 	// ② 把我们**多余**的历史映射清掉（只清同前缀 + 同内网地址的，别动同局域网其它出口），
 	//    保证 30 分钟一轮的续期不会在路由器里越积越多。
-	if n, _, err := g.CleanMappings(ctx, upnpMapDesc, 0, localIP); err == nil && n > 0 {
+	if n, _, err := g.CleanMappings(ctx, upnpMapDesc, 0, localIP, internalPort); err == nil && n > 0 {
 		logf("UPnP：清掉 %d 条本机同前缀的旧映射（换端口或上次退出的遗留）", n)
 	}
 	ext, err := selectExternalPort(ctx, g, internalPort, prefer, localIP, logf)
@@ -491,7 +526,8 @@ func ensurePortMapping(ctx context.Context, candidates []netip.Addr, internalPor
 // portMapper：端口选择只依赖这两件事，抽出来便于单测（真实实现 = *igd）。
 type portMapper interface {
 	addPortMapping(ctx context.Context, externalPort uint16, internalIP netip.Addr, internalPort uint16) error
-	CleanMappings(ctx context.Context, descPrefix string, onlyPort uint16, onlyClient netip.Addr) (int, []string, error)
+	CleanMappings(ctx context.Context, descPrefix string, onlyPort uint16, onlyClient netip.Addr,
+		keepInternalPort uint16) (int, []string, error)
 }
 
 // selectExternalPort：按「上次成功的端口 → 监听端口 → 监听端口+1」的顺序申请，返回成功的外部端口。
