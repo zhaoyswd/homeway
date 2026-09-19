@@ -6,8 +6,8 @@
 // 语义：
 //   - TCP：一条命令一条流。Connect 拨后端隧道内的流端口 → 写 CONNECT 行 → 等 OK/ERR；
 //     OK 之后返回的 net.Conn 保留 bufio 里可能读到的多余字节（否则会吞掉首批载荷）。
-//   - UDP：一问一答（DNS 语义）。每条请求开一个独立 socket（与服务端「一报一 socket」对称，
-//     用源端口做天然的多路复用键），等一个应答后关闭。
+//   - UDP：**长会话**。调用方开一条 socket（OpenUDP）后交给 NewSession，会话内所有数据报
+//     复用同一条真实 UDP socket（服务端按来源地址认会话）——见 udp_session.go。
 package flows
 
 import (
@@ -22,9 +22,6 @@ import (
 
 // ConnectTimeout：CONNECT 往返（不含之后的数据管道）的默认期限。
 const ConnectTimeout = 10 * time.Second
-
-// DatagramTimeout：一问一答的默认期限（DNS 场景）。
-const DatagramTimeout = 10 * time.Second
 
 // TCPDialFunc：拨隧道内 TCP（生产 = wgnet.DialTCPAddrPortCtx 适配）。
 type TCPDialFunc func(ctx context.Context, addr netip.AddrPort) (net.Conn, error)
@@ -70,44 +67,6 @@ func (c *Client) Connect(ctx context.Context, host string, port uint16) (net.Con
 	}
 	_ = conn.SetDeadline(time.Time{}) // 之后的数据管道由调用方控制期限
 	return &bufConn{Conn: conn, r: br}, nil
-}
-
-// Datagram 一问一答：把 [dst‖payload] 发往后端 UDP 流端口，返回应答来源与载荷。
-func (c *Client) Datagram(ctx context.Context, dst netip.AddrPort, payload []byte) (netip.AddrPort, []byte, error) {
-	if c.OpenUDP == nil {
-		return netip.AddrPort{}, nil, errors.New("flows: Client.OpenUDP 未配置")
-	}
-	if !c.UDPFlowAddr.IsValid() {
-		return netip.AddrPort{}, nil, errors.New("flows: Client.UDPFlowAddr 未配置")
-	}
-	pc, err := c.OpenUDP()
-	if err != nil {
-		return netip.AddrPort{}, nil, fmt.Errorf("flows: 开 UDP socket 失败: %w", err)
-	}
-	defer pc.Close()
-	deadline, ok := ctx.Deadline()
-	if !ok {
-		deadline = time.Now().Add(DatagramTimeout)
-	}
-	_ = pc.SetDeadline(deadline)
-	if _, err := pc.WriteTo(EncodeDgram(dst, payload), net.UDPAddrFromAddrPort(c.UDPFlowAddr)); err != nil {
-		return netip.AddrPort{}, nil, fmt.Errorf("flows: 数据报发送失败: %w", err)
-	}
-	buf := make([]byte, 65535)
-	n, from, err := pc.ReadFrom(buf)
-	if err != nil {
-		return netip.AddrPort{}, nil, fmt.Errorf("flows: 数据报应答未达: %w", err)
-	}
-	if ua, ok := from.(*net.UDPAddr); ok && ua != nil {
-		if got := ua.AddrPort(); got.IsValid() && got != c.UDPFlowAddr {
-			return netip.AddrPort{}, nil, fmt.Errorf("flows: 应答来源 %v 非流端口 %v", got, c.UDPFlowAddr)
-		}
-	}
-	src, body, err := DecodeDgram(buf[:n])
-	if err != nil {
-		return netip.AddrPort{}, nil, err
-	}
-	return src, body, nil
 }
 
 // bufConn：把「读过一行的 bufio.Reader」接回 net.Conn，避免吞掉已读进缓冲的载荷。

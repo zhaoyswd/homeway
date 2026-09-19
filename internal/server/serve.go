@@ -153,7 +153,9 @@ func Start(cfg ServeConfig) (*Server, error) {
 		s.dev.Close()
 		return nil, err
 	}
-	s.stopUDP, _ = flows.ServeUDP(udpPC, s.Stats)
+	// UDP 中继：长会话（QUIC/游戏）+ 会话级日志（建立/关闭各一行，含双向包数——
+	// 真机判断「QUIC 到底通没通」就靠这一行，逐包细节不在这里）。
+	s.stopUDP, _ = flows.ServeUDP(udpPC, s.Stats, flows.WithUDPLog(logf))
 
 	// files 原生协议服务：只监听本机回环（客户端经内部流的 CONNECT 让后端按本机网络重拨到这里）。
 	// 根 = 用户主目录、恒读写（协议无参数）；启动打一行根目录判据。

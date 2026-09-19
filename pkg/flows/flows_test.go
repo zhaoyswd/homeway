@@ -348,3 +348,90 @@ func waitStats(t *testing.T, st *Stats, key string, want uint64, d time.Duration
 	}
 	t.Fatalf("统计 %s 未到 %d：%v", key, want, st.Snapshot())
 }
+
+// 长会话 UDP（QUIC 语义）：同一条客户端会话内多次收发、且**一次请求可以收到多条应答**。
+func TestServeUDPPinnedSessionMultiReply(t *testing.T) {
+	// 目标服务器：每收到一条就回两条（模拟多发多收的长寿命 UDP 会话）。
+	srv, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer srv.Close()
+	srvAddr := netip.MustParseAddrPort(srv.LocalAddr().String())
+	go func() {
+		buf := make([]byte, 1500)
+		for {
+			n, a, err := srv.ReadFromUDP(buf)
+			if err != nil {
+				return
+			}
+			_, _ = srv.WriteToUDP(append([]byte("a:"), buf[:n]...), a)
+			_, _ = srv.WriteToUDP(append([]byte("b:"), buf[:n]...), a)
+		}
+	}()
+
+	inner, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	st := &Stats{}
+	stop, _ := ServeUDP(inner, st, WithUDPIdle(500*time.Millisecond))
+	defer stop()
+	innerAddr := netip.MustParseAddrPort(inner.LocalAddr().String())
+
+	cli, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cli.Close()
+	_ = cli.SetReadDeadline(time.Now().Add(3 * time.Second))
+	buf := make([]byte, 1500)
+
+	// 同一客户端 socket：连发两条请求 → 应收到 4 条应答（每条请求 2 条）
+	for i, q := range []string{"q1", "q2"} {
+		if _, err := cli.WriteToUDPAddrPort(EncodeDgram(srvAddr, []byte(q)), innerAddr); err != nil {
+			t.Fatal(err)
+		}
+		_ = i
+	}
+	got := map[string]int{}
+	for len(got) < 4 {
+		n, _, err := cli.ReadFromUDPAddrPort(buf)
+		if err != nil {
+			t.Fatalf("等应答失败（已收 %v）：%v", got, err)
+		}
+		_, payload, err := DecodeDgram(buf[:n])
+		if err != nil {
+			t.Fatal(err)
+		}
+		got[string(payload)]++
+	}
+	for _, want := range []string{"a:q1", "b:q1", "a:q2", "b:q2"} {
+		if got[want] != 1 {
+			t.Fatalf("应答缺失/重复：%v（want %s 恰一次）", got, want)
+		}
+	}
+	// 只有一次 dial（会话复用）
+	if d := st.Snapshot()["dialok"]; d != 1 {
+		t.Fatalf("dialok = %v，want 1（同一会话复用同一条真实 UDP socket）", d)
+	}
+
+	// 空闲回收：超过 idle 后再发 → 新会话（dialok=2）
+	time.Sleep(800 * time.Millisecond)
+	if _, err := cli.WriteToUDPAddrPort(EncodeDgram(srvAddr, []byte("q3")), innerAddr); err != nil {
+		t.Fatal(err)
+	}
+	for {
+		n, _, err := cli.ReadFromUDPAddrPort(buf)
+		if err != nil {
+			t.Fatalf("回收后等应答失败：%v", err)
+		}
+		_, payload, _ := DecodeDgram(buf[:n])
+		if string(payload) == "a:q3" {
+			break
+		}
+	}
+	if d := st.Snapshot()["dialok"]; d != 2 {
+		t.Fatalf("空闲回收后应新建会话：dialok = %v，want 2", d)
+	}
+}

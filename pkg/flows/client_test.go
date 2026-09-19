@@ -112,29 +112,51 @@ func TestClientDatagramRoundTrip(t *testing.T) {
 			return net.ListenPacket("udp4", "127.0.0.1:0")
 		},
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
 	dst := echo.LocalAddr().(*net.UDPAddr).AddrPort()
-	src, body, err := cli.Datagram(ctx, dst, []byte("dns-query"))
+	pc, err := cli.OpenUDP()
 	if err != nil {
-		t.Fatalf("Datagram: %v", err)
+		t.Fatalf("OpenUDP: %v", err)
 	}
-	if src != dst {
-		t.Fatalf("应答来源=%v 期望=%v", src, dst)
+	sess, err := OpenSession(pc, cli.UDPFlowAddr, dst)
+	if err != nil {
+		t.Fatalf("OpenSession: %v", err)
 	}
-	if string(body) != "dns-query" {
-		t.Fatalf("应答载荷=%q", body)
+	defer sess.Close()
+	_ = sess.SetDeadline(time.Now().Add(5 * time.Second))
+	if _, err := sess.Write([]byte("dns-query")); err != nil {
+		t.Fatalf("会话写失败：%v", err)
+	}
+	buf := make([]byte, 512)
+	n, err := sess.Read(buf)
+	if err != nil {
+		t.Fatalf("会话读失败：%v", err)
+	}
+	if string(buf[:n]) != "dns-query" {
+		t.Fatalf("应答载荷=%q", buf[:n])
 	}
 	time.Sleep(150 * time.Millisecond)
 	if snap := st.Snapshot(); snap["dialok"] != 1 {
 		t.Fatalf("计数契约不符：%v", snap)
 	}
+	_ = sess.Close()
 
 	dead := netip.AddrPortFrom(netip.MustParseAddr("127.0.0.1"), 1)
-	ctx2, cancel2 := context.WithTimeout(context.Background(), 300*time.Millisecond)
-	defer cancel2()
+	pc2, err := cli.OpenUDP()
+	if err != nil {
+		t.Fatalf("OpenUDP: %v", err)
+	}
+	defer pc2.Close()
+	sess2, err := OpenSession(pc2, cli.UDPFlowAddr, dead)
+	if err != nil {
+		t.Fatalf("OpenSession: %v", err)
+	}
+	defer sess2.Close()
+	_ = sess2.SetDeadline(time.Now().Add(300 * time.Millisecond))
 	start := time.Now()
-	if _, _, err := cli.Datagram(ctx2, dead, []byte("no-answer")); err == nil {
+	if _, err := sess2.Write([]byte("no-answer")); err != nil {
+		t.Fatalf("死目标写失败：%v", err)
+	}
+	if _, err := sess2.Read(buf); err == nil {
 		t.Fatal("死目标应超时")
 	}
 	if d := time.Since(start); d > 2*time.Second {
