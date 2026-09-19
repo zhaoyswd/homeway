@@ -60,6 +60,12 @@ func serve(args []string) error {
 		fs.PrintDefaults()
 	}
 	fs.Parse(args)
+	if rest := fs.Args(); len(rest) > 0 {
+		// 没有子命令（`serve` 在上面已经剥掉）：多出来的位置参数一定是写错了。
+		// 这条是**实测踩出来的**：`homewayd foo` 会被当成裸启动，真的起一个出口
+		// （抢不到 41641 就退让），还会把真出口的 UPnP 映射改成指向它自己。宁可报错。
+		return fmt.Errorf("不认识的参数：%v（直接 `homewayd [--relay 'rl1…']` 即可，没有其它子命令）", rest)
+	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
