@@ -50,14 +50,17 @@ jobs:
           set -euo pipefail
           VERSION="${GITHUB_REF##*/}"          # tag 名；手动试跑时是分支名
           LDFLAGS="-s -w -X main.version=${VERSION}"
+          # windows 的 -o 不会自动补 .exe，显式带上（否则打包时找不到文件）
+          EXT=""
+          [ "${GOOS}" = "windows" ] && EXT=".exe"
           mkdir -p dist/homewayd dist/homeway-relay
-          go build -trimpath -ldflags "${LDFLAGS}" -o dist/homewayd/homewayd ./cmd/homewayd
-          go build -trimpath -ldflags "${LDFLAGS}" -o dist/homeway-relay/homeway-relay ./cmd/homeway-relay
+          go build -trimpath -ldflags "${LDFLAGS}" -o "dist/homewayd/homewayd${EXT}" ./cmd/homewayd
+          go build -trimpath -ldflags "${LDFLAGS}" -o "dist/homeway-relay/homeway-relay${EXT}" ./cmd/homeway-relay
           cd dist
           ARCH="${GOARCH}${GOARM}"
           BASE="homeway_${VERSION#v}_${GOOS}_${ARCH}"
           if [ "${GOOS}" = "windows" ]; then
-            zip -q "${BASE}.zip" homewayd/homewayd.exe homeway-relay/homeway-relay.exe
+            zip -q "${BASE}.zip" "homewayd/homewayd${EXT}" "homeway-relay/homeway-relay${EXT}"
             sha256sum "${BASE}.zip" > "${BASE}.zip.sha256"
           else
             tar czf "${BASE}.tar.gz" homewayd homeway-relay
@@ -65,6 +68,7 @@ jobs:
           fi
           ls -l
       - uses: actions/upload-artifact@v4
+        if: matrix.goos != 'windows'
         with:
           name: homeway-${{ matrix.goos }}-${{ matrix.goarch }}${{ matrix.goarm }}
           path: dist/*.tar.gz*
