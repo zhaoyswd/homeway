@@ -87,10 +87,14 @@ const (
 )
 
 type dentry struct {
-	dev       proto.DevTag
-	pub       [32]byte
-	psk       [32]byte
-	ip        netip.Addr
+	dev proto.DevTag
+	pub [32]byte
+	psk [32]byte
+	ip  netip.Addr
+	// tunIP：第二派生地址（应用面 /32，review #16）。占用检测必须把**全部设备的
+	// 两个地址**当一个集合看——WG 的 allowedips 是全局前缀表，任何一个 /32 撞车
+	// 都会让其中一个设备的该地址方向错路由（此前只查 ip，应用面地址冲突静默通过）。
+	tunIP     netip.Addr
 	lastReg   time.Time
 	createdAt time.Time
 }
@@ -211,14 +215,16 @@ func (t *DeviceTable) Register(reg []byte, now time.Time) (Result, error) {
 			return res, nil
 		}
 		// 身份轮换：先移除旧 peer 再写新的 —— 顺序固定，避免旧 allowed_ip 悬空。
-		oldPub, oldIP := e.pub, e.ip
+		oldPub, oldIP, oldTunIP := e.pub, e.ip, e.tunIP
 		if rerr := t.cfg.RemovePeer(oldPub); rerr != nil {
 			t.logf("peer: ! dev=%s rotate 移除旧 peer（pub=%s）失败：%v", devShort(devTag), pubShort(oldPub), rerr)
 		}
 		t.pool.Release(oldIP)
+		t.pool.Release(oldTunIP)
 		ip := t.assignIPLocked(secret, pubkey, devTag)
-		e.pub, e.psk, e.ip, e.lastReg = pubkey, psk, ip, now
-		if aerr := t.cfg.AddPeer(PeerConfig{Pubkey: pubkey, PSK: psk, TunnelIP: ip, TunIP: proto.DeriveTunIP(secret, pubkey)}); aerr != nil {
+		tunIP := t.assignTunIPLocked(secret, pubkey, devTag)
+		e.pub, e.psk, e.ip, e.tunIP, e.lastReg = pubkey, psk, ip, tunIP, now
+		if aerr := t.cfg.AddPeer(PeerConfig{Pubkey: pubkey, PSK: psk, TunnelIP: ip, TunIP: tunIP}); aerr != nil {
 			t.logf("peer: ! dev=%s rotate 写入新 peer（pub=%s）失败：%v", devShort(devTag), pubShort(pubkey), aerr)
 		}
 		res := Result{DevTag: devTag, Pubkey: pubkey, TunnelIP: ip, Action: ActionRotated,
@@ -235,9 +241,10 @@ func (t *DeviceTable) Register(reg []byte, now time.Time) (Result, error) {
 		}
 	}
 	ip := t.assignIPLocked(secret, pubkey, devTag)
-	e := &dentry{dev: devTag, pub: pubkey, psk: psk, ip: ip, lastReg: now, createdAt: now}
+	tunIP := t.assignTunIPLocked(secret, pubkey, devTag)
+	e := &dentry{dev: devTag, pub: pubkey, psk: psk, ip: ip, tunIP: tunIP, lastReg: now, createdAt: now}
 	t.entries[devTag] = e
-	if aerr := t.cfg.AddPeer(PeerConfig{Pubkey: pubkey, PSK: psk, TunnelIP: ip, TunIP: proto.DeriveTunIP(secret, pubkey)}); aerr != nil {
+	if aerr := t.cfg.AddPeer(PeerConfig{Pubkey: pubkey, PSK: psk, TunnelIP: ip, TunIP: tunIP}); aerr != nil {
 		t.logf("peer: ! dev=%s 写入 peer（pub=%s）失败：%v", devShort(devTag), pubShort(pubkey), aerr)
 	}
 	if other, ok := t.findByPubLocked(pubkey, devTag); ok {
@@ -331,14 +338,36 @@ func (t *DeviceTable) assignIPLocked(secret [32]byte, pub [32]byte, dev proto.De
 	}
 }
 
-// ipTakenLocked 判断某地址是否已被表内其他设备占用（调用方持锁）。
+// ipTakenLocked 判断某地址是否已被表内设备占用（调用方持锁）。**双地址集合**
+// （review #16）：隧道地址与应用面地址共用一个 /16 空间，任一类的冲突都让
+// allowedips 的 /32 撞车——必须并集判定。
 func (t *DeviceTable) ipTakenLocked(ip netip.Addr) bool {
 	for _, e := range t.entries {
-		if e.ip == ip {
+		if e.ip == ip || e.tunIP == ip {
 			return true
 		}
 	}
 	return false
+}
+
+// assignTunIPLocked：应用面地址 = proto.DeriveTunIP（同设备相等已在 proto 层守卫）；
+// 与**其他设备**的任一地址撞车时退池并大声告警（与隧道地址冲突同语义：客户端仍用
+// 派生地址 ⇒ 该设备应用面不通，消解靠手机「重置本机身份」）。
+func (t *DeviceTable) assignTunIPLocked(secret [32]byte, pub [32]byte, dev proto.DevTag) netip.Addr {
+	ip := proto.DeriveTunIP(secret, pub)
+	if !t.ipTakenLocked(ip) {
+		return ip
+	}
+	for {
+		fallback := t.pool.Acquire()
+		if t.ipTakenLocked(fallback) {
+			continue
+		}
+		t.logf("⚠️ 应用面地址冲突：dev=%s 的派生 TunIP %v 已被其他设备占用，本次退到池地址 %v"+
+			"（客户端仍用派生地址 ⇒ 该设备应用流量不通；请在手机上「重置本机身份」后重连）",
+			devShort(dev), ip, fallback)
+		return fallback
+	}
 }
 
 // findByPubLocked 找「同一公钥挂在别的 devTag 上」的条目（克隆检测，诊断用）。
@@ -354,6 +383,7 @@ func (t *DeviceTable) findByPubLocked(pub [32]byte, except proto.DevTag) (proto.
 func (t *DeviceTable) removeLocked(e *dentry) {
 	delete(t.entries, e.dev) // map 删除带显式 found 语义（下面 Release 幂等）
 	t.pool.Release(e.ip)
+	t.pool.Release(e.tunIP) // 双地址时代的池归还（#16；非池地址 Release 是 no-op）
 	if err := t.cfg.RemovePeer(e.pub); err != nil {
 		t.logf("peer: ! dev=%s 移除 peer（pub=%s）失败：%v", devShort(e.dev), pubShort(e.pub), err)
 	}

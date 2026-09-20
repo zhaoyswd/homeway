@@ -43,3 +43,30 @@ func TestDeriveTunnelIP(t *testing.T) {
 		t.Log("（巧合：换 secret 后地址相同，仍属合法结果）")
 	}
 }
+
+// #16：双派生地址的跨端一致性——同 (secret, pubkey) 两地址必不相等且派生稳定；
+// 相等守卫（hw-app.2 再散列）两端同规则（本包即唯一真源）。
+func TestDeriveTunIPNeverEqualsTunnelIP(t *testing.T) {
+	var secret, pub [32]byte
+	for i := range secret {
+		secret[i] = byte(3*i + 7)
+	}
+	for i := range pub {
+		pub[i] = byte(5*i + 11)
+	}
+	tun := DeriveTunnelIP(secret, pub)
+	app := DeriveTunIP(secret, pub)
+	if tun == app {
+		t.Fatalf("同设备两派生地址相等：%v", tun)
+	}
+	// 稳定性：重算一致。
+	if DeriveTunIP(secret, pub) != app || DeriveTunnelIP(secret, pub) != tun {
+		t.Fatal("派生不稳定")
+	}
+	// 不同身份 → 地址不同（远大于 99.99% 的情形；本用例的固定输入必不等）。
+	pub2 := pub
+	pub2[0] ^= 1
+	if DeriveTunIP(secret, pub2) == app {
+		t.Fatal("不同身份派生出相同 TunIP")
+	}
+}

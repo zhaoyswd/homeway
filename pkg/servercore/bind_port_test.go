@@ -37,8 +37,8 @@ func TestOpenFallsBackWhenPortBusy(t *testing.T) {
 		t.Fatal("退让必须留一行可读日志")
 	}
 	// 收工（Open 已经起了接收循环，直接关 socket 即可）
-	if b.c != nil {
-		_ = b.c.Close()
+	if c := b.c.Load(); c != nil {
+		_ = c.Close()
 	}
 }
 
@@ -59,7 +59,7 @@ func TestOpenKeepsPortWhenFree(t *testing.T) {
 	if actual != port {
 		t.Logf("端口 %d 刚释放就被别人抢了，退让到 %d（可接受）", port, actual)
 	}
-	if b.c != nil {
-		_ = b.c.Close()
+	if c := b.c.Load(); c != nil {
+		_ = c.Close()
 	}
 }

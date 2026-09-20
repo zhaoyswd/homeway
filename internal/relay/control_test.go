@@ -10,6 +10,7 @@ import (
 	"bufio"
 	"context"
 	"crypto/rand"
+	"crypto/subtle"
 	"fmt"
 	"net"
 	"net/netip"
@@ -80,13 +81,38 @@ func (b *dialBackend) connect(t *testing.T) {
 	if b.secret != ([32]byte{}) {
 		macPSK = proto.RelayAuthMAC(b.secret, nonce, b.pub)
 	}
-	if err := proto.CtlWriteMsg(conn, proto.EncodeRelayProof(nonce, dh, b.pub, macPSK)); err != nil {
+	// v2 PROOF（末尾带协议版本）——生产后端（relayctl.go）同款。
+	if err := proto.CtlWriteMsg(conn, proto.EncodeRelayProofV(nonce, dh, b.pub, macPSK, proto.RelayCtlVer)); err != nil {
 		t.Fatalf("发 PROOF: %v", err)
 	}
-	typ, _, err = proto.CtlReadMsg(conn)
+	typ, okPayload, err := proto.CtlReadMsg(conn)
 	if err != nil || typ != proto.RelaySubOK {
 		t.Fatalf("等 OK: typ=0x%02x err=%v", typ, err)
 	}
+	// OK-MAC（token 模式）：与生产后端同款校验。
+	if b.secret != ([32]byte{}) {
+		mac, v2 := proto.DecodeRelayOKAuth(ctlWithSub(typ, okPayload))
+		if !v2 {
+			t.Fatal("token 模式的 v2 中继没在 OK 里带身份 MAC")
+		}
+		if subtle.ConstantTimeCompare(proto.RelayOKAuthMAC(b.secret, nonce), mac) != 1 {
+			t.Fatal("OK 的中继身份 MAC 不对")
+		}
+	}
+}
+
+// legupMarker：拨腿首包（v2 会话带 cookie → 认证 marker；v1 纯标记）。
+func (b *dialBackend) legupMarker(sess proto.CtlSession) []byte {
+	if !sess.HasCookie {
+		return []byte("LEGUP")
+	}
+	var key [32]byte
+	if b.secret != ([32]byte{}) {
+		key = b.secret
+	} else {
+		copy(key[:16], sess.Cookie[:])
+	}
+	return proto.LegupAuthPayload(sess.ID, sess.Cookie, key)
 }
 
 // readLoop：消费控制面消息（SESSION/RELEASE）。dialLeg 按通告即时拨。
@@ -131,7 +157,7 @@ func (b *dialBackend) dialLeg(t *testing.T, sess proto.CtlSession) *net.UDPConn 
 		t.Fatalf("拨腿: %v", err)
 	}
 	t.Cleanup(func() { leg.Close() })
-	if _, err := leg.Write([]byte("LEGUP")); err != nil {
+	if _, err := leg.Write(b.legupMarker(sess)); err != nil {
 		t.Fatalf("发 LEGUP: %v", err)
 	}
 	return leg
@@ -334,7 +360,8 @@ func TestControlReplayPromotesFallbackAssocs(t *testing.T) {
 	}
 	ephPub, nonce, _ := proto.DecodeRelayChallenge(ctlWithSub(typ, pl))
 	dh, _ := curve25519.X25519(be.priv[:], ephPub[:])
-	if err := proto.CtlWriteMsg(conn, proto.EncodeRelayProof(nonce, dh, be.pub, nil)); err != nil {
+	// v2 PROOF（开放模式无 PSK；版本字节让中继启用拨腿/提升路径）
+	if err := proto.CtlWriteMsg(conn, proto.EncodeRelayProofV(nonce, dh, be.pub, nil, proto.RelayCtlVer)); err != nil {
 		t.Fatal(err)
 	}
 	typ, _, rerr = proto.CtlReadMsg(conn)
@@ -372,7 +399,10 @@ func TestControlReplayPromotesFallbackAssocs(t *testing.T) {
 		t.Fatalf("拨腿: %v", derr)
 	}
 	defer leg.Close()
-	if _, err := leg.Write([]byte("LEGUP")); err != nil {
+	// 开放模式：认证 key = cookie 本身（与 legMACKey 同规则）。
+	var openKey [32]byte
+	copy(openKey[:16], sess.Cookie[:])
+	if _, err := leg.Write(proto.LegupAuthPayload(sess.ID, sess.Cookie, openKey)); err != nil {
 		t.Fatal(err)
 	}
 
@@ -503,10 +533,10 @@ func TestControlRedialLegUpNotForwarded(t *testing.T) {
 			t.Fatalf("重拨腿: %v", err)
 		}
 		defer leg2.Close()
-		if _, err := leg2.Write([]byte("LEGUP")); err != nil {
+		if _, err := leg2.Write(be.legupMarker(sess)); err != nil {
 			t.Fatal(err)
 		}
-		time.Sleep(100 * time.Millisecond) // 让漂移跟随先生效
+		time.Sleep(100 * time.Millisecond) // 让认证跟随先生效
 		if _, err := leg2.Write([]byte{7, 7}); err != nil {
 			t.Fatal(err)
 		}
@@ -529,8 +559,8 @@ func TestUnverifiedLegSurvivesReapWindow(t *testing.T) {
 		t.Fatal(err)
 	}
 	label := proto.RelayID(pub)
-	lg := r.legForControl(label, pub)   // 模拟控制握手进行中（腿已建、未验证）
-	time.Sleep(6500 * time.Millisecond) // 跨过至少一轮 5s reap
+	lg, _ := r.legForControl(label, pub) // 模拟控制握手进行中（腿已建、未验证）
+	time.Sleep(6500 * time.Millisecond)  // 跨过至少一轮 5s reap
 	r.mu.Lock()
 	_, still := r.legs[label]
 	r.mu.Unlock()

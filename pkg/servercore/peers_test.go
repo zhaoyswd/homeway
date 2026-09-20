@@ -364,3 +364,34 @@ func TestIPPoolZeroValueSentinelRegression(t *testing.T) {
 		t.Fatalf("重复释放后池状态被污染：got=%v", got)
 	}
 }
+
+// #16：设备表必须同时跟踪两个派生 /32（隧道地址 + 应用面地址）——allowedips 是
+// 全局前缀表，任一 /32 撞车都会错路由。占用判定（ipTakenLocked）必须并集生效，
+// 冲突时 assignTunIPLocked 退池并打告警。
+func TestTunIPOccupancyTracked(t *testing.T) {
+	tb := NewDeviceTable(newFakeCfg(), [][32]byte{testSecret}, DeviceConfig{})
+	now := time.Now()
+	if _, err := tb.Register(regFor(pubN(1), devN(1), now), now); err != nil {
+		t.Fatal(err)
+	}
+	e1 := tb.entries[devN(1)]
+	if !e1.tunIP.IsValid() {
+		t.Fatal("dentry 没记 tunIP（#16：应用面地址不进占用集合）")
+	}
+	if e1.tunIP == e1.ip {
+		t.Fatalf("同设备两地址相等：%v（proto 相等守卫失效）", e1.ip)
+	}
+	// 并集判定：两个地址都算占用。
+	if !tb.ipTakenLocked(e1.ip) || !tb.ipTakenLocked(e1.tunIP) {
+		t.Fatal("ipTakenLocked 不认双地址集合（#16 回归）")
+	}
+	// 第二台设备：AddPeer 落下去的 TunIP 不得与 dev1 的任何地址相同
+	//（派生撞车走退池路径——真撞上概率 ~2^-16，这里只验证「集合判定在」）。
+	if _, err := tb.Register(regFor(pubN(2), devN(2), now), now); err != nil {
+		t.Fatal(err)
+	}
+	pc := tb.cfg.(*fakeCfg).added[pubN(2)]
+	if pc.TunIP == e1.ip || pc.TunIP == e1.tunIP {
+		t.Fatalf("dev2 的 TunIP %v 与 dev1 的地址撞车未被处置", pc.TunIP)
+	}
+}

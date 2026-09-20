@@ -101,19 +101,36 @@ func EncodeRelayProof(nonce [16]byte, dh []byte, pubkey [32]byte, psk []byte) []
 
 // DecodeRelayProof：解析证明（校验留给调用方：它才知道 DH / 鉴权密钥）。
 // 兼容老的 33B 版本（只有 macDH）——老中继/老后端混跑时不至于死。
-func DecodeRelayProof(p []byte) (nonce [16]byte, macDH, macPSK []byte, err error) {
-	if len(p) != 49 && len(p) != 33 || p[0] != RelaySubProof {
-		return nonce, nil, nil, ErrFrameMalformed
+// 50B = v2 后端（末尾 1 字节协议版本，review #25）：中继据此启用 v2 能力
+// （SESSION cookie / OK 认证 / 腿认证）。v1 后端照旧 49B/33B。
+func DecodeRelayProof(p []byte) (nonce [16]byte, macDH, macPSK []byte, ver byte, err error) {
+	if len(p) != 49 && len(p) != 33 && len(p) != 50 || p[0] != RelaySubProof {
+		return nonce, nil, nil, 0, ErrFrameMalformed
 	}
 	copy(nonce[:], p[1:17])
 	macDH = p[17:33]
-	if len(p) == 49 {
+	if len(p) >= 49 {
 		macPSK = p[33:49]
 	}
-	return nonce, macDH, macPSK, nil
+	if len(p) == 50 {
+		ver = p[49]
+	}
+	return nonce, macDH, macPSK, ver, nil
 }
 
-// EncodeRelayOK / EncodeRelayKeepalive：小消息。
+// EncodeRelayProofV：v2 后端的 PROOF（49B 载荷 + 1 字节协议版本）。
+// ⚠️ 版本协商的方向（review #25）：CHALLENGE 形状不动（v1 后端的严格解码器
+// 遇到多一个字节会当畸形断开——中继无法先安全地自报版本），所以由**后端在
+// PROOF 里自报**、中继按长度判别；中继回 OK 时才带 v2 能力材料。v2 后端对
+// v1 中继（只可能出现在未发版的开发构建）会被当畸形拒——部署矩阵见 change 文档。
+func EncodeRelayProofV(nonce [16]byte, dh []byte, pubkey [32]byte, psk []byte, ver byte) []byte {
+	out := EncodeRelayProof(nonce, dh, pubkey, psk)
+	return append(out, ver)
+}
+
+// RelayCtlVer：控制协议版本。
+const RelayCtlVer = byte(2)
+
 func EncodeRelayOK() []byte        { return []byte{RelaySubOK} }
 func EncodeRelayAgain() []byte     { return []byte{RelaySubAgain} }
 func EncodeRelayKeepalive() []byte { return []byte{RelaySubKeepalive} }

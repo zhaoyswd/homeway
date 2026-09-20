@@ -42,5 +42,17 @@ func DeriveTunIP(secret [32]byte, pubkey [32]byte) netip.Addr {
 	h.Write(pubkey[:])
 	sum := h.Sum(nil)
 	v := (uint32(sum[2])<<8|uint32(sum[3]))%(65535-1) + 1 // 1..65534
-	return netip.AddrFrom4([4]byte{100, 64, byte(v >> 8), byte(v)})
+	ip := netip.AddrFrom4([4]byte{100, 64, byte(v >> 8), byte(v)})
+	// 同设备两地址相等守卫（review #16）：TunIP == TunnelIP 会让 hub 的分流键失效
+	//（应用回程被当核心自连送进 B 栈）。确定性扰动——再散列一次（标签后缀 ".2"），
+	// **两端必须同规则**（手机核与出口都走本函数，规则收在 proto 里即保证一致）。
+	if ip == DeriveTunnelIP(secret, pubkey) {
+		h2 := hmac.New(sha256.New, secret[:])
+		h2.Write([]byte("hw-app.2"))
+		h2.Write(pubkey[:])
+		sum2 := h2.Sum(nil)
+		v2 := (uint32(sum2[2])<<8|uint32(sum2[3]))%(65535-1) + 1
+		ip = netip.AddrFrom4([4]byte{100, 64, byte(v2 >> 8), byte(v2)})
+	}
+	return ip
 }

@@ -13,7 +13,6 @@ package server
 
 import (
 	"context"
-	"crypto/rand"
 	"net/netip"
 	"sync"
 	"time"
@@ -72,12 +71,21 @@ func startRelayLeg(ctx context.Context, bind *servercore.ServerBind, relayAddr n
 		return true
 	}
 	// 后端也在"两端之一"：中继把客户端的观察地址作为 hint 推给我们，我们据此**盲打**。
-	bind.OnHint = func(addr string) {
+	// 来源必须校验（#23）：hint 的源是中继的 per-client 分配 socket（端口动态、IP 恒为
+	// 中继地址）——只比 IP。未知源的 hint 只记日志，绝不盲打（hint 是「向任意地址发包」
+	// 的触发器，不能被第三方当放大器注入）。
+	bind.OnHint = func(addr string, src netip.AddrPort) {
+		if src.Addr().Unmap() != rc.relay.Addr().Unmap() {
+			rc.logf("中继：忽略来自未知源 %v 的地址线索（应为中继 %v）", src, rc.relay.Addr())
+			return
+		}
 		ap, err := netip.ParseAddrPort(addr)
 		if err != nil {
 			return
 		}
-		rc.punch(ap)
+		// 盲打移出接收 goroutine（#23）：punch 内有 3×150ms 的节奏 sleep，同步跑会把
+		// 腿/主 socket 的 ReceiveFunc 卡住几百毫秒（突发 hint 时 transit 全排队）。
+		go rc.punch(ap)
 	}
 	go rc.loop(ctx)
 	mode := "开放模式（无 token）"
@@ -147,11 +155,6 @@ func (rc *relayClient) handleControl(src netip.AddrPort, payload []byte) {
 		if err != nil {
 			return
 		}
-		var priv [32]byte
-		if _, err := rand.Read(priv[:]); err != nil {
-			return
-		}
-		_ = priv
 		dh, err := curve25519.X25519(rc.priv[:], ephPub[:])
 		if err != nil {
 			rc.logf("中继：挑战 DH 计算失败（%v）", err)
@@ -203,7 +206,8 @@ func (rc *relayClient) punch(client netip.AddrPort) {
 	}
 	rc.mu.Unlock()
 
-	dlogf("中继：收到对端地址线索 %v → 盲打 %d 包（开自己 NAT 过滤；能否直连仍由 WG 握手决定）",
+	// 摘要级（不是 dlogf）：这是「hint → 盲打」链路的判据行，且每地址 3s 节流，量可控。
+	rc.logf("中继：收到对端地址线索 %v → 盲打 %d 包（开自己 NAT 过滤；能否直连仍由 WG 握手决定）",
 		client, punchBurst)
 	for i := 0; i < punchBurst; i++ {
 		// 盲打包用小载荷腿帧：对端解析不出数据会静默丢弃，但 NAT 过滤已被打开。

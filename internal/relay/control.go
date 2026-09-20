@@ -17,7 +17,6 @@ package relay
 import (
 	"crypto/rand"
 	"crypto/subtle"
-	"errors"
 	"net"
 	"sync"
 	"sync/atomic"
@@ -50,11 +49,18 @@ func (cc *ctlConn) close() {
 	_ = cc.c.Close()
 }
 
-// ctlHandshakeMax：并发握手上限（review B7②：每个未完成握手占一个协程最长 10s，
-// 公网中继防「慢握手洪水」；认证后的连接不受此限）。
+// ctlHandshakeMax：**握手中**的并发上限（review B7②：每个未完成握手占一个协程
+// 最长 10s，公网中继防「慢握手洪水」）。
+// review #7 勘误：旧实现把这个计数当成「连接数」——Add(-1) 挂在 controlConn 的
+// defer 上、要到连接退出才释放 ⇒ 16 条空闲的已认证连接就把第 17 个后端的握手
+// 挡在门外（且拒绝时一行日志都没有）。现在**握手完成即释放**，长连改由
+// ctlEstablished（总数上限）约束。
 const ctlHandshakeMax = 16
 
-var ctlHandshaking atomic.Int32
+var (
+	ctlHandshaking atomic.Int32
+	ctlEstablished atomic.Int32
+)
 
 // serveControl：TCP 接入循环（每连接一个协程跑 handshake+readLoop）。
 func (r *Relay) serveControl(ln net.Listener) {
@@ -67,6 +73,7 @@ func (r *Relay) serveControl(ln net.Listener) {
 			ctlHandshaking.Add(-1)
 			_ = c.Close()
 			r.bump(func(s *Stats) { s.Dropped++ })
+			r.cfg.Logf("中继：并发握手上限 %d 已满，拒绝 %v（慢握手洪水防护）", ctlHandshakeMax, c.RemoteAddr())
 			continue
 		}
 		go r.controlConn(c)
@@ -75,11 +82,18 @@ func (r *Relay) serveControl(ln net.Listener) {
 
 // controlConn：一条控制连接的全生命周期。
 func (r *Relay) controlConn(c net.Conn) {
+	// #7：握手槽**只在握手中占用**——成功即释放（移出 defer 作用域），
+	// 失败/断开由这里的 defer 兜底（用 handshaking 标志防双释放）。
+	handshaking := true
+	defer func() {
+		if handshaking {
+			ctlHandshaking.Add(-1)
+		}
+	}()
 	defer c.Close()
-	defer ctlHandshaking.Add(-1)
 	_ = c.SetDeadline(time.Now().Add(10 * time.Second)) // 握手必须在 10s 内完成
 
-	// ① HELLO（带公钥）
+	// ① HELLO（带公钥；形状与 v1 完全一致——版本不自报在这里，见 EncodeRelayProofV 注释）
 	typ, payload, err := proto.CtlReadMsg(c)
 	if err != nil || typ != proto.RelaySubHello {
 		return
@@ -104,12 +118,13 @@ func (r *Relay) controlConn(c net.Conn) {
 		return
 	}
 
-	// ③ PROOF（校验与 UDP 注册完全一致：DH MAC + token 模式的 PSK MAC）
+	// ③ PROOF（校验与 UDP 注册完全一致：DH MAC + token 模式的 PSK MAC）。
+	// 末尾 1 字节 = 对端协议版本（50B = v2；49B/33B = v1，#25）。
 	typ, payload, err = proto.CtlReadMsg(c)
 	if err != nil || typ != proto.RelaySubProof {
 		return
 	}
-	gotNonce, macDH, macPSK, err := proto.DecodeRelayProof(withSubtype(typ, payload))
+	gotNonce, macDH, macPSK, ver, err := proto.DecodeRelayProof(withSubtype(typ, payload))
 	if err != nil || gotNonce != nonce {
 		return
 	}
@@ -131,21 +146,47 @@ func (r *Relay) controlConn(c net.Conn) {
 		}
 	}
 
-	// ④ OK + 挂到 leg（顶掉旧连接）
-	if err := proto.CtlWriteMsg(c, proto.EncodeRelayOK()); err != nil {
+	// ④ 已建立控制连接总数上限（#7/#18：认证长连各占一个读协程，要有总闸）。
+	if ctlEstablished.Add(1) > int32(r.cfg.MaxCtlConns) {
+		ctlEstablished.Add(-1)
+		r.bump(func(s *Stats) { s.Dropped++ })
+		r.cfg.Logf("中继：已建立控制连接达上限 %d，拒绝 %v（label %x）", r.cfg.MaxCtlConns, c.RemoteAddr(), label[:])
 		return
 	}
+	estab := true
+	defer func() {
+		if estab {
+			ctlEstablished.Add(-1)
+		}
+	}()
+
+	// ⑤ OK + 挂到 leg（顶掉旧连接）。v2 后端 + token 模式：OK 带 MAC 让后端
+	// 认证中继（#29——此前任何能截 TCP 的角色都能发 OK 再喂假 SESSION）。
+	okMsg := proto.EncodeRelayOK()
+	if ver >= proto.RelayCtlVer && r.cfg.Secret != ([32]byte{}) {
+		okMsg = proto.EncodeRelayOKAuth(proto.RelayOKAuthMAC(r.cfg.Secret, nonce))
+	}
+	if err := proto.CtlWriteMsg(c, okMsg); err != nil {
+		return
+	}
+	ctlHandshaking.Add(-1) // 握手完成：释放并发槽（#7）
+	handshaking = false
 	_ = c.SetDeadline(time.Time{}) // 清握手超时；后续用 readLoop 的滚动超时
 
-	lg := r.legForControl(label, pub)
+	lg, ok := r.legForControl(label, pub)
+	if !ok {
+		// 腿数达上限（#18：控制路径此前不受 MaxLegs 闸）
+		return
+	}
 	// 控制面过的是与 UDP 注册同一套 X25519 挑战 ⇒ 身份证明等价，但记在
 	// ctlVerified（与 UDP 的 verified 分开——review B4：混用会让孤儿清理的
 	// !verified 恒假，且两种证明语义不同）。
 	r.mu.Lock()
 	lg.ctlVerified = true
+	lg.ctlV2 = ver >= proto.RelayCtlVer
 	lg.last = time.Now()
 	r.mu.Unlock()
-	cc := &ctlConn{c: c, label: label}
+	cc := &ctlConn{c: c}
 	r.attachControl(lg, cc)
 	// 重放对账（review B1）：重连 = 后端已 ClearLegs，中继把该 label 的全部活跃
 	// 会话重新通告一遍，后端按重放重建腿——中继重启（表空 → 重放零条 = 后端清空）、
@@ -197,15 +238,22 @@ func (r *Relay) readControlLoop(lg *leg, cc *ctlConn, c net.Conn) {
 // 仍允许 —— dataPort 拨腿模式不需要 lg.addr；hints/兼容路径照旧依赖 UDP 注册。
 // last=now：未验证腿的注册窗口起点——reapLoop 的 legBootstrap 分支据此放行
 // 握手期（TCP 挑战 deadline 10s；零值 last 会被 5s 一轮的 reap 立即摘掉）。
-func (r *Relay) legForControl(label [8]byte, pub [32]byte) *leg {
+func (r *Relay) legForControl(label [8]byte, pub [32]byte) (*leg, bool) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	lg := r.legs[label]
 	if lg == nil {
+		// #18：控制路径建腿也过 MaxLegs 闸（与 UDP Hello 同一道防线——
+		// 否则持凭证者可经 TCP 把腿表灌爆，绕过匿名洪水防护的上限语义）。
+		if len(r.legs) >= r.cfg.MaxLegs {
+			r.stats.Denied++ // 持锁内直接计（bump 会再 Lock——当场死锁）
+			r.cfg.Logf("中继：注册腿总数已达上限 %d，拒绝控制面新腿 %x", r.cfg.MaxLegs, label[:])
+			return nil, false
+		}
 		lg = &leg{label: label, pubkey: pub, last: time.Now()}
 		r.legs[label] = lg
 	}
-	return lg
+	return lg, true
 }
 
 // attachControl：挂控制连接（顶掉旧连接；新连接生效）。
@@ -252,6 +300,9 @@ func (r *Relay) announceSession(lg *leg, sess proto.CtlSession) bool {
 // 回收永不触发，要等手机侧巡检 3 连败自愈（分钟级）。公共出口（旧路径本来通）
 // 的会话也被统一提升，短暂等腿（一轮通告+拨腿，几十 ms）后继续。
 func (r *Relay) replaySessions(lg *leg, cc *ctlConn) {
+	if !lg.ctlV2 {
+		return // v1 控制连接：解不开 v2 SESSION，也没有拨腿会话要重放（#25）
+	}
 	r.mu.Lock()
 	type pending struct {
 		msg   []byte
@@ -272,9 +323,14 @@ func (r *Relay) replaySessions(lg *leg, cc *ctlConn) {
 			a.dialUp = true
 			a.dialed = true
 			a.dialUpAt = time.Now()
+			// 提升会话换新 cookie（#3）：重放 = 后端已 ClearLegs，等它带新认证重拨。
+			if _, cerr := rand.Read(a.cookie[:]); cerr == nil {
+				a.authOK = false
+			}
 		}
 		port := uint16(a.sock.LocalAddr().(*net.UDPAddr).Port)
-		out = append(out, pending{msg: proto.EncodeCtlSession(proto.CtlSession{ID: a.sid, DataPort: port}), assoc: a})
+		out = append(out, pending{msg: proto.EncodeCtlSession(proto.CtlSession{
+			ID: a.sid, DataPort: port, Cookie: a.cookie, HasCookie: true}), assoc: a})
 	}
 	r.mu.Unlock()
 	sent := 0
@@ -301,18 +357,19 @@ func (r *Relay) replaySessions(lg *leg, cc *ctlConn) {
 	}
 }
 
-// releaseSession：通告会话回收（尽力而为；连接已断就跳过）。
+// releaseSession：通告会话回收。写失败即关连接（review #36，与 announceSession
+// 对齐）：半死的 TCP 上 RELEASE 会一直丢，后端的腿只能等空闲回收；关掉逼后端
+// 重连，重连后的重放对账把两边状态拉齐。
 func (r *Relay) releaseSession(lg *leg, id uint64) {
 	r.mu.Lock()
 	cc := lg.ctl
 	r.mu.Unlock()
 	if cc != nil {
-		_ = cc.writeMsg(proto.EncodeCtlRelease(id))
+		if err := cc.writeMsg(proto.EncodeCtlRelease(id)); err != nil {
+			cc.close()
+		}
 	}
 }
-
-// ErrNoControlConn：无控制连接（兼容路径继续走 per-client 敲洞）。
-var ErrNoControlConn = errors.New("relay: 后端无控制连接")
 
 // withSubtype：CtlReadMsg 的 payload 去掉了子类型字节，而 proto 的 RelaySub*
 // 编解码以「子类型 + 载荷」整条为对象 —— 拼回去再解。

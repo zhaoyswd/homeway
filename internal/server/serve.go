@@ -131,6 +131,12 @@ type Server struct {
 	files         *files.Server
 	termLn        net.Listener
 	termSrv       *term.TermService
+	// relayCtx：中继注册腿 + 控制客户端的生命周期（review #8：此前给的是
+	// context.Background()，Close 之后这两组协程与拨号循环永不退出——进程级
+	// 无所谓，但测试里每次都泄漏 goroutine）。
+	relayCtx    context.Context
+	relayCancel context.CancelFunc
+	relayStart  func() // dev.Up() 之后执行（socket 已开，#9）
 }
 
 // Start 装配并启动（非阻塞）。
@@ -245,10 +251,16 @@ func Start(cfg ServeConfig) (*Server, error) {
 		if rerr == nil {
 			s.relayEp = proto.Endpoint{Addr: relayAddr.String(), Relay: true}
 			s.relayWanted = true
-			startRelayLeg(context.Background(), s.bind, relayAddr, s.priv, wgPub(s.priv), relaySecret, logf)
-			// relay-backend-dial：控制通道（TCP，同号）+ SESSION 通告/拨腿。
-			// 失败只退避重连，不影响主服务（见 relayctl.go 头注释）。
-			startControlClient(context.Background(), s.bind, relayAddr, s.priv, wgPub(s.priv), relaySecret, logf)
+			// ⚠️ 只在这里**记下端点**，两个 start 挪到 dev.Up() 之后（review #9）：
+			// 此前注册腿在 Up 前开跑，SendRawTo 读到 nil 的 socket，启动日志第一行
+			// 就是假的「注册 Hello 发送失败」。token 打印顺序依赖 relayEp 先配好，
+			// 所以赋值留在原处、启动延后。
+			s.relayStart = func() {
+				startRelayLeg(s.relayCtx, s.bind, relayAddr, s.priv, wgPub(s.priv), relaySecret, logf)
+				// relay-backend-dial：控制通道（TCP，同号）+ SESSION 通告/拨腿。
+				// 失败只退避重连，不影响主服务（见 relayctl.go 头注释）。
+				startControlClient(s.relayCtx, s.bind, relayAddr, s.priv, wgPub(s.priv), relaySecret, logf)
+			}
 		} else {
 			logf("⚠️ --relay 解析失败（%v）—— 跳过中继注册", rerr)
 		}
@@ -346,9 +358,16 @@ func Start(cfg ServeConfig) (*Server, error) {
 		}
 	}
 
+	// 生命周期 ctx 在装配起点建（收工由 Close 取消，#8）。
+	s.relayCtx, s.relayCancel = context.WithCancel(context.Background())
 	if err := s.dev.Up(); err != nil { // FINDINGS 0.1-1
 		s.Close()
 		return nil, err
+	}
+	// 中继注册腿/控制客户端此刻才开跑（#9）：dev.Up() 内部打开 Bind（socket 就绪），
+	// SendRawTo 不再撞「socket 还没打开」。
+	if s.relayStart != nil {
+		s.relayStart()
 	}
 	pub := priv.PublicKey()
 	// 注意：这里是**配置端口**；端口被占用会自动退让，实际端口在下面异步落盘时打（见 listen_port.txt）。
@@ -359,6 +378,9 @@ func Start(cfg ServeConfig) (*Server, error) {
 
 // Close 收工（幂等性由各层保证；stop 函数可重复调用部分由调用方保证单次）。
 func (s *Server) Close() {
+	if s.relayCancel != nil {
+		s.relayCancel() // 中继注册腿 + 控制客户端随服务收工（#8）
+	}
 	if s.stopIntercept != nil {
 		s.stopIntercept()
 	}

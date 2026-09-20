@@ -37,8 +37,10 @@ type ServerBind struct {
 	// OnLegFrame：腿上帧的**额外**分派钩子（中继控制帧走这里；返回 true = 已消费，不进 device）。
 	// 已有的固定处理（data/reg/control-hint）在内，钩子只收 type ≥ 3 的帧与显式未处理的分支。
 	OnLegFrame func(typ byte, payload []byte, src netip.AddrPort) bool
-	OnHint     func(addr string) // 中继观察到的客户端公网地址（打洞用，阶段 6）
-	Logf       func(format string, args ...any)
+	// OnHint：中继观察到的客户端公网地址（打洞用）。带包源地址——接线方必须校验
+	// src 属中继（#23：hint 是「向任意地址盲打」的触发器，不能让未知源注入）。
+	OnHint func(addr string, src netip.AddrPort)
+	Logf   func(format string, args ...any)
 	// LogfD：细节级日志（入站新源/reg 拒绝这类排查行；nil 时回落 Logf）。
 	// 摘要/细节分流见 internal/server/logging.go（2026-09-20 用户口径：终端只看关键信息）。
 	LogfD func(format string, args ...any)
@@ -50,7 +52,11 @@ type ServerBind struct {
 	// 这就是出口同时服务 IPv4/IPv6 客户端的形态；比只绑一个地址更通用（v6 地址会轮换）。
 	BindIface *net.Interface
 
-	c        *net.UDPConn
+	// c：主 WG socket。**原子访问**（review #9）：Open 写一次，但 SendRawTo/LocalPort/
+	// STUNQuery/Send/RepinTo 可能从别的 goroutine 在 Open 完成前后读（启动顺序里
+	// 中继注册先于 dev.Up() 的年代就靠「读了 nil 报错」混过去）——裸字段在 -race 下
+	// 是真竞争。
+	c        atomic.Pointer[net.UDPConn]
 	stunMu   sync.Mutex
 	stunWait *stunPending
 
@@ -62,16 +68,31 @@ type ServerBind struct {
 	legCh   chan relayLegPkt
 	legOnce sync.Once
 	dead    chan struct{}
-	pinMu   sync.Mutex
-	pinned  *net.Interface // 当前实际钉住的网卡（Open 时设置，Repin 时更新）
+	// legRecent：最近被摘除的腿远端地址（TTL 内用于 Send 的「不回落主 socket」判定
+	// 与日志归因，review #17）。
+	legRecent  map[netip.AddrPort]time.Time
+	legDropped atomic.Uint64 // Send 因「曾是腿地址但腿已摘」而丢弃的包数（#17 观测面）
+	pinMu      sync.Mutex
+	pinned     *net.Interface // 当前实际钉住的网卡（Open 时设置，Repin 时更新）
+	closeOnce  sync.Once
 
-	// srcSeen：入站**新源**首包的排障记录（单读 goroutine 访问，无需锁）。
+	// srcSeen：入站**新源**首包的排障记录。
 	// 背景（2026-09-20 排查「直连时好时坏」）：出口对陌生/解不开的包零记录，
 	// 「包没到出口」「到了但回程被手机 NAT 过滤」「到了但没回」三个断点一个都看不到。
 	// 每个新来源只记一行首包（含 WG 消息类型），正常流量零噪音；
 	// 手机换 NAT 映射后的第一发直连握手必落一行 —— 直连路径到达性从此有据可查。
+	// ⚠️ **必须持锁**（review #1，致命）：Open 返回两条 ReceiveFunc（主 socket + 腿聚合），
+	// wireguard-go 为每条各起一个读 goroutine，两条路径都会走到这里 —— 注释里旧的
+	// 「单读 goroutine 无需锁」在 relay-backend-dial 合入当天就失效了，无锁时
+	// -race 报 DATA RACE、高并发直接 `fatal error: concurrent map writes` 把整个
+	// homewayd 进程带走。容量上限防公网口上的无界增长（满则整表清空并记一行）。
+	srcMu   sync.Mutex
 	srcSeen map[netip.AddrPort]bool
 }
+
+// srcSeenMax：新源记录表的容量上限。正常多客户端场景不过几百；满了说明在被扫描/
+// 洪泛，清表重来（这个表只是排障日志的去重，丢历史无 correctness 影响）。
+const srcSeenMax = 4096
 
 // Repin 按**名字**重新解析网卡并把它重新钉到当前 socket 上（换网/接口索引变化后调用）。
 // 没配 BindIface 时是 no-op（返回 nil, nil）。
@@ -92,7 +113,7 @@ func (b *ServerBind) Repin() (*net.Interface, error) {
 
 // RepinTo 把当前 socket 钉到**指定的**网卡上（自动挑卡/换网切换时用；传 nil = 不绑）。
 func (b *ServerBind) RepinTo(ifi *net.Interface) (*net.Interface, error) {
-	c := b.c
+	c := b.c.Load()
 	if c == nil {
 		return nil, fmt.Errorf("server: socket 还没打开")
 	}
@@ -129,6 +150,10 @@ const (
 	relayLegMax   = 64
 	relayLegIdle  = 3 * time.Minute
 	relayLegSweep = 30 * time.Second
+	// legRecentTTL：「最近摘除的腿地址」的保留窗口（#17）。窗口内对该地址的发送
+	// 被判为「腿已摘、不回落主 socket」直接丢弃；窗口过后按普通未知地址处理
+	// （回落主 socket —— 那可能是合法的新对端）。
+	legRecentTTL = 5 * time.Minute
 )
 
 // legInitLocked：腿通道与收工信号（一次）。
@@ -137,9 +162,21 @@ func (b *ServerBind) legInit() {
 		b.legByR = make(map[netip.AddrPort]*relayLeg)
 		b.legByID = make(map[uint64]*relayLeg)
 		b.legCh = make(chan relayLegPkt, 128)
+		b.legRecent = make(map[netip.AddrPort]time.Time)
 		b.dead = make(chan struct{})
 		go b.legReapLoop()
 	})
+}
+
+// legDead：Bind 是否已收工（dead 已关）。收工后 RegisterLeg/RemoveLeg/ClearLegs
+// 一律 no-op（review #38：否则能在已收工的 Bind 上挂出永不回收的新腿与读协程）。
+func (b *ServerBind) legDead() bool {
+	select {
+	case <-b.dead:
+		return true
+	default:
+		return false
+	}
 }
 
 // legReapLoop：腿空闲回收（review B1）。RELEASE 是主路径，这里是兜底——
@@ -162,14 +199,28 @@ func (b *ServerBind) legReapLoop() {
 				b.removeLegLocked(lg)
 			}
 		}
+		// 「最近摘除的腿地址」过期清理（#17 的判定窗口）。
+		for ap, at := range b.legRecent {
+			if now-at.UnixMilli() > legRecentTTL.Milliseconds() {
+				delete(b.legRecent, ap)
+			}
+		}
 		b.legMu.Unlock()
 	}
 }
 
-// RegisterLeg：向中继数据口拨一条腿（connected），发 LEGUP 标记并开始接收。
-// 同 id 或同远端重复注册 = 先拆旧再建（中继侧会话重建的语义）。
-func (b *ServerBind) RegisterLeg(id uint64, remote netip.AddrPort) error {
+// RegisterLeg：向中继数据口拨一条腿（connected），发认证标记并开始接收。
+// marker = 拨腿首包载荷：v2 会话是 LEGUP‖cookie‖MAC（腿身份认证，#3），
+// v1 是纯 "LEGUP"。同 id 或同远端重复注册 = 先拆旧再建（中继侧会话重建的语义）。
+// Bind 已收工（dead 已关）时 no-op（#38）。
+func (b *ServerBind) RegisterLeg(id uint64, remote netip.AddrPort, marker []byte) error {
 	b.legInit()
+	if b.legDead() {
+		return fmt.Errorf("server: bind 已收工，拒绝注册腿 #%d", id)
+	}
+	if len(marker) == 0 {
+		marker = []byte("LEGUP")
+	}
 	// 按目标族选 socket 网络（review B6：写死 udp4 会让 v6 中继端点恒失败）。
 	network := "udp4"
 	if remote.Addr().Is6() {
@@ -179,7 +230,7 @@ func (b *ServerBind) RegisterLeg(id uint64, remote netip.AddrPort) error {
 	if err != nil {
 		return err
 	}
-	if _, err := sock.Write([]byte("LEGUP")); err != nil {
+	if _, err := sock.Write(marker); err != nil {
 		_ = sock.Close()
 		return err
 	}
@@ -201,15 +252,20 @@ func (b *ServerBind) RegisterLeg(id uint64, remote netip.AddrPort) error {
 	}
 	b.legByID[id] = lg
 	b.legByR[remote] = lg
+	// 同地址重拨成功：撤掉「最近摘除」标记（这个远端又有腿了，Send 正常走腿）。
+	delete(b.legRecent, remote)
 	b.legMu.Unlock()
 	go b.legReadLoop(lg, sock)
 	return nil
 }
 
 // ClearLegs：拆掉全部腿（控制面重连对账——中继在 OK 后会重放全量 SESSION，
-// 后端先清再按重放重建；review B1 的「重启清孤儿」主路径）。
+// 后端先清再按重放重建；review B1 的「重启清孤儿」主路径）。收工后 no-op（#38）。
 func (b *ServerBind) ClearLegs() {
 	b.legInit()
+	if b.legDead() {
+		return
+	}
 	b.legMu.Lock()
 	defer b.legMu.Unlock()
 	for _, lg := range b.legByID {
@@ -217,9 +273,12 @@ func (b *ServerBind) ClearLegs() {
 	}
 }
 
-// RemoveLeg：按会话号拆腿（RELEASE / 收工）。不存在 = no-op。
+// RemoveLeg：按会话号拆腿（RELEASE / 收工）。不存在 = no-op；收工后 no-op（#38）。
 func (b *ServerBind) RemoveLeg(id uint64) {
 	b.legInit()
+	if b.legDead() {
+		return
+	}
 	b.legMu.Lock()
 	defer b.legMu.Unlock()
 	if lg := b.legByID[id]; lg != nil {
@@ -229,6 +288,7 @@ func (b *ServerBind) RemoveLeg(id uint64) {
 
 // removeLegLocked：关 socket + 双表摘除（调用方持锁）。socket 关闭让读协程退出；
 // 「同远端新腿不串旧流」由 socket 生命周期保证（旧 socket 已关，不可能再投递）。
+// 摘除的远端进 legRecent（#17：Send 在 TTL 内对它丢弃、不回落主 socket）。
 func (b *ServerBind) removeLegLocked(lg *relayLeg) {
 	_ = lg.sock.Close()
 	if b.legByID[lg.id] == lg {
@@ -237,10 +297,32 @@ func (b *ServerBind) removeLegLocked(lg *relayLeg) {
 	if b.legByR[lg.remote] == lg {
 		delete(b.legByR, lg.remote)
 	}
+	if b.legRecent != nil {
+		b.legRecent[lg.remote] = time.Now()
+	}
 }
 
 // legReadLoop：一条腿的读循环（connected socket 的 Read；源恒为腿远端）。
+// 读循环退出（socket 关闭/ICMP 拒绝等）即摘腿（review #8）：Send 会刷新 last，
+// 死腿靠空闲扫描永远扫不掉 —— 不在这里摘，WG 会一直往死 socket 写。
 func (b *ServerBind) legReadLoop(lg *relayLeg, sock *net.UDPConn) {
+	defer func() {
+		b.legMu.Lock()
+		// 只摘「仍是本人」的表项（期间可能已被 RegisterLeg 替换成新腿）。
+		if b.legByID[lg.id] == lg || b.legByR[lg.remote] == lg {
+			b.logf("腿（会话 #%d → %v）读循环退出，摘除", lg.id, lg.remote)
+			if b.legByID[lg.id] == lg {
+				delete(b.legByID, lg.id)
+			}
+			if b.legByR[lg.remote] == lg {
+				delete(b.legByR, lg.remote)
+			}
+			if b.legRecent != nil {
+				b.legRecent[lg.remote] = time.Now()
+			}
+		}
+		b.legMu.Unlock()
+	}()
 	buf := make([]byte, 65535)
 	for {
 		n, err := sock.Read(buf)
@@ -249,6 +331,9 @@ func (b *ServerBind) legReadLoop(lg *relayLeg, sock *net.UDPConn) {
 		}
 		if n == 5 && string(buf[:n]) == "LEGUP" {
 			continue // 防御：中继侧已吞，正常到不了这里
+		}
+		if n == 37 && string(buf[:5]) == "LEGUP" {
+			continue // 防御：认证 marker 的回显（同上）
 		}
 		lg.last.Store(time.Now().UnixMilli())
 		pkt := make([]byte, n)
@@ -288,12 +373,19 @@ func (b *ServerBind) legReceiveFunc() conn.ReceiveFunc {
 // SendRawTo：从**同一个 WG socket** 直接发给 addr（中继注册/保活/盲打都用它 ——
 // 注册腿必须与数据面同端口，NAT 映射才会一致，见 design D4）。
 func (b *ServerBind) SendRawTo(addr netip.AddrPort, payload []byte) error {
-	c := b.c
+	c := b.c.Load()
 	if c == nil {
 		return fmt.Errorf("server: socket 还没打开")
 	}
 	_, err := c.WriteToUDPAddrPort(payload, addr)
 	return err
+}
+
+// SendTo：与 Send 同款路由（endpoint 命中腿表走腿、否则主 socket、腿已摘则丢弃），
+// 供非 WG 调用方（测试/e2e）按「数据面真实路径」发包。注册/保活/盲打仍用 SendRawTo
+// （那条路刻意钉主 socket：注册腿必须与数据面同端口，NAT 映射才一致）。
+func (b *ServerBind) SendTo(addr netip.AddrPort, buf []byte) error {
+	return b.Send([][]byte{buf}, srvEP{addr})
 }
 
 // PinnedIface 当前钉住的网卡（没绑卡时 nil）。
@@ -405,7 +497,7 @@ func (b *ServerBind) Open(port uint16) ([]conn.ReceiveFunc, uint16, error) {
 			}
 		}
 	}
-	b.c = c
+	b.c.Store(c)
 	actual := uint16(c.LocalAddr().(*net.UDPAddr).Port)
 	b.legInit()
 	fn := func(packets [][]byte, sizes []int, eps []conn.Endpoint) (int, error) {
@@ -442,7 +534,9 @@ func (b *ServerBind) processPacket(packets [][]byte, sizes []int, eps []conn.End
 	}
 	if resp := probe.Respond(buf, src, b.Build, caps); resp != nil {
 		b.noteNewSrc(src, "参照点探测", len(buf))
-		_, _ = b.c.WriteToUDPAddrPort(resp, src)
+		if c := b.c.Load(); c != nil {
+			_, _ = c.WriteToUDPAddrPort(resp, src)
+		}
 		return 0, nil
 	}
 
@@ -469,7 +563,7 @@ func (b *ServerBind) processPacket(packets [][]byte, sizes []int, eps []conn.End
 			b.noteNewSrc(src, "腿帧控制", len(buf))
 			if b.OnHint != nil {
 				if addr, err := proto.DecodeHintPayload(payload); err == nil {
-					b.OnHint(addr)
+					b.OnHint(addr, src)
 				}
 			}
 			return 0, nil
@@ -529,14 +623,25 @@ func wgMsgName(b byte) string {
 // noteNewSrc：入站新源的首包一行（每个来源只记一次）。shape 描述这包的形态。
 // 收到「WG握手发起」却迟迟不形成会话 = 出口侧密钥/注册问题；一个新源都没有 =
 // 包死在半路（手机网络/运营商/路由器映射）——这两类从此一眼可分。
+// 持锁 + 容量上限（review #1，致命）：Open 返回两条 ReceiveFunc，wireguard-go 为
+// 各起一条读 goroutine，两条路径并发到这里 —— 无锁时 -race 报 DATA RACE、
+// 高并发直接 `fatal error: concurrent map writes` 带走整个 homewayd 进程。
 func (b *ServerBind) noteNewSrc(src netip.AddrPort, shape string, n int) {
+	b.srcMu.Lock()
 	if b.srcSeen == nil {
 		b.srcSeen = make(map[netip.AddrPort]bool)
 	}
 	if b.srcSeen[src] {
+		b.srcMu.Unlock()
 		return
 	}
+	if len(b.srcSeen) >= srcSeenMax {
+		// 满表：大概率在被扫描/洪泛。整表清空（排障去重表，不是 correctness 状态）。
+		b.srcSeen = make(map[netip.AddrPort]bool)
+		b.logfD("入站新源表满（%d 条），清表重记", srcSeenMax)
+	}
 	b.srcSeen[src] = true
+	b.srcMu.Unlock()
 	b.logfD("入站新源：%v（%s，%d 字节）", src, shape, n)
 }
 
@@ -549,25 +654,28 @@ func (b *ServerBind) logfD(format string, args ...any) {
 	b.logf(format, args...)
 }
 
+// Close 收工（幂等，#8/#38：sync.Once 保证并发 Close 不重入；收工后腿操作 no-op）。
 func (b *ServerBind) Close() error {
-	if b.dead != nil {
-		select {
-		case <-b.dead:
-		default:
-			close(b.dead)
+	b.closeOnce.Do(func() {
+		if b.dead != nil {
+			select {
+			case <-b.dead:
+			default:
+				close(b.dead)
+			}
 		}
-	}
-	b.legMu.Lock()
-	for _, lg := range b.legByID {
-		_ = lg.sock.Close()
-	}
-	b.legByID = map[uint64]*relayLeg{}
-	b.legByR = map[netip.AddrPort]*relayLeg{}
-	b.legMu.Unlock()
-	if b.c == nil {
-		return nil
-	}
-	return b.c.Close()
+		b.legMu.Lock()
+		for _, lg := range b.legByID {
+			_ = lg.sock.Close()
+		}
+		b.legByID = map[uint64]*relayLeg{}
+		b.legByR = map[netip.AddrPort]*relayLeg{}
+		b.legMu.Unlock()
+		if c := b.c.Load(); c != nil {
+			_ = c.Close()
+		}
+	})
+	return nil
 }
 
 // deliverSTUN 把 STUN 应答交给等待者（事务 ID 匹配才认）。返回 true = 已被消耗。
@@ -594,10 +702,11 @@ func (b *ServerBind) deliverSTUN(pkt []byte) bool {
 
 // LocalPort 返回实际监听的 UDP 端口（Open 之后有效；0 = 还没开）。
 func (b *ServerBind) LocalPort() uint16 {
-	if b.c == nil {
+	c := b.c.Load()
+	if c == nil {
 		return 0
 	}
-	return uint16(b.c.LocalAddr().(*net.UDPAddr).Port)
+	return uint16(c.LocalAddr().(*net.UDPAddr).Port)
 }
 
 // STUNQuery 在**本 Bind 的 UDP socket** 上问一次 STUN 服务器「你看到的我是什么地址」（IPv4 路径）。
@@ -613,7 +722,8 @@ func (b *ServerBind) STUNQueryV6(ctx context.Context, server string) (netip.Addr
 }
 
 func (b *ServerBind) stunQuery(ctx context.Context, server string, want6 bool) (netip.AddrPort, error) {
-	if b.c == nil {
+	c := b.c.Load()
+	if c == nil {
 		return netip.AddrPort{}, fmt.Errorf("server: bind 尚未 Open")
 	}
 	host, portStr, err := net.SplitHostPort(server)
@@ -660,7 +770,7 @@ func (b *ServerBind) stunQuery(ctx context.Context, server string, want6 bool) (
 		b.stunMu.Unlock()
 	}()
 
-	if _, err := b.c.WriteToUDPAddrPort(stunBindingRequest(txid), target); err != nil {
+	if _, err := c.WriteToUDPAddrPort(stunBindingRequest(txid), target); err != nil {
 		return netip.AddrPort{}, fmt.Errorf("发 STUN 请求: %w", err)
 	}
 	select {
@@ -682,6 +792,10 @@ func (b *ServerBind) Send(bufs [][]byte, ep conn.Endpoint) error {
 	// 回程必须与「后端拨出去的映射」同五元组（严格 NAT 的构造性穿透）。
 	b.legMu.RLock()
 	lg := b.legByR[e.ap]
+	recent := lg == nil && b.legRecent != nil
+	if recent {
+		_, recent = b.legRecent[e.ap]
+	}
 	b.legMu.RUnlock()
 	if lg != nil {
 		lg.last.Store(time.Now().UnixMilli())
@@ -692,8 +806,22 @@ func (b *ServerBind) Send(bufs [][]byte, ep conn.Endpoint) error {
 		}
 		return nil
 	}
+	if recent {
+		// #17：该 endpoint 是「最近还挂着腿的中继数据口」。腿不在了（RELEASE 丢失/
+		// 控制空窗回收/重连对账中）却从**主 socket** 发，会打到中继主口或被复用的
+		// 数据口 —— 要么被中继当未知源丢弃，要么污染别的会话。丢弃 + 计数；等
+		// 控制重连的 SESSION 重放重建腿（或下一个入站包重学 endpoint）后自愈。
+		if n := b.legDropped.Add(1); n <= 3 || n%1000 == 0 {
+			b.logfD("腿已摘（%v）期间丢弃出站 %d 包（等控制面重放重建腿）", e.ap, len(bufs))
+		}
+		return nil
+	}
+	c := b.c.Load()
+	if c == nil {
+		return fmt.Errorf("server: socket 还没打开")
+	}
 	for _, buf := range bufs {
-		if _, err := b.c.WriteToUDPAddrPort(buf, e.ap); err != nil {
+		if _, err := c.WriteToUDPAddrPort(buf, e.ap); err != nil {
 			return err
 		}
 	}

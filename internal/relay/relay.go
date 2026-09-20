@@ -38,6 +38,7 @@ const (
 	defaultMaxPerPeer  = 32               // 每个后端最多并发的客户端分配
 	defaultRateLimit   = 200              // 每个源地址每秒允许的包数（准入限流）
 	defaultMaxLegs     = 256              // 注册腿总数上限（白名单为空时的兜底）
+	defaultMaxCtlConns = 64               // 已建立控制连接总数上限（≥ MaxLegs 时等于不设限）
 	challengeTTL       = 15 * time.Second // 挑战有效期
 	// defaultDialWait：拨腿等待窗口——通告后等后端 LEGUP 的上限。后端拨腿失败
 	// （本地 socket 分配失败/腿上限）只记日志不回报，中继若无限等待，客户端上行
@@ -73,7 +74,10 @@ type Config struct {
 	Secret [32]byte
 	// MaxLegs：注册腿总数上限（0 = 默认 256）—— 防"匿名 Hello 洪水"把表撑爆（腿不注册成功也占位）。
 	MaxLegs int
-	Logf    func(format string, args ...any)
+	// MaxCtlConns：已建立控制连接总数上限（0 = 默认 64；review #7——此前只有
+	// 「握手中」的并发闸，认证后的长连不设限，被灌满后每个连接各挂一个读协程）。
+	MaxCtlConns int
+	Logf        func(format string, args ...any)
 }
 
 // Relay 中继实例。
@@ -103,6 +107,9 @@ type Stats struct {
 	Dropped       uint64 // 被丢弃的包（未知 peerId/超限/畸形）
 	ForwardedUp   uint64 // 客户端 → 后端 转发包数
 	ForwardedDown uint64 // 后端 → 客户端 转发包数
+	// LegRejected：拨腿会话上被拒的未认证/未知源包数（review #3 的观测面——
+	// 有值说明有人在扫数据口或后端腿重拨丢了 cookie，配「未知源被拒绝」日志）。
+	LegRejected uint64
 }
 
 type assocKey struct {
@@ -126,6 +133,10 @@ type leg struct {
 	// ctl：控制通道（relay-backend-dial）。非 nil 时客户端到达走「通告+等后端拨腿」，
 	// 而不是 per-client socket 主动发往 lg.addr（那条路在严格 NAT 上恒不通）。
 	ctl *ctlConn
+	// ctlV2：控制对端跑的是 v2 协议（PROOF 带版本，review #25）。只有 v2 后端才
+	// 走拨腿模式（SESSION 带 cookie、腿要认证）；v1 控制连接保持 per-client 旧路径
+	// ——它解不开 v2 SESSION，硬通告只会让它反复拨失败。
+	ctlV2 bool
 }
 
 type assoc struct {
@@ -146,8 +157,14 @@ type assoc struct {
 	dialed   bool
 	dialUp   bool
 	dialUpAt time.Time
-	pendMu   sync.Mutex
-	pend     [][]byte
+	// 腿身份认证（review #3）：cookie 只经控制通道发给会话所属后端；拨腿首包必须
+	// 回带 cookie+MAC，验过才认（authOK）。authSrc = 已认证的腿源（常态跟随它；
+	// 换源必须重新出示合法认证——未知源不改变 backend、不放行 pend、不续命）。
+	cookie  [16]byte
+	authOK  bool
+	authSrc netip.AddrPort
+	pendMu  sync.Mutex
+	pend    [][]byte
 }
 
 // ctlPendMax：拨腿等待窗口的客户端包缓冲上限（同直连引导的 pending 语义）。
@@ -180,6 +197,9 @@ func New(cfg Config) *Relay {
 	}
 	if cfg.MaxLegs <= 0 {
 		cfg.MaxLegs = defaultMaxLegs
+	}
+	if cfg.MaxCtlConns <= 0 {
+		cfg.MaxCtlConns = defaultMaxCtlConns
 	}
 	if cfg.Logf == nil {
 		cfg.Logf = func(string, ...any) {}
@@ -374,16 +394,22 @@ func (r *Relay) handleControl(src netip.AddrPort, label [8]byte, lg *leg, payloa
 		copy(pub[:], ephPub)
 		r.mu.Lock()
 		cur := r.legs[label]
-		if cur == nil || !cur.verified {
-			if cur == nil && len(r.legs) >= r.cfg.MaxLegs {
+		if cur == nil {
+			if len(r.legs) >= r.cfg.MaxLegs {
 				r.mu.Unlock()
 				r.bump(func(s *Stats) { s.Denied++ })
 				r.cfg.Logf("中继：注册腿总数已达上限 %d，拒绝新的 %x（防匿名洪水）", r.cfg.MaxLegs, label[:])
 				return
 			}
-			cur = &leg{label: label, pubkey: pubkey, last: time.Now()} // last=now：未验证腿的注册窗口起点（见 reapLoop 的 legBootstrap 分支）
+			cur = &leg{label: label, last: time.Now()} // last=now：未验证腿的注册窗口起点（见 reapLoop 的 legBootstrap 分支）
 			r.legs[label] = cur
 		}
+		// **复用既有对象，绝不替换**（review #2，高危）：腿上可能挂着长生命周期子状态
+		// （ctl 控制连接 / ctlVerified）。替换成新对象会让 ctl 指向脱离 map 的旧对象——
+		// 通告与重放全走新对象（无 ctl ⇒ 拨腿模式静默退化回旧敲洞路径），而孤儿控制
+		// 连接还在被回 KEEPALIVE、后端永不重连，两边日志全是"健康"的。中继重启后
+		// （控制先连、UDP Hello 后到）近乎必然踩中。
+		cur.pubkey = pubkey
 		cur.ephPriv, cur.nonce, cur.challAt = ephPriv, nonce, time.Now()
 		r.mu.Unlock()
 		_, _ = r.pc.WriteToUDPAddrPort(proto.EncodeFrame(proto.FrameTypeRelayReg,
@@ -393,12 +419,18 @@ func (r *Relay) handleControl(src netip.AddrPort, label [8]byte, lg *leg, payloa
 			r.bump(func(s *Stats) { s.Forged++ })
 			return
 		}
-		gotNonce, macDH, macPSK, err := proto.DecodeRelayProof(payload)
+		gotNonce, macDH, macPSK, _, err := proto.DecodeRelayProof(payload)
 		if err != nil {
 			r.bump(func(s *Stats) { s.Forged++ })
 			return
 		}
 		r.mu.Lock()
+		if r.legs[label] != lg {
+			// 挑战发出后腿被摘/被换（#2 的守卫）：旧对象上的证明不再作数。
+			r.mu.Unlock()
+			r.bump(func(s *Stats) { s.Forged++ })
+			return
+		}
 		if time.Since(lg.challAt) > challengeTTL || lg.nonce != gotNonce {
 			r.mu.Unlock()
 			r.bump(func(s *Stats) { s.Forged++ })
@@ -521,18 +553,30 @@ func (r *Relay) forwardUp(client netip.AddrPort, lg *leg, typ byte, payload []by
 			return
 		}
 		a = &assoc{key: key, backend: lg.addr, sock: sock, last: time.Now(), lastDown: time.Now()}
-		// relay-backend-dial：有控制连接的后端走「通告 + 等拨腿」——
-		// 不主动发往 lg.addr（严格 NAT 上恒不通），首包缓冲、等后端的 LEGUP。
+		// relay-backend-dial：有 v2 控制连接的后端走「通告 + 等拨腿」——
+		// 不主动发往 lg.addr（严格 NAT 上恒不通），首包缓冲、等后端的认证 LEGUP。
+		// v1 控制连接不走拨腿（解不开 v2 SESSION；保持 per-client 旧路径）。
 		if r.hasControlLocked(lg) {
 			r.nextSid++
 			a.sid = r.nextSid
 			a.dialUp = true
 			a.dialed = true
 			a.dialUpAt = time.Now()
+			if lg.ctlV2 {
+				// 每会话随机 cookie（review #3）：只经控制通道发给该后端，
+				// 拨腿首包必须回带 cookie+MAC 才被认作腿。
+				if _, cerr := rand.Read(a.cookie[:]); cerr != nil {
+					// 随机源失效极罕见：退回 v1（无认证）总比拒绝服务好
+					a.cookie = [16]byte{}
+				} else {
+					a.authOK = false
+				}
+			}
 		}
 		r.assocs[key] = a
 		r.stats.Assigned++
 		sid, dialUp := a.sid, a.dialUp
+		cookie, hasCookie := a.cookie, a.sid != 0 && lg.ctlV2
 		r.mu.Unlock()
 		go r.assocReadLoop(a)
 		// 腿建立：两端各推一次对端观察地址（不可信线索）
@@ -540,7 +584,7 @@ func (r *Relay) forwardUp(client netip.AddrPort, lg *leg, typ byte, payload []by
 		r.sendHintToBackend(a, client)
 		if dialUp {
 			port := uint16(sock.LocalAddr().(*net.UDPAddr).Port)
-			if r.announceSession(lg, proto.CtlSession{ID: sid, DataPort: port}) {
+			if r.announceSession(lg, proto.CtlSession{ID: sid, DataPort: port, Cookie: cookie, HasCookie: hasCookie}) {
 				r.cfg.Logf("中继：客户端 %v 起会话 #%d（拨腿模式）→ 后端 %x（数据口 %v）",
 					client, sid, lg.label[:], sock.LocalAddr())
 			} else {
@@ -583,14 +627,37 @@ func (r *Relay) forwardUp(client netip.AddrPort, lg *leg, typ byte, payload []by
 	r.bump(func(s *Stats) { s.ForwardedUp++ })
 }
 
-// hasControlLocked：leg 是否挂着控制连接（调用方持 r.mu）。
+// hasControlLocked：leg 是否挂着**v2**控制连接（调用方持 r.mu）。v1 控制连接不算——
+// 它解不开 v2 SESSION（cookie），硬通告只会让后端反复拨腿失败（review #25）。
 func (r *Relay) hasControlLocked(lg *leg) bool {
-	return lg != nil && lg.ctl != nil
+	return lg != nil && lg.ctl != nil && lg.ctlV2
+}
+
+// legMACKey：腿认证 MAC 的密钥——token 模式 = 中继鉴权密钥（与后端共享）；
+// 开放模式 = cookie 本身（只防盲攻击者；能读线路的观察者在开放模式下本就无防）。
+func (r *Relay) legMACKey(cookie [16]byte) [32]byte {
+	if r.cfg.Secret != ([32]byte{}) {
+		return r.cfg.Secret
+	}
+	var k [32]byte
+	copy(k[:16], cookie[:])
+	return k
+}
+
+// legRejectThrottle：未认证源被拒日志的节流（每会话首几条 + 之后抽样）。
+func legRejectLog(n uint64) bool {
+	return n <= 3 || n%100 == 0
 }
 
 // assocReadLoop：后端 → 客户端。后端回程是**裸 WG**（device 不知道帧），也可能带 hint 腿帧。
-// 拨腿模式下首个到达包 = 后端拨腿的标记（"LEGUP"，纯标记）或首批数据：登记腿源地址、
-// 放掉等腿窗口的缓冲，之后进入常态转发。
+//
+// 拨腿会话（sid!=0）走腿身份认证状态机（review #3）：
+//   - 首个合法的 LEGUP‖cookie‖MAC 才把该源认作腿（authOK/authSrc），放行等腿缓冲；
+//   - 已认证源漂移（NAT 重映射/重拨）必须**重新出示合法认证**——未知源不改变 backend、
+//     不放行 pend、不续命（旧实现「信任首个发包者 + 常态跟随源漂移」，任何扫到数据口
+//     的第三方都能收走 WG 密文/黑洞上行/注入 hint，相对旧模型是安全回归）；
+//   - v1 会话（无 cookie，仅存在于 v1 后端的 fallback 路径）维持旧行为：backend 恒为
+//     lg.addr，源变化由 forwardUp 的既有重建路径处理。
 func (r *Relay) assocReadLoop(a *assoc) {
 	buf := make([]byte, 65535)
 	for {
@@ -601,40 +668,62 @@ func (r *Relay) assocReadLoop(a *assoc) {
 		pkt := buf[:n]
 		from = unmap(from) // 与 readLoop 同款：4in6 映射形态统一成 v4，否则后续比较恒不等
 		r.mu.Lock()
-		// 双向任一活跃即续命（与出口 intercept 的共享时间戳同哲学）；下行时刻
-		// 单独记（DownSilent 判据），LEGUP 这类纯标记也算下行到达。
 		now := time.Now()
-		a.last, a.lastDown = now, now
-		if a.dialUp {
-			a.dialUp = false
-			a.backend = from
-			r.mu.Unlock()
-			a.pendMu.Lock()
-			pend := a.pend
-			a.pend = nil
-			a.pendMu.Unlock()
-			for _, p := range pend {
-				_, _ = a.sock.WriteToUDPAddrPort(p, from)
+		if a.sid != 0 {
+			// ---- v2 拨腿会话：认证状态机 ----
+			if a.authOK && a.authSrc == from {
+				// 常态：已认证源的下行（裸 WG 数据或重发的 LEGUP 标记都算）。
+				a.last, a.lastDown = now, now
+				r.mu.Unlock()
+			} else if c, isLegup := proto.LegupCookie(pkt); isLegup && c == a.cookie &&
+				proto.VerifyLegupAuth(pkt, a.sid, a.cookie, r.legMACKey(a.cookie)) {
+				// 合法认证：首拨（authOK=false，放行 pend）或已认证腿的重拨/换源
+				//（控制重连重放后的再拨——源变了但 cookie 认得出来）。
+				first := !a.authOK
+				moved := a.authOK && a.authSrc != from
+				a.authOK = true
+				a.authSrc = from
+				a.backend = from
+				a.last, a.lastDown = now, now
+				r.mu.Unlock()
+				if first {
+					r.mu.Lock()
+					a.dialUp = false
+					r.mu.Unlock()
+					a.pendMu.Lock()
+					pend := a.pend
+					a.pend = nil
+					a.pendMu.Unlock()
+					for _, p := range pend {
+						_, _ = a.sock.WriteToUDPAddrPort(p, from)
+					}
+				}
+				if moved {
+					r.cfg.Logf("中继：会话 #%d 的后端腿重拨 → %v（cookie 认证通过，跟随）", a.sid, from)
+				}
+			} else {
+				// 未认证/未知源：丢弃并计数，不改变任何状态、不续命（#3）。
+				r.stats.LegRejected++
+				n := r.stats.LegRejected
+				rateOK := r.legRateOKLocked(from.Addr())
+				r.mu.Unlock()
+				if rateOK && legRejectLog(n) {
+					r.cfg.Logf("中继：会话 #%d 收到未知源 %v 的包（%dB）—— 已拒绝（未认证不得成为腿；累计 %d 次）",
+						a.sid, from, len(pkt), n)
+				}
+				continue
 			}
-		} else if a.dialed && a.backend != from {
-			// 常态源校正（review B5）：**只对拨腿会话**（a.dialed）生效——后端腿的
-			// NAT 映射漂移（重拨/换网）时，不更新的话下行会持续发往死地址、而客户端
-			// 发包让 a.last 一直新鲜——会话半死到空闲回收。源变化即跟随（腿由后端
-			// 拨出，能从此地址发来即证明可达）。
-			// fallback 会话（sid==0，backend 恒为 lg.addr）不跟随：它的"源变化"
-			// 属于 UDP 注册腿换源，由 forwardUp 的既有重建路径处理（曾因 4in6 形态
-			// 差异被误改写 → 误判漂移 → 误重建，测试 TestControlReplaySkipsFallbackAssocs 抓到）。
-			a.backend = from
-			r.mu.Unlock()
-			r.cfg.Logf("中继：会话 #%d 的后端腿源漂移 → %v（跟随）", a.sid, from)
 		} else {
+			// ---- v1 会话（sid==0，fallback：backend = lg.addr）----
+			a.last, a.lastDown = now, now
 			r.mu.Unlock()
 		}
-		// LEGUP 吞包：首腿与重拨腿（控制重连重放后的再拨）都会发这个标记。
-		// 判定必须在分支外——重拨腿的 LEGUP 是"新源首包"，走漂移跟随分支，
-		// 若只在 dialUp 分支里吞，它会被当数据转发给客户端（review 2026-09-21；
-		// WG 层虽会丢弃 5 字节残包，但别把标记泄给对端）。
-		if len(pkt) == 5 && string(pkt) == "LEGUP" {
+		// LEGUP 家族吞包（判定在分支外）：首腿、重拨腿与已认证源的重复标记都不外泄
+		//（WG 层虽会丢弃 5 字节残包，但别把标记泄给对端）。
+		if proto.IsPlainLegup(pkt) {
+			continue
+		}
+		if _, isLegup := proto.LegupCookie(pkt); isLegup {
 			continue
 		}
 		frame := pkt
@@ -647,6 +736,21 @@ func (r *Relay) assocReadLoop(a *assoc) {
 		}
 		r.bump(func(s *Stats) { s.ForwardedDown++ })
 	}
+}
+
+// legRateOKLocked：被拒路径的每源限速（**调用方持 r.mu**——它在认证拒绝分支内使用，
+// 包一层 Lock 会当场死锁）。只约束**日志与认证计算**的代价，不碰转发——转发只对
+// 已认证源发生，真实后端不会被限。阈值取准入限流的 10 倍。
+func (r *Relay) legRateOKLocked(ip netip.Addr) bool {
+	now := time.Now()
+	b := r.rates[ip]
+	limit := r.cfg.RateLimit * 10
+	if b == nil || now.Sub(b.window) >= time.Second {
+		r.rates[ip] = &rateBucket{window: now, count: 1}
+		return true
+	}
+	b.count++
+	return b.count <= limit
 }
 
 // sendHintToClient：把**后端注册腿的源地址**告诉客户端（客户端据此打洞）。

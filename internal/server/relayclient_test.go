@@ -6,8 +6,11 @@ package server
 import (
 	"context"
 	"crypto/rand"
+	"fmt"
 	"net"
 	"net/netip"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -235,5 +238,71 @@ func TestRelayTokenModeEndToEnd(t *testing.T) {
 	time.Sleep(2 * time.Second)
 	if _, ok := rl.RegisterLeg(proto.RelayID(pub2)); ok {
 		t.Fatal("没带 token 的后端不该注册成功")
+	}
+}
+
+// TestHintSourceValidation（review #23）：hint 只信中继 IP（per-client 分配 socket
+// 端口动态）。未知源的 hint 只记日志、绝不盲打；中继源的 hint 正常触发（异步）盲打。
+func TestHintSourceValidation(t *testing.T) {
+	var mu sync.Mutex
+	var lines []string
+	logf := func(f string, a ...any) {
+		mu.Lock()
+		defer mu.Unlock()
+		lines = append(lines, fmt.Sprintf(f, a...))
+	}
+	relayAddr := netip.MustParseAddrPort("127.0.0.1:41641")
+
+	sbind := &servercore.ServerBind{Logf: logf, LogfD: logf}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	var priv [32]byte
+	if _, err := rand.Read(priv[:]); err != nil {
+		t.Fatal(err)
+	}
+	// startRelayLeg 会挂 OnHint 钩子并起 loop（socket 未 Open 时 Hello 发送失败只记日志，
+	// 不影响本测试）。
+	startRelayLeg(ctx, sbind, relayAddr, priv, wgPub(priv), [32]byte{}, logf)
+
+	waitFor := func(what string) bool {
+		deadline := time.Now().Add(2 * time.Second)
+		for time.Now().Before(deadline) {
+			mu.Lock()
+			for _, l := range lines {
+				if strings.Contains(l, what) {
+					mu.Unlock()
+					return true
+				}
+			}
+			mu.Unlock()
+			time.Sleep(10 * time.Millisecond)
+		}
+		return false
+	}
+
+	// ① 未知源的 hint：必须出现「忽略」行，且永不出现「盲打」。
+	stranger := netip.MustParseAddrPort("203.0.113.7:5000")
+	sbind.OnHint("198.51.100.9:40000", stranger)
+	if !waitFor("忽略来自未知源") {
+		mu.Lock()
+		t.Fatalf("未知源 hint 没有被拒绝：%v", lines)
+		mu.Unlock()
+	}
+	mu.Lock()
+	for _, l := range lines {
+		if strings.Contains(l, "盲打") {
+			mu.Unlock()
+			t.Fatalf("未知源的 hint 触发了盲打：%s", l)
+		}
+	}
+	mu.Unlock()
+
+	// ② 中继 IP（任意端口——per-client 分配 socket）的 hint：正常盲打（异步，等日志）。
+	legSrc := netip.AddrPortFrom(relayAddr.Addr(), 40001)
+	sbind.OnHint("198.51.100.9:40000", legSrc)
+	if !waitFor("盲打") {
+		mu.Lock()
+		t.Fatalf("中继源的 hint 没有触发盲打：%v", lines)
+		mu.Unlock()
 	}
 }
