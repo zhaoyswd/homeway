@@ -39,14 +39,14 @@ type relayClient struct {
 	label [8]byte // 中继路由键 = RelayID(pub)；发往中继的包都要带这层标签
 	// secret：中继 token（rl1…）里的鉴权密钥；非零 = token 模式（中继会校验 PSK MAC）。
 	secret [32]byte
-	bind  *servercore.ServerBind
-	logf  func(string, ...any)
+	bind   *servercore.ServerBind
+	logf   func(string, ...any)
 
-	mu       sync.Mutex
-	pending  [16]byte    // 未完成的挑战 nonce
-	ephPriv  [32]byte    // 对应临时私钥
-	challAt  time.Time
-	verified bool
+	mu        sync.Mutex
+	pending   [16]byte // 未完成的挑战 nonce
+	ephPriv   [32]byte // 对应临时私钥
+	challAt   time.Time
+	verified  bool
 	lastPunch map[netip.Addr]time.Time
 }
 

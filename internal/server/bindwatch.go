@@ -67,10 +67,10 @@ func stateOf(ifi *net.Interface) ifaceState {
 
 // BindWatchOpts：绑卡看护的参数（Resolve/Probe 可注入，便于单测）。
 type BindWatchOpts struct {
-	Explicit     *net.Interface                        // 显式指定（--bind-interface <网卡名>）：只做重解析
-	ProbeTargets []netip.AddrPort                      // 探针目标（默认 anycast DNS）
-	Repin        func(*net.Interface) error            // 把 WG socket 钉到这张卡（servercore.ServerBind.RepinTo）
-	OnChange     func()                                // 换卡后要做的事（踢公网端点重测）
+	Explicit     *net.Interface             // 显式指定（--bind-interface <网卡名>）：只做重解析
+	ProbeTargets []netip.AddrPort           // 探针目标（默认 anycast DNS）
+	Repin        func(*net.Interface) error // 把 WG socket 钉到这张卡（servercore.ServerBind.RepinTo）
+	OnChange     func()                     // 换卡后要做的事（踢公网端点重测）
 	Logf         func(string, ...any)
 	Interval     time.Duration
 	// Resolve：挑一张要钉的卡。auto = 候选探针取最快；explicit = 按名字重解析。

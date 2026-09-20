@@ -29,7 +29,7 @@ import (
 const ctlKeepaliveEvery = 25 * time.Second
 
 // ctlReadTimeout：控制连接的读超时 = 3× 保活（超时即断，等后端重连）。
-const ctlReadTimeout = 3 * ctlKeepaliveEvery + 15*time.Second
+const ctlReadTimeout = 3*ctlKeepaliveEvery + 15*time.Second
 
 // ctlConn：一条已鉴权的控制连接（只允许串行写；读在专属协程）。
 type ctlConn struct {
