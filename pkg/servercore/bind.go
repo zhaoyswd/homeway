@@ -67,14 +67,18 @@ type ServerBind struct {
 	legByID map[uint64]*relayLeg
 	legCh   chan relayLegPkt
 	legOnce sync.Once
-	dead    chan struct{}
+	// dead_：腿侧收工信号。**每次 Close 关闭、每次 Open 重建**（deadMu 保护）——
+	// wireguard-go 的 BindUpdate 契约就是「Close 旧 bind → Open 新 bind」循环，
+	// Close 若只执行一次（sync.Once），第二轮 Close 变 no-op：socket 不关、接收
+	// goroutine 永远退不出（review #8 要的幂等是「不 panic/可重复」，不是「只许一次」）。
+	deadMu sync.Mutex
+	dead_  chan struct{}
 	// legRecent：最近被摘除的腿远端地址（TTL 内用于 Send 的「不回落主 socket」判定
 	// 与日志归因，review #17）。
 	legRecent  map[netip.AddrPort]time.Time
 	legDropped atomic.Uint64 // Send 因「曾是腿地址但腿已摘」而丢弃的包数（#17 观测面）
 	pinMu      sync.Mutex
 	pinned     *net.Interface // 当前实际钉住的网卡（Open 时设置，Repin 时更新）
-	closeOnce  sync.Once
 
 	// srcSeen：入站**新源**首包的排障记录。
 	// 背景（2026-09-20 排查「直连时好时坏」）：出口对陌生/解不开的包零记录，
@@ -163,16 +167,39 @@ func (b *ServerBind) legInit() {
 		b.legByID = make(map[uint64]*relayLeg)
 		b.legCh = make(chan relayLegPkt, 128)
 		b.legRecent = make(map[netip.AddrPort]time.Time)
-		b.dead = make(chan struct{})
 		go b.legReapLoop()
 	})
 }
 
-// legDead：Bind 是否已收工（dead 已关）。收工后 RegisterLeg/RemoveLeg/ClearLegs
+// deadCh：当前世代的收工信号（惰性创建；deadMu 保护——Open 会整体换新）。
+func (b *ServerBind) deadCh() chan struct{} {
+	b.deadMu.Lock()
+	defer b.deadMu.Unlock()
+	if b.dead_ == nil {
+		b.dead_ = make(chan struct{})
+	}
+	return b.dead_
+}
+
+// closeDead：关掉当前世代信号（幂等）。
+func (b *ServerBind) closeDead() {
+	b.deadMu.Lock()
+	defer b.deadMu.Unlock()
+	if b.dead_ == nil {
+		return
+	}
+	select {
+	case <-b.dead_:
+	default:
+		close(b.dead_)
+	}
+}
+
+// legDead：Bind 当前世代是否已收工。收工后 RegisterLeg/RemoveLeg/ClearLegs
 // 一律 no-op（review #38：否则能在已收工的 Bind 上挂出永不回收的新腿与读协程）。
 func (b *ServerBind) legDead() bool {
 	select {
-	case <-b.dead:
+	case <-b.deadCh():
 		return true
 	default:
 		return false
@@ -187,7 +214,7 @@ func (b *ServerBind) legReapLoop() {
 	defer t.Stop()
 	for {
 		select {
-		case <-b.dead:
+		case <-b.deadCh():
 			return
 		case <-t.C:
 		}
@@ -340,20 +367,21 @@ func (b *ServerBind) legReadLoop(lg *relayLeg, sock *net.UDPConn) {
 		copy(pkt, buf[:n])
 		select {
 		case b.legCh <- relayLegPkt{pkt: pkt, src: lg.remote}:
-		case <-b.dead:
+		case <-b.deadCh():
 			return
 		}
 	}
 }
 
 // legReceiveFunc：聚合的腿接收函数（Open 时追加到 ReceiveFunc 列表）。
-func (b *ServerBind) legReceiveFunc() conn.ReceiveFunc {
+// dead 参数 = Open 时刻的收工信号（Close→Open 换代后，旧接收函数随旧信号退出）。
+func (b *ServerBind) legReceiveFunc(dead chan struct{}) conn.ReceiveFunc {
 	return func(packets [][]byte, sizes []int, eps []conn.Endpoint) (int, error) {
 		for {
 			var lp relayLegPkt
 			select {
 			case lp = <-b.legCh:
-			case <-b.dead:
+			case <-dead:
 				// 收工信号：阻塞读退出（device 关 Bind 时会停；这里返回错误让循环结束）
 				return 0, net.ErrClosed
 			}
@@ -500,6 +528,14 @@ func (b *ServerBind) Open(port uint16) ([]conn.ReceiveFunc, uint16, error) {
 	b.c.Store(c)
 	actual := uint16(c.LocalAddr().(*net.UDPAddr).Port)
 	b.legInit()
+	// 换代收工信号：上一世代的腿侧读循环/聚合接收随旧信号退出（BindUpdate 的
+	// Close→Open 循环语义；此前 dead 由 legInit 建一次，Once 化的 Close 会让
+	// 第二轮 Close 变 no-op——socket 不关、接收 goroutine 卡死，实测踩过）。
+	b.closeDead()
+	b.deadMu.Lock()
+	b.dead_ = make(chan struct{})
+	dead := b.dead_
+	b.deadMu.Unlock()
 	fn := func(packets [][]byte, sizes []int, eps []conn.Endpoint) (int, error) {
 		n, src, err := c.ReadFromUDPAddrPort(packets[0])
 		if err != nil {
@@ -512,7 +548,7 @@ func (b *ServerBind) Open(port uint16) ([]conn.ReceiveFunc, uint16, error) {
 		copy(buf, packets[0][:n])
 		return b.processPacket(packets, sizes, eps, buf, src)
 	}
-	return []conn.ReceiveFunc{fn, b.legReceiveFunc()}, actual, nil
+	return []conn.ReceiveFunc{fn, b.legReceiveFunc(dead)}, actual, nil
 }
 
 // processPacket：一个入站 UDP 包的完整解析（主 socket 与中继数据腿共用）。
@@ -654,27 +690,21 @@ func (b *ServerBind) logfD(format string, args ...any) {
 	b.logf(format, args...)
 }
 
-// Close 收工（幂等，#8/#38：sync.Once 保证并发 Close 不重入；收工后腿操作 no-op）。
+// Close 收工。**可重复、可重开**（wireguard-go 的 BindUpdate 就是 Close→Open 循环，
+// review #8 的幂等 = 并发/重复调用不 panic、不漏关；不是「只执行一次」）：
+// 关当前世代的收工信号（腿侧读循环退出）+ 全部腿 + 主 socket。Open 会重建信号。
 func (b *ServerBind) Close() error {
-	b.closeOnce.Do(func() {
-		if b.dead != nil {
-			select {
-			case <-b.dead:
-			default:
-				close(b.dead)
-			}
-		}
-		b.legMu.Lock()
-		for _, lg := range b.legByID {
-			_ = lg.sock.Close()
-		}
-		b.legByID = map[uint64]*relayLeg{}
-		b.legByR = map[netip.AddrPort]*relayLeg{}
-		b.legMu.Unlock()
-		if c := b.c.Load(); c != nil {
-			_ = c.Close()
-		}
-	})
+	b.closeDead()
+	b.legMu.Lock()
+	for _, lg := range b.legByID {
+		_ = lg.sock.Close()
+	}
+	b.legByID = map[uint64]*relayLeg{}
+	b.legByR = map[netip.AddrPort]*relayLeg{}
+	b.legMu.Unlock()
+	if c := b.c.Load(); c != nil {
+		_ = c.Close()
+	}
 	return nil
 }
 

@@ -114,6 +114,34 @@ type DeviceTable struct {
 
 	entries map[proto.DevTag]*dentry
 	pool    *ipPool
+
+	// opMu：设备配置操作（AddPeer/RemovePeer=IpcSet）的串行锁。这些操作拿的是
+	// wireguard device 的内部锁——**绝不能在 ReceiveFunc 里同步等它**：device.Close
+	// 的收工会等 ReceiveFunc 退出、而 IpcSet 在等 device 的锁，互为环就是死锁
+	//（实测：注册恰好落在收工窗口时整套测试挂死）。applyDeviceOp 把操作丢到后台
+	// 串行执行、调用方只做有界等待。
+	opMu sync.Mutex
+}
+
+// devOpTimeout：applyDeviceOp 的等待上界。正常 IpcSet 是微秒级；超时只发生在
+// 「设备正在收工」的窗口——放弃等待让 ReceiveFunc 能返回（操作仍在后台排队，
+// 收工后自然完成或随设备一起消亡）。
+const devOpTimeout = 2 * time.Second
+
+// applyDeviceOp：后台串行执行一个设备配置操作，调用方有界等待。
+func (t *DeviceTable) applyDeviceOp(op func()) {
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		t.opMu.Lock()
+		defer t.opMu.Unlock()
+		op()
+	}()
+	select {
+	case <-done:
+	case <-time.After(devOpTimeout):
+		t.logf("peer: ⚠️ 设备配置操作 %v 未完成（设备收工中的锁竞争）—— 调用方不再等待（操作已排队）", devOpTimeout)
+	}
 }
 
 // tunnelBase：冲突兜底地址池基址（/16，逐 /32 分配）。正常路径不用池，见 assignIPLocked。
@@ -214,19 +242,24 @@ func (t *DeviceTable) Register(reg []byte, now time.Time) (Result, error) {
 			t.logf("peer: ~ dev=%s refresh (idle=%s) n=%d/%d", devShort(devTag), roundDur(res.Idle), len(t.entries), t.max)
 			return res, nil
 		}
-		// 身份轮换：先移除旧 peer 再写新的 —— 顺序固定，避免旧 allowed_ip 悬空。
+		// 身份轮换：先移除旧 peer 再写新的 —— 顺序固定，避免旧 allowed_ip 悬空
+		//（两步包进同一个后台 op，串行保序）。
 		oldPub, oldIP, oldTunIP := e.pub, e.ip, e.tunIP
-		if rerr := t.cfg.RemovePeer(oldPub); rerr != nil {
-			t.logf("peer: ! dev=%s rotate 移除旧 peer（pub=%s）失败：%v", devShort(devTag), pubShort(oldPub), rerr)
-		}
+		t.applyDeviceOp(func() {
+			if rerr := t.cfg.RemovePeer(oldPub); rerr != nil {
+				t.logf("peer: ! dev=%s rotate 移除旧 peer（pub=%s）失败：%v", devShort(devTag), pubShort(oldPub), rerr)
+			}
+		})
 		t.pool.Release(oldIP)
 		t.pool.Release(oldTunIP)
 		ip := t.assignIPLocked(secret, pubkey, devTag)
 		tunIP := t.assignTunIPLocked(secret, pubkey, devTag)
 		e.pub, e.psk, e.ip, e.tunIP, e.lastReg = pubkey, psk, ip, tunIP, now
-		if aerr := t.cfg.AddPeer(PeerConfig{Pubkey: pubkey, PSK: psk, TunnelIP: ip, TunIP: tunIP}); aerr != nil {
-			t.logf("peer: ! dev=%s rotate 写入新 peer（pub=%s）失败：%v", devShort(devTag), pubShort(pubkey), aerr)
-		}
+		t.applyDeviceOp(func() {
+			if aerr := t.cfg.AddPeer(PeerConfig{Pubkey: pubkey, PSK: psk, TunnelIP: ip, TunIP: tunIP}); aerr != nil {
+				t.logf("peer: ! dev=%s rotate 写入新 peer（pub=%s）失败：%v", devShort(devTag), pubShort(pubkey), aerr)
+			}
+		})
 		res := Result{DevTag: devTag, Pubkey: pubkey, TunnelIP: ip, Action: ActionRotated,
 			OldPubkey: oldPub, OldIP: oldIP, Idle: now.Sub(prev)}
 		t.logf("peer: ~ dev=%s rotate pub=%s→%s ip=%v→%v n=%d/%d",
@@ -244,9 +277,11 @@ func (t *DeviceTable) Register(reg []byte, now time.Time) (Result, error) {
 	tunIP := t.assignTunIPLocked(secret, pubkey, devTag)
 	e := &dentry{dev: devTag, pub: pubkey, psk: psk, ip: ip, tunIP: tunIP, lastReg: now, createdAt: now}
 	t.entries[devTag] = e
-	if aerr := t.cfg.AddPeer(PeerConfig{Pubkey: pubkey, PSK: psk, TunnelIP: ip, TunIP: tunIP}); aerr != nil {
-		t.logf("peer: ! dev=%s 写入 peer（pub=%s）失败：%v", devShort(devTag), pubShort(pubkey), aerr)
-	}
+	t.applyDeviceOp(func() {
+		if aerr := t.cfg.AddPeer(PeerConfig{Pubkey: pubkey, PSK: psk, TunnelIP: ip, TunIP: tunIP}); aerr != nil {
+			t.logf("peer: ! dev=%s 写入 peer（pub=%s）失败：%v", devShort(devTag), pubShort(pubkey), aerr)
+		}
+	})
 	if other, ok := t.findByPubLocked(pubkey, devTag); ok {
 		t.logf("peer: ! pub=%s 同时登记在 dev=%s 与 dev=%s（疑似同一身份被两台设备使用：克隆/迁移过应用数据？）",
 			pubShort(pubkey), devShort(other), devShort(devTag))
@@ -384,9 +419,12 @@ func (t *DeviceTable) removeLocked(e *dentry) {
 	delete(t.entries, e.dev) // map 删除带显式 found 语义（下面 Release 幂等）
 	t.pool.Release(e.ip)
 	t.pool.Release(e.tunIP) // 双地址时代的池归还（#16；非池地址 Release 是 no-op）
-	if err := t.cfg.RemovePeer(e.pub); err != nil {
-		t.logf("peer: ! dev=%s 移除 peer（pub=%s）失败：%v", devShort(e.dev), pubShort(e.pub), err)
-	}
+	pub := e.pub
+	t.applyDeviceOp(func() {
+		if err := t.cfg.RemovePeer(pub); err != nil {
+			t.logf("peer: ! dev=%s 移除 peer（pub=%s）失败：%v", devShort(e.dev), pubShort(pub), err)
+		}
+	})
 }
 
 // Len 当前设备数。
