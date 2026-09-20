@@ -186,7 +186,9 @@ func (b *ServerBind) RegisterLeg(id uint64, remote netip.AddrPort) error {
 	lg := &relayLeg{id: id, remote: remote, sock: sock}
 	lg.last.Store(time.Now().UnixMilli())
 	b.legMu.Lock()
-	if len(b.legByID) >= relayLegMax {
+	// 上限只拦「新 id」（review C3）：对已有 id 的重放/重建是替换语义，满员时
+	// 若先拦后换，中继 replay 会把活跃会话的腿拒之门外。
+	if _, exists := b.legByID[id]; !exists && len(b.legByID) >= relayLegMax {
 		b.legMu.Unlock()
 		_ = sock.Close()
 		return fmt.Errorf("腿数已达上限 %d", relayLegMax)

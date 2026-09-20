@@ -153,12 +153,12 @@ func (r *Relay) controlConn(c net.Conn) {
 	r.replaySessions(lg, cc)
 	defer func() {
 		r.detachControl(lg, cc)
-		// 孤儿清理：控制断开时腿若既无 UDP 注册（verified=false 且无 addr）也无新
-		// 控制连接，就是纯控制 leg 的尸体——从表里摘掉，防泄漏。
+		// 孤儿清理（review C2 收敛）：纯控制腿的尸体——既无 UDP 注册（verified=false
+		// 且无 addr）也无新控制连接，**且没有任何活跃会话**——才立即删。有会话的腿
+		// 留给 reapLoop 的 LegTimeout 路径（90s）：控制 TCP 瞬断时立刻删腿会让该
+		// 后端全部会话的上行立刻被丢（下行还挂在 assoc 上），比留到超时更伤。
 		r.mu.Lock()
-		if lg.ctl == nil && !lg.verified && !lg.addr.IsValid() {
-			// 纯控制腿的尸体（无 UDP 注册、无新控制连接）：从表里摘掉防泄漏。
-			// ctlVerified 的腿走 reapLoop 的 LegTimeout 路径。
+		if lg.ctl == nil && !lg.verified && !lg.addr.IsValid() && r.countAssocsLocked(lg.label) == 0 {
 			delete(r.legs, lg.label)
 		}
 		r.mu.Unlock()
@@ -247,6 +247,13 @@ func (r *Relay) replaySessions(lg *leg, cc *ctlConn) {
 	var msgs [][]byte
 	for _, a := range r.assocs {
 		if a.key.label != lg.label {
+			continue
+		}
+		if a.sid == 0 {
+			// 兼容路径会话（控制断开期间建立的 fallback，走 lg.addr 的旧转发）：
+			// 不重放（review C1）——多条 id=0 的 SESSION 会让后端 RegisterLeg(0,…)
+			// 互相顶掉（同 id 替换），「重放一条、打断其余」；且 id=0 永远等不到
+			// RELEASE，只能靠后端 3min 空闲回收兜。
 			continue
 		}
 		port := uint16(a.sock.LocalAddr().(*net.UDPAddr).Port)

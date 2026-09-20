@@ -119,7 +119,7 @@ func readLine(r *bufio.Reader) (string, error) {
 
 type Stats struct {
 	dialOK, dialFail, flows, rejected uint64
-	udpReplied, udpNoReply             uint64 // 转发出去的 UDP 会话：收到过回包 / 只有上行（实测 UDP 可用性）
+	udpReplied, udpNoReply            uint64 // 转发出去的 UDP 会话：收到过回包 / 只有上行（实测 UDP 可用性）
 }
 
 func (s *Stats) IncrOK()   { atomic.AddUint64(&s.dialOK, 1) }

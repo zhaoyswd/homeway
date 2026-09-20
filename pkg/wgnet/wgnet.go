@@ -169,7 +169,7 @@ func (n *Net) Close() error {
 
 func (n *Net) MTU() (int, error) { return n.mtu, nil }
 
-func (n *Net) BatchSize() int   { return 1 }
+func (n *Net) BatchSize() int { return 1 }
 
 // Stack 暴露底层 gVisor 栈（过境拦截层挂 SetTransportProtocolHandler 用；
 // 别处不要绕过 Net 的拨号/监听面直接操作栈）。

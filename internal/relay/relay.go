@@ -566,6 +566,7 @@ func (r *Relay) assocReadLoop(a *assoc) {
 			return
 		}
 		pkt := buf[:n]
+		from = unmap(from) // 与 readLoop 同款：4in6 映射形态统一成 v4，否则后续比较恒不等
 		r.mu.Lock()
 		if a.dialUp {
 			a.dialUp = false
@@ -581,11 +582,14 @@ func (r *Relay) assocReadLoop(a *assoc) {
 			if string(pkt) == "LEGUP" {
 				continue // 纯标记，不转发
 			}
-		} else if a.backend != from {
-			// 常态源校正（review B5）：后端腿的 NAT 映射漂移（重拨/换网）时，
-			// 不更新的话下行会持续发往死地址、而客户端发包让 a.last 一直新鲜——
-			// 会话半死到空闲回收。源变化即跟随（腿由后端拨出，能从此地址发来
-			// 即证明可达）。
+		} else if a.dialed && a.backend != from {
+			// 常态源校正（review B5）：**只对拨腿会话**（a.dialed）生效——后端腿的
+			// NAT 映射漂移（重拨/换网）时，不更新的话下行会持续发往死地址、而客户端
+			// 发包让 a.last 一直新鲜——会话半死到空闲回收。源变化即跟随（腿由后端
+			// 拨出，能从此地址发来即证明可达）。
+			// fallback 会话（sid==0，backend 恒为 lg.addr）不跟随：它的"源变化"
+			// 属于 UDP 注册腿换源，由 forwardUp 的既有重建路径处理（曾因 4in6 形态
+			// 差异被误改写 → 误判漂移 → 误重建，测试 TestControlReplaySkipsFallbackAssocs 抓到）。
 			a.backend = from
 			r.mu.Unlock()
 			r.cfg.Logf("中继：会话 #%d 的后端腿源漂移 → %v（跟随）", a.sid, from)

@@ -86,11 +86,11 @@ type udpRelay struct {
 	// newSock：给每个会话开一条到目标的通道（出口用 = 绑卡直连或经代理；nil = 系统默认直连）。
 	// 入参是该会话的目标地址（工厂按家族建 udp4/udp6）。
 	newSock func(netip.AddrPort) (UDPConn, error)
-	idle      time.Duration
-	st        *Stats
-	pc        net.PacketConn
-	logf      func(format string, args ...any)
-	seq       atomic.Uint64
+	idle    time.Duration
+	st      *Stats
+	pc      net.PacketConn
+	logf    func(format string, args ...any)
+	seq     atomic.Uint64
 
 	mu       sync.Mutex
 	sessions map[string]*udpSession

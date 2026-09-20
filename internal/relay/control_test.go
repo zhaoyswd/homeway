@@ -292,3 +292,77 @@ func ctlWithSub(typ byte, payload []byte) []byte {
 	out = append(out, payload...)
 	return out
 }
+
+// 控制断开期间建立的 fallback 会话（sid==0，走 lg.addr 旧路径）在控制重连后
+// 不被 replay 误伤（review C1）：重放必须跳过 sid==0，否则 RegisterLeg(0,…)
+// 同 id 互相顶掉、腿被关，原本跑得好的会话被打断。
+func TestControlReplaySkipsFallbackAssocs(t *testing.T) {
+	r := startRelay(t, Config{})
+	relayAddr := netip.AddrPortFrom(netip.MustParseAddr("127.0.0.1"), r.LocalAddr().Port())
+
+	// 后端 A：UDP 注册腿（无控制面）——兼容形态。
+	be := newFakeBackend(t, relayAddr)
+	if !be.register() {
+		t.Fatal("UDP 注册失败")
+	}
+	cli := newFakeClient(t, be.label, relayAddr)
+	cli.send([]byte("fallback-flow"))
+	payload, from, ok := be.readData(2 * time.Second)
+	if !ok || string(payload) != "fallback-flow" {
+		t.Fatalf("fallback 会话不通：payload=%q ok=%v", payload, ok)
+	}
+	// 回程确认会话健康
+	if _, err := be.pc.WriteToUDPAddrPort([]byte("R-fb"), from); err != nil {
+		t.Fatal(err)
+	}
+	if got, ok := cli.readData(2 * time.Second); !ok || string(got) != "R-fb" {
+		t.Fatalf("fallback 回程失败：%q ok=%v", got, ok)
+	}
+
+	// 同一公钥身份（同一 label）再挂一条控制连接（模拟重连/换代）：
+	// 鉴权需要私钥证明——复用 be 的私钥。
+	conn, err := net.DialTimeout("tcp", relayAddr.String(), 3*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	if err := proto.CtlWriteMsg(conn, proto.EncodeRelayHello(be.pub)); err != nil {
+		t.Fatal(err)
+	}
+	_ = conn.SetReadDeadline(time.Now().Add(3 * time.Second))
+	typ, pl, rerr := proto.CtlReadMsg(conn)
+	if rerr != nil || typ != proto.RelaySubChallenge {
+		t.Fatalf("等 CHALLENGE: %v", rerr)
+	}
+	ephPub, nonce, _ := proto.DecodeRelayChallenge(ctlWithSub(typ, pl))
+	dh, _ := curve25519.X25519(be.priv[:], ephPub[:])
+	if err := proto.CtlWriteMsg(conn, proto.EncodeRelayProof(nonce, dh, be.pub, nil)); err != nil {
+		t.Fatal(err)
+	}
+	typ, _, rerr = proto.CtlReadMsg(conn)
+	if rerr != nil || typ != proto.RelaySubOK {
+		t.Fatalf("等 OK: typ=0x%02x err=%v", typ, rerr)
+	}
+
+	// 重放（OK 后立即发生）：sid==0 的 fallback 会话**不得**出现在通告里。
+	_ = conn.SetReadDeadline(time.Now().Add(500 * time.Millisecond))
+	for {
+		typ, pl, rerr := proto.CtlReadMsg(conn)
+		if rerr != nil {
+			break // 读空 = 没有被误放的通告
+		}
+		if typ == proto.RelayCtlSession {
+			if sess, serr := proto.DecodeCtlSession(ctlWithSub(typ, pl)); serr == nil && sess.ID == 0 {
+				t.Fatal("replay 把 sid==0 的 fallback 会话也重放了（C1 回归）")
+			}
+		}
+	}
+
+	// fallback 会话应仍然健康（腿没被误拨/误关）。
+	cli.send([]byte("still-ok"))
+	payload, from, ok = be.readData(2 * time.Second)
+	if !ok || string(payload) != "still-ok" {
+		t.Fatalf("replay 后 fallback 会话被打断：payload=%q ok=%v", payload, ok)
+	}
+	_ = from
+}

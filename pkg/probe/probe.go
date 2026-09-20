@@ -58,7 +58,7 @@ type Response struct {
 	Type  byte
 	Nonce [8]byte
 	Build string
-	Flags byte            // 出口能力位（type=ping；老出口不回这一段 ⇒ 0）
+	Flags byte           // 出口能力位（type=ping；老出口不回这一段 ⇒ 0）
 	Seen  netip.AddrPort // type=hint：后端看到的客户端源地址
 }
 
