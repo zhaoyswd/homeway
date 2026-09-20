@@ -1,19 +1,7 @@
-// homeway-relay：Homeway 中继——多租户注册腿 + per-client 分配式转发 + hint 控制帧。
+// CLI：中继（relay）角色的命令行入口。由 cmd/homeway 按角色分发调用。
 //
-//	homeway-relay                                  # 零参数即可：端口自动挑（冲突就 +1），启动即打印中继 token
-//	homeway-relay --advertise a.b.c.d:port         # 有公网 IP 时给出对外地址（写进 token）
-//	homeway-relay --state <dir>                    # 换身份才需要（默认 ~/.config/homeway-relay）
-//
-// **凭据方向**（2026-09-19 与用户定的口径）：中继启动时生成/加载自己的鉴权密钥，
-// 并打印一个 **中继 token（rl1…）**，内容 = 中继地址 + 该密钥。后端拿 token 启动：
-//
-//	homewayd --relay 'rl1…'
-//
-// 于是中继侧**不需要预先知道任何后端身份**：换后端、换身份都不用动中继配置、更不用重启。
-//
-// 定位：中继是**路径而不是参与方**——只见密文、零 WG 感知、零业务落盘
-// （--state 只存自己的鉴权密钥，重启不变 ⇒ token 稳定）。
-package main
+// 本文件只做参数解析、密钥加载与 token 打印，转发逻辑在 relay.go。
+package relay
 
 import (
 	"context"
@@ -27,25 +15,57 @@ import (
 	"path/filepath"
 	"strings"
 	"syscall"
+	"time"
 
-	"github.com/zhaoyswd/homeway/internal/relay"
 	"github.com/zhaoyswd/homeway/pkg/egress"
 	"github.com/zhaoyswd/homeway/pkg/proto"
 )
 
-// version 由 CI 用 -ldflags "-X main.version=<tag>" 注入（必须是 var：-X 对 const 无效）。
-var version = "0.0.0-dev"
+// CLI 解析中继参数并启动，阻塞到进程收到 SIGINT/SIGTERM。
+func CLI(args []string) error {
+	fs := flag.NewFlagSet("homeway relay", flag.ExitOnError)
+	state := fs.String("state", defaultStateDir(), "state 目录（存中继鉴权密钥；重启不变 ⇒ token 稳定）")
+	listen := fs.String("listen", ":41641", "监听地址（UDP）")
+	advertise := fs.String("advertise", "", "token 里公布的中继地址（逗号分隔 host:port；默认用本机网卡地址）")
+	fs.Usage = func() {
+		fmt.Fprintln(os.Stderr, `用法：
+  homeway relay                            # 零参数启动；启动日志里的「中继 token（rl1…）」给出口用
+  homeway relay --advertise a.b.c.d:port   # 公网机才需要：指定 token 里公布的对外地址`)
+		fs.PrintDefaults()
+	}
+	_ = fs.Parse(args)
+	if rest := fs.Args(); len(rest) > 0 {
+		// 本角色**没有子命令**：位置参数一定是写错了。早先文档里写过并不存在的 `token` 子命令，
+		// 它被静默忽略、把中继又起了一遍（还占了另一个端口）。宁可报错。
+		return fmt.Errorf("不认识的参数：%v（直接 `homeway relay [--advertise …]` 即可，没有子命令）", rest)
+	}
 
-func main() {
-	args := os.Args[1:]
-	if len(args) > 0 && (args[0] == "--version" || args[0] == "version") {
-		fmt.Println("homeway-relay", version)
-		return
+	secret, created, err := loadSecret(*state)
+	if err != nil {
+		return err
 	}
-	if err := cmdServe(args); err != nil {
-		fmt.Fprintln(os.Stderr, "homeway-relay:", err)
-		os.Exit(1)
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	r := New(Config{
+		Addr:   *listen,
+		Secret: secret,
+		Logf:   logf,
+	})
+	if created {
+		logf("已生成中继鉴权密钥（%s/relay.key，0600）—— 重启不变，token 因此稳定", *state)
 	}
+	return r.RunWithReady(ctx, func(actual netip.AddrPort) {
+		token, eps, terr := buildToken(secret, *advertise, actual.Port())
+		if terr != nil {
+			logf("⚠️ token 生成失败（%v）—— 后端可用裸地址走开放模式", terr)
+			return
+		}
+		logf("中继 token：%s", token)
+		logf("  端点 %v ｜ 后端这样用：homeway exit --relay '%s'", eps, token)
+		if allPrivate(eps) {
+			logf("  ⚠️ 公布的地址都在内网：公网中继请加 --advertise <公网IP:端口>")
+		}
+	})
 }
 
 func defaultStateDir() string {
@@ -75,56 +95,6 @@ func loadSecret(stateDir string) ([32]byte, bool, error) {
 		return secret, false, err
 	}
 	return secret, true, nil
-}
-
-func cmdServe(args []string) error {
-	fs := flag.NewFlagSet("homeway-relay", flag.ExitOnError)
-	state := fs.String("state", defaultStateDir(), "state 目录（存中继鉴权密钥；重启不变 ⇒ token 稳定）")
-	listen := fs.String("listen", ":41641", "监听地址（UDP）")
-	advertise := fs.String("advertise", "", "token 里公布的中继地址（逗号分隔 host:port；默认用本机网卡地址）")
-	fs.Usage = func() {
-		fmt.Fprintln(os.Stderr, `用法：
-  homeway-relay                            # 零参数启动；启动日志里的「中继 token（rl1…）」给后端用
-  homeway-relay --advertise a.b.c.d:port   # 公网机才需要：指定 token 里公布的对外地址`)
-		fs.PrintDefaults()
-	}
-	_ = fs.Parse(args)
-	if rest := fs.Args(); len(rest) > 0 {
-		// 本程序**没有子命令**：位置参数一定是写错了。早先文档里写过并不存在的 `token` 子命令，
-		// 它被静默忽略、把中继又起了一遍（还占了另一个端口）。宁可报错。
-		return fmt.Errorf("不认识的参数：%v（直接 `homeway-relay [--advertise …]` 即可，没有子命令）", rest)
-	}
-
-	secret, created, err := loadSecret(*state)
-	if err != nil {
-		return err
-	}
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer stop()
-	r := relay.New(relay.Config{
-		Addr:   *listen,
-		Secret: secret,
-		Logf:   logf,
-	})
-	if created {
-		logf("已生成中继鉴权密钥（%s/relay.key，0600）—— 重启不变，token 因此稳定", *state)
-	}
-	// 绑定之后再打 token：端口冲突会自动退让，token 里必须是**实际**端口。
-	go func() {
-		<-ctx.Done()
-	}()
-	return r.RunWithReady(ctx, func(actual netip.AddrPort) {
-		token, eps, terr := buildToken(secret, *advertise, actual.Port())
-		if terr != nil {
-			logf("⚠️ token 生成失败（%v）—— 后端可用裸地址走开放模式", terr)
-			return
-		}
-		logf("中继 token：%s", token)
-		logf("  端点 %v ｜ 后端这样用：homewayd --relay '%s'", eps, token)
-		if allPrivate(eps) {
-			logf("  ⚠️ 公布的地址都在内网：公网中继请加 --advertise <公网IP:端口>")
-		}
-	})
 }
 
 // buildToken：把中继地址（--advertise 优先，否则本机物理网卡地址）+ 端口 + 鉴权密钥编成 rl1 token。
@@ -200,20 +170,6 @@ func buildToken(secret [32]byte, advertise string, port uint16) (string, []strin
 	return tok, addrs, err
 }
 
-// portOf：从 --listen（如 ":41741" 或 "0.0.0.0:41741"）里取端口。
-func portOf(listen string) uint16 {
-	_, p, err := net.SplitHostPort(listen)
-	if err != nil {
-		return 41641
-	}
-	var n uint16
-	_, _ = fmt.Sscanf(p, "%d", &n)
-	if n == 0 {
-		n = 41641
-	}
-	return n
-}
-
 // allPrivate：公布的地址全在内网吗（提醒加 --advertise）。
 func allPrivate(addrs []string) bool {
 	for _, a := range addrs {
@@ -240,5 +196,6 @@ func splitList(v string) []string {
 }
 
 func logf(format string, args ...any) {
-	fmt.Printf("[homeway-relay] "+format+"\n", args...)
+	// 带时间戳：跨端排障（手机核日志 ↔ 中继日志）必须能对时刻（与 homewayd 同口径）。
+	fmt.Printf(time.Now().Format("2006-01-02 15:04:05.000 ")+"[homeway-relay] "+format+"\n", args...)
 }

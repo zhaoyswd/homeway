@@ -1,14 +1,7 @@
-// homewayd：Homeway 后端（出口）——WG 端点 + token 签发 + 流服务（files / 终端 / 端口转发目标）。
+// CLI：出口（exit）角色的命令行入口。由 cmd/homeway 按角色分发调用。
 //
-//	homewayd                     # 零参数即可：UPnP/STUN 默认开，WG socket 自动挑卡，端口冲突自动退让，
-//	                             # 启动即打印客户端 token（粘进 App 的「添加主机」）
-//	homewayd --relay 'rl1…'      # 需要中继时只多这一个参数（中继 token 由 homeway-relay 启动时打印）
-//	homewayd --state <dir>       # 换身份/换端口才需要（默认 ~/.config/homeway）
-//
-// 设计口径（2026-09-19 与用户定）：**不要生成/查询类命令**。出口的身份、token 台账、
-// 实际监听端口、已公布的公网端点全部是 state 目录里的文件；token 由 serve 自己打印
-// （启动时 + 端点变化时），要看当前值就读日志，不另设命令。
-package main
+// 本文件只做参数解析与调用 Run，不含任何数据面逻辑。
+package server
 
 import (
 	"context"
@@ -21,34 +14,14 @@ import (
 	"strings"
 	"syscall"
 	"time"
-
-	"github.com/zhaoyswd/homeway/internal/server"
 )
 
-// version 由 CI 用 -ldflags "-X main.version=<tag>" 注入（必须是 var：-X 对 const 无效）。
-var version = "0.0.0-dev"
-
-func main() {
-	args := os.Args[1:]
-	if len(args) > 0 && (args[0] == "--version" || args[0] == "version") {
-		fmt.Println("homewayd", version)
-		return
-	}
-	// 裸 `homewayd` = `homewayd serve`（用户口径：普通用户不需要任何参数）。
-	if len(args) > 0 && args[0] == "serve" {
-		args = args[1:]
-	}
-	if err := serve(args); err != nil {
-		fmt.Fprintln(os.Stderr, "homewayd:", err)
-		os.Exit(1)
-	}
-}
-
-func serve(args []string) error {
-	fs := flag.NewFlagSet("homewayd", flag.ExitOnError)
-	stateDir := fs.String("state", defaultStateDir(), "state 目录（身份密钥 + token 台账）")
+// CLI 解析出口参数并启动，阻塞到进程收到 SIGINT/SIGTERM。
+func CLI(args []string) error {
+	fs := flag.NewFlagSet("homeway exit", flag.ExitOnError)
+	stateDir := fs.String("state", defaultStateDir(), "state 目录（身份密钥 + token 台账；换身份/多开才需要）")
 	listen := fs.Uint("listen", 41641, "WG 监听端口（被占用自动退让）")
-	relayServer := fs.String("relay", "", "中继 token（rl1…，由 homeway-relay 启动时打印；空 = 不用中继）")
+	relayServer := fs.String("relay", "", "中继 token（rl1…，由 `homeway relay` 启动时打印；空 = 不用中继）")
 	bindIface := fs.String("bind-interface", "auto", "WG socket 钉哪张卡：auto（默认，探针自动挑能出网的物理网卡）/ none（不绑，走系统默认路由）/ 网卡名 / IP 字面量")
 	upnp := fs.Bool("upnp", true, "向路由器申请 UDP 端口映射（默认开；--upnp=false 关）")
 	stunServer := fs.String("stun", "stun.cloudflare.com:3478", "STUN 服务器（观测 IPv4 公网映射；空 = 关）")
@@ -58,16 +31,18 @@ func serve(args []string) error {
 	verbose := fs.Bool("verbose", false, "打印 wireguard-go 详细日志（排障用）")
 	fs.Usage = func() {
 		fmt.Fprintln(os.Stderr, `用法：
-  homewayd                     # 零参数启动；启动日志里的「客户端 token」就是手机要粘的地址
-  homewayd --relay 'rl1…'      # 需要中继时只加这一个参数`)
+  homeway                      # 零参数启动出口；启动日志里的「客户端 token」就是手机要粘的地址
+  homeway exit                 # 同上（显式角色）
+  homeway exit --relay 'rl1…'  # 需要中继时只加这一个参数
+  homeway relay                # 启动中继（homeway relay --help）`)
 		fs.PrintDefaults()
 	}
 	fs.Parse(args)
 	if rest := fs.Args(); len(rest) > 0 {
-		// 没有子命令（`serve` 在上面已经剥掉）：多出来的位置参数一定是写错了。
-		// 这条是**实测踩出来的**：`homewayd foo` 会被当成裸启动，真的起一个出口
+		// 没有子命令：多出来的位置参数一定是写错了。
+		// 这条是**实测踩出来的**：`homeway foo` 会被当成裸启动，真的起一个出口
 		// （抢不到 41641 就退让），还会把真出口的 UPnP 映射改成指向它自己。宁可报错。
-		return fmt.Errorf("不认识的参数：%v（直接 `homewayd [--relay 'rl1…']` 即可，没有其它子命令）", rest)
+		return fmt.Errorf("不认识的参数：%v（直接 `homeway [--relay 'rl1…']` 即可，没有其它子命令）", rest)
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -76,7 +51,7 @@ func serve(args []string) error {
 	if err != nil {
 		return err
 	}
-	return server.Run(ctx, server.ServeConfig{
+	return Run(ctx, ServeConfig{
 		StateDir:   *stateDir,
 		ListenPort: uint16(*listen),
 		Verbose:    *verbose,
@@ -98,24 +73,24 @@ func serve(args []string) error {
 //	none / off：不绑（走系统默认路由）。TUN 型代理抢默认路由的机器上不要用；
 //	网卡名（如 en0）：显式钉这张，换网时按名字重解析；
 //	IPv4/IPv6 字面量：单栈绑该地址（历史上用于绕开 Surge 抢路由）。
-func resolveBind(v string) (netip.Addr, *net.Interface, server.BindMode, error) {
+func resolveBind(v string) (netip.Addr, *net.Interface, BindMode, error) {
 	v = strings.TrimSpace(v)
 	switch strings.ToLower(v) {
 	case "", "auto":
-		return netip.Addr{}, nil, server.BindAuto, nil
+		return netip.Addr{}, nil, BindAuto, nil
 	case "none", "off", "no":
-		return netip.Addr{}, nil, server.BindOff, nil
+		return netip.Addr{}, nil, BindOff, nil
 	}
 	if ip, err := netip.ParseAddr(v); err == nil {
-		return ip, nil, server.BindOff, nil
+		return ip, nil, BindOff, nil
 	}
 	ifi, err := net.InterfaceByName(v)
 	if err != nil {
 		// 名字写错/网卡暂时不在：**告警后退回 auto**（探针挑一张能出网的），不让出口起不来。
 		logf("⚠️ --bind-interface %q 找不到（%v）—— 退回 auto（自动挑卡）", v, err)
-		return netip.Addr{}, nil, server.BindAuto, nil
+		return netip.Addr{}, nil, BindAuto, nil
 	}
-	return netip.Addr{}, ifi, server.BindExplicit, nil
+	return netip.Addr{}, ifi, BindExplicit, nil
 }
 
 func defaultStateDir() string {
@@ -124,8 +99,4 @@ func defaultStateDir() string {
 		return "./homeway-state"
 	}
 	return home + "/.config/homeway"
-}
-
-func logf(format string, args ...any) {
-	fmt.Printf("[homewayd] "+format+"\n", args...)
 }

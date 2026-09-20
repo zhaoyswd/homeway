@@ -53,18 +53,18 @@ jobs:
           # windows 的 -o 不会自动补 .exe，显式带上（否则打包时找不到文件）
           EXT=""
           [ "${GOOS}" = "windows" ] && EXT=".exe"
-          # 产物直接放包根：解出来就是两个二进制，用户不用先 cd 进子目录（2026-09-20 用户要求）
+          # 单二进制（exit / relay 按子命令区分）。产物直接放包根：解出来就是可执行文件，
+          # 用户不用先 cd 进子目录。
           mkdir -p dist
-          go build -trimpath -ldflags "${LDFLAGS}" -o "dist/homewayd${EXT}" ./cmd/homewayd
-          go build -trimpath -ldflags "${LDFLAGS}" -o "dist/homeway-relay${EXT}" ./cmd/homeway-relay
+          go build -trimpath -ldflags "${LDFLAGS}" -o "dist/homeway${EXT}" ./cmd/homeway
           cd dist
           ARCH="${GOARCH}${GOARM}"
           BASE="homeway_${VERSION#v}_${GOOS}_${ARCH}"
           if [ "${GOOS}" = "windows" ]; then
-            zip -q "${BASE}.zip" "homewayd${EXT}" "homeway-relay${EXT}"
+            zip -q "${BASE}.zip" "homeway${EXT}"
             sha256sum "${BASE}.zip" > "${BASE}.zip.sha256"
           else
-            tar czf "${BASE}.tar.gz" homewayd homeway-relay
+            tar czf "${BASE}.tar.gz" homeway
             sha256sum "${BASE}.tar.gz" > "${BASE}.tar.gz.sha256"
           fi
           ls -l
@@ -91,10 +91,11 @@ jobs:
         run: |
           set -euo pipefail
           tar xzf homeway_*_linux_amd64.tar.gz
-          ./homewayd --version
-          ./homeway-relay --version
-          ./homewayd --help >/dev/null 2>&1 || true
-          ./homeway-relay --version | grep -q '^homeway-relay '
+          ./homeway --version | grep -q '^homeway '
+          ./homeway relay --version | grep -q '^homeway '
+          ./homeway --help >/dev/null 2>&1 || true
+          ./homeway exit --help >/dev/null 2>&1 || true
+          ./homeway relay --help >/dev/null 2>&1 || true
 
   release:
     needs: smoke

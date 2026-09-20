@@ -1,7 +1,11 @@
 # 3.11 / 阿里云出口的容器形态（对应 tailcat 时代的 scratch 镜像）。
 # 用法（在仓库根，先在宿主编出 linux 二进制）：
-#   GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -trimpath -ldflags "-s -w" -o build/homewayd ./cmd/homewayd
+#   GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -trimpath -ldflags "-s -w" -o build/homeway ./cmd/homeway
 #   docker build -f Dockerfile.scratch -t homeway:<tag> .
+#
+# 单二进制按角色运行：默认（无参数）= 出口；要跑中继就传 `relay`：
+#   docker run -d --name homeway-exit  --network host ... homeway:<tag>
+#   docker run -d --name homeway-relay --network host ... homeway:<tag> relay --advertise 1.2.3.4:41741
 FROM scratch
-COPY build/homewayd /homewayd
-ENTRYPOINT ["/homewayd"]
+COPY build/homeway /homeway
+ENTRYPOINT ["/homeway"]
