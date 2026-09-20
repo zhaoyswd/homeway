@@ -132,7 +132,10 @@ func TestDeviceTableCapEvictsOnlyStale(t *testing.T) {
 	if _, err := tb.Register(regFor(pubN(1), devN(1), t0), t0); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := tb.Register(regFor(pubN(2), devN(2), t0), t0); err != nil {
+	// dev2 比 dev1 晚 30s 注册：同为失联时「最旧 = dev1」是确定的。
+	//（同刻注册的两台在 map 迭代序下淘汰谁随机——曾让本用例在全包跑时偶发红。）
+	t1 := t0.Add(30 * time.Second)
+	if _, err := tb.Register(regFor(pubN(2), devN(2), t1), t1); err != nil {
 		t.Fatal(err)
 	}
 	// 2 分钟后两台都超过 grace：第三个设备应淘汰最旧的（dev1），不拒绝
@@ -172,7 +175,10 @@ func TestDeviceTableFullRejectsWhenAllActive(t *testing.T) {
 	if _, err := tb.Register(regFor(pubN(1), devN(1), t0), t0); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := tb.Register(regFor(pubN(2), devN(2), t0), t0); err != nil {
+	// dev2 比 dev1 晚 30s 注册：同为失联时「最旧 = dev1」是确定的。
+	//（同刻注册的两台在 map 迭代序下淘汰谁随机——曾让本用例在全包跑时偶发红。）
+	t1 := t0.Add(30 * time.Second)
+	if _, err := tb.Register(regFor(pubN(2), devN(2), t1), t1); err != nil {
 		t.Fatal(err)
 	}
 	// 全部在宽限期内：拒绝新设备，绝不淘汰在线设备

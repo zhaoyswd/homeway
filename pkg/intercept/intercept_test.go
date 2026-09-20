@@ -15,6 +15,7 @@ import (
 	"net"
 	"net/netip"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -61,6 +62,28 @@ type harness struct {
 	in       *Interceptor
 	dialed   []string
 	dialErr  map[string]error
+
+	logMu sync.Mutex
+	logs  []string
+}
+
+// logf：拦截回调（非测试协程）唯一的日志出口——锁内收集；测试体收尾用
+// dumpLogs 输出。不直接 t.Logf：测试结束后回调仍可能打日志，与 testing
+// 框架回收 common 存在数据竞争（-race 偶发红）。
+func (h *harness) logf(f string, a ...any) {
+	h.logMu.Lock()
+	h.logs = append(h.logs, fmt.Sprintf(f, a...))
+	h.logMu.Unlock()
+}
+
+func (h *harness) dumpLogs(t *testing.T) {
+	t.Helper()
+	h.logMu.Lock()
+	for _, l := range h.logs {
+		t.Logf("[exit] %s", l)
+	}
+	h.logs = nil
+	h.logMu.Unlock()
 }
 
 // newHarness：客户端（HandleLocal:true）+ 服务端（HandleLocal:false，挂拦截）。
@@ -90,7 +113,7 @@ func newHarness(t *testing.T, dialOverride func(ctx context.Context, network, ad
 		Dial:     dial,
 		TCPIdle:  30 * time.Second,
 		UDPIdle:  30 * time.Second,
-		Logf:     func(f string, a ...any) { t.Logf(f, a...) },
+		Logf:     h.logf,
 	}, nil)
 	if err != nil {
 		t.Fatalf("attach: %v", err)
@@ -168,6 +191,7 @@ func TestTransitTCP(t *testing.T) {
 			closed <- fmt.Sprint(a...)
 		}
 	}
+	defer h.dumpLogs(t)
 	c, err := h.cli.DialTCPAddrPort(netip.MustParseAddrPort(foreignDst + ":443"))
 	if err != nil {
 		t.Fatalf("dial: %v", err)

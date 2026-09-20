@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"net"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -56,7 +57,10 @@ func TestWatchBindSwitchesWhenProbeFails(t *testing.T) {
 // 指纹变化的判据：索引/地址变了就重新钉（显式模式按名字重解析）。
 func TestWatchBindRepinsOnIfaceChange(t *testing.T) {
 	cur := &net.Interface{Name: "en0", Index: 6, Flags: net.FlagUp}
-	state := ifaceState{index: 6, up: true, addrs: "192.0.2.12/24"}
+	// state 会被 watchBind 协程（State 回调）与测试主线并发读写——atomic.Pointer
+	// 同步（此前 -race 报「81 行写 vs 回调 67 行读」的数据竞争）。
+	state := atomic.Pointer[ifaceState]{}
+	state.Store(&ifaceState{index: 6, up: true, addrs: "192.0.2.12/24"})
 	repinned := make(chan string, 4)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -64,7 +68,7 @@ func TestWatchBindRepinsOnIfaceChange(t *testing.T) {
 		Explicit: cur,
 		Resolve:  func(context.Context) (*net.Interface, error) { return cur, nil },
 		Probe:    func(context.Context, *net.Interface) error { return nil },
-		State:    func(*net.Interface) ifaceState { return state },
+		State:    func(*net.Interface) ifaceState { return *state.Load() },
 		Repin:    func(ifi *net.Interface) error { repinned <- ifi.Name; return nil },
 		Logf:     func(string, ...any) {},
 		Interval: 10 * time.Millisecond,
@@ -78,7 +82,7 @@ func TestWatchBindRepinsOnIfaceChange(t *testing.T) {
 		t.Fatalf("指纹没变不该重钉，实际重钉了 %s", name)
 	default:
 	}
-	state = ifaceState{index: 6, up: true, addrs: "192.168.3.99/24"} // IP 变了
+	state.Store(&ifaceState{index: 6, up: true, addrs: "192.168.3.99/24"}) // IP 变了
 	if got := waitName(t, repinned); got != "en0" {
 		t.Fatalf("指纹变化应重钉，实际 %s", got)
 	}

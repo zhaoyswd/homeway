@@ -161,11 +161,16 @@ func New(cfg Config) *Relay {
 }
 
 // LocalAddr 监听地址（Run 之后可用；测试里取随机端口）。
+// pc 的跨协程访问只有 Run 写 / 这里读：持 r.mu 同步（曾在 -race 下报
+// Run 写 vs 测试轮询 LocalAddr 读的竞争）。
 func (r *Relay) LocalAddr() netip.AddrPort {
-	if r.pc == nil {
+	r.mu.Lock()
+	pc := r.pc
+	r.mu.Unlock()
+	if pc == nil {
 		return netip.AddrPort{}
 	}
-	if ua, ok := r.pc.LocalAddr().(*net.UDPAddr); ok {
+	if ua, ok := pc.LocalAddr().(*net.UDPAddr); ok {
 		return ua.AddrPort()
 	}
 	return netip.AddrPort{}
@@ -193,7 +198,9 @@ func (r *Relay) Run(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	r.mu.Lock()
 	r.pc = pc
+	r.mu.Unlock()
 	if r.onReady != nil {
 		r.onReady(netip.AddrPortFrom(netip.Addr{}, uint16(pc.LocalAddr().(*net.UDPAddr).Port)))
 	}
