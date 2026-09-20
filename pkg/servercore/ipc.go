@@ -27,9 +27,11 @@ func NewIPCConfigurer(dev *device.Device) Configurer { return &ipcConfigurer{dev
 // 避免再被"复活"。如果将来要做"手机冻结期间也保持会话"，正确的位置是**手机侧**开 persistent
 // keepalive（NAT 后的一侧），不是这里。
 func (d *ipcConfigurer) AddPeer(pc PeerConfig) error {
+	// 两个 /32：隧道 IP（核心自连/注册）+ 应用面 IP（L3 transit 的源/回程目的，
+	// l3-exit-intercept D4）。同派生、同登记，收发两向的路由都唯一。
 	return d.dev.IpcSet(fmt.Sprintf(
-		"public_key=%s\npreshared_key=%s\nallowed_ip=%s/32\n",
-		hex.EncodeToString(pc.Pubkey[:]), hex.EncodeToString(pc.PSK[:]), pc.TunnelIP))
+		"public_key=%s\npreshared_key=%s\nallowed_ip=%s/32\nallowed_ip=%s/32\n",
+		hex.EncodeToString(pc.Pubkey[:]), hex.EncodeToString(pc.PSK[:]), pc.TunnelIP, pc.TunIP))
 }
 
 func (d *ipcConfigurer) RemovePeer(pub [32]byte) error {

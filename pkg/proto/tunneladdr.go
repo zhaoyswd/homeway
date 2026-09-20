@@ -30,3 +30,17 @@ func DeriveTunnelIP(secret [32]byte, pubkey [32]byte) netip.Addr {
 	v := (uint32(sum[0])<<8|uint32(sum[1]))%(65535-1) + 1 // 1..65534
 	return netip.AddrFrom4([4]byte{100, 64, byte(v >> 8), byte(v)})
 }
+
+// DeriveTunIP：同一设备的应用面（VpnConfig/TUN）地址——l3-exit-intercept 的
+// 「第二派生地址」。为什么需要两个：hub 按目的地址分流（隧道 IP → 核心自连的
+// B 栈，其余 → TUN），若 TUN 地址 == 隧道 IP，应用回程包会被当成核心自连的回包
+// 送进 B 栈、应用永远收不到（端到端测试当场抓到）。两个地址都登记进后端 peer 的
+// allowed_ip（ipc.AddPeer），派生确定性相同（secret + pubkey + 不同标签）。
+func DeriveTunIP(secret [32]byte, pubkey [32]byte) netip.Addr {
+	h := hmac.New(sha256.New, secret[:])
+	h.Write([]byte("hw-app"))
+	h.Write(pubkey[:])
+	sum := h.Sum(nil)
+	v := (uint32(sum[2])<<8|uint32(sum[3]))%(65535-1) + 1 // 1..65534
+	return netip.AddrFrom4([4]byte{100, 64, byte(v >> 8), byte(v)})
+}

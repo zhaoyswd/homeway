@@ -43,14 +43,26 @@ type Net struct {
 	mtu      int
 }
 
-// Create 装配 netstack：SACK 开、Nagle 关。
+// Opts：CreateOpts 的可选项。HandleLocal 见 gVisor stack.Options 同名项——
+// **过境拦截侧必须关**：开了会把「混杂模式下临时端点覆盖源地址检查」变成
+// 所有外来包都被判成 martian 丢弃（ipv4.HandlePacket 的 HandleLocal 分支）。
+type Opts struct {
+	HandleLocal bool
+}
+
+// Create 装配 netstack：SACK 开、Nagle 关（手机侧默认形态，HandleLocal 开）。
 func Create(localAddresses []netip.Addr, mtu int) (tun.Device, *Net, error) {
+	return CreateOpts(localAddresses, mtu, Opts{HandleLocal: true})
+}
+
+// CreateOpts：带选项装配（出口过境拦截侧用 HandleLocal:false）。
+func CreateOpts(localAddresses []netip.Addr, mtu int, opts Opts) (tun.Device, *Net, error) {
 	n := &Net{
 		ep: channel.New(1024, uint32(mtu), ""),
 		stack: stack.New(stack.Options{
 			NetworkProtocols:   []stack.NetworkProtocolFactory{ipv4.NewProtocol, ipv6.NewProtocol},
 			TransportProtocols: []stack.TransportProtocolFactory{tcp.NewProtocol, udp.NewProtocol, icmp.NewProtocol4, icmp.NewProtocol6},
-			HandleLocal:        true,
+			HandleLocal:        opts.HandleLocal,
 		}),
 		events:   make(chan tun.Event, 10),
 		incoming: make(chan *buffer.View),
@@ -157,7 +169,11 @@ func (n *Net) Close() error {
 
 func (n *Net) MTU() (int, error) { return n.mtu, nil }
 
-func (n *Net) BatchSize() int { return 1 }
+func (n *Net) BatchSize() int   { return 1 }
+
+// Stack 暴露底层 gVisor 栈（过境拦截层挂 SetTransportProtocolHandler 用；
+// 别处不要绕过 Net 的拨号/监听面直接操作栈）。
+func (n *Net) Stack() *stack.Stack { return n.stack }
 
 // ---------- 拨号/监听面（自管端点：每个 TCP 端点逐个关 Nagle） ----------
 //

@@ -15,6 +15,7 @@ import (
 	"github.com/zhaoyswd/homeway/pkg/egress"
 	"github.com/zhaoyswd/homeway/pkg/files"
 	"github.com/zhaoyswd/homeway/pkg/flows"
+	"github.com/zhaoyswd/homeway/pkg/intercept"
 	"github.com/zhaoyswd/homeway/pkg/proto"
 	"github.com/zhaoyswd/homeway/pkg/servercore"
 	"github.com/zhaoyswd/homeway/pkg/term"
@@ -116,12 +117,15 @@ type Server struct {
 	bindIface *net.Interface     // 本轮实际钉住的网卡（auto 挑出来的或显式给的；nil = 不绑）
 	priv      [32]byte           // WG 静态私钥（中继注册腿要用它做挑战响应）
 	secret    [32]byte           // token 凭证种子（打客户端 token 用）
-	relayEp   proto.Endpoint     // serve --relay 给的中继端点（打客户端 token 时带上）
+	relayEp    proto.Endpoint    // serve --relay 给的中继端点（打客户端 token 时带上）
+	relayWanted bool             // --relay 解析成功：token 未并入中继端点前不打印（只打最终形态）
 	tokMu     sync.Mutex
 	lastToken string             // 上次打印过的客户端 token（变了才重打）
 	udpCap    *udpCapState       // 默认路径的 UDP 能力（周期探测；探测应答里回报）
 	stopTCP func()
 	stopUDP func()
+	// stopIntercept：过境拦截层收工（关会话通知；栈随 tunDev 生命周期回收）。
+	stopIntercept func()
 	pubKick chan struct{} // 公网端点探测的"立即重测"信号（换网事件踢）
 	filesLn net.Listener
 	files   *files.Server
@@ -132,10 +136,12 @@ type Server struct {
 // Start 装配并启动（非阻塞）。
 func Start(cfg ServeConfig) (*Server, error) {
 	cfg.fill()
-	st, err := OpenState(cfg.StateDir)
+	st, err := OpenState(cfg.StateDir) // MkdirAll：debug.log 依赖目录先存在
 	if err != nil {
 		return nil, err
 	}
+	// 两级日志在 state 目录就绪后立起来：细节写 <state>/debug.log。
+	initDebugLogClose = initDebugLog(cfg.StateDir, cfg.Verbose)
 	priv, err := st.PrivateKey()
 	if err != nil {
 		return nil, err
@@ -144,8 +150,25 @@ func Start(cfg ServeConfig) (*Server, error) {
 	if err != nil {
 		return nil, err
 	}
+	if len(secrets) == 0 {
+		// 零参首启（全新 state 目录、没有 tokens.jsonl）：先签发一条凭证并落台账。
+		// 不然启动时打印的客户端 token 会带**全零 Secret**（出口自己的 reg 验证
+		// 也不认它——台账里根本没这条），生来无效（2026-09-20 实测踩中：裸启动
+		// 新目录后打出的 token 手机无法连接）。台账里的 endpoints 字段仅信息性，
+		// 实际验证只读 secrets；真正的客户端 token 由 printClientToken 用实时
+		// 端点 + 这把 secret 铸出。
+		if _, ierr := st.IssueToken(nil); ierr != nil {
+			return nil, fmt.Errorf("state: 初始凭证签发失败: %w", ierr)
+		}
+		if secrets, err = st.Secrets(); err != nil || len(secrets) == 0 {
+			return nil, fmt.Errorf("state: 初始凭证签发后仍读不到（%v）", err)
+		}
+	}
 
-	tunDev, ns, err := wgnet.Create([]netip.Addr{cfg.TunnelIP}, 1280)
+	// 过境拦截栈（l3-exit-intercept）：HandleLocal 必须关（混杂+spoofing 的前提，
+	// 见 pkg/intercept 包注释）；老 flows 客户端由「监听挪真实 127.0.0.1 + 豁免转投」
+	// 继续服务（换代完成后移除）。
+	tunDev, ns, err := wgnet.CreateOpts([]netip.Addr{cfg.TunnelIP}, 1280, wgnet.Opts{HandleLocal: false})
 	if err != nil {
 		return nil, err
 	}
@@ -167,6 +190,17 @@ func Start(cfg ServeConfig) (*Server, error) {
 		}
 	}
 	s := &Server{cfg: cfg, Stats: &flows.Stats{}}
+	inter, ierr := intercept.Attach(ns, intercept.Config{
+		TunnelIP: cfg.TunnelIP,
+		MaxConns: cfg.FlowMaxConns,
+		TCPIdle:  cfg.FlowIdle,
+		Logf:     dlogf,
+	}, s.Stats)
+	if ierr != nil {
+		tunDev.Close()
+		return nil, ierr
+	}
+	s.stopIntercept = inter.Close
 	s.bindIface = resolvedIf
 	s.priv = priv
 	if len(secrets) > 0 {
@@ -180,7 +214,7 @@ func Start(cfg ServeConfig) (*Server, error) {
 	if buildTag == "" {
 		buildTag = "homewayd-dev"
 	}
-	sbind := &servercore.ServerBind{Logf: logf, Build: buildTag, BindAddr: cfg.BindAddr, BindIface: resolvedIf,
+	sbind := &servercore.ServerBind{Logf: logf, LogfD: dlogf, Build: buildTag, BindAddr: cfg.BindAddr, BindIface: resolvedIf,
 		Caps: func() byte { return s.UDPCapFlags() }}
 	s.bind = sbind
 	s.dev = device.NewDevice(tunDev, sbind, device.NewLogger(level, "homewayd"))
@@ -188,9 +222,9 @@ func Start(cfg ServeConfig) (*Server, error) {
 		MaxDevices: cfg.MaxDevices,
 		TTL:        cfg.PeerTTL,
 	})
-	s.Table.SetLogger(logf)
+	s.Table.SetLogger(dlogf)
 	peerCap, peerTTL, peerGrace := s.Table.Limits()
-	logf("peer 表：设备表就绪（cap=%d，ttl=%v，grace=%v；按 devTag 记账/刷新/轮换）", peerCap, peerTTL, peerGrace)
+	dlogf("peer 表：设备表就绪（cap=%d，ttl=%v，grace=%v；按 devTag 记账/刷新/轮换）", peerCap, peerTTL, peerGrace)
 	// token 台账热加载：serve 自己重签 token（端点变化时）后，新 secret 立刻可用，
 	// 不需要重启出口（见 PeerTable.reload 的注释）。
 	s.Table.SetSecretsReloader(st.Secrets)
@@ -201,6 +235,22 @@ func Start(cfg ServeConfig) (*Server, error) {
 		return nil, err
 	}
 
+	// 中继注册腿（--relay）：从 WG socket 出站注册，NAT 后的出口由此可被客户端到达。
+	// 参数可以是 **中继 token（rl1…，含地址 + 鉴权密钥）** 或裸 host:port（开放模式）。
+	// ⚠️ 必须在 StartPublicEndpoint 的结果落地前把 relayEp 配好（2026-09-20 用户口径：
+	// 指定了 --relay 就不该先打一个**不带中继端点**的 token）——此前这段排在后面，
+	// STUN 快时 token 会先打一版无中继的、再重打一版带中继的。
+	if cfg.Relay != "" {
+		relayAddr, relaySecret, rerr := ParseRelayArg(cfg.Relay)
+		if rerr == nil {
+			s.relayEp = proto.Endpoint{Addr: relayAddr.String(), Relay: true}
+			s.relayWanted = true
+			startRelayLeg(context.Background(), s.bind, relayAddr, s.priv, wgPub(s.priv), relaySecret, logf)
+		} else {
+			logf("⚠️ --relay 解析失败（%v）—— 跳过中继注册", rerr)
+		}
+	}
+
 	// 公网端点自动公布（UPnP 映射 + 同 socket STUN 观测；两条证据一致才写 public_endpoint.txt）。
 	// 必须放在 IpcSet 之后：device 到这一刻才打开 Bind（socket 有了端口，STUN 才有意义）。
 	s.StartPublicEndpoint(context.Background(), PublicOpts{
@@ -208,7 +258,10 @@ func Start(cfg ServeConfig) (*Server, error) {
 		Pinned: cfg.BindAddr.IsValid() || resolvedIf != nil, Logf: logf,
 	})
 
-	tcpLn, err := ns.ListenTCPAddrPort(netip.AddrPortFrom(cfg.TunnelIP, cfg.FlowPort))
+	// 兼容期 flows 监听（l3-exit-intercept 前）：挪到真实 127.0.0.1——注册了
+	// SetTransportProtocolHandler 后 netstack 内的 listener 不再收包，老客户端
+	// 发往 隧道IP:7800/7801 的流由拦截层的豁免规则转投到这里。新客户端不再用 flows。
+	tcpLn, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", cfg.FlowPort))
 	if err != nil {
 		s.dev.Close()
 		return nil, err
@@ -226,7 +279,7 @@ func Start(cfg ServeConfig) (*Server, error) {
 		s.dev.Close()
 		return nil, err
 	}
-	udpPC, err := ns.ListenUDPAddrPort(netip.AddrPortFrom(cfg.TunnelIP, cfg.UDPFlowPort))
+	udpPC, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: int(cfg.UDPFlowPort)})
 	if err != nil {
 		s.stopTCP()
 		s.dev.Close()
@@ -234,7 +287,7 @@ func Start(cfg ServeConfig) (*Server, error) {
 	}
 	// UDP 中继：长会话（QUIC/游戏）+ 会话级日志（建立/关闭各一行，含双向包数——
 	// 真机判断「QUIC 到底通没通」就靠这一行，逐包细节不在这里）。
-	udpOpts := []flows.UDPOption{flows.WithUDPLog(logf)}
+	udpOpts := []flows.UDPOption{flows.WithUDPLog(dlogf)}
 	s.stopUDP, _ = flows.ServeUDP(udpPC, s.Stats, udpOpts...)
 
 	// files 原生协议服务：只监听本机回环（客户端经内部流的 CONNECT 让后端按本机网络重拨到这里）。
@@ -245,7 +298,7 @@ func Start(cfg ServeConfig) (*Server, error) {
 	if err != nil {
 		logf("⚠️ files 根目录不可用（%v）—— 文件管理会报错，其余功能不受影响", err)
 	} else {
-		fsrv.SetLogger(logf)
+		fsrv.SetLogger(dlogf)
 		fln, lerr := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", cfg.FilesPort))
 		if lerr != nil {
 			fsrv.Close()
@@ -267,7 +320,7 @@ func Start(cfg ServeConfig) (*Server, error) {
 	if term.Disabled() {
 		logf("term 服务被 HOMEWAY_TERM=off 关闭")
 	} else {
-		tsrv := term.New(logf)
+		tsrv := term.New(dlogf)
 		tln, terr := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", cfg.TermPort))
 		if terr != nil {
 			// 与 files 同一取舍：可选服务起不来不影响隧道/转发。
@@ -303,6 +356,9 @@ func Start(cfg ServeConfig) (*Server, error) {
 
 // Close 收工（幂等性由各层保证；stop 函数可重复调用部分由调用方保证单次）。
 func (s *Server) Close() {
+	if s.stopIntercept != nil {
+		s.stopIntercept()
+	}
 	if s.stopUDP != nil {
 		s.stopUDP()
 	}
@@ -324,7 +380,19 @@ func (s *Server) Close() {
 	if s.termSrv != nil {
 		s.termSrv.Close()
 	}
+	closeDebugLog()
 }
+
+// closeDebugLog 收工时关细节日志（幂等）。
+func closeDebugLog() {
+	if c := initDebugLogClose; c != nil {
+		c()
+		initDebugLogClose = nil
+	}
+}
+
+// initDebugLogClose Start 里挂上的细节日志收工函数（进程只有一个 Server 实例）。
+var initDebugLogClose func()
 
 // Run 阻塞直到 ctx 结束。
 func Run(ctx context.Context, cfg ServeConfig) error {
@@ -351,19 +419,8 @@ func Run(ctx context.Context, cfg ServeConfig) error {
 	pub6 := PubFromPriv(s.priv)
 	logf("后端身份：标签 %x ｜公钥 %x…", label, pub6[:6])
 
-	// 中继注册腿（--relay）：从 WG socket 出站注册，NAT 后的出口由此可被客户端到达。
-	// 参数可以是 **中继 token（rl1…，含地址 + 鉴权密钥）** 或裸 host:port（开放模式）。
-	if cfg.Relay != "" {
-		relayAddr, relaySecret, rerr := ParseRelayArg(cfg.Relay)
-		if rerr == nil {
-			s.relayEp = proto.Endpoint{Addr: relayAddr.String(), Relay: true}
-			startRelayLeg(ctx, s.bind, relayAddr, s.priv, wgPub(s.priv), relaySecret, logf)
-		} else {
-			logf("⚠️ --relay 解析失败（%v）—— 跳过中继注册", rerr)
-		}
-	}
 	// 默认路径能不能承载 UDP：周期探测 + 探测应答里回报（转发流量一律走默认路由，这是它的属性）。
-	s.startUDPCapProbe(ctx, logf)
+	s.startUDPCapProbe(ctx, dlogf)
 	// 设备表周期回收：只清「超过 TTL 没有成功注册」的失联设备（在线设备被客户端周期注册刷新，
 	// 不会误收）。10 分钟一拍、±10% 抖动；TTL<=0 时这个 goroutine 直接返回。
 	go s.Table.RunGC(ctx, 10*time.Minute)
@@ -468,7 +525,9 @@ func wgPub(priv [32]byte) [32]byte {
 }
 
 func logf(format string, args ...any) {
-	fmt.Printf("[homewayd] "+format+"\n", args...)
+	// 带时间戳：跨端排障（手机核日志 ↔ 出口日志）必须能对时刻——之前没有时间戳，
+	// 只能靠叙事顺序对齐（2026-09-20 排查「直连时好时坏」时的实痛）。
+	fmt.Printf(time.Now().Format("2006-01-02 15:04:05.000 ")+"[homewayd] "+format+"\n", args...)
 }
 
 var _ = wgtypes.Key{} // 保留引用

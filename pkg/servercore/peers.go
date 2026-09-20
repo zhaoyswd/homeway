@@ -32,6 +32,9 @@ type PeerConfig struct {
 	Pubkey   [32]byte
 	PSK      [32]byte
 	TunnelIP netip.Addr // 100.64.0.0/16 内 /32
+	// TunIP 应用面地址（l3-exit-intercept D4 的第二派生地址）：
+	// L3 transit 的源/回程目的，与 TunnelIP 一起登记 allowed_ip。
+	TunIP netip.Addr
 }
 
 // Configurer 把表项落到 WG device（生产实现包 IpcSet；测试用 fake）。
@@ -215,7 +218,7 @@ func (t *DeviceTable) Register(reg []byte, now time.Time) (Result, error) {
 		t.pool.Release(oldIP)
 		ip := t.assignIPLocked(secret, pubkey, devTag)
 		e.pub, e.psk, e.ip, e.lastReg = pubkey, psk, ip, now
-		if aerr := t.cfg.AddPeer(PeerConfig{Pubkey: pubkey, PSK: psk, TunnelIP: ip}); aerr != nil {
+		if aerr := t.cfg.AddPeer(PeerConfig{Pubkey: pubkey, PSK: psk, TunnelIP: ip, TunIP: proto.DeriveTunIP(secret, pubkey)}); aerr != nil {
 			t.logf("peer: ! dev=%s rotate 写入新 peer（pub=%s）失败：%v", devShort(devTag), pubShort(pubkey), aerr)
 		}
 		res := Result{DevTag: devTag, Pubkey: pubkey, TunnelIP: ip, Action: ActionRotated,
@@ -234,7 +237,7 @@ func (t *DeviceTable) Register(reg []byte, now time.Time) (Result, error) {
 	ip := t.assignIPLocked(secret, pubkey, devTag)
 	e := &dentry{dev: devTag, pub: pubkey, psk: psk, ip: ip, lastReg: now, createdAt: now}
 	t.entries[devTag] = e
-	if aerr := t.cfg.AddPeer(PeerConfig{Pubkey: pubkey, PSK: psk, TunnelIP: ip}); aerr != nil {
+	if aerr := t.cfg.AddPeer(PeerConfig{Pubkey: pubkey, PSK: psk, TunnelIP: ip, TunIP: proto.DeriveTunIP(secret, pubkey)}); aerr != nil {
 		t.logf("peer: ! dev=%s 写入 peer（pub=%s）失败：%v", devShort(devTag), pubShort(pubkey), aerr)
 	}
 	if other, ok := t.findByPubLocked(pubkey, devTag); ok {
