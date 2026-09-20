@@ -51,6 +51,13 @@ type ServerBind struct {
 	stunWait *stunPending
 	pinMu    sync.Mutex
 	pinned   *net.Interface // 当前实际钉住的网卡（Open 时设置，Repin 时更新）
+
+	// srcSeen：入站**新源**首包的排障记录（单读 goroutine 访问，无需锁）。
+	// 背景（2026-09-20 排查「直连时好时坏」）：出口对陌生/解不开的包零记录，
+	// 「包没到出口」「到了但回程被手机 NAT 过滤」「到了但没回」三个断点一个都看不到。
+	// 每个新来源只记一行首包（含 WG 消息类型），正常流量零噪音；
+	// 手机换 NAT 映射后的第一发直连握手必落一行 —— 直连路径到达性从此有据可查。
+	srcSeen map[netip.AddrPort]bool
 }
 
 // Repin 按**名字**重新解析网卡并把它重新钉到当前 socket 上（换网/接口索引变化后调用）。
@@ -224,6 +231,7 @@ func (b *ServerBind) Open(port uint16) ([]conn.ReceiveFunc, uint16, error) {
 		// STUN 观测：只认事务 ID 匹配的应答，消耗掉不进 device（见 STUNQuery）。
 		if stunLooksLikeResponse(buf) {
 			if b.deliverSTUN(buf) {
+				b.noteNewSrc(src, "STUN应答", n)
 				return 0, nil
 			}
 		}
@@ -235,6 +243,7 @@ func (b *ServerBind) Open(port uint16) ([]conn.ReceiveFunc, uint16, error) {
 				caps = b.Caps()
 			}
 			if resp := probe.Respond(buf, src, b.Build, caps); resp != nil {
+			b.noteNewSrc(src, "参照点探测", n)
 			_, _ = c.WriteToUDPAddrPort(resp, src)
 			return 0, nil
 		}
@@ -242,20 +251,24 @@ func (b *ServerBind) Open(port uint16) ([]conn.ReceiveFunc, uint16, error) {
 		if len(buf) > 0 && buf[0] == 0xBB {
 			typ, payload, err := proto.DecodeFrame(buf)
 			if err != nil {
+				b.noteNewSrc(src, "畸形腿帧", n)
 				return 0, nil // 畸形腿帧：丢弃不中断（fn 返回 0 会继续被调用）
 			}
 			switch typ {
 			case proto.FrameTypeData:
+				b.noteNewSrc(src, "腿帧数据", n)
 				sizes[0] = len(payload)
 				copy(packets[0], payload)
 				eps[0] = srvEP{src}
 				return 1, nil
 			case proto.FrameTypeReg:
+				b.noteNewSrc(src, "腿帧注册", n)
 				if _, err := b.Table.Register(payload, nowTime()); err != nil {
 					b.logf("reg 腿帧被拒（来源 %v）：%v", src, err)
 				}
 				return 0, nil
 			case proto.FrameTypeControl:
+				b.noteNewSrc(src, "腿帧控制", n)
 				if b.OnHint != nil {
 					if addr, err := proto.DecodeHintPayload(payload); err == nil {
 						b.OnHint(addr)
@@ -264,6 +277,7 @@ func (b *ServerBind) Open(port uint16) ([]conn.ReceiveFunc, uint16, error) {
 				return 0, nil
 			default:
 				// 中继控制帧（type≥3）等留给钩子；没钩子就按前向兼容忽略。
+				b.noteNewSrc(src, fmt.Sprintf("腿帧type=%d", typ), n)
 				if b.OnLegFrame != nil && b.OnLegFrame(typ, payload, src) {
 					return 0, nil
 				}
@@ -272,6 +286,11 @@ func (b *ServerBind) Open(port uint16) ([]conn.ReceiveFunc, uint16, error) {
 		}
 
 		if reg, rest, ok := proto.SplitDirectReg(buf); ok {
+			shape := "直连reg搭车"
+			if len(rest) > 0 {
+				shape += "+" + wgMsgName(rest[0])
+			}
+			b.noteNewSrc(src, shape, n)
 			if _, err := b.Table.Register(reg, nowTime()); err != nil {
 				b.logf("reg 搭车被拒（来源 %v）：%v", src, err)
 				return 0, nil
@@ -283,11 +302,45 @@ func (b *ServerBind) Open(port uint16) ([]conn.ReceiveFunc, uint16, error) {
 		}
 
 		// 直连裸 WG
+		shape := "直连裸WG"
+		if n > 0 {
+			shape = "直连裸" + wgMsgName(buf[0])
+		}
+		b.noteNewSrc(src, shape, n)
 		sizes[0] = n
 		eps[0] = srvEP{src}
 		return 1, nil
 	}
 	return []conn.ReceiveFunc{fn}, actual, nil
+}
+
+// wgMsgName：WG 报文类型码 → 可读名（首包日志用；type 见 wireguard 规范）。
+func wgMsgName(b byte) string {
+	switch b {
+	case 1:
+		return "WG握手发起"
+	case 2:
+		return "WG握手应答"
+	case 3:
+		return "WG cookie"
+	case 4:
+		return "WG传输数据"
+	}
+	return "非WG"
+}
+
+// noteNewSrc：入站新源的首包一行（每个来源只记一次）。shape 描述这包的形态。
+// 收到「WG握手发起」却迟迟不形成会话 = 出口侧密钥/注册问题；一个新源都没有 =
+// 包死在半路（手机网络/运营商/路由器映射）——这两类从此一眼可分。
+func (b *ServerBind) noteNewSrc(src netip.AddrPort, shape string, n int) {
+	if b.srcSeen == nil {
+		b.srcSeen = make(map[netip.AddrPort]bool)
+	}
+	if b.srcSeen[src] {
+		return
+	}
+	b.srcSeen[src] = true
+	b.logf("入站新源：%v（%s，%d 字节）", src, shape, n)
 }
 
 func (b *ServerBind) Close() error {
