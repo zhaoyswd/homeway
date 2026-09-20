@@ -39,7 +39,7 @@ func TestRelayLegEndToEnd(t *testing.T) {
 	label := proto.RelayID(pub)
 	sbind := &servercore.ServerBind{
 		Logf:  func(f string, a ...any) { t.Logf("[backend] "+f, a...) },
-		Table: servercore.NewPeerTable(nil, [][32]byte{{1}}, 8, 0),
+		Table: servercore.NewDeviceTable(nil, [][32]byte{{1}}, servercore.DeviceConfig{MaxDevices: 8}),
 	}
 	fns, port, err := sbind.Open(0)
 	if err != nil {

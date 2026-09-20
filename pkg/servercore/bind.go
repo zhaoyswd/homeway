@@ -28,7 +28,7 @@ var nowTime = time.Now
 // 中继负责把回程包包装成腿帧发回客户端）。
 type ServerBind struct {
 	Port   uint16
-	Table  *PeerTable
+	Table  *DeviceTable
 	Build  string            // 探测应答里回报的构建标记（就绪行/排障用）
 	// Caps：探测应答里回报的能力位（bit0 = 出口默认路径可承载 UDP；nil 或未探过 = 0）。
 	// 用函数而不是值：UDP 能力是**周期性探测**的结论，运行期会变（换网/代理开关）。
@@ -252,7 +252,7 @@ func (b *ServerBind) Open(port uint16) ([]conn.ReceiveFunc, uint16, error) {
 				return 1, nil
 			case proto.FrameTypeReg:
 				if _, err := b.Table.Register(payload, nowTime()); err != nil {
-					b.logf("reg 腿帧验证失败（来源 %v）：%v", src, err)
+					b.logf("reg 腿帧被拒（来源 %v）：%v", src, err)
 				}
 				return 0, nil
 			case proto.FrameTypeControl:
@@ -273,7 +273,7 @@ func (b *ServerBind) Open(port uint16) ([]conn.ReceiveFunc, uint16, error) {
 
 		if reg, rest, ok := proto.SplitDirectReg(buf); ok {
 			if _, err := b.Table.Register(reg, nowTime()); err != nil {
-				b.logf("reg 搭车验证失败（来源 %v）：%v", src, err)
+				b.logf("reg 搭车被拒（来源 %v）：%v", src, err)
 				return 0, nil
 			}
 			sizes[0] = len(rest)

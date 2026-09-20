@@ -77,8 +77,10 @@ func TestHintRoundTrip(t *testing.T) {
 
 func TestSplitDirectReg(t *testing.T) {
 	var secret, pubkey [32]byte
+	var devTag DevTag
 	pubkey[0] = 7
-	reg := EncodeReg(secret, pubkey, time.Now())
+	devTag[0] = 0x33
+	reg := EncodeReg(secret, pubkey, devTag, time.Now())
 	wgPkt := []byte{1, 0, 0, 0, 0x5a, 0x5a}
 	joined := append(append([]byte{}, reg...), wgPkt...)
 
@@ -86,7 +88,7 @@ func TestSplitDirectReg(t *testing.T) {
 	if !ok || len(gotReg) != len(reg) || string(rest) != string(wgPkt) {
 		t.Fatalf("ok=%v reg=%d rest=%v", ok, len(gotReg), rest)
 	}
-	if _, err := VerifyReg(secret, gotReg, time.Now(), 0); err != nil {
+	if _, _, err := VerifyReg(secret, gotReg, time.Now(), 0); err != nil {
 		t.Fatalf("拆出的 reg 校验失败: %v", err)
 	}
 	if _, _, ok := SplitDirectReg(wgPkt); ok {

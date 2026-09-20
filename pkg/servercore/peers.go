@@ -1,8 +1,10 @@
 package servercore
 
 import (
-	"container/list"
-	"fmt"
+	"context"
+	"encoding/hex"
+	"errors"
+	"math/rand"
 	"net/netip"
 	"sync"
 	"time"
@@ -10,17 +12,26 @@ import (
 	"github.com/zhaoyswd/homeway/pkg/proto"
 )
 
-// 动态 peer 表（wg-native-stack tasks 3.2）。
-// lazyPeers 三条教训全带上：cap + LRU、TTL、显式 found 标志（netip 零值哨兵坑）。
+// 设备表（2026-09-20 起，取代按 WG 公钥为键的动态 peer 表）。
 //
-// 表项由 reg 报文驱动：VerifyReg 过 → 不存在则登记（AddPeer + 隧道 IP 分配），
-// 已存在则刷新 lastReg 并置 LRU 头。重放无害：旧公钥没有对应私钥，握手无法完成，
-// 重复 reg 只刷新时间戳。TTL 过期由 GC（或下次 Register 惰性触发）清理。
+// 为什么要换代：客户端身份从前是「每隧道世代一把临时密钥」，而旧表以公钥为键、按「上次注册时间」
+// 做 LRU —— 于是每次重连都占一个新名额，表满后淘汰的永远是「注册最老」的那条，而它恰好可能是
+// 一台长连、仍在线的设备（老 ≠ 死）。实测：A 长连 + B 重连 8 次 ⇒ A 被 RemovePeer，黑洞 2–4 分钟。
+//
+// 现在的语义（与 openspec/changes/device-identity-persist 的 spec 一一对应）：
+//   - 键 = 注册报文里的设备标签 devTag（设备本地生成、跨连接稳定，见 pkg/proto/reg.go）；
+//   - 同设备重复注册只刷新 lastReg；同 devTag 换公钥 = 身份轮换 ⇒ 原子替换 device 侧 peer 配置；
+//   - 表满只淘汰**超过活跃宽限期（grace）未刷新**的设备中最旧的一条；全部活跃则拒绝新设备
+//     （ErrTableFull，绝不淘汰在线设备）；
+//   - TTL 周期回收长期不活跃设备（RunGC）；
+//   - 登记/刷新/轮换/淘汰/拒绝/回收各打一行日志（dev/pub 短指纹 + 隧道地址 + n/cap + 原因）。
+//
+// 隧道地址仍由 (secret, pubkey) 两端各自派生（proto.DeriveTunnelIP）：身份稳定 ⇒ 地址稳定；
+// 身份轮换时地址随新公钥变化，由替换路径处理。
 type PeerConfig struct {
-	Pubkey    [32]byte
-	PSK       [32]byte
-	TunnelIP  netip.Addr // 100.64.0.0/16 内 /32
-	Keepalive int        // 秒；0 = 不配置
+	Pubkey   [32]byte
+	PSK      [32]byte
+	TunnelIP netip.Addr // 100.64.0.0/16 内 /32
 }
 
 // Configurer 把表项落到 WG device（生产实现包 IpcSet；测试用 fake）。
@@ -29,159 +40,296 @@ type Configurer interface {
 	RemovePeer(pubkey [32]byte) error
 }
 
-type pentry struct {
-	pub     [32]byte
-	psk     [32]byte
-	ip      netip.Addr
-	lastReg time.Time
-	el      *list.Element // LRU 链表节点（front=最新）
+// Action 一次注册/回收对设备表造成的变化（测试断言与日志口径）。
+type Action string
+
+const (
+	ActionAdded     Action = "add"
+	ActionRefreshed Action = "refresh"
+	ActionRotated   Action = "rotate"
+	ActionExpired   Action = "expire"
+)
+
+// Result 一次登记/回收的结果快照。
+type Result struct {
+	DevTag   proto.DevTag
+	Pubkey   [32]byte
+	TunnelIP netip.Addr
+	Action   Action
+	// 轮换时填充（旧公钥/旧隧道地址），日志用。
+	OldPubkey [32]byte
+	OldIP     netip.Addr
+	// Idle = 距上一次活跃（刷新/轮换/回收时填充）。
+	Idle time.Duration
 }
 
-type PeerTable struct {
+var (
+	// ErrNoToken reg 报文没有任何已知 token secret 能验通。
+	ErrNoToken = errors.New("peers: reg 验证失败（无匹配 token）")
+	// ErrTableFull 表满且所有设备都在活跃宽限期内刷新过——拒绝新设备，绝不淘汰在线设备。
+	ErrTableFull = errors.New("peers: 设备表已满且没有超过活跃宽限期的失联设备")
+)
+
+// DeviceConfig 设备表参数（零值走默认）。
+type DeviceConfig struct {
+	MaxDevices int           // <=0 = 32
+	TTL        time.Duration // 0 = 7 天；<0 = 关闭 TTL 回收
+	Grace      time.Duration // <=0 = 10 分钟（表满淘汰门槛）
+}
+
+const (
+	defaultMaxDevices = 32
+	defaultTTL        = 7 * 24 * time.Hour
+	defaultGrace      = 10 * time.Minute
+)
+
+type dentry struct {
+	dev       proto.DevTag
+	pub       [32]byte
+	psk       [32]byte
+	ip        netip.Addr
+	lastReg   time.Time
+	createdAt time.Time
+}
+
+// DeviceTable 以设备标签为键的动态设备表（wg-native-stack tasks 3.2 的换代）。
+type DeviceTable struct {
 	mu      sync.Mutex
 	cfg     Configurer
 	secrets [][32]byte
-	// reload 可选：reg 验证失败时重新读一次 token 台账。
-	// 为什么要有它：serve 重签 token（端点/公网映射变化时）只是往 tokens.jsonl 追加一行，
-	// 而服务进程只在启动时读过；「重签 → 粘贴到手机」这条日常路径如果必须重启出口才能生效，真机上极其别扭
-	//（2026-09-19 实测：新 token 的 REG 被拒，日志 `reg 验证失败（无匹配 token）`）。
-	// 只在**失败路径**调用 ⇒ 热路径零开销。
+	// reload 可选：reg 验证失败时重新读一次 token 台账（serve 重签 token 后免重启生效）。
 	reload func() ([][32]byte, error)
-	cap     int
-	ttl     time.Duration
+	logf   func(format string, args ...any)
 
-	entries map[[32]byte]*pentry
-	lru     *list.List
+	max   int
+	ttl   time.Duration
+	grace time.Duration
+
+	entries map[proto.DevTag]*dentry
 	pool    *ipPool
 }
 
-// DefaultTunnelBase：动态客户端的隧道 IP 池基址（/16，逐 /32 分配）。
+// tunnelBase：冲突兜底地址池基址（/16，逐 /32 分配）。正常路径不用池，见 assignIPLocked。
 const tunnelBase = "100.64.0.0"
 
-func NewPeerTable(cfg Configurer, secrets [][32]byte, maxPeers int, ttl time.Duration) *PeerTable {
-	if maxPeers <= 0 {
-		maxPeers = 8
+// NewDeviceTable 建表（cfg 零值走默认：32 台 / 7 天 / 10 分钟宽限）。
+func NewDeviceTable(cfg Configurer, secrets [][32]byte, opt DeviceConfig) *DeviceTable {
+	if opt.MaxDevices <= 0 {
+		opt.MaxDevices = defaultMaxDevices
 	}
-	if ttl <= 0 {
-		ttl = 24 * time.Hour
+	if opt.TTL == 0 {
+		opt.TTL = defaultTTL
 	}
-	return &PeerTable{
+	if opt.Grace <= 0 {
+		opt.Grace = defaultGrace
+	}
+	return &DeviceTable{
 		cfg:     cfg,
 		secrets: secrets,
-		cap:     maxPeers,
-		ttl:     ttl,
-		entries: make(map[[32]byte]*pentry, maxPeers),
-		lru:     list.New(),
+		logf:    logf,
+		max:     opt.MaxDevices,
+		ttl:     opt.TTL,
+		grace:   opt.Grace,
+		entries: make(map[proto.DevTag]*dentry, opt.MaxDevices),
 		pool:    newIPPool(netip.MustParseAddr(tunnelBase)),
 	}
 }
 
-// SetSecretsReloader 注入「重读 token 台账」的回调（见字段注释）。传 nil = 关闭热加载。
-func (t *PeerTable) SetSecretsReloader(fn func() ([][32]byte, error)) {
+// SetLogger 注入正式日志（homewayd 装配）；不注入则用包内兜底。
+func (t *DeviceTable) SetLogger(fn func(format string, args ...any)) {
+	if fn == nil {
+		return
+	}
+	t.mu.Lock()
+	t.logf = fn
+	t.mu.Unlock()
+}
+
+// SetSecretsReloader 注入「重读 token 台账」的回调（传 nil = 关闭热加载）。
+func (t *DeviceTable) SetSecretsReloader(fn func() ([][32]byte, error)) {
 	t.mu.Lock()
 	t.reload = fn
 	t.mu.Unlock()
 }
 
-// currentSecrets 取一份当前 secret 快照（注册路径用；调用方不加锁）。
-func (t *PeerTable) currentSecrets() [][32]byte {
+func (t *DeviceTable) currentSecrets() [][32]byte {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	return t.secrets
 }
 
-// Register 验证 reg 报文并确保 peer 在表内。返回登记的公钥。
-func (t *PeerTable) Register(reg []byte, now time.Time) ([32]byte, error) {
-	var pubkey [32]byte
-	var secret [32]byte
-	match := func(secs [][32]byte) bool {
+// verify 逐一试 token secret，返回 (公钥, 设备标签, 命中的 secret)。
+func (t *DeviceTable) verify(reg []byte, now time.Time) (pubkey [32]byte, devTag proto.DevTag, secret [32]byte, err error) {
+	try := func(secs [][32]byte) bool {
 		for _, sec := range secs {
-			if pk, err := proto.VerifyReg(sec, reg, now, 0); err == nil {
-				pubkey, secret = pk, sec
+			if pk, dt, verr := proto.VerifyReg(sec, reg, now, 0); verr == nil {
+				pubkey, devTag, secret = pk, dt, sec
 				return true
 			}
 		}
 		return false
 	}
-	ok := match(t.currentSecrets())
-	if !ok {
-		t.mu.Lock()
-		reload := t.reload
-		t.mu.Unlock()
-		if reload != nil {
-			if secs, err := reload(); err == nil && len(secs) > 0 {
-				t.mu.Lock()
-				t.secrets = secs
-				t.mu.Unlock()
-				ok = match(secs)
+	if try(t.currentSecrets()) {
+		return pubkey, devTag, secret, nil
+	}
+	t.mu.Lock()
+	reload := t.reload
+	t.mu.Unlock()
+	if reload != nil {
+		if secs, rerr := reload(); rerr == nil && len(secs) > 0 {
+			t.mu.Lock()
+			t.secrets = secs
+			t.mu.Unlock()
+			if try(secs) {
+				return pubkey, devTag, secret, nil
 			}
 		}
 	}
-	if !ok {
-		return pubkey, fmt.Errorf("peers: reg 验证失败（无匹配 token）")
+	return pubkey, devTag, secret, ErrNoToken
+}
+
+// Register 验证 reg 报文并按设备标签登记/刷新/轮换。返回本次动作快照（日志与测试用）。
+func (t *DeviceTable) Register(reg []byte, now time.Time) (Result, error) {
+	pubkey, devTag, secret, err := t.verify(reg, now)
+	if err != nil {
+		return Result{}, err
 	}
 	psk := proto.DerivePSK(secret)
 
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	if e, found := t.entries[pubkey]; found {
-		e.lastReg = now // 重放/重连：仅刷新
-		t.lru.MoveToFront(e.el)
-		return pubkey, nil
+
+	if e, found := t.entries[devTag]; found {
+		prev := e.lastReg
+		if e.pub == pubkey {
+			e.lastReg = now
+			res := Result{DevTag: devTag, Pubkey: pubkey, TunnelIP: e.ip, Action: ActionRefreshed, Idle: now.Sub(prev)}
+			t.logf("peer: ~ dev=%s refresh (idle=%s) n=%d/%d", devShort(devTag), roundDur(res.Idle), len(t.entries), t.max)
+			return res, nil
+		}
+		// 身份轮换：先移除旧 peer 再写新的 —— 顺序固定，避免旧 allowed_ip 悬空。
+		oldPub, oldIP := e.pub, e.ip
+		if rerr := t.cfg.RemovePeer(oldPub); rerr != nil {
+			t.logf("peer: ! dev=%s rotate 移除旧 peer（pub=%s）失败：%v", devShort(devTag), pubShort(oldPub), rerr)
+		}
+		t.pool.Release(oldIP)
+		ip := t.assignIPLocked(secret, pubkey, devTag)
+		e.pub, e.psk, e.ip, e.lastReg = pubkey, psk, ip, now
+		if aerr := t.cfg.AddPeer(PeerConfig{Pubkey: pubkey, PSK: psk, TunnelIP: ip}); aerr != nil {
+			t.logf("peer: ! dev=%s rotate 写入新 peer（pub=%s）失败：%v", devShort(devTag), pubShort(pubkey), aerr)
+		}
+		res := Result{DevTag: devTag, Pubkey: pubkey, TunnelIP: ip, Action: ActionRotated,
+			OldPubkey: oldPub, OldIP: oldIP, Idle: now.Sub(prev)}
+		t.logf("peer: ~ dev=%s rotate pub=%s→%s ip=%v→%v n=%d/%d",
+			devShort(devTag), pubShort(oldPub), pubShort(pubkey), oldIP, ip, len(t.entries), t.max)
+		return res, nil
 	}
-	if len(t.entries) >= t.cap {
-		t.evictLRULocked()
-	}
-	// 隧道地址 = 两端各自从临时公钥派生（tasks 3.7）：客户端用它做流侧源地址，
-	// 后端把它写进 allowed_ip。逐设备唯一，且不需要额外往返/协议字段。
-	ip := proto.DeriveTunnelIP(secret, pubkey)
-	if t.ipTakenLocked(ip) {
-		// 理论冲突（cap=8 时 ≈0.04%）：退到池分配并大声打一行——重启其中一台设备
-		// 会换新临时公钥、重新抽地址（不要在这里驱逐对方：那会让两台设备反复互相踢）。
-		for {
-			fallback := t.pool.Acquire()
-			if t.ipTakenLocked(fallback) {
-				continue
-			}
-			logf("⚠️ 隧道地址冲突：派生地址 %v 已被其他 peer 占用，本次退到池地址 %v（重启任一台设备即可换地址）", ip, fallback)
-			ip = fallback
-			break
+
+	if len(t.entries) >= t.max {
+		if !t.evictStaleLocked(now) {
+			t.logf("peer: ! dev=%s reject reason=table-full n=%d/%d", devShort(devTag), len(t.entries), t.max)
+			return Result{}, ErrTableFull
 		}
 	}
-	e := &pentry{pub: pubkey, psk: psk, ip: ip, lastReg: now}
-	e.el = t.lru.PushFront(e)
-	t.entries[pubkey] = e
-	t.cfg.AddPeer(PeerConfig{Pubkey: pubkey, PSK: psk, TunnelIP: ip, Keepalive: 25})
-	return pubkey, nil
+	ip := t.assignIPLocked(secret, pubkey, devTag)
+	e := &dentry{dev: devTag, pub: pubkey, psk: psk, ip: ip, lastReg: now, createdAt: now}
+	t.entries[devTag] = e
+	if aerr := t.cfg.AddPeer(PeerConfig{Pubkey: pubkey, PSK: psk, TunnelIP: ip}); aerr != nil {
+		t.logf("peer: ! dev=%s 写入 peer（pub=%s）失败：%v", devShort(devTag), pubShort(pubkey), aerr)
+	}
+	if other, ok := t.findByPubLocked(pubkey, devTag); ok {
+		t.logf("peer: ! pub=%s 同时登记在 dev=%s 与 dev=%s（疑似同一身份被两台设备使用：克隆/迁移过应用数据？）",
+			pubShort(pubkey), devShort(other), devShort(devTag))
+	}
+	t.logf("peer: + dev=%s pub=%s ip=%v n=%d/%d", devShort(devTag), pubShort(pubkey), ip, len(t.entries), t.max)
+	return Result{DevTag: devTag, Pubkey: pubkey, TunnelIP: ip, Action: ActionAdded}, nil
 }
 
-// GC 清理 TTL 过期表项，返回清理数。
-func (t *PeerTable) GC(now time.Time) int {
+// GC 回收超过 TTL 未刷新的设备，返回被回收的条目（每个都打了日志）。
+func (t *DeviceTable) GC(now time.Time) []Result {
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	n := 0
-	for el := t.lru.Back(); el != nil; {
-		prev := el.Prev()
-		e := el.Value.(*pentry)
-		if now.Sub(e.lastReg) > t.ttl {
-			t.removeLocked(e)
-			n++
-		}
-		el = prev
+	if t.ttl <= 0 {
+		return nil
 	}
-	return n
+	var victims []*dentry
+	for _, e := range t.entries {
+		if now.Sub(e.lastReg) > t.ttl {
+			victims = append(victims, e)
+		}
+	}
+	out := make([]Result, 0, len(victims))
+	for _, e := range victims {
+		res := Result{DevTag: e.dev, Pubkey: e.pub, TunnelIP: e.ip, Action: ActionExpired, Idle: now.Sub(e.lastReg)}
+		t.removeLocked(e)
+		t.logf("peer: - dev=%s reason=ttl (idle=%s) n=%d/%d", devShort(res.DevTag), roundDur(res.Idle), len(t.entries), t.max)
+		out = append(out, res)
+	}
+	return out
 }
 
-func (t *PeerTable) evictLRULocked() {
-	el := t.lru.Back()
-	if el == nil {
+// RunGC 周期回收（ctx 结束即退出）。every<=0 或 TTL 关闭时不做事。
+// 节拍带 ±10% 抖动：多出口同时扫表时错开。
+func (t *DeviceTable) RunGC(ctx context.Context, every time.Duration) {
+	if every <= 0 || t.ttl <= 0 {
 		return
 	}
-	t.removeLocked(el.Value.(*pentry))
+	for {
+		wait := time.Duration(float64(every) * (0.9 + 0.2*rand.Float64()))
+		timer := time.NewTimer(wait)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return
+		case <-timer.C:
+		}
+		t.GC(time.Now())
+	}
 }
 
-// ipTakenLocked 判断某地址是否已被表内其他 peer 占用（调用方持锁）。
-func (t *PeerTable) ipTakenLocked(ip netip.Addr) bool {
+// evictStaleLocked 表满时淘汰：只在「超过 grace 未刷新」的设备里挑最旧的一条。
+// 返回 false = 全部活跃（调用方应拒绝新设备，绝不淘汰在线设备）。
+func (t *DeviceTable) evictStaleLocked(now time.Time) bool {
+	var victim *dentry
+	for _, e := range t.entries {
+		if now.Sub(e.lastReg) <= t.grace {
+			continue // 活跃宽限期内：不碰
+		}
+		if victim == nil || e.lastReg.Before(victim.lastReg) {
+			victim = e
+		}
+	}
+	if victim == nil {
+		return false
+	}
+	idle := now.Sub(victim.lastReg)
+	dev := victim.dev
+	t.removeLocked(victim)
+	t.logf("peer: - dev=%s reason=stale (idle=%s) n=%d/%d", devShort(dev), roundDur(idle), len(t.entries), t.max)
+	return true
+}
+
+// assignIPLocked：隧道地址 = 两端各自从 (secret, 公钥) 派生（tasks 3.7）。
+// 理论冲突（cap=32 时 ≈0.05%）退到池分配并大声告警 —— 注意身份持久化之后
+// 重启不再换钥匙，消解冲突要靠用户「重置本机身份」。
+func (t *DeviceTable) assignIPLocked(secret [32]byte, pub [32]byte, dev proto.DevTag) netip.Addr {
+	ip := proto.DeriveTunnelIP(secret, pub)
+	if !t.ipTakenLocked(ip) {
+		return ip
+	}
+	for {
+		fallback := t.pool.Acquire()
+		if t.ipTakenLocked(fallback) {
+			continue
+		}
+		t.logf("⚠️ 隧道地址冲突：dev=%s 的派生地址 %v 已被其他设备占用，本次退到池地址 %v（客户端仍用派生地址发包 ⇒ 该设备会不通；请在手机上「重置本机身份」后重连）",
+			devShort(dev), ip, fallback)
+		return fallback
+	}
+}
+
+// ipTakenLocked 判断某地址是否已被表内其他设备占用（调用方持锁）。
+func (t *DeviceTable) ipTakenLocked(ip netip.Addr) bool {
 	for _, e := range t.entries {
 		if e.ip == ip {
 			return true
@@ -190,31 +338,57 @@ func (t *PeerTable) ipTakenLocked(ip netip.Addr) bool {
 	return false
 }
 
-func (t *PeerTable) removeLocked(e *pentry) {
-	t.lru.Remove(e.el)
-	delete(t.entries, e.pub) // map 删除带显式 found 语义（下面 Release 幂等）
-	t.pool.Release(e.ip)
-	t.cfg.RemovePeer(e.pub)
+// findByPubLocked 找「同一公钥挂在别的 devTag 上」的条目（克隆检测，诊断用）。
+func (t *DeviceTable) findByPubLocked(pub [32]byte, except proto.DevTag) (proto.DevTag, bool) {
+	for dev, e := range t.entries {
+		if dev != except && e.pub == pub {
+			return dev, true
+		}
+	}
+	return proto.DevTag{}, false
 }
 
-func (t *PeerTable) Len() int {
+func (t *DeviceTable) removeLocked(e *dentry) {
+	delete(t.entries, e.dev) // map 删除带显式 found 语义（下面 Release 幂等）
+	t.pool.Release(e.ip)
+	if err := t.cfg.RemovePeer(e.pub); err != nil {
+		t.logf("peer: ! dev=%s 移除 peer（pub=%s）失败：%v", devShort(e.dev), pubShort(e.pub), err)
+	}
+}
+
+// Len 当前设备数。
+func (t *DeviceTable) Len() int {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	return len(t.entries)
 }
 
-// TunnelIP 查询某公钥的隧道 IP（诊断）。found 显式返回——netip 零值不是哨兵。
-func (t *PeerTable) TunnelIP(pub [32]byte) (ip netip.Addr, found bool) {
+// Cap 容量。
+func (t *DeviceTable) Cap() int { return t.max }
+
+// Limits 返回 (cap, ttl, grace)，启动日志用。
+func (t *DeviceTable) Limits() (int, time.Duration, time.Duration) { return t.max, t.ttl, t.grace }
+
+// TunnelIP 查询某公钥的隧道地址（诊断）。found 显式返回——netip 零值不是哨兵。
+func (t *DeviceTable) TunnelIP(pub [32]byte) (netip.Addr, bool) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	e, ok := t.entries[pub]
-	if !ok {
-		return netip.Addr{}, false
+	for _, e := range t.entries {
+		if e.pub == pub {
+			return e.ip, true
+		}
 	}
-	return e.ip, true
+	return netip.Addr{}, false
 }
 
-// ipPool：顺序分配 + 释放回收。全部显式标志，零值地址不承担「未找到」语义。
+// devShort / pubShort：日志用短指纹（4 字节 hex）。
+func devShort(d proto.DevTag) string { return hex.EncodeToString(d[:4]) }
+func pubShort(p [32]byte) string     { return hex.EncodeToString(p[:4]) }
+
+func roundDur(d time.Duration) time.Duration { return d.Round(time.Second) }
+
+// ipPool：顺序分配 + 释放回收（只服务隧道地址冲突的兜底路径）。
+// 全部显式标志，零值地址不承担「未找到」语义。
 type ipPool struct {
 	base netip.Addr
 	next uint32

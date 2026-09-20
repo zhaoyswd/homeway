@@ -59,6 +59,8 @@ type ServeConfig struct {
 	TermPort     uint16        // 终端会话 / agent gateway 在本机的监听端口
 	FlowMaxConns int           // 内部流并发上限（0 = 默认 64）
 	FlowIdle     time.Duration // 内部流空闲回收（0 = 默认 30 分钟；终端会话腿也走这里，别设太短）
+	MaxDevices   int           // 设备表容量（0 = 32）
+	PeerTTL      time.Duration // 长期不活跃设备的回收期限（0 = 7 天；<0 = 关闭 TTL 回收）
 	BuildTag     string        // 探测应答里回报的构建标记（空 = 用内置默认）
 	BindAddr     netip.Addr    // 非零 = 把 WG UDP socket 绑到该地址（该网卡出站；STUN 观测同 socket）
 	BindIface    *net.Interface // 非空 = 双栈监听并整条 socket 钉在该网卡（同时支持 v4/v6 客户端）
@@ -95,13 +97,19 @@ func (c *ServeConfig) fill() {
 	if c.FlowIdle <= 0 {
 		c.FlowIdle = 30 * time.Minute
 	}
+	if c.MaxDevices <= 0 {
+		c.MaxDevices = 32
+	}
+	if c.PeerTTL == 0 {
+		c.PeerTTL = 7 * 24 * time.Hour
+	}
 }
 
 // Server：homewayd 的完整数据面装配（netstack + WG device + ServerBind + PeerTable + flows）。
 type Server struct {
 	cfg   ServeConfig
 	Stats *flows.Stats // dialok / dialfail / flows（状态面 3.6 消费）
-	Table *servercore.PeerTable
+	Table *servercore.DeviceTable
 
 	dev     *device.Device
 	bind    *servercore.ServerBind
@@ -176,7 +184,13 @@ func Start(cfg ServeConfig) (*Server, error) {
 		Caps: func() byte { return s.UDPCapFlags() }}
 	s.bind = sbind
 	s.dev = device.NewDevice(tunDev, sbind, device.NewLogger(level, "homewayd"))
-	s.Table = servercore.NewPeerTable(servercore.NewIPCConfigurer(s.dev), secrets, 8, 0)
+	s.Table = servercore.NewDeviceTable(servercore.NewIPCConfigurer(s.dev), secrets, servercore.DeviceConfig{
+		MaxDevices: cfg.MaxDevices,
+		TTL:        cfg.PeerTTL,
+	})
+	s.Table.SetLogger(logf)
+	peerCap, peerTTL, peerGrace := s.Table.Limits()
+	logf("peer 表：设备表就绪（cap=%d，ttl=%v，grace=%v；按 devTag 记账/刷新/轮换）", peerCap, peerTTL, peerGrace)
 	// token 台账热加载：serve 自己重签 token（端点变化时）后，新 secret 立刻可用，
 	// 不需要重启出口（见 PeerTable.reload 的注释）。
 	s.Table.SetSecretsReloader(st.Secrets)
@@ -350,6 +364,9 @@ func Run(ctx context.Context, cfg ServeConfig) error {
 	}
 	// 默认路径能不能承载 UDP：周期探测 + 探测应答里回报（转发流量一律走默认路由，这是它的属性）。
 	s.startUDPCapProbe(ctx, logf)
+	// 设备表周期回收：只清「超过 TTL 没有成功注册」的失联设备（在线设备被客户端周期注册刷新，
+	// 不会误收）。10 分钟一拍、±10% 抖动；TTL<=0 时这个 goroutine 直接返回。
+	go s.Table.RunGC(ctx, 10*time.Minute)
 	// 换网自愈：绑了物理网卡时，网卡索引/地址变化后重钉 socket 并立刻重测公网端点
 	// （否则接口索引一变，socket 就钉在一个不存在的网卡上；端点也会 stale 到下一轮 10 分钟）。
 	if s.bindIface != nil && cfg.BindAddr.IsValid() == false {
@@ -455,4 +472,3 @@ func logf(format string, args ...any) {
 }
 
 var _ = wgtypes.Key{} // 保留引用
-

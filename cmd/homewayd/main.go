@@ -20,6 +20,7 @@ import (
 	"os/signal"
 	"strings"
 	"syscall"
+	"time"
 
 	"github.com/zhaoyswd/homeway/internal/server"
 )
@@ -52,6 +53,8 @@ func serve(args []string) error {
 	upnp := fs.Bool("upnp", true, "向路由器申请 UDP 端口映射（默认开；--upnp=false 关）")
 	stunServer := fs.String("stun", "stun.cloudflare.com:3478", "STUN 服务器（观测 IPv4 公网映射；空 = 关）")
 	stun6Server := fs.String("stun6", "stun.cloudflare.com:3478", "IPv6 路径校验用的 STUN（空 = 关）")
+	maxPeers := fs.Int("max-peers", 32, "设备表容量（同时记住的设备数上限；表满只淘汰超过活跃宽限期未刷新的失联设备）")
+	peerTTL := fs.Duration("peer-ttl", 7*24*time.Hour, "长期不活跃设备的回收期限（0 = 关闭 TTL 回收）")
 	verbose := fs.Bool("verbose", false, "打印 wireguard-go 详细日志（排障用）")
 	fs.Usage = func() {
 		fmt.Fprintln(os.Stderr, `用法：
@@ -84,6 +87,8 @@ func serve(args []string) error {
 		STUN:       *stunServer,
 		STUN6:      *stun6Server,
 		Relay:      *relayServer,
+		MaxDevices: *maxPeers,
+		PeerTTL:    *peerTTL,
 	})
 }
 
