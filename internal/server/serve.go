@@ -8,8 +8,8 @@ import (
 	"net/netip"
 	"os"
 	"strconv"
-	"sync"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/zhaoyswd/homeway/pkg/egress"
@@ -19,8 +19,8 @@ import (
 	"github.com/zhaoyswd/homeway/pkg/proto"
 	"github.com/zhaoyswd/homeway/pkg/servercore"
 	"github.com/zhaoyswd/homeway/pkg/term"
-	"golang.org/x/crypto/curve25519"
 	"github.com/zhaoyswd/homeway/pkg/wgnet"
+	"golang.org/x/crypto/curve25519"
 	"golang.zx2c4.com/wireguard/device"
 	"golang.zx2c4.com/wireguard/wgctrl/wgtypes"
 )
@@ -55,21 +55,21 @@ type ServeConfig struct {
 	TunnelIP     netip.Addr
 	FlowPort     uint16
 	UDPFlowPort  uint16
-	FilesPort    uint16        // files 服务在本机的监听端口（客户端经流协议 CONNECT 到它）
-	FilesRoot    string        // files 根（空 = 用户主目录；协议恒读写）
-	TermPort     uint16        // 终端会话 / agent gateway 在本机的监听端口
-	FlowMaxConns int           // 内部流并发上限（0 = 默认 64）
-	FlowIdle     time.Duration // 内部流空闲回收（0 = 默认 30 分钟；终端会话腿也走这里，别设太短）
-	MaxDevices   int           // 设备表容量（0 = 32）
-	PeerTTL      time.Duration // 长期不活跃设备的回收期限（0 = 7 天；<0 = 关闭 TTL 回收）
-	BuildTag     string        // 探测应答里回报的构建标记（空 = 用内置默认）
-	BindAddr     netip.Addr    // 非零 = 把 WG UDP socket 绑到该地址（该网卡出站；STUN 观测同 socket）
+	FilesPort    uint16         // files 服务在本机的监听端口（客户端经流协议 CONNECT 到它）
+	FilesRoot    string         // files 根（空 = 用户主目录；协议恒读写）
+	TermPort     uint16         // 终端会话 / agent gateway 在本机的监听端口
+	FlowMaxConns int            // 内部流并发上限（0 = 默认 64）
+	FlowIdle     time.Duration  // 内部流空闲回收（0 = 默认 30 分钟；终端会话腿也走这里，别设太短）
+	MaxDevices   int            // 设备表容量（0 = 32）
+	PeerTTL      time.Duration  // 长期不活跃设备的回收期限（0 = 7 天；<0 = 关闭 TTL 回收）
+	BuildTag     string         // 探测应答里回报的构建标记（空 = 用内置默认）
+	BindAddr     netip.Addr     // 非零 = 把 WG UDP socket 绑到该地址（该网卡出站；STUN 观测同 socket）
 	BindIface    *net.Interface // 非空 = 双栈监听并整条 socket 钉在该网卡（同时支持 v4/v6 客户端）
 	BindMode     BindMode       // WG socket 钉哪张卡：auto（默认，自动挑）/explicit（用 BindIface）/off（不绑）
-	UPnP         bool          // 启动后向路由器申请 UDP 端口映射并 30 分钟续期
-	STUN         string        // 非空 = 在监听 socket 上向该 STUN 服务器观测公网映射（如 stun.miwifi.com:3478）
-	STUN6        string        // 非空 = 用该服务器做 **IPv6** 路径校验（要有 AAAA，如 stun.cloudflare.com:3478）
-	Relay        string        // 非空 = 向该中继注册一条反向注册腿（host:port），NAT 后的出口由此可被客户端到达
+	UPnP         bool           // 启动后向路由器申请 UDP 端口映射并 30 分钟续期
+	STUN         string         // 非空 = 在监听 socket 上向该 STUN 服务器观测公网映射（如 stun.miwifi.com:3478）
+	STUN6        string         // 非空 = 用该服务器做 **IPv6** 路径校验（要有 AAAA，如 stun.cloudflare.com:3478）
+	Relay        string         // 非空 = 向该中继注册一条反向注册腿（host:port），NAT 后的出口由此可被客户端到达
 	Verbose      bool
 }
 
@@ -112,25 +112,25 @@ type Server struct {
 	Stats *flows.Stats // dialok / dialfail / flows（状态面 3.6 消费）
 	Table *servercore.DeviceTable
 
-	dev     *device.Device
-	bind    *servercore.ServerBind
-	bindIface *net.Interface     // 本轮实际钉住的网卡（auto 挑出来的或显式给的；nil = 不绑）
-	priv      [32]byte           // WG 静态私钥（中继注册腿要用它做挑战响应）
-	secret    [32]byte           // token 凭证种子（打客户端 token 用）
-	relayEp    proto.Endpoint    // serve --relay 给的中继端点（打客户端 token 时带上）
-	relayWanted bool             // --relay 解析成功：token 未并入中继端点前不打印（只打最终形态）
-	tokMu     sync.Mutex
-	lastToken string             // 上次打印过的客户端 token（变了才重打）
-	udpCap    *udpCapState       // 默认路径的 UDP 能力（周期探测；探测应答里回报）
-	stopTCP func()
-	stopUDP func()
+	dev         *device.Device
+	bind        *servercore.ServerBind
+	bindIface   *net.Interface // 本轮实际钉住的网卡（auto 挑出来的或显式给的；nil = 不绑）
+	priv        [32]byte       // WG 静态私钥（中继注册腿要用它做挑战响应）
+	secret      [32]byte       // token 凭证种子（打客户端 token 用）
+	relayEp     proto.Endpoint // serve --relay 给的中继端点（打客户端 token 时带上）
+	relayWanted bool           // --relay 解析成功：token 未并入中继端点前不打印（只打最终形态）
+	tokMu       sync.Mutex
+	lastToken   string       // 上次打印过的客户端 token（变了才重打）
+	udpCap      *udpCapState // 默认路径的 UDP 能力（周期探测；探测应答里回报）
+	stopTCP     func()
+	stopUDP     func()
 	// stopIntercept：过境拦截层收工（关会话通知；栈随 tunDev 生命周期回收）。
 	stopIntercept func()
-	pubKick chan struct{} // 公网端点探测的"立即重测"信号（换网事件踢）
-	filesLn net.Listener
-	files   *files.Server
-	termLn  net.Listener
-	termSrv *term.TermService
+	pubKick       chan struct{} // 公网端点探测的"立即重测"信号（换网事件踢）
+	filesLn       net.Listener
+	files         *files.Server
+	termLn        net.Listener
+	termSrv       *term.TermService
 }
 
 // Start 装配并启动（非阻塞）。
@@ -443,7 +443,7 @@ func Run(ctx context.Context, cfg ServeConfig) error {
 				s.KickPublicEndpoint() // 端点要重测（可能换网/换 IP）
 				s.KickUDPCapProbe()    // UDP 能力也要重测（换了条路）
 			},
-			Logf:     logf,
+			Logf: logf,
 		})
 	}
 	<-ctx.Done()

@@ -71,6 +71,11 @@ func runControlConn(ctx context.Context, bind *servercore.ServerBind, relay neti
 		return fmt.Errorf("拨控制通道: %w", err)
 	}
 	defer conn.Close()
+	// connCtx：本连接的生命周期。保活 goroutine 挂它而不是外层 ctx（服务器
+	// ctx 是 Background、永不取消——挂它会让每次重连漏一个阻塞的 goroutine，
+	// review B2）。defer cancel() 在本连接结束（返回）时唤醒保活 goroutine 退出。
+	connCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
 
 	// ① HELLO
 	if err := proto.CtlWriteMsg(conn, proto.EncodeRelayHello(pub)); err != nil {
@@ -107,7 +112,10 @@ func runControlConn(ctx context.Context, bind *servercore.ServerBind, relay neti
 	if typ != proto.RelaySubOK {
 		return fmt.Errorf("控制面握手被拒（type=0x%02x）", typ)
 	}
-	logf("中继控制面已连（%v）—— SESSION 通告/拨腿模式启用", relay)
+	// 重连对账（review B1）：旧腿全部作废——中继会立刻重放活跃会话（replaySessions），
+	// 按重放重建。中继重启场景 = 重放零条 = 干净清空。
+	bind.ClearLegs()
+	logf("中继控制面已连（%v）—— 已清腿表，等待会话重放", relay)
 
 	// 保活 + 读循环（SESSION/RELEASE）。中继侧读超时 = 3×保活+15s，留足容错。
 	keep := time.NewTicker(ctlKeepaliveEvery)
@@ -115,7 +123,7 @@ func runControlConn(ctx context.Context, bind *servercore.ServerBind, relay neti
 	go func() {
 		for {
 			select {
-			case <-ctx.Done():
+			case <-connCtx.Done():
 				return
 			case <-keep.C:
 			}

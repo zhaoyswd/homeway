@@ -33,8 +33,8 @@ const udpCapInterval = 5 * time.Minute
 // 分两位是必须的：TUN 型代理对 UDP 按端口区别对待（Surge 转发 DNS 但丢 QUIC），
 // 只测 53 会得出"UDP 可用"的错误结论。
 const (
-	UDPCapDNS      = byte(1 << 0)
-	UDPCapGeneric  = byte(1 << 1)
+	UDPCapDNS     = byte(1 << 0)
+	UDPCapGeneric = byte(1 << 1)
 	// UDPCapObserved：**实测证据** —— 最近一轮窗口里有转发的 UDP 会话收到过回包。
 	// 探针只能证明"某一类端口可达"，这一位来自真实流量，才对应"QUIC 这类到底能不能用"。
 	UDPCapObserved = byte(1 << 2)

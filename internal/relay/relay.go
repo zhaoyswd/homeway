@@ -99,6 +99,10 @@ type leg struct {
 	nonce    [16]byte
 	challAt  time.Time
 	verified bool
+	// ctlVerified：控制面（TCP 挑战）认证过。与 verified（UDP 注册挑战）是**两种
+	// 证明**，转发准入与过期判定用「任一」——不再让控制面认证直接置 verified，
+	// 否则孤儿清理的 !verified 恒假成死代码（review B4）。
+	ctlVerified bool
 	// ctl：控制通道（relay-backend-dial）。非 nil 时客户端到达走「通告+等后端拨腿」，
 	// 而不是 per-client socket 主动发往 lg.addr（那条路在严格 NAT 上恒不通）。
 	ctl *ctlConn
@@ -296,7 +300,7 @@ func (r *Relay) handlePacket(_ context.Context, src netip.AddrPort, pkt []byte) 
 		r.handleControl(src, label, lg, payload)
 		return
 	}
-	if lg == nil || !lg.verified {
+	if lg == nil || !(lg.verified || lg.ctlVerified) {
 		// 准入：没有已注册的后端，谁也别想转发（蹭不到资源）
 		r.bump(func(s *Stats) { s.Dropped++ })
 		return
@@ -392,11 +396,16 @@ func (r *Relay) handleControl(src netip.AddrPort, label [8]byte, lg *leg, payloa
 		// 内存里的挑战私钥用完即弃
 		lg.ephPriv = [32]byte{}
 		var stale []assocKey
+		var staleSids []uint64
 		if moved {
-			// 后端换网/重映射：它的旧分配腿对端地址已变，全部作废重建
+			// 后端换网/重映射：它的旧分配腿对端地址已变，全部作废重建。
+			// 拨腿会话补发 RELEASE（review B1）：后端侧的腿等它重拨/重放对账。
 			for k, a := range r.assocs {
 				if k.label == label {
 					stale = append(stale, k)
+					if a.sid != 0 {
+						staleSids = append(staleSids, a.sid)
+					}
 					_ = a.sock.Close()
 				}
 			}
@@ -406,6 +415,9 @@ func (r *Relay) handleControl(src netip.AddrPort, label [8]byte, lg *leg, payloa
 		}
 		r.stats.Registered++
 		r.mu.Unlock()
+		for _, sid := range staleSids {
+			r.releaseSession(lg, sid)
+		}
 		if moved {
 			r.cfg.Logf("中继：后端 %x 注册腿地址变化 → %v（旧分配 %d 条已作废，等客户端重建）",
 				label[:], src, len(stale))
@@ -414,17 +426,19 @@ func (r *Relay) handleControl(src netip.AddrPort, label [8]byte, lg *leg, payloa
 		}
 		_, _ = r.pc.WriteToUDPAddrPort(proto.EncodeFrame(proto.FrameTypeRelayReg, proto.EncodeRelayOK()), src)
 	case proto.RelaySubKeepalive:
-		if lg == nil || !lg.verified {
+		if lg == nil || !(lg.verified || lg.ctlVerified) {
 			// 腿不在了（中继刚重启/已过期）：明确让后端重注册 —— 否则它以为还在，只发保活，
 			// 两边就永远对不上（实测踩过：中继重启后后端一直不重注册）。
 			_, _ = r.pc.WriteToUDPAddrPort(proto.EncodeFrame(proto.FrameTypeRelayReg, proto.EncodeRelayAgain()), src)
 			return
 		}
-		if lg.addr != src {
-			// 换了地址的保活不算数：要求重新走一遍注册（防地址冒用）
+		if lg.addr.IsValid() && lg.addr != src {
+			// 换了地址的保活不算数：要求重新走一遍注册（防地址冒用）。
 			_, _ = r.pc.WriteToUDPAddrPort(proto.EncodeFrame(proto.FrameTypeRelayReg, proto.EncodeRelayAgain()), src)
 			return
 		}
+		// 无 UDP 注册（纯控制腿）的 keepalive：addr 无从比对，静默续命即可——
+		// 回 Again 只会让后端无意义地重注册刷屏（review B7③）。
 		r.mu.Lock()
 		lg.last = time.Now()
 		r.mu.Unlock()
@@ -560,6 +574,14 @@ func (r *Relay) assocReadLoop(a *assoc) {
 			if string(pkt) == "LEGUP" {
 				continue // 纯标记，不转发
 			}
+		} else if a.backend != from {
+			// 常态源校正（review B5）：后端腿的 NAT 映射漂移（重拨/换网）时，
+			// 不更新的话下行会持续发往死地址、而客户端发包让 a.last 一直新鲜——
+			// 会话半死到空闲回收。源变化即跟随（腿由后端拨出，能从此地址发来
+			// 即证明可达）。
+			a.backend = from
+			r.mu.Unlock()
+			r.cfg.Logf("中继：会话 #%d 的后端腿源漂移 → %v（跟随）", a.sid, from)
 		} else {
 			r.mu.Unlock()
 		}
@@ -593,7 +615,14 @@ func (r *Relay) sendHintToClient(a *assoc, lg *leg) {
 // sendHintToBackend：把**客户端在中继眼里的源地址**告诉后端（后端据此盲打 + 学习）。
 func (r *Relay) sendHintToBackend(a *assoc, client netip.AddrPort) {
 	frame := proto.EncodeHint(client.String())
-	_, _ = a.sock.WriteToUDPAddrPort(frame, a.backend)
+	// 持锁读 backend（review B5）：assocReadLoop 在锁内写它，裸读是数据竞争。
+	r.mu.Lock()
+	dst := a.backend
+	r.mu.Unlock()
+	if !dst.IsValid() {
+		return // 拨腿等待中（无 backend 可发）
+	}
+	_, _ = a.sock.WriteToUDPAddrPort(frame, dst)
 }
 
 // reapLoop：回收空闲分配腿 + 过期注册腿。
@@ -634,7 +663,7 @@ func (r *Relay) reapLoop(ctx context.Context) {
 		for label, lg := range r.legs {
 			// 有控制连接的腿由控制保活续命（readControlLoop 刷 last）；
 			// UDP 注册腿（verified）按 UDP 保活过期。两者都在 → 任一活着即保留。
-			alive := lg.verified && now.Sub(lg.last) <= r.cfg.LegTimeout
+			alive := (lg.verified || lg.ctlVerified) && now.Sub(lg.last) <= r.cfg.LegTimeout
 			if lg.ctl != nil {
 				alive = now.Sub(lg.last) <= r.cfg.LegTimeout
 			}
@@ -686,11 +715,26 @@ func (r *Relay) statsLoop(ctx context.Context) {
 }
 
 func (r *Relay) closeAll() {
+	// 拨腿会话补发 RELEASE（review B1，尽力而为——进程即将退出，写不进 TCP 就算了；
+	// 后端还有 ClearLegs+重放对账与空闲回收两层兜底）。
 	r.mu.Lock()
-	defer r.mu.Unlock()
+	type rel struct {
+		lg  *leg
+		sid uint64
+	}
+	var rels []rel
 	for k, a := range r.assocs {
+		if a.sid != 0 {
+			if lg := r.legs[k.label]; lg != nil {
+				rels = append(rels, rel{lg: lg, sid: a.sid})
+			}
+		}
 		_ = a.sock.Close()
 		delete(r.assocs, k)
+	}
+	r.mu.Unlock()
+	for _, x := range rels {
+		r.releaseSession(x.lg, x.sid)
 	}
 }
 
@@ -742,7 +786,7 @@ func (r *Relay) RegisterLeg(label [8]byte) (netip.AddrPort, bool) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	lg := r.legs[label]
-	if lg == nil || !lg.verified {
+	if lg == nil || !(lg.verified || lg.ctlVerified) {
 		return netip.AddrPort{}, false
 	}
 	return lg.addr, true

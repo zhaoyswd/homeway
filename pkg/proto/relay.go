@@ -114,9 +114,9 @@ func DecodeRelayProof(p []byte) (nonce [16]byte, macDH, macPSK []byte, err error
 }
 
 // EncodeRelayOK / EncodeRelayKeepalive：小消息。
-func EncodeRelayOK() []byte          { return []byte{RelaySubOK} }
-func EncodeRelayAgain() []byte       { return []byte{RelaySubAgain} }
-func EncodeRelayKeepalive() []byte   { return []byte{RelaySubKeepalive} }
+func EncodeRelayOK() []byte        { return []byte{RelaySubOK} }
+func EncodeRelayAgain() []byte     { return []byte{RelaySubAgain} }
+func EncodeRelayKeepalive() []byte { return []byte{RelaySubKeepalive} }
 func RelaySubtype(p []byte) (byte, bool) {
 	if len(p) == 0 {
 		return 0, false

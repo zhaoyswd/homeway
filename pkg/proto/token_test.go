@@ -93,7 +93,7 @@ func TestTokenMalformed(t *testing.T) {
 		t.Fatalf("err = %v, want ErrMalformed", err)
 	}
 	// 合法 base64 但没有 hmw1 前缀
-	if _, err := DecodeToken("xxw1"+strings.Repeat("A", 100)); !errors.Is(err, ErrMalformed) {
+	if _, err := DecodeToken("xxw1" + strings.Repeat("A", 100)); !errors.Is(err, ErrMalformed) {
 		t.Fatalf("err = %v, want ErrMalformed", err)
 	}
 }

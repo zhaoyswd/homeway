@@ -16,9 +16,11 @@ package relay
 
 import (
 	"crypto/rand"
+	"crypto/subtle"
 	"errors"
 	"net"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/zhaoyswd/homeway/pkg/proto"
@@ -48,12 +50,24 @@ func (cc *ctlConn) close() {
 	_ = cc.c.Close()
 }
 
+// ctlHandshakeMax：并发握手上限（review B7②：每个未完成握手占一个协程最长 10s，
+// 公网中继防「慢握手洪水」；认证后的连接不受此限）。
+const ctlHandshakeMax = 16
+
+var ctlHandshaking atomic.Int32
+
 // serveControl：TCP 接入循环（每连接一个协程跑 handshake+readLoop）。
 func (r *Relay) serveControl(ln net.Listener) {
 	for {
 		c, err := ln.Accept()
 		if err != nil {
 			return
+		}
+		if ctlHandshaking.Add(1) > ctlHandshakeMax {
+			ctlHandshaking.Add(-1)
+			_ = c.Close()
+			r.bump(func(s *Stats) { s.Dropped++ })
+			continue
 		}
 		go r.controlConn(c)
 	}
@@ -62,6 +76,7 @@ func (r *Relay) serveControl(ln net.Listener) {
 // controlConn：一条控制连接的全生命周期。
 func (r *Relay) controlConn(c net.Conn) {
 	defer c.Close()
+	defer ctlHandshaking.Add(-1)
 	_ = c.SetDeadline(time.Now().Add(10 * time.Second)) // 握手必须在 10s 内完成
 
 	// ① HELLO（带公钥）
@@ -102,14 +117,14 @@ func (r *Relay) controlConn(c net.Conn) {
 	if derr != nil {
 		return
 	}
-	if !hmacEqual(proto.RelayProofMAC(dh, nonce, pub), macDH) {
+	if subtle.ConstantTimeCompare(proto.RelayProofMAC(dh, nonce, pub), macDH) != 1 {
 		r.bump(func(s *Stats) { s.Forged++ })
 		r.cfg.Logf("中继：控制面 %v 的 DH 校验不过 —— 拒绝", c.RemoteAddr())
 		return
 	}
 	if r.cfg.Secret != ([32]byte{}) {
 		want := proto.RelayAuthMAC(r.cfg.Secret, nonce, pub)
-		if len(macPSK) != 16 || !hmacEqual(want, macPSK) {
+		if len(macPSK) != 16 || subtle.ConstantTimeCompare(want, macPSK) != 1 {
 			r.bump(func(s *Stats) { s.Forged++ })
 			r.cfg.Logf("中继：控制面 %v 的 token 校验不过 —— 拒绝", c.RemoteAddr())
 			return
@@ -123,20 +138,27 @@ func (r *Relay) controlConn(c net.Conn) {
 	_ = c.SetDeadline(time.Time{}) // 清握手超时；后续用 readLoop 的滚动超时
 
 	lg := r.legForControl(label, pub)
-	// 控制面过的是与 UDP 注册同一套 X25519 挑战 ⇒ 身份证明等价，腿直接置 verified
-	//（addr 仍空：hints/兼容转发照旧依赖 UDP 注册腿；数据走拨腿）。
+	// 控制面过的是与 UDP 注册同一套 X25519 挑战 ⇒ 身份证明等价，但记在
+	// ctlVerified（与 UDP 的 verified 分开——review B4：混用会让孤儿清理的
+	// !verified 恒假，且两种证明语义不同）。
 	r.mu.Lock()
-	lg.verified = true
+	lg.ctlVerified = true
 	lg.last = time.Now()
 	r.mu.Unlock()
 	cc := &ctlConn{c: c, label: label}
 	r.attachControl(lg, cc)
+	// 重放对账（review B1）：重连 = 后端已 ClearLegs，中继把该 label 的全部活跃
+	// 会话重新通告一遍，后端按重放重建腿——中继重启（表空 → 重放零条 = 后端清空）、
+	// 控制连接抖动（表还在 → 原样重建）两条路径都靠它收敛。
+	r.replaySessions(lg, cc)
 	defer func() {
 		r.detachControl(lg, cc)
 		// 孤儿清理：控制断开时腿若既无 UDP 注册（verified=false 且无 addr）也无新
 		// 控制连接，就是纯控制 leg 的尸体——从表里摘掉，防泄漏。
 		r.mu.Lock()
 		if lg.ctl == nil && !lg.verified && !lg.addr.IsValid() {
+			// 纯控制腿的尸体（无 UDP 注册、无新控制连接）：从表里摘掉防泄漏。
+			// ctlVerified 的腿走 reapLoop 的 LegTimeout 路径。
 			delete(r.legs, lg.label)
 		}
 		r.mu.Unlock()
@@ -158,6 +180,13 @@ func (r *Relay) readControlLoop(lg *leg, cc *ctlConn, c net.Conn) {
 			r.mu.Lock()
 			lg.last = time.Now()
 			r.mu.Unlock()
+			// 回发一个 KEEPALIVE（review B3）：后端读侧 deadline = 3×保活+15s，
+			// 无会话事件时若中继永远静默，后端每 ~90s 空转重连一次（且每次重连
+			// 叠加 B2 的泄漏）。被动回显模式——后端 25s 发、中继必答，链路双向
+			// 始终有消息，无需中继自持 ticker。
+			if err := cc.writeMsg(proto.EncodeRelayKeepalive()); err != nil {
+				return
+			}
 		default:
 			// 后端→中继方向目前没有其它消息；未知子类型按前向兼容忽略。
 		}
@@ -212,6 +241,29 @@ func (r *Relay) announceSession(lg *leg, sess proto.CtlSession) bool {
 	return true
 }
 
+// replaySessions：向（新建立的）控制连接重放该后端的全部活跃会话。
+func (r *Relay) replaySessions(lg *leg, cc *ctlConn) {
+	r.mu.Lock()
+	var msgs [][]byte
+	for _, a := range r.assocs {
+		if a.key.label != lg.label {
+			continue
+		}
+		port := uint16(a.sock.LocalAddr().(*net.UDPAddr).Port)
+		msgs = append(msgs, proto.EncodeCtlSession(proto.CtlSession{ID: a.sid, DataPort: port}))
+	}
+	r.mu.Unlock()
+	for _, m := range msgs {
+		if err := cc.writeMsg(m); err != nil {
+			cc.close()
+			return
+		}
+	}
+	if len(msgs) > 0 {
+		r.cfg.Logf("中继：后端 %x 控制面重放 %d 条活跃会话", lg.label[:], len(msgs))
+	}
+}
+
 // releaseSession：通告会话回收（尽力而为；连接已断就跳过）。
 func (r *Relay) releaseSession(lg *leg, id uint64) {
 	r.mu.Lock()
@@ -220,17 +272,6 @@ func (r *Relay) releaseSession(lg *leg, id uint64) {
 	if cc != nil {
 		_ = cc.writeMsg(proto.EncodeCtlRelease(id))
 	}
-}
-
-func hmacEqual(a, b []byte) bool {
-	if len(a) != len(b) {
-		return false
-	}
-	var v byte
-	for i := range a {
-		v |= a[i] ^ b[i]
-	}
-	return v == 0
 }
 
 // ErrNoControlConn：无控制连接（兼容路径继续走 per-client 敲洞）。
