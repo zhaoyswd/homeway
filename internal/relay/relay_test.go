@@ -168,6 +168,9 @@ func (c *fakeClient) readHint(d time.Duration) (string, bool) {
 func startRelay(t *testing.T, cfg Config) *Relay {
 	t.Helper()
 	cfg.Addr = "127.0.0.1:0"
+	if cfg.Logf == nil {
+		cfg.Logf = func(f string, a ...any) { t.Logf("[relay] "+f, a...) }
+	}
 	r := New(cfg)
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})

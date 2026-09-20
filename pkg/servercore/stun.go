@@ -13,7 +13,7 @@ import (
 // —— 旧栈踩过这个坑（PATCHES §2.5 的「源端口被改写」判据），这里用同 socket 观测从根上避开。
 
 const (
-	stunMagicCookie = 0x2112A442
+	stunMagicCookie         = 0x2112A442
 	stunTypeBindingRequest  = 0x0001
 	stunTypeBindingResponse = 0x0101
 

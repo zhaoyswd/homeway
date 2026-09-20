@@ -73,7 +73,7 @@ func (s *Server) StartPublicEndpoint(ctx context.Context, opts PublicOpts) {
 			case <-ctx.Done():
 				return
 			case <-s.pubKick: // 换网事件：别等下一个 10 分钟窗口，立刻重测
-				opts.Logf("公网端点：收到换网事件，立即重测")
+				dlogf("公网端点：收到换网事件，立即重测")
 			case <-time.After(wait):
 			}
 		}
@@ -96,7 +96,7 @@ func (s *Server) refreshPublicEndpoint(ctx context.Context, opts PublicOpts) boo
 	logf := opts.Logf
 	port := waitLocalPort(ctx, opts.Bind, 30*time.Second)
 	if port == 0 {
-		logf("公网端点：WG socket 30s 内还没开，跳过本轮")
+		dlogf("公网端点：WG socket 30s 内还没开，跳过本轮")
 		return false
 	}
 	ctx, cancel := context.WithTimeout(ctx, 40*time.Second)
@@ -215,6 +215,11 @@ func (s *Server) printClientToken(opts PublicOpts, published []string, logf func
 		add(s.relayEp)
 	}
 	if len(eps) == 0 {
+		return
+	}
+	// 指定了 --relay：中继端点没并入前不打 token —— 先打一版不带中继的只会
+	// 误导（用户粘了它，蜂窝下就没人能连上）（2026-09-20 用户口径）。
+	if s.relayWanted && !seen[s.relayEp.Addr] {
 		return
 	}
 	tok, err := proto.EncodeToken(proto.Token{

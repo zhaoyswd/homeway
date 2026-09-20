@@ -514,7 +514,7 @@ func ensurePortMapping(ctx context.Context, candidates []netip.Addr, internalPor
 	// ② 把我们**多余**的历史映射清掉（只清同前缀 + 同内网地址的，别动同局域网其它出口），
 	//    保证 30 分钟一轮的续期不会在路由器里越积越多。
 	if n, _, err := g.CleanMappings(ctx, upnpMapDesc, 0, localIP, internalPort); err == nil && n > 0 {
-		logf("UPnP：清掉 %d 条本机同前缀的旧映射（换端口或上次退出的遗留）", n)
+		dlogf("UPnP：清掉 %d 条本机同前缀的旧映射（换端口或上次退出的遗留）", n)
 	}
 	ext, err := selectExternalPort(ctx, g, internalPort, prefer, localIP, logf)
 	if err != nil {

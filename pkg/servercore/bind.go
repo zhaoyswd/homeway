@@ -27,17 +27,20 @@ var nowTime = time.Now
 // Send 恒裸发（对端 endpoint 是中继分配地址或客户端直连地址，两者都收裸 WG；
 // 中继负责把回程包包装成腿帧发回客户端）。
 type ServerBind struct {
-	Port   uint16
-	Table  *DeviceTable
-	Build  string            // 探测应答里回报的构建标记（就绪行/排障用）
+	Port  uint16
+	Table *DeviceTable
+	Build string // 探测应答里回报的构建标记（就绪行/排障用）
 	// Caps：探测应答里回报的能力位（bit0 = 出口默认路径可承载 UDP；nil 或未探过 = 0）。
 	// 用函数而不是值：UDP 能力是**周期性探测**的结论，运行期会变（换网/代理开关）。
-	Caps   func() byte
+	Caps func() byte
 	// OnLegFrame：腿上帧的**额外**分派钩子（中继控制帧走这里；返回 true = 已消费，不进 device）。
 	// 已有的固定处理（data/reg/control-hint）在内，钩子只收 type ≥ 3 的帧与显式未处理的分支。
 	OnLegFrame func(typ byte, payload []byte, src netip.AddrPort) bool
-	OnHint func(addr string) // 中继观察到的客户端公网地址（打洞用，阶段 6）
-	Logf   func(format string, args ...any)
+	OnHint     func(addr string) // 中继观察到的客户端公网地址（打洞用，阶段 6）
+	Logf       func(format string, args ...any)
+	// LogfD：细节级日志（入站新源/reg 拒绝这类排查行；nil 时回落 Logf）。
+	// 摘要/细节分流见 internal/server/logging.go（2026-09-20 用户口径：终端只看关键信息）。
+	LogfD func(format string, args ...any)
 	// BindAddr 非零时把 UDP socket 绑到这张网卡的地址上：
 	// ① 出站走该接口（绕开 TUN 型代理抢默认路由，旧栈的 `--bind-interface=physical`）；
 	// ② STUN 观测到的才是**这个 socket** 在路由器上的真实映射。
@@ -49,6 +52,15 @@ type ServerBind struct {
 	c        *net.UDPConn
 	stunMu   sync.Mutex
 	stunWait *stunPending
+
+	// relay-backend-dial 的数据腿表：远端（中继:P_x）→ connected socket。
+	// 收：每腿一个读协程推 legCh，聚合 ReceiveFunc 消费；发：Send 按端点选腿。
+	legMu  sync.RWMutex
+	legByR map[netip.AddrPort]*relayLeg
+	legByID map[uint64]*relayLeg
+	legCh  chan relayLegPkt
+	legOnce sync.Once
+	dead    chan struct{}
 	pinMu    sync.Mutex
 	pinned   *net.Interface // 当前实际钉住的网卡（Open 时设置，Repin 时更新）
 
@@ -94,6 +106,123 @@ func (b *ServerBind) RepinTo(ifi *net.Interface) (*net.Interface, error) {
 	}
 	b.pinned = ifi
 	return ifi, nil
+}
+
+// relayLeg：一条到中继数据口的 connected UDP 腿（relay-backend-dial）。
+type relayLeg struct {
+	id     uint64 // 中继侧会话号（RELEASE 关联）
+	remote netip.AddrPort
+	sock   *net.UDPConn
+}
+
+// relayLegPkt：腿上读到的（包， 源=腿远端）。
+type relayLegPkt struct {
+	pkt []byte
+	src netip.AddrPort
+}
+
+// legInitLocked：腿通道与收工信号（一次）。
+func (b *ServerBind) legInit() {
+	b.legOnce.Do(func() {
+		b.legByR = make(map[netip.AddrPort]*relayLeg)
+		b.legByID = make(map[uint64]*relayLeg)
+		b.legCh = make(chan relayLegPkt, 128)
+		b.dead = make(chan struct{})
+	})
+}
+
+// RegisterLeg：向中继数据口拨一条腿（connected），发 LEGUP 标记并开始接收。
+// 同 id 或同远端重复注册 = 先拆旧再建（中继侧会话重建的语义）。
+func (b *ServerBind) RegisterLeg(id uint64, remote netip.AddrPort) error {
+	b.legInit()
+	sock, err := net.DialUDP("udp4", nil, &net.UDPAddr{IP: remote.Addr().AsSlice(), Port: int(remote.Port())})
+	if err != nil {
+		return err
+	}
+	if _, err := sock.Write([]byte("LEGUP")); err != nil {
+		_ = sock.Close()
+		return err
+	}
+	lg := &relayLeg{id: id, remote: remote, sock: sock}
+	b.legMu.Lock()
+	if old := b.legByID[id]; old != nil {
+		b.removeLegLocked(old)
+	}
+	if old := b.legByR[remote]; old != nil {
+		b.removeLegLocked(old)
+	}
+	b.legByID[id] = lg
+	b.legByR[remote] = lg
+	b.legMu.Unlock()
+	go b.legReadLoop(lg, sock)
+	return nil
+}
+
+// RemoveLeg：按会话号拆腿（RELEASE / 收工）。不存在 = no-op。
+func (b *ServerBind) RemoveLeg(id uint64) {
+	b.legInit()
+	b.legMu.Lock()
+	defer b.legMu.Unlock()
+	if lg := b.legByID[id]; lg != nil {
+		b.removeLegLocked(lg)
+	}
+}
+
+// removeLegLocked：关 socket + 双表摘除（调用方持锁）。socket 关闭让读协程退出；
+// 「同远端新腿不串旧流」由 socket 生命周期保证（旧 socket 已关，不可能再投递）。
+func (b *ServerBind) removeLegLocked(lg *relayLeg) {
+	_ = lg.sock.Close()
+	if b.legByID[lg.id] == lg {
+		delete(b.legByID, lg.id)
+	}
+	if b.legByR[lg.remote] == lg {
+		delete(b.legByR, lg.remote)
+	}
+}
+
+// legReadLoop：一条腿的读循环（connected socket 的 Read；源恒为腿远端）。
+func (b *ServerBind) legReadLoop(lg *relayLeg, sock *net.UDPConn) {
+	buf := make([]byte, 65535)
+	for {
+		n, err := sock.Read(buf)
+		if err != nil {
+			return
+		}
+		if n == 5 && string(buf[:n]) == "LEGUP" {
+			continue // 防御：中继侧已吞，正常到不了这里
+		}
+		pkt := make([]byte, n)
+		copy(pkt, buf[:n])
+		select {
+		case b.legCh <- relayLegPkt{pkt: pkt, src: lg.remote}:
+		case <-b.dead:
+			return
+		}
+	}
+}
+
+// legReceiveFunc：聚合的腿接收函数（Open 时追加到 ReceiveFunc 列表）。
+func (b *ServerBind) legReceiveFunc() conn.ReceiveFunc {
+	return func(packets [][]byte, sizes []int, eps []conn.Endpoint) (int, error) {
+		for {
+			var lp relayLegPkt
+			select {
+			case lp = <-b.legCh:
+			case <-b.dead:
+				// 收工信号：阻塞读退出（device 关 Bind 时会停；这里返回错误让循环结束）
+				return 0, net.ErrClosed
+			}
+			// 腿上的包与主 socket 同构（中继按 0xBB 帧封装后转发）——走同一条解析。
+			n, err := b.processPacket(packets, sizes, eps, lp.pkt, lp.src)
+			if err != nil {
+				return 0, err
+			}
+			if n > 0 {
+				return n, nil
+			}
+			// 被内部消费（腿帧/探测/STUN）的包：继续读下一条
+		}
+	}
 }
 
 // SendRawTo：从**同一个 WG socket** 直接发给 addr（中继注册/保活/盲打都用它 ——
@@ -218,6 +347,7 @@ func (b *ServerBind) Open(port uint16) ([]conn.ReceiveFunc, uint16, error) {
 	}
 	b.c = c
 	actual := uint16(c.LocalAddr().(*net.UDPAddr).Port)
+	b.legInit()
 	fn := func(packets [][]byte, sizes []int, eps []conn.Endpoint) (int, error) {
 		n, src, err := c.ReadFromUDPAddrPort(packets[0])
 		if err != nil {
@@ -226,12 +356,20 @@ func (b *ServerBind) Open(port uint16) ([]conn.ReceiveFunc, uint16, error) {
 		if src.Addr().Is4In6() {
 			src = netip.AddrPortFrom(src.Addr().Unmap(), src.Port())
 		}
-		buf := packets[0][:n]
+		buf := make([]byte, n)
+		copy(buf, packets[0][:n])
+		return b.processPacket(packets, sizes, eps, buf, src)
+	}
+	return []conn.ReceiveFunc{fn, b.legReceiveFunc()}, actual, nil
+}
 
-		// STUN 观测：只认事务 ID 匹配的应答，消耗掉不进 device（见 STUNQuery）。
+// processPacket：一个入站 UDP 包的完整解析（主 socket 与中继数据腿共用）。
+// 返回 >0 = 交给 device 的包数；0 = 内部消费；err = 读路径终止。
+func (b *ServerBind) processPacket(packets [][]byte, sizes []int, eps []conn.Endpoint, buf []byte, src netip.AddrPort) (int, error) {
+	// STUN 观测：只认事务 ID 匹配的应答，消耗掉不进 device（见 STUNQuery）。
 		if stunLooksLikeResponse(buf) {
 			if b.deliverSTUN(buf) {
-				b.noteNewSrc(src, "STUN应答", n)
+				b.noteNewSrc(src, "STUN应答", len(buf))
 				return 0, nil
 			}
 		}
@@ -239,36 +377,36 @@ func (b *ServerBind) Open(port uint16) ([]conn.ReceiveFunc, uint16, error) {
 		// 参照点探测（tasks 3.6）：明文一问一答，不进 WG、不登记 peer、不碰会话状态。
 		// 客户端在「全部候选失败」时用它做三档归因（本机 / 链路 / 后端）。
 		caps := byte(0)
-			if b.Caps != nil {
-				caps = b.Caps()
-			}
-			if resp := probe.Respond(buf, src, b.Build, caps); resp != nil {
-			b.noteNewSrc(src, "参照点探测", n)
-			_, _ = c.WriteToUDPAddrPort(resp, src)
+		if b.Caps != nil {
+			caps = b.Caps()
+		}
+		if resp := probe.Respond(buf, src, b.Build, caps); resp != nil {
+			b.noteNewSrc(src, "参照点探测", len(buf))
+			_, _ = b.c.WriteToUDPAddrPort(resp, src)
 			return 0, nil
 		}
 
 		if len(buf) > 0 && buf[0] == 0xBB {
 			typ, payload, err := proto.DecodeFrame(buf)
 			if err != nil {
-				b.noteNewSrc(src, "畸形腿帧", n)
+				b.noteNewSrc(src, "畸形腿帧", len(buf))
 				return 0, nil // 畸形腿帧：丢弃不中断（fn 返回 0 会继续被调用）
 			}
 			switch typ {
 			case proto.FrameTypeData:
-				b.noteNewSrc(src, "腿帧数据", n)
+				b.noteNewSrc(src, "腿帧数据", len(buf))
 				sizes[0] = len(payload)
 				copy(packets[0], payload)
 				eps[0] = srvEP{src}
 				return 1, nil
 			case proto.FrameTypeReg:
-				b.noteNewSrc(src, "腿帧注册", n)
+				b.noteNewSrc(src, "腿帧注册", len(buf))
 				if _, err := b.Table.Register(payload, nowTime()); err != nil {
-					b.logf("reg 腿帧被拒（来源 %v）：%v", src, err)
+					b.logfD("reg 腿帧被拒（来源 %v）：%v", src, err)
 				}
 				return 0, nil
 			case proto.FrameTypeControl:
-				b.noteNewSrc(src, "腿帧控制", n)
+				b.noteNewSrc(src, "腿帧控制", len(buf))
 				if b.OnHint != nil {
 					if addr, err := proto.DecodeHintPayload(payload); err == nil {
 						b.OnHint(addr)
@@ -277,7 +415,7 @@ func (b *ServerBind) Open(port uint16) ([]conn.ReceiveFunc, uint16, error) {
 				return 0, nil
 			default:
 				// 中继控制帧（type≥3）等留给钩子；没钩子就按前向兼容忽略。
-				b.noteNewSrc(src, fmt.Sprintf("腿帧type=%d", typ), n)
+				b.noteNewSrc(src, fmt.Sprintf("腿帧type=%d", typ), len(buf))
 				if b.OnLegFrame != nil && b.OnLegFrame(typ, payload, src) {
 					return 0, nil
 				}
@@ -290,9 +428,9 @@ func (b *ServerBind) Open(port uint16) ([]conn.ReceiveFunc, uint16, error) {
 			if len(rest) > 0 {
 				shape += "+" + wgMsgName(rest[0])
 			}
-			b.noteNewSrc(src, shape, n)
+			b.noteNewSrc(src, shape, len(buf))
 			if _, err := b.Table.Register(reg, nowTime()); err != nil {
-				b.logf("reg 搭车被拒（来源 %v）：%v", src, err)
+				b.logfD("reg 搭车被拒（来源 %v）：%v", src, err)
 				return 0, nil
 			}
 			sizes[0] = len(rest)
@@ -303,15 +441,14 @@ func (b *ServerBind) Open(port uint16) ([]conn.ReceiveFunc, uint16, error) {
 
 		// 直连裸 WG
 		shape := "直连裸WG"
-		if n > 0 {
+		if len(buf) > 0 {
 			shape = "直连裸" + wgMsgName(buf[0])
 		}
-		b.noteNewSrc(src, shape, n)
-		sizes[0] = n
+		b.noteNewSrc(src, shape, len(buf))
+		sizes[0] = len(buf)
+		copy(packets[0], buf)
 		eps[0] = srvEP{src}
 		return 1, nil
-	}
-	return []conn.ReceiveFunc{fn}, actual, nil
 }
 
 // wgMsgName：WG 报文类型码 → 可读名（首包日志用；type 见 wireguard 规范）。
@@ -340,10 +477,33 @@ func (b *ServerBind) noteNewSrc(src netip.AddrPort, shape string, n int) {
 		return
 	}
 	b.srcSeen[src] = true
-	b.logf("入站新源：%v（%s，%d 字节）", src, shape, n)
+	b.logfD("入站新源：%v（%s，%d 字节）", src, shape, n)
+}
+
+// logfD 细节级（未接线时回落摘要级，别丢线索）。
+func (b *ServerBind) logfD(format string, args ...any) {
+	if b.LogfD != nil {
+		b.LogfD(format, args...)
+		return
+	}
+	b.logf(format, args...)
 }
 
 func (b *ServerBind) Close() error {
+	if b.dead != nil {
+		select {
+		case <-b.dead:
+		default:
+			close(b.dead)
+		}
+	}
+	b.legMu.Lock()
+	for _, lg := range b.legByID {
+		_ = lg.sock.Close()
+	}
+	b.legByID = map[uint64]*relayLeg{}
+	b.legByR = map[netip.AddrPort]*relayLeg{}
+	b.legMu.Unlock()
 	if b.c == nil {
 		return nil
 	}
@@ -457,6 +617,19 @@ func (b *ServerBind) Send(bufs [][]byte, ep conn.Endpoint) error {
 	e, ok := ep.(srvEP)
 	if !ok {
 		return fmt.Errorf("server: 未知 endpoint 类型 %T", ep)
+	}
+	// relay-backend-dial：endpoint 命中腿表时走该腿的 connected socket——
+	// 回程必须与「后端拨出去的映射」同五元组（严格 NAT 的构造性穿透）。
+	b.legMu.RLock()
+	lg := b.legByR[e.ap]
+	b.legMu.RUnlock()
+	if lg != nil {
+		for _, buf := range bufs {
+			if _, err := lg.sock.Write(buf); err != nil {
+				return err
+			}
+		}
+		return nil
 	}
 	for _, buf := range bufs {
 		if _, err := b.c.WriteToUDPAddrPort(buf, e.ap); err != nil {

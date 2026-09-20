@@ -246,6 +246,9 @@ func Start(cfg ServeConfig) (*Server, error) {
 			s.relayEp = proto.Endpoint{Addr: relayAddr.String(), Relay: true}
 			s.relayWanted = true
 			startRelayLeg(context.Background(), s.bind, relayAddr, s.priv, wgPub(s.priv), relaySecret, logf)
+			// relay-backend-dial：控制通道（TCP，同号）+ SESSION 通告/拨腿。
+			// 失败只退避重连，不影响主服务（见 relayctl.go 头注释）。
+			startControlClient(context.Background(), s.bind, relayAddr, s.priv, wgPub(s.priv), relaySecret, logf)
 		} else {
 			logf("⚠️ --relay 解析失败（%v）—— 跳过中继注册", rerr)
 		}

@@ -203,7 +203,7 @@ func (rc *relayClient) punch(client netip.AddrPort) {
 	}
 	rc.mu.Unlock()
 
-	rc.logf("中继：收到对端地址线索 %v → 盲打 %d 包（开自己 NAT 过滤；能否直连仍由 WG 握手决定）",
+	dlogf("中继：收到对端地址线索 %v → 盲打 %d 包（开自己 NAT 过滤；能否直连仍由 WG 握手决定）",
 		client, punchBurst)
 	for i := 0; i < punchBurst; i++ {
 		// 盲打包用小载荷腿帧：对端解析不出数据会静默丢弃，但 NAT 过滤已被打开。

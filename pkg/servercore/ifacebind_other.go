@@ -7,5 +7,5 @@ import (
 	"net/netip"
 )
 
-func pinSocketToIface(*net.UDPConn, *net.Interface) error      { return nil }
-func ifaceForAddr(netip.Addr) *net.Interface                   { return nil }
+func pinSocketToIface(*net.UDPConn, *net.Interface) error { return nil }
+func ifaceForAddr(netip.Addr) *net.Interface              { return nil }

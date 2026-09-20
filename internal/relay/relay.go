@@ -68,6 +68,9 @@ type Relay struct {
 	rates   map[netip.Addr]*rateBucket
 
 	stats Stats
+
+	nextSid uint64
+	ctlLn   net.Listener
 }
 
 // Stats 中继计数（诊断/测试用）。
@@ -96,14 +99,29 @@ type leg struct {
 	nonce    [16]byte
 	challAt  time.Time
 	verified bool
+	// ctl：控制通道（relay-backend-dial）。非 nil 时客户端到达走「通告+等后端拨腿」，
+	// 而不是 per-client socket 主动发往 lg.addr（那条路在严格 NAT 上恒不通）。
+	ctl *ctlConn
 }
 
 type assoc struct {
 	key     assocKey
-	backend netip.AddrPort // 注册腿地址（回程发给它）
+	backend netip.AddrPort // 注册腿地址（回程发给它；拨腿模式下 = 后端腿的实际源地址）
 	sock    *net.UDPConn   // 该客户端专属的上游 socket（后端看到的"客户端地址"）
 	last    time.Time
+	// 拨腿模式（relay-backend-dial）：等后端来拨。首包（LEGUP）到达前，
+	// 客户端包缓冲在 pend（≤16）；到达后 backend = 腿源地址，缓冲放行。
+	// dialed 是**持久**标志（本会话由拨腿承载——backend=腿源地址，与 lg.addr
+	// 是两个概念，地址漂移检查不适用）；dialUp 只标「等待中」。
+	sid    uint64
+	dialed bool
+	dialUp bool
+	pendMu sync.Mutex
+	pend   [][]byte
 }
+
+// ctlPendMax：拨腿等待窗口的客户端包缓冲上限（同直连引导的 pending 语义）。
+const ctlPendMax = 16
 
 type rateBucket struct {
 	window time.Time
@@ -175,6 +193,22 @@ func (r *Relay) Run(ctx context.Context) error {
 	if r.onReady != nil {
 		r.onReady(netip.AddrPortFrom(netip.Addr{}, uint16(pc.LocalAddr().(*net.UDPAddr).Port)))
 	}
+	// TCP 控制监听（relay-backend-dial）：与 UDP **实际**端口同号（配置口可能被退让过；
+	// 随机口(:0)时两边各自随机会对不上）。两个独立端口空间 ⇒ 部署零新增、token 不变。
+	// 起不来**不致命**：中继退回纯 UDP 模式（后端拨腿特性整体缺席）。
+	ctlAddr := mustResolve(r.cfg.Addr)
+	ctlAddr.Port = pc.LocalAddr().(*net.UDPAddr).Port
+	if tcpLn, terr := net.Listen("tcp", ctlAddr.String()); terr == nil {
+		r.ctlLn = tcpLn
+		go r.serveControl(tcpLn)
+		go func() {
+			<-ctx.Done()
+			_ = tcpLn.Close()
+		}()
+		r.cfg.Logf("中继控制面：TCP %v 就绪（后端拨腿模式可用）", tcpLn.Addr())
+	} else {
+		r.cfg.Logf("⚠️ 控制面 TCP %v 监听失败（%v）—— 退回纯 UDP 中继（拨腿特性缺席）", ctlAddr.String(), terr)
+	}
 	who := "⚠️ 开放注册：任何知道本地址的后端都能用它中转（正常路径下不会出现）"
 	if r.cfg.Secret != ([32]byte{}) {
 		rid := proto.RelaySecretID(r.cfg.Secret)
@@ -201,6 +235,7 @@ func (r *Relay) listen() (*net.UDPConn, error) {
 	if err == nil {
 		return pc, nil
 	}
+	_ = 0 // （TCP 控制监听在 Serve 里另起；此处保持原 UDP 退让逻辑不动）
 	r.cfg.Logf("⚠️ 监听端口 %d 被占用（%v）—— 自动往后找", want, err)
 	for p := want + 1; want != 0 && p <= want+9; p++ {
 		la := *laddr
@@ -403,13 +438,23 @@ func (r *Relay) forwardUp(client netip.AddrPort, lg *leg, typ byte, payload []by
 	key := assocKey{label: lg.label, client: client}
 	r.mu.Lock()
 	a := r.assocs[key]
-	if a != nil && a.backend != lg.addr {
-		// 后端注册腿换了地址（重映射）：老分配作废，重建
+	if a != nil && !a.dialed && a.backend != lg.addr {
+		// 后端注册腿换了地址（重映射）：老分配作废，重建。
+		// 拨腿模式不适用：backend = 腿源地址（与 lg.addr 是两个概念，
+		// 无 UDP 注册时 lg.addr 为零值，按它比对会恒不等 → 每包都拆会话重建。
 		_ = a.sock.Close()
 		delete(r.assocs, key)
 		a = nil
 	}
 	if a == nil {
+		// 无可达路径不建会话：既无 UDP 注册腿（lg.addr 无效）也无控制连接时，
+		// 建了也只能指向零值地址（死会话，客户端首包竞态在控制面握手窗口里
+		// 会踩中）——丢弃让客户端重试，等后端任一路径就绪。
+		if !lg.addr.IsValid() && !r.hasControlLocked(lg) {
+			r.mu.Unlock()
+			r.bump(func(s *Stats) { s.Dropped++ })
+			return
+		}
 		if r.countAssocsLocked(lg.label) >= r.cfg.MaxPerPeer {
 			r.mu.Unlock()
 			r.bump(func(s *Stats) { s.Dropped++ })
@@ -423,33 +468,101 @@ func (r *Relay) forwardUp(client netip.AddrPort, lg *leg, typ byte, payload []by
 			return
 		}
 		a = &assoc{key: key, backend: lg.addr, sock: sock, last: time.Now()}
+		// relay-backend-dial：有控制连接的后端走「通告 + 等拨腿」——
+		// 不主动发往 lg.addr（严格 NAT 上恒不通），首包缓冲、等后端的 LEGUP。
+		if r.hasControlLocked(lg) {
+			r.nextSid++
+			a.sid = r.nextSid
+			a.dialUp = true
+			a.dialed = true
+		}
 		r.assocs[key] = a
 		r.stats.Assigned++
+		sid, dialUp := a.sid, a.dialUp
 		r.mu.Unlock()
 		go r.assocReadLoop(a)
 		// 腿建立：两端各推一次对端观察地址（不可信线索）
 		r.sendHintToClient(a, lg)
 		r.sendHintToBackend(a, client)
-		r.cfg.Logf("中继：客户端 %v 起一条分配腿 → 后端 %x（中继侧出口 %v）",
-			client, lg.label[:], a.sock.LocalAddr())
+		if dialUp {
+			port := uint16(sock.LocalAddr().(*net.UDPAddr).Port)
+			if r.announceSession(lg, proto.CtlSession{ID: sid, DataPort: port}) {
+				r.cfg.Logf("中继：客户端 %v 起会话 #%d（拨腿模式）→ 后端 %x（数据口 %v）",
+					client, sid, lg.label[:], sock.LocalAddr())
+			} else {
+				// 通告失败（连接刚断）：这条会话没腿可等——回收掉，客户端重试会再触发
+				_ = sock.Close()
+				r.mu.Lock()
+				delete(r.assocs, key)
+				r.mu.Unlock()
+				r.bump(func(s *Stats) { s.Dropped++ })
+				return
+			}
+		} else {
+			r.cfg.Logf("中继：客户端 %v 起一条分配腿 → 后端 %x（中继侧出口 %v）",
+				client, lg.label[:], a.sock.LocalAddr())
+		}
 	} else {
 		a.last = time.Now()
 		r.mu.Unlock()
 	}
 	frame := proto.EncodeFrame(typ, payload)
-	_, _ = a.sock.WriteToUDPAddrPort(frame, lg.addr)
+	r.mu.Lock()
+	if a.dialUp {
+		// 等腿窗口：缓冲（上限外丢弃——QUIC 首包风暴也就 1-2 个包）
+		a.pendMu.Lock()
+		if len(a.pend) < ctlPendMax {
+			a.pend = append(a.pend, frame)
+			a.pendMu.Unlock()
+			r.mu.Unlock()
+			r.bump(func(s *Stats) { s.ForwardedUp++ })
+			return
+		}
+		a.pendMu.Unlock()
+		r.mu.Unlock()
+		r.bump(func(s *Stats) { s.Dropped++ })
+		return
+	}
+	dst := a.backend
+	r.mu.Unlock()
+	_, _ = a.sock.WriteToUDPAddrPort(frame, dst)
 	r.bump(func(s *Stats) { s.ForwardedUp++ })
 }
 
+// hasControlLocked：leg 是否挂着控制连接（调用方持 r.mu）。
+func (r *Relay) hasControlLocked(lg *leg) bool {
+	return lg != nil && lg.ctl != nil
+}
+
 // assocReadLoop：后端 → 客户端。后端回程是**裸 WG**（device 不知道帧），也可能带 hint 腿帧。
+// 拨腿模式下首个到达包 = 后端拨腿的标记（"LEGUP"，纯标记）或首批数据：登记腿源地址、
+// 放掉等腿窗口的缓冲，之后进入常态转发。
 func (r *Relay) assocReadLoop(a *assoc) {
 	buf := make([]byte, 65535)
 	for {
-		n, _, err := a.sock.ReadFromUDPAddrPort(buf)
+		n, from, err := a.sock.ReadFromUDPAddrPort(buf)
 		if err != nil {
 			return
 		}
 		pkt := buf[:n]
+		r.mu.Lock()
+		if a.dialUp {
+			a.dialUp = false
+			a.backend = from
+			r.mu.Unlock()
+			a.pendMu.Lock()
+			pend := a.pend
+			a.pend = nil
+			a.pendMu.Unlock()
+			for _, p := range pend {
+				_, _ = a.sock.WriteToUDPAddrPort(p, from)
+			}
+			if string(pkt) == "LEGUP" {
+				continue // 纯标记，不转发
+			}
+		} else {
+			r.mu.Unlock()
+		}
 		frame := pkt
 		if len(pkt) == 0 || pkt[0] != 0xBB {
 			// 裸 WG：包成数据腿帧再发给客户端
@@ -495,18 +608,41 @@ func (r *Relay) reapLoop(ctx context.Context) {
 		}
 		now := time.Now()
 		var reclaim int
+		var released []*leg
+		var releasedIds []uint64
 		r.mu.Lock()
 		for k, a := range r.assocs {
 			if now.Sub(a.last) > r.cfg.IdleTimeout {
 				_ = a.sock.Close()
 				delete(r.assocs, k)
 				reclaim++
+				if a.sid != 0 {
+					if lg := r.legs[k.label]; lg != nil {
+						released = append(released, lg)
+						releasedIds = append(releasedIds, a.sid)
+					}
+				}
 			}
 		}
+		r.mu.Unlock()
+		// 拨腿会话回收 → 通告后端放腿（锁外写，避免与 announceSession 抢锁序）。
+		for i, lg := range released {
+			r.releaseSession(lg, releasedIds[i])
+		}
+		r.mu.Lock()
 		r.stats.Reclaimed += uint64(reclaim)
 		for label, lg := range r.legs {
-			if lg.verified && now.Sub(lg.last) > r.cfg.LegTimeout {
+			// 有控制连接的腿由控制保活续命（readControlLoop 刷 last）；
+			// UDP 注册腿（verified）按 UDP 保活过期。两者都在 → 任一活着即保留。
+			alive := lg.verified && now.Sub(lg.last) <= r.cfg.LegTimeout
+			if lg.ctl != nil {
+				alive = now.Sub(lg.last) <= r.cfg.LegTimeout
+			}
+			if !alive {
 				r.cfg.Logf("中继：后端 %x 注册腿过期（%v 无保活）—— 摘掉", label[:], now.Sub(lg.last).Round(time.Second))
+				if lg.ctl != nil {
+					lg.ctl.close()
+				}
 				for k, a := range r.assocs {
 					if k.label == label {
 						_ = a.sock.Close()
