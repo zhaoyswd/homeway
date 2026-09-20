@@ -39,6 +39,22 @@ const (
 	defaultRateLimit   = 200              // 每个源地址每秒允许的包数（准入限流）
 	defaultMaxLegs     = 256              // 注册腿总数上限（白名单为空时的兜底）
 	challengeTTL       = 15 * time.Second // 挑战有效期
+	// defaultDialWait：拨腿等待窗口——通告后等后端 LEGUP 的上限。后端拨腿失败
+	// （本地 socket 分配失败/腿上限）只记日志不回报，中继若无限等待，客户端上行
+	// 会一直刷新 a.last，空闲回收永不触发（review 2026-09-21：会话永久悬挂）。
+	defaultDialWait = 15 * time.Second
+	// defaultDownSilent：会话**下行**静默上限——上行仍活跃（a.last 新鲜）而腿/后端
+	// 方向零下行超过该值即拆会话。半死会话的兜底：后端腿被 RELEASE 丢失/控制空窗
+	// 期回收后，客户端包持续灌进死地址、谁也不报错。拆会话安全：端到端状态
+	// （WG 会话密钥、出口过境会话）不键在中继会话上，下一包即重建（亚秒抖动）；
+	// 纯单向 UDP 流会每过该窗口吃到一次重建抖动——QUIC/TCP 恒有下行不受影响。
+	defaultDownSilent = 5 * time.Minute
+	// legBootstrap：未完成验证的腿（Hello 后/控制握手中）只保留这么久的注册窗口。
+	// 防「匿名 Hello 占位」（MaxLegs 之外的第二道闸），同时让慢握手不与 reap 轮
+	// 竞争（review 2026-09-21：建腿 last 零值 + verified=false，5s 一轮的 reap 会
+	// 把握手中的腿摘出 map——TCP 控制路径此后不自愈，dialUp 模式静默失效）。
+	// 覆盖 UDP challengeTTL(15s) 与 TCP 握手 deadline(10s) 两条窗口。
+	legBootstrap = 30 * time.Second
 )
 
 // Config 中继参数。
@@ -46,8 +62,12 @@ type Config struct {
 	Addr        string        // 监听地址（如 :41641）
 	IdleTimeout time.Duration // 分配腿空闲回收（0 = 默认 90s）
 	LegTimeout  time.Duration // 注册腿过期（0 = 默认 90s）
-	MaxPerPeer  int           // 每个后端的最大并发分配（0 = 默认 32）
-	RateLimit   int           // 每源每秒包数上限（0 = 默认 200）
+	// DialWait：拨腿等待窗口（0 = 默认 15s；测试可调短）。
+	DialWait time.Duration
+	// DownSilent：会话下行静默上限（0 = 默认 5min；测试可调短）。
+	DownSilent time.Duration
+	MaxPerPeer int // 每个后端的最大并发分配（0 = 默认 32）
+	RateLimit  int // 每源每秒包数上限（0 = 默认 200）
 	// Secret：中继**鉴权密钥**（非零 = token 模式：只接受持有 rl1 token 的后端）。
 	// 零值 = 开放模式（谁都能注册，仅测试用）。密钥由 cmd 从 --state 加载/生成。
 	Secret [32]byte
@@ -112,16 +132,22 @@ type assoc struct {
 	key     assocKey
 	backend netip.AddrPort // 注册腿地址（回程发给它；拨腿模式下 = 后端腿的实际源地址）
 	sock    *net.UDPConn   // 该客户端专属的上游 socket（后端看到的"客户端地址"）
-	last    time.Time
+	last    time.Time      // 最近一次任一方向活动（空闲回收判据）
+	// lastDown：最近一次**下行**（腿/后端方向到达）时刻。与 last 分开记：
+	// 半死会话（上行活跃、下行恒零）光看 last 永远活着——DownSilent 用它判死。
+	lastDown time.Time
 	// 拨腿模式（relay-backend-dial）：等后端来拨。首包（LEGUP）到达前，
 	// 客户端包缓冲在 pend（≤16）；到达后 backend = 腿源地址，缓冲放行。
 	// dialed 是**持久**标志（本会话由拨腿承载——backend=腿源地址，与 lg.addr
 	// 是两个概念，地址漂移检查不适用）；dialUp 只标「等待中」。
-	sid    uint64
-	dialed bool
-	dialUp bool
-	pendMu sync.Mutex
-	pend   [][]byte
+	// dialUpAt：等待开始时刻（DialWait 超时判据——后端拨腿失败不回报，
+	// 中继侧必须自持看门狗，否则客户端上行会让会话悬挂到天荒地老）。
+	sid      uint64
+	dialed   bool
+	dialUp   bool
+	dialUpAt time.Time
+	pendMu   sync.Mutex
+	pend     [][]byte
 }
 
 // ctlPendMax：拨腿等待窗口的客户端包缓冲上限（同直连引导的 pending 语义）。
@@ -139,6 +165,12 @@ func New(cfg Config) *Relay {
 	}
 	if cfg.LegTimeout <= 0 {
 		cfg.LegTimeout = defaultLegTimeout
+	}
+	if cfg.DialWait <= 0 {
+		cfg.DialWait = defaultDialWait
+	}
+	if cfg.DownSilent <= 0 {
+		cfg.DownSilent = defaultDownSilent
 	}
 	if cfg.MaxPerPeer <= 0 {
 		cfg.MaxPerPeer = defaultMaxPerPeer
@@ -349,7 +381,7 @@ func (r *Relay) handleControl(src netip.AddrPort, label [8]byte, lg *leg, payloa
 				r.cfg.Logf("中继：注册腿总数已达上限 %d，拒绝新的 %x（防匿名洪水）", r.cfg.MaxLegs, label[:])
 				return
 			}
-			cur = &leg{label: label, pubkey: pubkey}
+			cur = &leg{label: label, pubkey: pubkey, last: time.Now()} // last=now：未验证腿的注册窗口起点（见 reapLoop 的 legBootstrap 分支）
 			r.legs[label] = cur
 		}
 		cur.ephPriv, cur.nonce, cur.challAt = ephPriv, nonce, time.Now()
@@ -488,7 +520,7 @@ func (r *Relay) forwardUp(client netip.AddrPort, lg *leg, typ byte, payload []by
 			r.bump(func(s *Stats) { s.Dropped++ })
 			return
 		}
-		a = &assoc{key: key, backend: lg.addr, sock: sock, last: time.Now()}
+		a = &assoc{key: key, backend: lg.addr, sock: sock, last: time.Now(), lastDown: time.Now()}
 		// relay-backend-dial：有控制连接的后端走「通告 + 等拨腿」——
 		// 不主动发往 lg.addr（严格 NAT 上恒不通），首包缓冲、等后端的 LEGUP。
 		if r.hasControlLocked(lg) {
@@ -496,6 +528,7 @@ func (r *Relay) forwardUp(client netip.AddrPort, lg *leg, typ byte, payload []by
 			a.sid = r.nextSid
 			a.dialUp = true
 			a.dialed = true
+			a.dialUpAt = time.Now()
 		}
 		r.assocs[key] = a
 		r.stats.Assigned++
@@ -568,6 +601,10 @@ func (r *Relay) assocReadLoop(a *assoc) {
 		pkt := buf[:n]
 		from = unmap(from) // 与 readLoop 同款：4in6 映射形态统一成 v4，否则后续比较恒不等
 		r.mu.Lock()
+		// 双向任一活跃即续命（与出口 intercept 的共享时间戳同哲学）；下行时刻
+		// 单独记（DownSilent 判据），LEGUP 这类纯标记也算下行到达。
+		now := time.Now()
+		a.last, a.lastDown = now, now
 		if a.dialUp {
 			a.dialUp = false
 			a.backend = from
@@ -578,9 +615,6 @@ func (r *Relay) assocReadLoop(a *assoc) {
 			a.pendMu.Unlock()
 			for _, p := range pend {
 				_, _ = a.sock.WriteToUDPAddrPort(p, from)
-			}
-			if string(pkt) == "LEGUP" {
-				continue // 纯标记，不转发
 			}
 		} else if a.dialed && a.backend != from {
 			// 常态源校正（review B5）：**只对拨腿会话**（a.dialed）生效——后端腿的
@@ -596,6 +630,13 @@ func (r *Relay) assocReadLoop(a *assoc) {
 		} else {
 			r.mu.Unlock()
 		}
+		// LEGUP 吞包：首腿与重拨腿（控制重连重放后的再拨）都会发这个标记。
+		// 判定必须在分支外——重拨腿的 LEGUP 是"新源首包"，走漂移跟随分支，
+		// 若只在 dialUp 分支里吞，它会被当数据转发给客户端（review 2026-09-21；
+		// WG 层虽会丢弃 5 字节残包，但别把标记泄给对端）。
+		if len(pkt) == 5 && string(pkt) == "LEGUP" {
+			continue
+		}
 		frame := pkt
 		if len(pkt) == 0 || pkt[0] != 0xBB {
 			// 裸 WG：包成数据腿帧再发给客户端
@@ -604,9 +645,6 @@ func (r *Relay) assocReadLoop(a *assoc) {
 		if _, err := r.pc.WriteToUDPAddrPort(frame, a.key.client); err != nil {
 			return
 		}
-		r.mu.Lock()
-		a.last = time.Now()
-		r.mu.Unlock()
 		r.bump(func(s *Stats) { s.ForwardedDown++ })
 	}
 }
@@ -636,9 +674,24 @@ func (r *Relay) sendHintToBackend(a *assoc, client netip.AddrPort) {
 	_, _ = a.sock.WriteToUDPAddrPort(frame, dst)
 }
 
+// reapInterval：回收扫描节拍。默认 5s；配置了更短的回收窗时按其一半收缩
+// （测试用百毫秒级超时，不必等 5s 一轮；生产默认值都不收缩）。
+func (r *Relay) reapInterval() time.Duration {
+	d := 5 * time.Second
+	for _, c := range []time.Duration{r.cfg.IdleTimeout, r.cfg.DialWait, r.cfg.DownSilent} {
+		if c > 0 && c/2 < d {
+			d = c / 2
+		}
+	}
+	if d < 20*time.Millisecond {
+		d = 20 * time.Millisecond
+	}
+	return d
+}
+
 // reapLoop：回收空闲分配腿 + 过期注册腿。
 func (r *Relay) reapLoop(ctx context.Context) {
-	t := time.NewTicker(5 * time.Second)
+	t := time.NewTicker(r.reapInterval())
 	defer t.Stop()
 	for {
 		select {
@@ -652,15 +705,27 @@ func (r *Relay) reapLoop(ctx context.Context) {
 		var releasedIds []uint64
 		r.mu.Lock()
 		for k, a := range r.assocs {
-			if now.Sub(a.last) > r.cfg.IdleTimeout {
-				_ = a.sock.Close()
-				delete(r.assocs, k)
-				reclaim++
-				if a.sid != 0 {
-					if lg := r.legs[k.label]; lg != nil {
-						released = append(released, lg)
-						releasedIds = append(releasedIds, a.sid)
-					}
+			why := ""
+			switch {
+			case now.Sub(a.last) > r.cfg.IdleTimeout:
+				why = "" // 普通空闲：走既有聚合计数，不逐条打日志
+			case a.dialUp && now.Sub(a.dialUpAt) > r.cfg.DialWait:
+				why = fmt.Sprintf("拨腿等待超 %v（通告后无 LEGUP——后端拨腿失败/通告丢失）", r.cfg.DialWait)
+			case now.Sub(a.lastDown) > r.cfg.DownSilent:
+				why = fmt.Sprintf("下行静默超 %v（上行仍活跃——半死会话兜底）", r.cfg.DownSilent)
+			default:
+				continue
+			}
+			if why != "" {
+				r.cfg.Logf("中继：会话 #%d 回收：%s", a.sid, why)
+			}
+			_ = a.sock.Close()
+			delete(r.assocs, k)
+			reclaim++
+			if a.sid != 0 {
+				if lg := r.legs[k.label]; lg != nil {
+					released = append(released, lg)
+					releasedIds = append(releasedIds, a.sid)
 				}
 			}
 		}
@@ -672,11 +737,14 @@ func (r *Relay) reapLoop(ctx context.Context) {
 		r.mu.Lock()
 		r.stats.Reclaimed += uint64(reclaim)
 		for label, lg := range r.legs {
-			// 有控制连接的腿由控制保活续命（readControlLoop 刷 last）；
-			// UDP 注册腿（verified）按 UDP 保活过期。两者都在 → 任一活着即保留。
-			alive := (lg.verified || lg.ctlVerified) && now.Sub(lg.last) <= r.cfg.LegTimeout
-			if lg.ctl != nil {
-				alive = now.Sub(lg.last) <= r.cfg.LegTimeout
+			// 存活判定：挂着控制连接的腿由控制保活续命（readControlLoop 刷 last）；
+			// 已验证（UDP 注册挑战或控制面挑战任一）按 last 在 LegTimeout 内；
+			// **未验证的腿只保留 legBootstrap 注册窗口**——建腿时 last=now（见
+			// legForControl / handleControl Hello），窗口内完成不了验证就摘，
+			// 既防匿名 Hello 占位、又让慢握手不与 reap 轮竞争（见 legBootstrap 注释）。
+			alive := now.Sub(lg.last) <= r.cfg.LegTimeout
+			if lg.ctl == nil && !lg.verified && !lg.ctlVerified {
+				alive = now.Sub(lg.last) <= legBootstrap
 			}
 			if !alive {
 				r.cfg.Logf("中继：后端 %x 注册腿过期（%v 无保活）—— 摘掉", label[:], now.Sub(lg.last).Round(time.Second))

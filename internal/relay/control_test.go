@@ -395,3 +395,147 @@ func TestControlReplayPromotesFallbackAssocs(t *testing.T) {
 		t.Fatalf("提升后回程失败：%q ok=%v", got, ok)
 	}
 }
+
+// ---------- review 2026-09-21 修复的回归测试 ----------
+
+// 拨腿等待超时：通告后后端不拨腿（拨失败/通告丢失），会话必须在 DialWait 内被拆
+// 并补发 RELEASE——否则客户端上行一直刷新 a.last，空闲回收永不触发（悬挂到天荒地老）。
+func TestControlDialWaitTimeout(t *testing.T) {
+	r := startRelay(t, Config{DialWait: 250 * time.Millisecond})
+	relayAddr := netip.AddrPortFrom(netip.MustParseAddr("127.0.0.1"), r.LocalAddr().Port())
+	be := newDialBackend(t, relayAddr, [32]byte{})
+	be.connect(t)
+	be.readLoop(t)
+
+	cli := newFakeClient(t, be.label, relayAddr)
+	cli.send([]byte("no-leg"))
+	select {
+	case sess := <-be.sessions:
+		// 收到通告但故意不拨腿。
+		select {
+		case id := <-be.releases:
+			if id != sess.ID {
+				t.Fatalf("RELEASE 会话号不符：%d want %d", id, sess.ID)
+			}
+		case <-time.After(3 * time.Second):
+			t.Fatal("拨腿等待超时后没收到 RELEASE——会话悬挂了")
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("没收到 SESSION 通告")
+	}
+	if st := r.Stats(); st.Reclaimed < 1 {
+		t.Fatalf("回收计数没涨：%+v", st)
+	}
+}
+
+// 下行静默看门狗：会话建立后腿/后端方向静默、客户端上行持续（a.last 恒新鲜），
+// DownSilent 到点必须拆会话（半死会话兜底）；且拆会话是安全的——下一包即重建
+// 全新会话（新 sid + 新数据口），拨腿后数据无缝继续。
+func TestControlDownSilentReap(t *testing.T) {
+	r := startRelay(t, Config{DownSilent: 400 * time.Millisecond})
+	relayAddr := netip.AddrPortFrom(netip.MustParseAddr("127.0.0.1"), r.LocalAddr().Port())
+	be := newDialBackend(t, relayAddr, [32]byte{})
+	be.connect(t)
+	be.readLoop(t)
+
+	cli := newFakeClient(t, be.label, relayAddr)
+	cli.send([]byte("warm"))
+	var firstID uint64
+	select {
+	case sess := <-be.sessions:
+		firstID = sess.ID
+		leg := be.dialLeg(t, sess)
+		be.readLeg(t, leg, "warm") // 等腿缓冲放行（下行时间戳就此启动）
+		// 腿静默、客户端持续上行（每 60ms 一包，保持 a.last 新鲜）。
+		stop := time.After(3 * time.Second)
+	sendLoop:
+		for {
+			select {
+			case <-stop:
+				break sendLoop
+			case id := <-be.releases:
+				if id != firstID {
+					t.Fatalf("RELEASE 会话号不符：%d want %d", id, firstID)
+				}
+				// 拆会话安全断言：下一包应重建全新会话并照常送达。
+				cli.send([]byte("revive"))
+				select {
+				case sess2 := <-be.sessions:
+					if sess2.ID == firstID {
+						t.Fatal("重建会话复用了旧 sid（应全新分配）")
+					}
+					leg2 := be.dialLeg(t, sess2)
+					be.readLeg(t, leg2, "revive")
+					return
+				case <-time.After(3 * time.Second):
+					t.Fatal("拆会话后没有重建通告")
+				}
+			case <-time.After(60 * time.Millisecond):
+				cli.send([]byte("tick"))
+			}
+		}
+		t.Fatal("下行静默超时后没收到 RELEASE——半死会话没被回收")
+	case <-time.After(3 * time.Second):
+		t.Fatal("没收到 SESSION 通告")
+	}
+}
+
+// 重拨腿的 LEGUP 不得泄给客户端：控制重连重放后后端再拨腿，第二个 LEGUP 是
+// 「新源首包」，走源漂移跟随分支——吞包判定必须在分支外，否则标记被当数据转发。
+func TestControlRedialLegUpNotForwarded(t *testing.T) {
+	r := startRelay(t, Config{})
+	relayAddr := netip.AddrPortFrom(netip.MustParseAddr("127.0.0.1"), r.LocalAddr().Port())
+	be := newDialBackend(t, relayAddr, [32]byte{})
+	be.connect(t)
+	be.readLoop(t)
+
+	cli := newFakeClient(t, be.label, relayAddr)
+	cli.send([]byte("first"))
+	select {
+	case sess := <-be.sessions:
+		leg := be.dialLeg(t, sess)
+		be.readLeg(t, leg, "first")
+
+		// 重拨腿（新 socket，同数据口）：先 LEGUP 再真实数据。
+		remote := netip.AddrPortFrom(relayAddr.Addr(), sess.DataPort)
+		leg2, err := net.DialUDP("udp4", nil, net.UDPAddrFromAddrPort(remote))
+		if err != nil {
+			t.Fatalf("重拨腿: %v", err)
+		}
+		defer leg2.Close()
+		if _, err := leg2.Write([]byte("LEGUP")); err != nil {
+			t.Fatal(err)
+		}
+		time.Sleep(100 * time.Millisecond) // 让漂移跟随先生效
+		if _, err := leg2.Write([]byte{7, 7}); err != nil {
+			t.Fatal(err)
+		}
+		// 客户端收到的必须是数据，不是 LEGUP 标记。
+		got, ok := cli.readData(2 * time.Second)
+		if !ok || string(got) != string([]byte{7, 7}) {
+			t.Fatalf("客户端收到的不对（LEGUP 泄漏或数据丢失）：%q ok=%v", got, ok)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("没收到 SESSION 通告")
+	}
+}
+
+// 未验证腿的注册窗口：Hello/控制握手期间的腿（verified=false、无 ctl）必须扛过
+// 至少一轮 reap（旧代码 5s 一轮必摘——TCP 控制路径摘后不自愈，dialUp 永久失效）。
+func TestUnverifiedLegSurvivesReapWindow(t *testing.T) {
+	r := startRelay(t, Config{})
+	var pub [32]byte
+	if _, err := rand.Read(pub[:]); err != nil {
+		t.Fatal(err)
+	}
+	label := proto.RelayID(pub)
+	lg := r.legForControl(label, pub)   // 模拟控制握手进行中（腿已建、未验证）
+	time.Sleep(6500 * time.Millisecond) // 跨过至少一轮 5s reap
+	r.mu.Lock()
+	_, still := r.legs[label]
+	r.mu.Unlock()
+	if !still {
+		t.Fatal("握手中的腿被 reap 摘掉了（legBootstrap 宽限没生效）")
+	}
+	_ = lg
+}

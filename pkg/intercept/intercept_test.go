@@ -20,6 +20,7 @@ import (
 	"time"
 
 	"golang.zx2c4.com/wireguard/tun"
+	"gvisor.dev/gvisor/pkg/tcpip/adapters/gonet"
 
 	"github.com/zhaoyswd/homeway/pkg/wgnet"
 )
@@ -297,5 +298,50 @@ func TestExemptUDP(t *testing.T) {
 	}
 	if string(buf[:n]) != "exempt-udp" {
 		t.Fatalf("echo = %q", string(buf[:n]))
+	}
+}
+
+// UDP 会话上限（review 2026-09-21：TCP 有 MaxConns 闸而 UDP 原先无闸）：
+// MaxUDPSessions=2 时第三个五元组不建会话——目标收不到该流的包。
+func TestUDPSessionCap(t *testing.T) {
+	echo := echoUDP(t)
+	h := newHarness(t, func(ctx context.Context, network, address string) (net.Conn, error) {
+		var d net.Dialer
+		return d.DialContext(ctx, network, echo.String())
+	})
+	h.in.cfg.MaxUDPSessions = 2 // harness 归一化后直接钳制（发包前设置，无并发）
+
+	dial := func(port int) *gonet.UDPConn {
+		pc, err := h.cli.DialUDPAddrPort(
+			netip.AddrPortFrom(netip.MustParseAddr(cliAddr), 0),
+			netip.MustParseAddrPort(fmt.Sprintf("%s:%d", foreignDst, port)),
+		)
+		if err != nil {
+			t.Fatalf("udp dial: %v", err)
+		}
+		t.Cleanup(func() { pc.Close() })
+		return pc
+	}
+	// 前两个五元组：正常建会话并收到回显。
+	for _, port := range []int{5301, 5302} {
+		pc := dial(port)
+		pc.SetDeadline(time.Now().Add(3 * time.Second))
+		if _, err := pc.Write([]byte("in-cap")); err != nil {
+			t.Fatalf("write: %v", err)
+		}
+		buf := make([]byte, 256)
+		if _, err := pc.Read(buf); err != nil {
+			t.Fatalf("上限内会话不应失败（port %d）：%v", port, err)
+		}
+	}
+	// 第三个五元组：超上限，不建会话（读侧等不到回显）。
+	pc3 := dial(5303)
+	pc3.SetDeadline(time.Now().Add(300 * time.Millisecond))
+	if _, err := pc3.Write([]byte("over-cap")); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	buf := make([]byte, 256)
+	if n, err := pc3.Read(buf); err == nil {
+		t.Fatalf("超上限的会话竟然通了（%d 字节）——MaxUDPSessions 没拦住", n)
 	}
 }

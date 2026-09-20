@@ -10,6 +10,7 @@ package wgnet
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net"
 	"net/netip"
@@ -180,6 +181,12 @@ func (n *Net) Stack() *stack.Stack { return n.stack }
 // gVisor 此快照的栈级 TCPDelayEnabled 是单向的（endpoint.go:910 只在 true 时
 // SetDelayOption(true)，false 被无视）⇒ 必须逐端点关。
 
+// ErrRefused：TCP 拨号收到对端 RST（目标端口无服务）。手机核的 PathProbe/
+// 打洞探测靠它判「隧道通、出口在、目标只是拒绝」——tcpip 错误经 fmt.Errorf("%v")
+// 包装后类型即丢，上层只能退化成子串匹配（措辞一改判据就翻）。这里在包装点
+// 显式挂哨兵，上层用 errors.Is 判（wgcore.IsRefusedLike）。
+var ErrRefused = errors.New("connection refused")
+
 func (n *Net) DialTCPAddrPort(addr netip.AddrPort) (*gonet.TCPConn, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
@@ -212,6 +219,9 @@ func (n *Net) DialTCPAddrPortCtx(ctx context.Context, addr netip.AddrPort) (*gon
 	}
 	if err != nil {
 		ep.Close()
+		if _, ok := err.(*tcpip.ErrConnectionRefused); ok {
+			return nil, fmt.Errorf("wgnet: connect: %w", ErrRefused)
+		}
 		return nil, fmt.Errorf("wgnet: connect: %v", err)
 	}
 	return gonet.NewTCPConn(&wq, ep), nil

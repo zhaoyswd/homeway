@@ -39,9 +39,15 @@ func startControlClient(ctx context.Context, bind *servercore.ServerBind, relay 
 			if ctx.Err() != nil {
 				return
 			}
-			err := runControlConn(ctx, bind, relay, priv, pub, relaySecret, logf)
+			handshakeOK, err := runControlConn(ctx, bind, relay, priv, pub, relaySecret, logf)
 			if ctx.Err() != nil {
 				return
+			}
+			if handshakeOK {
+				// 成功建立过的连接断线：退避从最小值重新起（review 2026-09-21：
+				// 只增不减会让长期运行后的每次断线恢复都等满 30s 上限——
+				// 中继重启的恢复被历史退避拖慢）。
+				backoff = ctlReconnectMin
 			}
 			if err != nil {
 				logf("中继控制面断开（%v）—— %v 后重连", err, backoff)
@@ -62,13 +68,15 @@ func startControlClient(ctx context.Context, bind *servercore.ServerBind, relay 
 }
 
 // runControlClient 的一次完整连接生命周期（返回 = 连接结束）。
+// handshakeOK：本次连接是否完成了握手并进入读循环（true = 曾健康运行，断线
+// 重连应从最小退避起；false = 连握都没握上，退避继续翻倍）。
 func runControlConn(ctx context.Context, bind *servercore.ServerBind, relay netip.AddrPort,
-	priv [32]byte, pub [32]byte, relaySecret [32]byte, logf func(string, ...any)) error {
+	priv [32]byte, pub [32]byte, relaySecret [32]byte, logf func(string, ...any)) (handshakeOK bool, err error) {
 
 	d := net.Dialer{Timeout: ctlDialTimeout}
 	conn, err := d.DialContext(ctx, "tcp", relay.String())
 	if err != nil {
-		return fmt.Errorf("拨控制通道: %w", err)
+		return false, fmt.Errorf("拨控制通道: %w", err)
 	}
 	defer conn.Close()
 	// connCtx：本连接的生命周期。保活 goroutine 挂它而不是外层 ctx（服务器
@@ -76,45 +84,52 @@ func runControlConn(ctx context.Context, bind *servercore.ServerBind, relay neti
 	// review B2）。defer cancel() 在本连接结束（返回）时唤醒保活 goroutine 退出。
 	connCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
+	// ctx 收工即断连接：读循环的 deadline 是 3×保活+15s，不主动关的话
+	// 收工要等最长 90s 读超时才返回（保活 goroutine 停发不会打断阻塞中的读）。
+	go func() {
+		<-connCtx.Done()
+		_ = conn.Close()
+	}()
 
 	// ① HELLO
 	if err := proto.CtlWriteMsg(conn, proto.EncodeRelayHello(pub)); err != nil {
-		return fmt.Errorf("发 HELLO: %w", err)
+		return false, fmt.Errorf("发 HELLO: %w", err)
 	}
 	// ② CHALLENGE → ③ PROOF
 	typ, payload, err := proto.CtlReadMsg(conn)
 	if err != nil {
-		return fmt.Errorf("读 CHALLENGE: %w", err)
+		return false, fmt.Errorf("读 CHALLENGE: %w", err)
 	}
 	if typ != proto.RelaySubChallenge {
-		return errors.New("控制面握手不是 CHALLENGE")
+		return false, errors.New("控制面握手不是 CHALLENGE")
 	}
 	ephPub, nonce, cerr := proto.DecodeRelayChallenge(withSubtype(typ, payload))
 	if cerr != nil {
-		return fmt.Errorf("解析 CHALLENGE: %w", cerr)
+		return false, fmt.Errorf("解析 CHALLENGE: %w", cerr)
 	}
 	dh, derr := curve25519.X25519(priv[:], ephPub[:])
 	if derr != nil {
-		return fmt.Errorf("算 DH: %w", derr)
+		return false, fmt.Errorf("算 DH: %w", derr)
 	}
 	var macPSK []byte
 	if relaySecret != ([32]byte{}) {
 		macPSK = proto.RelayAuthMAC(relaySecret, nonce, pub)
 	}
 	if err := proto.CtlWriteMsg(conn, proto.EncodeRelayProof(nonce, dh, pub, macPSK)); err != nil {
-		return fmt.Errorf("发 PROOF: %w", err)
+		return false, fmt.Errorf("发 PROOF: %w", err)
 	}
 	// ④ OK
 	typ, payload, err = proto.CtlReadMsg(conn)
 	if err != nil {
-		return fmt.Errorf("读 OK: %w", err)
+		return false, fmt.Errorf("读 OK: %w", err)
 	}
 	if typ != proto.RelaySubOK {
-		return fmt.Errorf("控制面握手被拒（type=0x%02x）", typ)
+		return false, fmt.Errorf("控制面握手被拒（type=0x%02x）", typ)
 	}
 	// 重连对账（review B1）：旧腿全部作废——中继会立刻重放活跃会话（replaySessions），
 	// 按重放重建。中继重启场景 = 重放零条 = 干净清空。
 	bind.ClearLegs()
+	handshakeOK = true // 从这里起算「曾健康运行」：断线重连从最小退避起
 	logf("中继控制面已连（%v）—— 已清腿表，等待会话重放", relay)
 
 	// 保活 + 读循环（SESSION/RELEASE）。中继侧读超时 = 3×保活+15s，留足容错。
@@ -135,12 +150,12 @@ func runControlConn(ctx context.Context, bind *servercore.ServerBind, relay neti
 	}()
 	for {
 		if ctx.Err() != nil {
-			return ctx.Err()
+			return true, ctx.Err()
 		}
 		_ = conn.SetReadDeadline(time.Now().Add(3*ctlKeepaliveEvery + 15*time.Second))
 		typ, payload, err := proto.CtlReadMsg(conn)
 		if err != nil {
-			return fmt.Errorf("控制面读: %w", err)
+			return true, fmt.Errorf("控制面读: %w", err)
 		}
 		switch typ {
 		case proto.RelayCtlSession:

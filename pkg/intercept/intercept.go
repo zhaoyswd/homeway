@@ -45,6 +45,9 @@ const (
 	defaultTCPIdle  = 6 * time.Minute
 	defaultUDPIdle  = flows.DefaultUDPIdle // 60s，与手机侧空闲回收对齐
 	dialTimeout     = 10 * time.Second
+	// defaultMaxUDPSessions：与 TCP 的 defaultMaxConns 同量级（保险阀不是整形：
+	// 正常使用远达不到，防失控应用把 goroutine/内存打满）。
+	defaultMaxUDPSessions = 4096
 	// 读粒度：短期限轮转 + 共享活跃时间戳（防「单方向静默误杀长轮询」）。
 	readSlice = 30 * time.Second
 	bufSize   = 64 << 10
@@ -58,7 +61,12 @@ type Config struct {
 	MaxConns int
 	TCPIdle  time.Duration
 	UDPIdle  time.Duration
-	Logf     func(format string, args ...any)
+	// MaxUDPSessions：UDP 会话上限（0 = 默认 4096）。TCP 有 MaxConns 保险阀，
+	// UDP 每会话 3 goroutine + 端点 + 双向缓冲——失控应用按五元组洪水时同样
+	// 需要闸（review 2026-09-21：原先 UDP 无闸，与 TCP 不对称）。超限返回
+	// false = 未处理，netstack 按「无监听」回 ICMP 不可达（客户端快速失败）。
+	MaxUDPSessions int
+	Logf           func(format string, args ...any)
 }
 
 // Interceptor：挂在 wgnet 栈上的过境流拦截层。Close 收全部会话。
@@ -101,6 +109,9 @@ func Attach(n *wgnet.Net, cfg Config, st *flows.Stats) (*Interceptor, error) {
 	}
 	if cfg.UDPIdle <= 0 {
 		cfg.UDPIdle = defaultUDPIdle
+	}
+	if cfg.MaxUDPSessions <= 0 {
+		cfg.MaxUDPSessions = defaultMaxUDPSessions
 	}
 	if cfg.Logf == nil {
 		cfg.Logf = func(string, ...any) {}
@@ -190,6 +201,10 @@ func (in *Interceptor) serveTCP(r *tcp.ForwarderRequest, dst, src netip.AddrPort
 	var wq waiter.Queue
 	ep, terr := r.CreateEndpoint(&wq)
 	if terr != nil {
+		// tun2socks 同款：CreateEndpoint 失败也要 Complete(true)——把请求从
+		// Forwarder 的 inFlight 摘除并回 RST（漏了会占住 maxInFlight 槽位，
+		// review 2026-09-21）。
+		r.Complete(true)
 		upstream.Close()
 		if in.st != nil {
 			in.st.IncrFail()
@@ -240,6 +255,14 @@ func (in *Interceptor) handleUDPPacket(id stack.TransportEndpointID, pkt *stack.
 		}
 		in.udpMu.Unlock()
 		return true
+	}
+	if len(in.udpSess) >= in.cfg.MaxUDPSessions {
+		in.udpMu.Unlock()
+		if in.st != nil {
+			in.st.IncrReject()
+		}
+		in.cfg.Logf("intercept: udp 会话上限 %d 已满，丢 %v ← %v", in.cfg.MaxUDPSessions, dst, src)
+		return false // 未处理 → netstack 回 ICMP 不可达，客户端快速失败
 	}
 	in.udpSess[key] = true
 	in.udpMu.Unlock()

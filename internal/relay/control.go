@@ -195,12 +195,14 @@ func (r *Relay) readControlLoop(lg *leg, cc *ctlConn, c net.Conn) {
 
 // legForControl：按 label 找（或建）leg。控制面建立的 leg 没有 UDP 地址，
 // 仍允许 —— dataPort 拨腿模式不需要 lg.addr；hints/兼容路径照旧依赖 UDP 注册。
+// last=now：未验证腿的注册窗口起点——reapLoop 的 legBootstrap 分支据此放行
+// 握手期（TCP 挑战 deadline 10s；零值 last 会被 5s 一轮的 reap 立即摘掉）。
 func (r *Relay) legForControl(label [8]byte, pub [32]byte) *leg {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	lg := r.legs[label]
 	if lg == nil {
-		lg = &leg{label: label, pubkey: pub}
+		lg = &leg{label: label, pubkey: pub, last: time.Now()}
 		r.legs[label] = lg
 	}
 	return lg
@@ -263,11 +265,13 @@ func (r *Relay) replaySessions(lg *leg, cc *ctlConn) {
 		if a.sid == 0 {
 			// 提升：拿全新会话号（不是 0——多条 id=0 会互相顶掉，且 RELEASE
 			// 语义要求 sid!=0），切拨腿模式。通告成功与否在锁外验证，失败则
-			// 回滚成 fallback（下次重连再试）。
+			// 回滚成 fallback（下次重连再试）。dialUpAt 从提升时刻起算——
+			// 拨腿等待超时（DialWait）按它判。
 			r.nextSid++
 			a.sid = r.nextSid
 			a.dialUp = true
 			a.dialed = true
+			a.dialUpAt = time.Now()
 		}
 		port := uint16(a.sock.LocalAddr().(*net.UDPAddr).Port)
 		out = append(out, pending{msg: proto.EncodeCtlSession(proto.CtlSession{ID: a.sid, DataPort: port}), assoc: a})

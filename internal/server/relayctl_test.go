@@ -165,3 +165,80 @@ steadyOK:
 		t.Fatalf("中继计数不对：%+v", st)
 	}
 }
+
+// runControlConn 的 handshakeOK 信号（backoff 重置的依据，review 2026-09-21）：
+// 握手成功并进入读循环的连接断开 → true（重连从最小退避起）；
+// 连握都没握上（被拒）→ false（退避继续翻倍）。
+func TestRunControlConnHandshakeSignal(t *testing.T) {
+	newBind := func(t *testing.T) *servercore.ServerBind {
+		t.Helper()
+		b := &servercore.ServerBind{
+			Logf:  func(f string, a ...any) { t.Logf("[backend] "+f, a...) },
+			Table: servercore.NewDeviceTable(nil, [][32]byte{{1}}, servercore.DeviceConfig{MaxDevices: 8}),
+		}
+		if _, _, err := b.Open(0); err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { b.Close() })
+		return b
+	}
+	var priv [32]byte
+	if _, err := rand.Read(priv[:]); err != nil {
+		t.Fatal(err)
+	}
+	pub := wgPub(priv)
+	logf := func(f string, a ...any) { t.Logf("[ctl] "+f, a...) }
+
+	// ① 开放模式中继：握手成功 → cancel ctx 断开 → handshakeOK 必须为 true。
+	rl := relay.New(relay.Config{Addr: "127.0.0.1:0", Logf: logf})
+	rctx, rcancel := context.WithCancel(context.Background())
+	rlDone := make(chan struct{})
+	go func() { defer close(rlDone); _ = rl.Run(rctx) }()
+	t.Cleanup(func() { rcancel(); <-rlDone })
+	for i := 0; i < 100 && !rl.LocalAddr().IsValid(); i++ {
+		time.Sleep(10 * time.Millisecond)
+	}
+	relayAddr := netip.AddrPortFrom(netip.MustParseAddr("127.0.0.1"), rl.LocalAddr().Port())
+
+	ctx1, cancel1 := context.WithCancel(context.Background())
+	okCh := make(chan bool, 1)
+	go func() {
+		ok, _ := runControlConn(ctx1, newBind(t), relayAddr, priv, pub, [32]byte{}, logf)
+		okCh <- ok
+	}()
+	time.Sleep(500 * time.Millisecond) // 等握手完成进入读循环
+	cancel1()
+	select {
+	case ok := <-okCh:
+		if !ok {
+			t.Fatal("健康连接断开后 handshakeOK=false（backoff 会被历史退避拖满 30s）")
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("runControlConn 没退出")
+	}
+
+	// ② token 模式中继 + 错 secret：握手被拒 → handshakeOK 必须为 false。
+	var secret [32]byte
+	if _, err := rand.Read(secret[:]); err != nil {
+		t.Fatal(err)
+	}
+	rl2 := relay.New(relay.Config{Addr: "127.0.0.1:0", Secret: secret, Logf: logf})
+	r2ctx, r2cancel := context.WithCancel(context.Background())
+	rl2Done := make(chan struct{})
+	go func() { defer close(rl2Done); _ = rl2.Run(r2ctx) }()
+	t.Cleanup(func() { r2cancel(); <-rl2Done })
+	for i := 0; i < 100 && !rl2.LocalAddr().IsValid(); i++ {
+		time.Sleep(10 * time.Millisecond)
+	}
+	relayAddr2 := netip.AddrPortFrom(netip.MustParseAddr("127.0.0.1"), rl2.LocalAddr().Port())
+
+	ctx2, cancel2 := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel2()
+	ok2, err2 := runControlConn(ctx2, newBind(t), relayAddr2, priv, pub, [32]byte{}, logf)
+	if ok2 {
+		t.Fatal("被拒的握手 handshakeOK=true（会把 backoff 重置当成连上过）")
+	}
+	if err2 == nil {
+		t.Fatal("被拒的握手 err 为空")
+	}
+}
