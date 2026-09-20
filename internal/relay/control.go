@@ -242,32 +242,58 @@ func (r *Relay) announceSession(lg *leg, sess proto.CtlSession) bool {
 }
 
 // replaySessions：向（新建立的）控制连接重放该后端的全部活跃会话。
+//
+// sid==0 的 fallback 会话（控制空窗期建立、走 lg.addr 旧敲洞路径）在这里被
+// **提升**而非跳过（review D1）：分配全新 sid、切到拨腿模式（dialUp=true，后续
+// 客户端包进等腿缓冲）并通告。这是唯一干净的收敛路径——否则严格 NAT 后端的
+// fallback 会话在旧路径上恒不可达，而客户端持续重试让 a.last 一直新鲜，空闲
+// 回收永不触发，要等手机侧巡检 3 连败自愈（分钟级）。公共出口（旧路径本来通）
+// 的会话也被统一提升，短暂等腿（一轮通告+拨腿，几十 ms）后继续。
 func (r *Relay) replaySessions(lg *leg, cc *ctlConn) {
 	r.mu.Lock()
-	var msgs [][]byte
+	type pending struct {
+		msg   []byte
+		assoc *assoc
+	}
+	var out []pending
 	for _, a := range r.assocs {
 		if a.key.label != lg.label {
 			continue
 		}
 		if a.sid == 0 {
-			// 兼容路径会话（控制断开期间建立的 fallback，走 lg.addr 的旧转发）：
-			// 不重放（review C1）——多条 id=0 的 SESSION 会让后端 RegisterLeg(0,…)
-			// 互相顶掉（同 id 替换），「重放一条、打断其余」；且 id=0 永远等不到
-			// RELEASE，只能靠后端 3min 空闲回收兜。
-			continue
+			// 提升：拿全新会话号（不是 0——多条 id=0 会互相顶掉，且 RELEASE
+			// 语义要求 sid!=0），切拨腿模式。通告成功与否在锁外验证，失败则
+			// 回滚成 fallback（下次重连再试）。
+			r.nextSid++
+			a.sid = r.nextSid
+			a.dialUp = true
+			a.dialed = true
 		}
 		port := uint16(a.sock.LocalAddr().(*net.UDPAddr).Port)
-		msgs = append(msgs, proto.EncodeCtlSession(proto.CtlSession{ID: a.sid, DataPort: port}))
+		out = append(out, pending{msg: proto.EncodeCtlSession(proto.CtlSession{ID: a.sid, DataPort: port}), assoc: a})
 	}
 	r.mu.Unlock()
-	for _, m := range msgs {
-		if err := cc.writeMsg(m); err != nil {
+	sent := 0
+	for _, p := range out {
+		if err := cc.writeMsg(p.msg); err != nil {
 			cc.close()
+			// 通告失败：从失败点起回滚剩余的提升（已发出的算数——后端会拨腿，
+			// assocReadLoop 的 LEGUP 分支会完成交接）。
+			r.mu.Lock()
+			for _, q := range out[sent+1:] {
+				if q.assoc.dialUp && q.assoc.sid != 0 && q.assoc.key.label == lg.label {
+					q.assoc.sid = 0
+					q.assoc.dialUp = false
+					q.assoc.dialed = false
+				}
+			}
+			r.mu.Unlock()
 			return
 		}
+		sent++
 	}
-	if len(msgs) > 0 {
-		r.cfg.Logf("中继：后端 %x 控制面重放 %d 条活跃会话", lg.label[:], len(msgs))
+	if len(out) > 0 {
+		r.cfg.Logf("中继：后端 %x 控制面重放 %d 条活跃会话", lg.label[:], len(out))
 	}
 }
 

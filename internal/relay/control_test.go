@@ -293,14 +293,14 @@ func ctlWithSub(typ byte, payload []byte) []byte {
 	return out
 }
 
-// 控制断开期间建立的 fallback 会话（sid==0，走 lg.addr 旧路径）在控制重连后
-// 不被 replay 误伤（review C1）：重放必须跳过 sid==0，否则 RegisterLeg(0,…)
-// 同 id 互相顶掉、腿被关，原本跑得好的会话被打断。
-func TestControlReplaySkipsFallbackAssocs(t *testing.T) {
+// 控制空窗期建立的 fallback 会话（sid==0，走 lg.addr 旧路径）在控制上线后被
+// **提升**为拨腿会话（review D1）：重放通告必须是全新 sid（!=0，不互相顶掉），
+// 后端拨腿后数据无缝继续。同时锁定「不重放 id=0」（C1 的原始断言）。
+func TestControlReplayPromotesFallbackAssocs(t *testing.T) {
 	r := startRelay(t, Config{})
 	relayAddr := netip.AddrPortFrom(netip.MustParseAddr("127.0.0.1"), r.LocalAddr().Port())
 
-	// 后端 A：UDP 注册腿（无控制面）——兼容形态。
+	// 后端：UDP 注册腿（控制空窗形态）。
 	be := newFakeBackend(t, relayAddr)
 	if !be.register() {
 		t.Fatal("UDP 注册失败")
@@ -311,7 +311,6 @@ func TestControlReplaySkipsFallbackAssocs(t *testing.T) {
 	if !ok || string(payload) != "fallback-flow" {
 		t.Fatalf("fallback 会话不通：payload=%q ok=%v", payload, ok)
 	}
-	// 回程确认会话健康
 	if _, err := be.pc.WriteToUDPAddrPort([]byte("R-fb"), from); err != nil {
 		t.Fatal(err)
 	}
@@ -319,8 +318,7 @@ func TestControlReplaySkipsFallbackAssocs(t *testing.T) {
 		t.Fatalf("fallback 回程失败：%q ok=%v", got, ok)
 	}
 
-	// 同一公钥身份（同一 label）再挂一条控制连接（模拟重连/换代）：
-	// 鉴权需要私钥证明——复用 be 的私钥。
+	// 同一身份再挂控制连接（模拟控制恢复/重连）。
 	conn, err := net.DialTimeout("tcp", relayAddr.String(), 3*time.Second)
 	if err != nil {
 		t.Fatal(err)
@@ -344,25 +342,56 @@ func TestControlReplaySkipsFallbackAssocs(t *testing.T) {
 		t.Fatalf("等 OK: typ=0x%02x err=%v", typ, rerr)
 	}
 
-	// 重放（OK 后立即发生）：sid==0 的 fallback 会话**不得**出现在通告里。
-	_ = conn.SetReadDeadline(time.Now().Add(500 * time.Millisecond))
-	for {
+	// 重放：fallback 会话必须被提升——通告一条 sid!=0 的 SESSION（不是 0）。
+	_ = conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+	var sess proto.CtlSession
+	gotPromote := false
+	for !gotPromote {
 		typ, pl, rerr := proto.CtlReadMsg(conn)
 		if rerr != nil {
-			break // 读空 = 没有被误放的通告
+			t.Fatalf("没等到提升通告：%v", rerr)
 		}
-		if typ == proto.RelayCtlSession {
-			if sess, serr := proto.DecodeCtlSession(ctlWithSub(typ, pl)); serr == nil && sess.ID == 0 {
-				t.Fatal("replay 把 sid==0 的 fallback 会话也重放了（C1 回归）")
-			}
+		if typ != proto.RelayCtlSession {
+			continue
 		}
+		s, serr := proto.DecodeCtlSession(ctlWithSub(typ, pl))
+		if serr != nil {
+			continue
+		}
+		if s.ID == 0 {
+			t.Fatal("重放通告了 id=0（C1 回归：会互相顶掉且永无 RELEASE）")
+		}
+		sess = s
+		gotPromote = true
 	}
 
-	// fallback 会话应仍然健康（腿没被误拨/误关）。
-	cli.send([]byte("still-ok"))
-	payload, from, ok = be.readData(2 * time.Second)
-	if !ok || string(payload) != "still-ok" {
-		t.Fatalf("replay 后 fallback 会话被打断：payload=%q ok=%v", payload, ok)
+	// 拨腿（后端收到提升通告后的动作）。
+	remote := netip.AddrPortFrom(relayAddr.Addr(), sess.DataPort)
+	leg, derr := net.DialUDP("udp4", nil, net.UDPAddrFromAddrPort(remote))
+	if derr != nil {
+		t.Fatalf("拨腿: %v", derr)
 	}
-	_ = from
+	defer leg.Close()
+	if _, err := leg.Write([]byte("LEGUP")); err != nil {
+		t.Fatal(err)
+	}
+
+	// 提升后会话无缝继续：客户端发包 → 等腿缓冲放行 → 腿上送达。
+	cli.send([]byte("promoted-flow"))
+	buf := make([]byte, 2048)
+	_ = leg.SetReadDeadline(time.Now().Add(3 * time.Second))
+	n, lerr := leg.Read(buf)
+	if lerr != nil {
+		t.Fatalf("提升后腿上没收到数据：%v", lerr)
+	}
+	if typ, payload, derr := proto.DecodeFrame(buf[:n]); derr != nil || typ != proto.FrameTypeData || string(payload) != "promoted-flow" {
+		t.Fatalf("腿上数据：typ=%d payload=%q err=%v", typ, payload, derr)
+	}
+	// 回程照走腿 → 客户端。
+	if _, err := leg.Write([]byte{5, 5}); err != nil {
+		t.Fatal(err)
+	}
+	if got, ok := cli.readData(2 * time.Second); !ok || string(got) != string([]byte{5, 5}) {
+		t.Fatalf("提升后回程失败：%q ok=%v", got, ok)
+	}
 }
