@@ -1,29 +1,31 @@
 homeway 第三方组件声明（THIRD-PARTY-NOTICES）
 ================================================================================
 本文件随 homeway 二进制分发：GitHub Release 归档包与容器镜像里各带一份。
-homeway 自有代码的许可见 LICENSE（MIT）；本文件只覆盖**静态链接进二进制**的第三方组件——
-它们用的是 BSD-3 / MIT / Apache-2.0，都要求以二进制形式分发时把版权声明、许可条款与
-免责声明复现在随分发的材料里。
+homeway 自有代码的许可见 LICENSE（MIT）；本文件只覆盖**静态链接进任一发版平台二进制**的
+第三方组件——它们用的是 BSD-3 / MIT / Apache-2.0，都要求以二进制形式分发时把版权声明、
+许可条款与免责声明复现在随分发的材料里。
 
 真源就是本文件，内容由 tools/gen-third-party-notices.sh 从各依赖自己的 LICENSE 原文拼装，
 **不要手改**（改了会被 CI 的 --check 门禁打回）。分节标记 `===== <id> =====` 与手机端 App
 的许可页（tier 仓 entry/src/main/ets/model/ThirdPartyLicenses.ets）同款，便于两仓对照。
 许可原文完全相同的组件（如 golang.org/x 系列）共用一个分节。
 
-清单口径 = `go list -deps ./cmd/homeway`：只在 go.mod 里、没被二进制链接的模块不列。
+清单口径 = 发版矩阵逐平台 `go list -deps ./cmd/homeway` 的并集（组件行的「平台」标注它
+出现在哪些目标上；只在 go.mod 里、没被任何平台二进制链接的模块不列）。
 
 一、随二进制分发的第三方组件
 --------------------------------------------------------------------------------
-- Go runtime（标准库与运行时） go1.24 — BSD-3-Clause — Copyright 2009 The Go Authors. — 全文见 ===== go =====
-- creack/pty（出口侧 pty，终端会话用） v1.1.24 — MIT — Copyright (c) 2011 Keith Rarick — 全文见 ===== pty =====
-- google/btree（B 树，gVisor 的依赖） v1.1.2 — Apache-2.0 — Copyright 2014 Google Inc. — 全文见 ===== btree =====
-- golang.org/x/crypto v0.37.0 — BSD-3-Clause — Copyright 2009 The Go Authors. — 全文见 ===== xgo =====
-- golang.org/x/net v0.39.0 — BSD-3-Clause — Copyright 2009 The Go Authors. — 全文见 ===== xgo =====
-- golang.org/x/sys v0.32.0 — BSD-3-Clause — Copyright 2009 The Go Authors. — 全文见 ===== xgo =====
-- golang.org/x/time v0.7.0 — BSD-3-Clause — Copyright 2009 The Go Authors. — 全文见 ===== xgo =====
-- wireguard-go（WireGuard 数据面） v0.0.0-20260522210424-ecfc5a8d5446 — MIT — Copyright (C) 2017-2025 WireGuard LLC. All Rights Reserved. — 全文见 ===== wireguard =====
-- wireguard/wgctrl（UAPI 控制客户端） v0.0.0-20241231184526-a9ab2273dd10 — MIT — Copyright (C) 2018-2022 Matt Layher — 全文见 ===== wgctrl =====
-- gVisor（netstack：出口过境拦截） v0.0.0-20250503011706-39ed1f5ac29c — Apache-2.0 — Copyright 2018 The gVisor Authors. — 全文见 ===== gvisor =====
+- Go runtime（标准库与运行时） go1.24 — BSD-3-Clause — Copyright 2009 The Go Authors. — 平台：全部 — 全文见 ===== go =====
+- creack/pty（出口侧 pty，终端会话用） v1.1.24 — MIT — Copyright (c) 2011 Keith Rarick — 平台：darwin linux — 全文见 ===== pty =====
+- google/btree（B 树，gVisor 的依赖） v1.1.2 — Apache-2.0 — Copyright 2014 Google Inc. — 平台：darwin linux windows — 全文见 ===== btree =====
+- golang.org/x/crypto v0.37.0 — BSD-3-Clause — Copyright 2009 The Go Authors. — 平台：darwin linux windows — 全文见 ===== go =====
+- golang.org/x/net v0.39.0 — BSD-3-Clause — Copyright 2009 The Go Authors. — 平台：darwin linux windows — 全文见 ===== go =====
+- golang.org/x/sys v0.32.0 — BSD-3-Clause — Copyright 2009 The Go Authors. — 平台：darwin linux windows — 全文见 ===== go =====
+- golang.org/x/time v0.7.0 — BSD-3-Clause — Copyright 2009 The Go Authors. — 平台：darwin linux windows — 全文见 ===== go =====
+- wintun（Windows TUN 驱动的 Go 绑定，仅 Windows 构建） v0.0.0-20230126152724-0fa3db229ce2 — MIT — Copyright (C) 2017-2021 WireGuard LLC. All Rights Reserved. — 平台：windows — 全文见 ===== wintun =====
+- wireguard-go（WireGuard 数据面） v0.0.0-20260522210424-ecfc5a8d5446 — MIT — Copyright (C) 2017-2025 WireGuard LLC. All Rights Reserved. — 平台：darwin linux windows — 全文见 ===== wintun =====
+- wireguard/wgctrl（UAPI 控制客户端） v0.0.0-20241231184526-a9ab2273dd10 — MIT — Copyright (C) 2018-2022 Matt Layher — 平台：darwin linux windows — 全文见 ===== wgctrl =====
+- gVisor（netstack：出口过境拦截） v0.0.0-20250503011706-39ed1f5ac29c — Apache-2.0 — Copyright 2018 The gVisor Authors. — 平台：darwin linux windows — 全文见 ===== gvisor =====
 
 二、许可全文
 ================================================================================
@@ -285,7 +287,7 @@ SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
    See the License for the specific language governing permissions and
    limitations under the License.
 
-===== wireguard =====
+===== wintun =====
 Permission is hereby granted, free of charge, to any person obtaining a copy of
 this software and associated documentation files (the "Software"), to deal in
 the Software without restriction, including without limitation the rights to

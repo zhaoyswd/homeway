@@ -96,3 +96,39 @@ func TestAppendOnReopen(t *testing.T) {
 		t.Fatalf("重启应追加: %q", b)
 	}
 }
+
+// 轮转失败不得 panic（评审整改 2026-09-22）：目录被删后写满一轮触发 rotateLocked，
+// 旧实现在重开失败后会拿 nil 句柄 Write 直接把进程带崩；现在应返回错误并可在
+// 目录恢复后继续写。
+func TestRotateFailureNoPanic(t *testing.T) {
+	dir := t.TempDir()
+	w, err := Open(dir, "l.log", 16, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer w.Close()
+	if _, err := w.Write([]byte("first\n")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.RemoveAll(dir); err != nil {
+		t.Fatal(err)
+	}
+	// 超限写 → 触发轮转 → rename/open 都会失败：必须报错而不是 panic。
+	if _, err := w.Write([]byte("second-line-longer-than-limit\n")); err == nil {
+		t.Fatal("目录已删，写应失败")
+	}
+	// 目录恢复后应自愈（Write 里的重开路径）。
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := w.Write([]byte("recovered\n")); err != nil {
+		t.Fatalf("目录恢复后应自愈: %v", err)
+	}
+	b, err := os.ReadFile(filepath.Join(dir, "l.log"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.HasSuffix(string(b), "recovered\n") {
+		t.Fatalf("恢复后内容不符: %q", b)
+	}
+}

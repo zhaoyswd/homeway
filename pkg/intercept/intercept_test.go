@@ -63,6 +63,7 @@ func crossWire(t *testing.T, a, b tun.Device) (stop func()) {
 type harness struct {
 	cli, srv *wgnet.Net
 	in       *Interceptor
+	st       *Stats // 每个 harness 都挂计数器（UDP 归宿/拨号计数的断言用）
 	dialed   []string
 	dialErr  map[string]error
 
@@ -107,7 +108,7 @@ func newHarnessCfg(t *testing.T, dialOverride func(ctx context.Context, network,
 		t.Fatalf("server wgnet: %v", err)
 	}
 	crossWire(t, cli, srv)
-	h := &harness{cli: cli, srv: srv, dialErr: map[string]error{}}
+	h := &harness{cli: cli, srv: srv, dialErr: map[string]error{}, st: &Stats{}}
 	dial := func(ctx context.Context, network, address string) (net.Conn, error) {
 		h.dialed = append(h.dialed, address)
 		if dialOverride != nil {
@@ -126,7 +127,7 @@ func newHarnessCfg(t *testing.T, dialOverride func(ctx context.Context, network,
 	if mutate != nil {
 		mutate(&cfgI)
 	}
-	h.in, err = Attach(srv, cfgI, nil)
+	h.in, err = Attach(srv, cfgI, h.st)
 	if err != nil {
 		t.Fatalf("attach: %v", err)
 	}
@@ -372,6 +373,116 @@ func TestExemptUDP(t *testing.T) {
 		t.Fatalf("echo = %q", string(buf[:n]))
 	}
 }
+
+// UDP 会话归宿计数的口径（flows-compat-remove 评审整改）：IncrUDPSession 只对
+// transit 会话上报。豁免/本机回环（隧道 IP 同端口、DNS :53 改写代答）不走真实
+// 转发路径，掺进去会让 udpcap 的「实测有回包」恒真（DNS 代答每查询必回包），
+// 掏空这个位「QUIC 这类到底通不通」的含义。
+func TestUDPSessionStatsScope(t *testing.T) {
+	echo := echoUDP(t)
+	h := newHarnessCfg(t, func(ctx context.Context, network, address string) (net.Conn, error) {
+		if strings.HasSuffix(address, ":5354") { // ③ 号分支：写成功但永无回包的黑洞
+			return newBlackholeConn(), nil
+		}
+		var d net.Dialer
+		return d.DialContext(ctx, network, echo.String())
+	}, func(c *Config) {
+		c.UDPIdle = 300 * time.Millisecond // 会话快速按空闲收口，计数断言不用等
+		c.DNSPort = echo.Port()
+		c.DNSIdle = 300 * time.Millisecond
+	})
+	// waitIdle：等活跃会话数归零（会话关闭时才上报归宿计数）。
+	waitIdle := func() {
+		t.Helper()
+		deadline := time.Now().Add(5 * time.Second)
+		for {
+			if h.st.Snapshot()["flows"] == 0 {
+				return
+			}
+			if time.Now().After(deadline) {
+				t.Fatalf("会话未收口：flows=%d", h.st.Snapshot()["flows"])
+			}
+			time.Sleep(20 * time.Millisecond)
+		}
+	}
+	udpRoundtrip := func(dstPort string, msg string, wantReply bool) {
+		t.Helper()
+		pc, err := h.cli.DialUDPAddrPort(
+			netip.AddrPortFrom(netip.MustParseAddr(cliAddr), 0),
+			netip.MustParseAddrPort(foreignDst+":"+dstPort),
+		)
+		if err != nil {
+			t.Fatalf("udp dial: %v", err)
+		}
+		pc.SetDeadline(time.Now().Add(5 * time.Second))
+		if _, err := pc.Write([]byte(msg)); err != nil {
+			t.Fatalf("write: %v", err)
+		}
+		if !wantReply {
+			// write 异步入隧道，立刻 close 会与拦截层建会话竞速（包被丢）：
+			// 等会话计数出现再关，让「只有上行」的会话真正建立过。
+			deadline := time.Now().Add(5 * time.Second)
+			for h.st.Snapshot()["flows"] == 0 {
+				if time.Now().After(deadline) {
+					t.Fatalf("会话未建立（flows=0）")
+				}
+				time.Sleep(10 * time.Millisecond)
+			}
+		}
+		if wantReply {
+			buf := make([]byte, 1024)
+			n, err := pc.Read(buf)
+			if err != nil {
+				t.Fatalf("read: %v", err)
+			}
+			if string(buf[:n]) != msg {
+				t.Fatalf("echo = %q", string(buf[:n]))
+			}
+		}
+		pc.Close()
+		waitIdle()
+	}
+
+	// ① 豁免（DNS :53 改写 → 代答每查询必回包）：计数两组都必须是 0。
+	udpRoundtrip("53", "dns-q", true)
+	if r, n := h.st.UDPSessions(); r != 0 || n != 0 {
+		t.Fatalf("豁免会话不得进归宿计数：replied=%d noReply=%d", r, n)
+	}
+	// ② transit 有回包 → replied+1。
+	udpRoundtrip("5353", "transit-ok", true)
+	if r, n := h.st.UDPSessions(); r != 1 || n != 0 {
+		t.Fatalf("transit 有回包应 replied=1：replied=%d noReply=%d", r, n)
+	}
+	// ③ transit 无回包（黑洞，只有上行）→ noReply+1。
+	udpRoundtrip("5354", "transit-dead", false)
+	if r, n := h.st.UDPSessions(); r != 1 || n != 1 {
+		t.Fatalf("transit 无回包应 noReply=1：replied=%d noReply=%d", r, n)
+	}
+}
+
+// blackholeConn：写全收、读挂到 Close（「转发出去但永无回包」的确定性替身——
+// 不能用 127.0.0.1:1 这类死端口：macOS 上连接型 UDP 首个 Write 就同步回
+// ECONNREFUSED，拦截层走「首包写失败」不建会话，测不到归宿计数路径）。
+type blackholeConn struct {
+	once sync.Once
+	done chan struct{}
+}
+
+func newBlackholeConn() *blackholeConn { return &blackholeConn{done: make(chan struct{})} }
+func (c *blackholeConn) Read([]byte) (int, error) {
+	<-c.done
+	return 0, io.EOF
+}
+func (c *blackholeConn) Write(p []byte) (int, error) { return len(p), nil }
+func (c *blackholeConn) Close() error {
+	c.once.Do(func() { close(c.done) })
+	return nil
+}
+func (c *blackholeConn) LocalAddr() net.Addr              { return nil }
+func (c *blackholeConn) RemoteAddr() net.Addr             { return nil }
+func (c *blackholeConn) SetDeadline(time.Time) error      { return nil }
+func (c *blackholeConn) SetReadDeadline(time.Time) error  { return nil }
+func (c *blackholeConn) SetWriteDeadline(time.Time) error { return nil }
 
 // UDP 会话上限（review 2026-09-21：TCP 有 MaxConns 闸而 UDP 原先无闸）：
 // MaxUDPSessions=2 时第三个五元组不建会话——目标收不到该流的包。

@@ -1,7 +1,7 @@
 # homeway
 
 Homeway 的后端与中继：基于 WireGuard 的自建出口栈 —— 一个 `homeway` 二进制同时承载
-**出口**（WG 端点、token 签发、流服务）与**中继**（多租户注册腿、per-client 分配式转发、
+**出口**（WG 端点、token 签发、过境拦截层）与**中继**（多租户注册腿、per-client 分配式转发、
 hint 地址观察）两个角色。手机端 App 仓库私有，本仓库承载**线上协议的唯一真源**
 （`pkg/proto`：token / 注册报文 / 中继帧）。
 
@@ -73,10 +73,9 @@ darwin 产物带的是 **Go 链接器自动加的 ad-hoc 签名**（`codesign -d
 
 ```
 cmd/homeway         单入口：按角色（exit / relay）分发
-internal/server     出口（WG 端点 + netstack + 流服务 + 设备表）与它的 CLI
+internal/server     出口（WG 端点 + 拦截层 + 本机服务 + 设备表）与它的 CLI
 internal/relay      中继（注册腿 + per-client 转发 + hint）与它的 CLI
 pkg/proto           线上契约：token（hmw1 格式）/ reg 报文 / 中继帧 + golden vectors
-pkg/flows           内部流协议两端（阶段 2/3 实现）
 ```
 
 ## 开发

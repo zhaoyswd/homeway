@@ -11,10 +11,11 @@ import (
 
 // fakeMapper：内存映射表 + 按预置规则拒绝/接受，记录每次尝试的外部端口。
 type fakeMapper struct {
-	reject  map[uint16]bool
-	table   []upnpMapping // listMappings 返回的既有映射（占位判定用）
-	listErr error         // 注入枚举失败（fail-open 用例）
-	tried   []uint16
+	reject      map[uint16]bool
+	table       []upnpMapping // listMappings 返回的既有映射（占位判定用）
+	listErr     error         // 注入枚举失败（fail-open 用例）
+	listPartial bool          // 注入枚举截断（complete=false，fail-open 用例）
+	tried       []uint16
 }
 
 func (f *fakeMapper) addPortMapping(_ context.Context, ext uint16, _ netip.Addr, _ uint16) error {
@@ -29,8 +30,8 @@ func (f *fakeMapper) CleanMappings(context.Context, string, uint16, netip.Addr, 
 	return 0, nil, nil
 }
 
-func (f *fakeMapper) listMappings(context.Context, int) ([]upnpMapping, error) {
-	return f.table, f.listErr
+func (f *fakeMapper) listMappings(context.Context, int) ([]upnpMapping, bool, error) {
+	return f.table, !f.listPartial, f.listErr
 }
 
 // 端口选择顺序：上次成功的端口 → 监听端口 → 监听端口+1。
@@ -250,5 +251,75 @@ func TestSelectExternalPortExhaustedByOccupancy(t *testing.T) {
 	m = &fakeMapper{table: table[:2]}
 	if got, err := selectExternalPort(context.Background(), m, base, 0, mine, func(string, ...any) {}); err != nil || got != base+2 {
 		t.Fatalf("两条被占应让到 %d：got=%d err=%v", base+2, got, err)
+	}
+}
+
+// ---- 评审整改 2026-09-22 的三组新用例 ----
+
+// 路由器把 NewInternalClient 报成非 IP 形态（主机名/空/带端口/v4-mapped）：
+// classifyMapping 必须判 ownerUnknown，selectExternalPort 必须整轮 fail-open
+// （直接申请回监听口），而不是把自己的映射当 foreign 每轮 +1 漂移到让尽。
+func TestSelectExternalPortUnparseableClient(t *testing.T) {
+	for _, client := range []string{"mac-mini.local", "", "192.168.3.10:41641", "::ffff:192.168.3.10"} {
+		base := uint16(42000)
+		f := &fakeMapper{table: []upnpMapping{{
+			ExternalPort: base, Protocol: "UDP", InternalPort: base,
+			InternalClient: client, Description: upnpMapDesc + " x",
+		}}}
+		got, err := selectExternalPort(context.Background(), f, base, 0, netip.MustParseAddr("192.168.3.10"), func(string, ...any) {})
+		if err != nil {
+			t.Fatalf("client=%q: %v", client, err)
+		}
+		if got != base {
+			t.Fatalf("client=%q: 归属不明应整轮 fail-open 直接拿监听口 %d，got %d", client, base, got)
+		}
+		if len(f.tried) != 1 || f.tried[0] != base {
+			t.Fatalf("client=%q: 应只申请监听口一次，tried=%v", client, f.tried)
+		}
+	}
+}
+
+// classifyMapping 表驱动：客户端字段的四类形态钉进契约（unknown/foreign/ours）。
+func TestClassifyMappingClientForms(t *testing.T) {
+	me := netip.MustParseAddr("192.168.3.10")
+	mk := func(client string) upnpMapping {
+		return upnpMapping{ExternalPort: 41641, Protocol: "UDP", InternalPort: 41641,
+			InternalClient: client, Description: upnpMapDesc + " test"}
+	}
+	cases := []struct {
+		client string
+		want   mappingOwner
+	}{
+		{"192.168.3.10", ownerOurs},
+		{"mac-mini.local", ownerUnknown},
+		{"", ownerUnknown},
+		{"192.168.3.10:41641", ownerUnknown},
+		{"::ffff:192.168.3.10", ownerOurs}, // v4-mapped：netip 能解析且 Unmap 后同址——正确认领
+		{"192.168.3.99", ownerForeign},
+	}
+	for _, c := range cases {
+		if got := classifyMapping(mk(c.client), upnpMapDesc, me, 41641); got != c.want {
+			t.Errorf("client=%q: want %v got %v", c.client, c.want, got)
+		}
+	}
+	// 前缀不是自己的：无论客户端形态，一律 foreign。
+	other := mk("192.168.3.10")
+	other.Description = "别的软件的映射"
+	if got := classifyMapping(other, upnpMapDesc, me, 41641); got != ownerForeign {
+		t.Errorf("非本家前缀应 foreign，got %v", got)
+	}
+}
+
+// 枚举截断（走满上限没见表尾标记）：清单残缺时不得拿「清单里没有」当「路由器上没有」
+// ——必须整轮 fail-open（按旧逻辑直接申请），否则看不见的别人映射会被先删后加吃掉。
+func TestSelectExternalPortTruncatedList(t *testing.T) {
+	base := uint16(43000)
+	f := &fakeMapper{table: []upnpMapping{}, listPartial: true}
+	got, err := selectExternalPort(context.Background(), f, base, 0, netip.MustParseAddr("192.168.3.10"), func(string, ...any) {})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != base || len(f.tried) != 1 || f.tried[0] != base {
+		t.Fatalf("截断清单应 fail-open 直接申请监听口，got=%d tried=%v", got, f.tried)
 	}
 }

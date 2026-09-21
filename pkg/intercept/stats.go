@@ -7,6 +7,10 @@ import "sync/atomic"
 // 历史注记：这个类型原来住在 pkg/flows（旧栈「每流一协议」时代的共享计数器），
 // flows 兼容监听退役（openspec flows-compat-remove）后随包消亡，类型平移到本包——
 // 计数键名（dialok/dialfail/flows/rejected）是观测面契约，测试与诊断都在用，不改名。
+// 口径注记（flows 退役后）：dialok/dialfail 现仅计 **TCP**（旧 flows 时代 UDP 会话
+// 建立也计一次 dialok；transit UDP 无连接语义，不再计）；flows 是 TCP+UDP 活跃
+// 会话的 gauge；udpReplied/udpNoReply 只收 transit 会话——豁免/本机回环不走真实
+// 转发路径（DNS 代答每查询必回包），掺进去会把「实测有回包」做成恒真。
 type Stats struct {
 	dialOK, dialFail, flows, rejected uint64
 	udpReplied, udpNoReply            uint64 // 转发出去的 UDP 会话：收到过回包 / 只有上行（实测 UDP 可用性）

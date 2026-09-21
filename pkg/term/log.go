@@ -5,7 +5,7 @@
 //   - `newTermService` 改名为导出的 `New`（homewayd 装配用）。
 //   - 传输挂接不变：`ServeConn(net.Conn)` 就是「客户端一条腿一条连接」，
 //     新栈里由 internal/server 在 127.0.0.1:<TermPort> 上 accept 后喂进来
-//     （客户端经内部流 CONNECT 到该端口，后端按本机网络重拨）。
+//     （客户端拨隧道 IP 同端口，出口豁免规则转投 <state>/term.sock——flows 时代曾走 CONNECT，已退役）。
 package term
 
 // Logf 日志函数（同 tailscale logger.Logf 签名）；可为 nil。

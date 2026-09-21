@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"net"
 	"net/netip"
@@ -11,6 +12,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/zhaoyswd/homeway/pkg/dns"
@@ -115,10 +117,12 @@ type Server struct {
 	pubKick       chan struct{} // 公网端点探测的"立即重测"信号（换网事件踢）
 	firstProbe    chan struct{} // 第一次端点探测结束（Run 的 token 兜底在等它；nil=探测被关）
 	filesLn       net.Listener
-	filesSock     string // files 的 UDS 路径（Close 时清 socket 文件；空 = 未起）
+	filesSock     string      // files 的 UDS 路径（Close 时清 socket 文件；空 = 未起）
+	filesOwn      os.FileInfo // bind 出的文件身份（removeSockOwn 只删自己的）
 	files         *files.Server
 	termLn        net.Listener
-	termSock      string // term 的 UDS 路径（同上）
+	termSock      string      // term 的 UDS 路径（同上）
+	termOwn       os.FileInfo // 同 filesOwn
 	termSrv       *term.TermService
 	// relayCtx：中继注册腿 + 控制客户端的生命周期（review #8：此前给的是
 	// context.Background()，Close 之后这两组协程与拨号循环永不退出——进程级
@@ -331,14 +335,18 @@ func Start(cfg ServeConfig) (*Server, error) {
 		logf("⚠️ files 根目录不可用（%v）—— 文件管理会报错，其余功能不受影响", err)
 	} else {
 		fsrv.SetLogger(dlogf)
-		fsock, fln, lerr := listenLocalService(cfg.StateDir, "files.sock")
+		fsock, fln, fown, lerr := listenLocalService(cfg.StateDir, "files.sock")
 		if lerr != nil {
 			fsrv.Close()
-			logf("⚠️ files 监听 %s 失败（%v）—— 文件管理会报错（state 目录异常），其余功能不受影响", fsock, lerr)
+			logf("⚠️ files 监听 %s 失败（%v）—— 文件管理会报错（state 目录异常/被其它实例占用），其余功能不受影响", fsock, lerr)
 		} else {
-			s.filesLn, s.filesSock, s.files = fln, fsock, fsrv
+			s.filesLn, s.filesSock, s.filesOwn, s.files = fln, fsock, fown, fsrv
 			go func() {
-				if serr := fsrv.Serve(fln); serr != nil {
+				serr := fsrv.Serve(fln)
+				// Serve 返回 = Accept 循环退出（EMFILE 等）：摘监听，让后续拨号
+				// ECONNREFUSED 快速失败，而不是握手进 backlog 后无人 Accept 挂住。
+				fln.Close()
+				if serr != nil {
 					logf("files 服务收工：%v", serr)
 				}
 			}()
@@ -346,23 +354,26 @@ func Start(cfg ServeConfig) (*Server, error) {
 		}
 	}
 
-	// 终端会话 / agent gateway：只监听本机回环，客户端经内部流 CONNECT 到 127.0.0.1:<TermPort>。
-	// 会话由后端持有（客户端断开只摘泵，不杀进程）；开关 HOMEWAY_TERM=off，调参 HOMEWAY_TERM_*。
+	// 终端会话 / agent gateway（exit-service-uds：UDS 承载 <state>/term.sock）。客户端拨隧道 IP:<TermPort>，
+	// 拦截层按 LocalServices 映射转投；会话由后端持有（客户端断开只摘泵，不杀进程）；
+	// 开关 HOMEWAY_TERM=off，调参 HOMEWAY_TERM_*。
 	if term.Disabled() {
 		logf("term 服务被 HOMEWAY_TERM=off 关闭")
 	} else {
 		tsrv := term.New(dlogf)
-		tsock, tln, terr := listenLocalService(cfg.StateDir, "term.sock")
+		tsock, tln, town, terr := listenLocalService(cfg.StateDir, "term.sock")
 		if terr != nil {
 			// 与 files 同一取舍：可选服务起不来不影响隧道/转发。
-			logf("⚠️ term 监听 %s 失败（%v）—— 终端功能会报错，其余功能不受影响", tsock, terr)
+			logf("⚠️ term 监听 %s 失败（%v）—— 终端功能会报错（state 目录异常/被其它实例占用），其余功能不受影响", tsock, terr)
 			tsrv.Close()
 		} else {
-			s.termLn, s.termSock, s.termSrv = tln, tsock, tsrv
+			s.termLn, s.termSock, s.termOwn, s.termSrv = tln, tsock, town, tsrv
 			go func() {
 				for {
 					conn, aerr := tln.Accept()
 					if aerr != nil {
+						// Accept 退出（同 files：别留一个「文件在、无人收」的监听点）。
+						tln.Close()
 						return
 					}
 					go tsrv.ServeConn(conn)
@@ -392,22 +403,62 @@ func Start(cfg ServeConfig) (*Server, error) {
 	return s, nil
 }
 
-// listenLocalService：本机服务的 UDS 监听（exit-service-uds）。listen 前清死残留
-// socket 文件（进程独占 state 目录，残留只可能来自自己的异常退出——Go 的 unix
-// listener Close 不摘文件）。路径超过 sockaddr_un 上限时直接报错（重试无意义）。
-func listenLocalService(stateDir, name string) (string, net.Listener, error) {
+// listenLocalService：本机服务的 UDS 监听（exit-service-uds）。
+// 残留处理按「死/活」区分（评审整改 2026-09-22）：先拨一下现有路径——拨得通 =
+// 另一个活实例占着同一路径（同 state 双实例），报占用让调用方按可选服务失败
+// 摘除（先到先得，与旧 TCP 端口被占的行为一致）；拨不通（ECONNREFUSED/ENOENT）
+// 才是异常退出留下的死残留，删掉重绑。判活挡住了「新实例无条件抢走路径」；
+// 返回的 own（bind 出的文件身份）配合 removeSockOwn 再挡住「退出时删掉后来
+// 接管者的 socket」。
+// 注：Go 的 UnixListener.Close 默认会按路径 unlink（unlinkOnClose=true）——本函数
+// 在 listen 成功后关掉这个默认，删除统一走身份比对路径（见 removeSockOwn）。
+// 路径超过 sockaddr_un 上限时直接报错（重试无意义）。
+func listenLocalService(stateDir, name string) (string, net.Listener, os.FileInfo, error) {
 	sock := filepath.Join(stateDir, name)
 	if len(sock) >= 100 { // sockaddr_un.sun_path 保守上限（darwin 104 / linux 108）
-		return sock, nil, fmt.Errorf("路径超长（%d 字节 ≥ 100，sun_path 上限）", len(sock))
+		return sock, nil, nil, fmt.Errorf("路径超长（%d 字节 ≥ 100，sun_path 上限）", len(sock))
+	}
+	if c, derr := net.DialTimeout("unix", sock, 200*time.Millisecond); derr == nil {
+		_ = c.Close()
+		return sock, nil, nil, errors.New("socket 已被另一个活实例占用（同 state 双实例？）")
+	} else if !errors.Is(derr, syscall.ENOENT) && !errors.Is(derr, syscall.ECONNREFUSED) {
+		// ENOENT=文件不在；ECONNREFUSED=监听者已死只剩文件（都是可清的死残留）。
+		// 其余（超时等模糊结果）按「有人占着」处理：不删状态不明的东西。
+		return sock, nil, nil, fmt.Errorf("socket 占用状态不明（%v），不接管", derr)
 	}
 	if err := os.Remove(sock); err != nil && !os.IsNotExist(err) {
-		return sock, nil, fmt.Errorf("清残留 socket 失败：%w", err)
+		return sock, nil, nil, fmt.Errorf("清残留 socket 失败：%w", err)
 	}
 	ln, err := net.Listen("unix", sock)
 	if err != nil {
-		return sock, nil, err
+		return sock, nil, nil, err
 	}
-	return sock, ln, nil
+	if ul, ok := ln.(*net.UnixListener); ok {
+		ul.SetUnlinkOnClose(false) // 删除走 removeSockOwn 的身份比对，防误删接管者
+	}
+	own, serr := os.Stat(sock)
+	if serr != nil {
+		ln.Close()
+		return sock, nil, nil, serr
+	}
+	return sock, ln, own, nil
+}
+
+// removeSockOwn：只删「还是自己 bind 出来的那个文件」。路径已被别的实例接管
+// （SameFile 不匹配）时不动它——旧实现按路径无条件删，会在双实例场景把后来
+// 接管者的活 socket 摘掉，让它在无任何报错的情况下永久不可达。
+func removeSockOwn(path string, own os.FileInfo) {
+	if own == nil {
+		_ = os.Remove(path) // 没拿到身份（防御）：退回按路径删
+		return
+	}
+	cur, err := os.Stat(path)
+	if err != nil {
+		return // 已不在（含 Go listener Close 摘过等）
+	}
+	if os.SameFile(own, cur) {
+		_ = os.Remove(path)
+	}
 }
 
 // Close 收工（幂等性由各层保证；stop 函数可重复调用部分由调用方保证单次）。
@@ -426,14 +477,14 @@ func (s *Server) Close() {
 	}
 	if s.filesLn != nil {
 		s.filesLn.Close()
-		_ = os.Remove(s.filesSock) // unix listener 的 Close 不摘 socket 文件，手动清
+		removeSockOwn(s.filesSock, s.filesOwn)
 	}
 	if s.files != nil {
 		s.files.Close()
 	}
 	if s.termLn != nil {
 		s.termLn.Close()
-		_ = os.Remove(s.termSock)
+		removeSockOwn(s.termSock, s.termOwn)
 	}
 	if s.termSrv != nil {
 		s.termSrv.Close()

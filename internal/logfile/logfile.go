@@ -63,6 +63,11 @@ func (w *Writer) Write(p []byte) (int, error) {
 	}
 	if w.size+int64(len(p)) > w.maxBytes {
 		w.rotateLocked()
+		if w.f == nil {
+			// 轮转失败（重开没成）：丢本段而不是 panic——目录被删/权限被改这类
+			// 持久故障不该把出口进程带走，下一次 Write 还会重试 open。
+			return 0, w.openError
+		}
 	}
 	n, err := w.f.Write(p)
 	w.size += int64(n)

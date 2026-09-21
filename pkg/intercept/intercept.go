@@ -385,7 +385,9 @@ func (in *Interceptor) serveUDP(dst, src netip.AddrPort, key string, first []byt
 
 	// 双向逐报泵 + 空闲看门狗（共享活跃时间戳：双向任一有进展即续命，
 	// 防单方向静默误杀 QUIC/长轮询型会话）。downSeen：real→peer 方向写过
-	// = 这条会话收到过回包（关闭时上报 IncrUDPSession，udpcap 的实测位靠它）。
+	// = 这条会话收到过回包（关闭时上报 IncrUDPSession，udpcap 的实测位靠它；
+	// 豁免/本机回环会话不报——它们不走真实转发路径，掺进去会让 udpcap 的
+	// 「实测有回包」恒真（DNS 代答每查询必回包），掏空这个位的含义）。
 	var last atomic.Int64
 	var downSeen atomic.Bool
 	last.Store(time.Now().UnixNano())
@@ -393,7 +395,9 @@ func (in *Interceptor) serveUDP(dst, src netip.AddrPort, key string, first []byt
 	var once sync.Once
 	done := make(chan struct{})
 	finish := func() { once.Do(func() { _ = peer.Close(); _ = real.Close(); close(done) }) }
-	pump := func(from net.Conn, to net.Conn) {
+	// isReal 显式传参而不是比较 from == real：net.Conn 是接口，若将来注入的
+	// Dial 返回带不可比较字段的实现，接口比较会运行期 panic。
+	pump := func(from net.Conn, to net.Conn, isReal bool) {
 		defer wg.Done()
 		buf := make([]byte, bufSize)
 		for {
@@ -404,7 +408,7 @@ func (in *Interceptor) serveUDP(dst, src netip.AddrPort, key string, first []byt
 					finish()
 					return
 				}
-				if from == real {
+				if isReal {
 					downSeen.Store(true)
 				}
 				last.Store(time.Now().UnixNano())
@@ -446,13 +450,15 @@ func (in *Interceptor) serveUDP(dst, src netip.AddrPort, key string, first []byt
 		}
 	}
 	wg.Add(3)
-	go pump(peer, real)
-	go pump(real, peer)
+	go pump(peer, real, false)
+	go pump(real, peer, true)
 	go watch()
 	wg.Wait()
 	if in.st != nil {
 		in.st.DecrFlow()
-		in.st.IncrUDPSession(downSeen.Load())
+		if !exempt {
+			in.st.IncrUDPSession(downSeen.Load())
+		}
 	}
 	in.cfg.Logf("udp intercept: 会话 #%d 关闭（%v ← %v）", n, target, src)
 }

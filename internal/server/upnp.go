@@ -24,11 +24,10 @@ import (
 )
 
 const (
-	ssdpAddr        = "239.255.255.250:1900"
-	ssdpST          = "urn:schemas-upnp-org:device:InternetGatewayDevice:1"
-	upnpMapDesc     = "homeway-exit"
-	upnpTimeout     = 5 * time.Second
-	upnpRenewPeriod = 30 * time.Minute
+	ssdpAddr    = "239.255.255.250:1900"
+	ssdpST      = "urn:schemas-upnp-org:device:InternetGatewayDevice:1"
+	upnpMapDesc = "homeway-exit"
+	upnpTimeout = 5 * time.Second
 )
 
 type upnpService struct {
@@ -297,19 +296,23 @@ type upnpMapping struct {
 }
 
 // listMappings 枚举路由器上的端口映射（最多 max 条；713 = 到表尾）。
-func (g *igd) listMappings(ctx context.Context, max int) ([]upnpMapping, error) {
+// complete=false 表示**没见到表尾标记就到了 max 条或读完了**（表 >max / 路由器漏报）：
+// 这份清单是残缺的，调用方不能拿「清单里没有」当「路由器上没有」用（评审整改：
+// 残缺清单会让 selectExternalPort 误判候选口空闲，先删后加吃掉看不见的别人映射）。
+func (g *igd) listMappings(ctx context.Context, max int) ([]upnpMapping, bool, error) {
 	var out []upnpMapping
 	for i := 0; i < max; i++ {
 		body, err := g.soap(ctx, "GetGenericPortMappingEntry", [2]string{"NewPortMappingIndex", fmt.Sprint(i)})
 		if err != nil {
-			if strings.Contains(err.Error(), "713") || strings.Contains(body, "SpecifiedArrayIndexInvalid") {
-				return out, nil
+			if strings.Contains(err.Error(), "713") || strings.Contains(body, "SpecifiedArrayIndexInvalid") ||
+				strings.Contains(body, ">713<") {
+				return out, true, nil
 			}
-			return out, err
+			return out, false, err
 		}
 		// 有些路由器把 713 也放在 HTTP 200 的 SOAP Fault 里返回（实测）：同样按「到表尾」处理。
 		if strings.Contains(body, "SpecifiedArrayIndexInvalid") || strings.Contains(body, ">713<") {
-			return out, nil
+			return out, true, nil
 		}
 		m := upnpMapping{Index: i}
 		m.RemoteHost = xmlTag(body, "NewRemoteHost")
@@ -322,7 +325,9 @@ func (g *igd) listMappings(ctx context.Context, max int) ([]upnpMapping, error) 
 		m.LeaseDuration = uint32(atoiOr0(xmlTag(body, "NewLeaseDuration")))
 		out = append(out, m)
 	}
-	return out, nil
+	// 走满 max 条仍没见表尾标记：清单可能被截断（也可能恰好 max 条满表，无法区分——
+	// 按截断处理，保守）。
+	return out, false, nil
 }
 
 func xmlTag(body, tag string) string {
@@ -350,9 +355,10 @@ func atoiOr0(s string) int {
 type mappingOwner int
 
 const (
-	ownerForeign      mappingOwner = iota // 别人的：另一台出口、第三方软件或手动映射——绝不动
-	ownerOurs                             // 我们自己的（陈旧或当前）：可安全「删了重建」
-	ownerLiveSibling                      // 同机器另一活实例的：不动
+	ownerForeign     mappingOwner = iota // 别人的：另一台出口、第三方软件或手动映射——绝不动
+	ownerOurs                            // 我们自己的（陈旧或当前）：可安全「删了重建」
+	ownerLiveSibling                     // 同机器另一活实例的：不动
+	ownerUnknown                         // 前缀像自己但内网客户端形态无法核验（路由器回主机名/空/带端口）——归属不明
 )
 
 // classifyMapping：所有权三元组（描述前缀 + 内网客户端地址 + 内网端口活监听）的单一实现，
@@ -365,7 +371,13 @@ func classifyMapping(m upnpMapping, descPrefix string, client netip.Addr, listen
 	}
 	if client.IsValid() {
 		ip, err := netip.ParseAddr(m.InternalClient)
-		if err != nil || ip.Unmap() != client.Unmap() {
+		if err != nil {
+			// 有些路由器把 NewInternalClient 报成主机名/空/带端口（评审实测一类机型）：
+			// 这既可能是我们自己的映射（客户端形态怪），也可能是别人的——归属不明。
+			// 调用方对 unknown 不得当 foreign 让位（否则自己的映射每轮 +1 漂移到让尽）。
+			return ownerUnknown
+		}
+		if ip.Unmap() != client.Unmap() {
 			return ownerForeign
 		}
 	}
@@ -409,7 +421,7 @@ func (g *igd) ReAddShortLease(ctx context.Context, extPort uint16, internalIP ne
 // （判据见 portInUse；同机器跑第二个出口时，这是唯一能把两者分开的东西）。
 func (g *igd) CleanMappings(ctx context.Context, descPrefix string, onlyPort uint16,
 	onlyClient netip.Addr, keepInternalPort uint16) (int, []string, error) {
-	list, err := g.listMappings(ctx, 200)
+	list, _, err := g.listMappings(ctx, 200)
 	if err != nil {
 		return 0, nil, err
 	}
@@ -465,7 +477,7 @@ func portInUse(port uint16) bool {
 // 返回顺序偏好：① 外部端口 == 当前监听端口（本来就对得上）；② 否则取表里第一条我们的（大概率是上次沿用/回退的那个）。
 func (g *igd) FindOurMapping(ctx context.Context, descPrefix string, client netip.Addr,
 	listenPort uint16) (uint16, uint16, bool) {
-	list, err := g.listMappings(ctx, 200)
+	list, _, err := g.listMappings(ctx, 200)
 	if err != nil {
 		return 0, 0, false
 	}
@@ -527,7 +539,7 @@ func ensurePortMapping(ctx context.Context, candidates []netip.Addr, internalPor
 		}
 	}
 	// ② 把我们**多余**的历史映射清掉（只清同前缀 + 同内网地址的，别动同局域网其它出口），
-	//    保证 30 分钟一轮的续期不会在路由器里越积越多。
+	//    保证周期续期（成功 10 分钟/失败 2 分钟一轮）不会在路由器里越积越多。
 	if n, _, err := g.CleanMappings(ctx, upnpMapDesc, 0, localIP, internalPort); err == nil && n > 0 {
 		dlogf("UPnP：清掉 %d 条本机同前缀的旧映射（换端口或上次退出的遗留）", n)
 	}
@@ -545,7 +557,7 @@ type portMapper interface {
 	addPortMapping(ctx context.Context, externalPort uint16, internalIP netip.Addr, internalPort uint16) error
 	CleanMappings(ctx context.Context, descPrefix string, onlyPort uint16, onlyClient netip.Addr,
 		keepInternalPort uint16) (int, []string, error)
-	listMappings(ctx context.Context, max int) ([]upnpMapping, error)
+	listMappings(ctx context.Context, max int) ([]upnpMapping, bool, error)
 }
 
 // selectExternalPort：按「上次成功的端口 → 监听端口 → +1…+9」的顺序申请，返回成功的外部端口。
@@ -558,9 +570,15 @@ type portMapper interface {
 // 映射表枚举失败时 fail-open：跳过核验直接申请（单出口可用性优先，家容路由器枚举报错不罕见）。
 func selectExternalPort(ctx context.Context, g portMapper, internalPort, prefer uint16, localIP netip.Addr,
 	logf func(string, ...any)) (uint16, error) {
-	list, lerr := g.listMappings(ctx, 200)
-	if lerr != nil {
+	list, complete, lerr := g.listMappings(ctx, 200)
+	verify := lerr == nil && complete
+	switch {
+	case ctx.Err() != nil:
+		return 0, ctx.Err() // 收工中：别把 ctx 取消当「路由器毛糙」走 fail-open
+	case lerr != nil:
 		logf("UPnP：映射表枚举失败（%v），本轮跳过所有权核验，按旧逻辑直接申请", lerr)
+	case !complete:
+		logf("UPnP：映射表枚举不完整（%d 条未见表尾标记，表超上限或路由器漏报），本轮跳过所有权核验，按旧逻辑直接申请", len(list))
 	}
 	taken := make(map[uint16]upnpMapping, len(list))
 	for _, m := range list {
@@ -568,26 +586,50 @@ func selectExternalPort(ctx context.Context, g portMapper, internalPort, prefer 
 			taken[m.ExternalPort] = m
 		}
 	}
+	// 归属不明的条目（前缀像自己但客户端形态无法核验）让整张表不可信：本轮 fail-open
+	// （按旧逻辑直接申请）——把它当 foreign 会让自己的映射每轮 +1 漂移直到候选让尽
+	// （评审实测的确定性回归），而当 ours 又可能在多出口下删掉别人的，两头都不对。
+	if verify {
+		for _, m := range taken {
+			if classifyMapping(m, upnpMapDesc, localIP, internalPort) == ownerUnknown {
+				logf("UPnP：映射表中存在归属不明的条目（外部 %d 客户端=%q desc=%s，路由器客户端字段形态异常），本轮跳过所有权核验，按旧逻辑直接申请",
+					m.ExternalPort, m.InternalClient, m.Description)
+				verify = false
+				break
+			}
+		}
+	}
 	cands := []uint16{prefer}
-	for i := uint16(0); i <= 9; i++ {
-		cands = append(cands, internalPort+i)
+	for i := 0; i <= 9; i++ {
+		c := int(internalPort) + i // int 计算：uint16 直接加会在 >65526 时回绕到特权端口
+		if c > 0xFFFF {
+			break
+		}
+		cands = append(cands, uint16(c))
 	}
 	tried := map[uint16]bool{}
 	occupied, refused := 0, 0
+	var firstOccupant string
 	for _, ext := range cands {
 		if ext == 0 || tried[ext] {
 			continue
 		}
 		tried[ext] = true
-		if lerr == nil {
+		if verify {
 			if m, ok := taken[ext]; ok {
 				switch classifyMapping(m, upnpMapDesc, localIP, internalPort) {
 				case ownerForeign:
 					occupied++
+					if firstOccupant == "" {
+						firstOccupant = fmt.Sprintf("%s（desc=%s）", m.InternalClient, m.Description)
+					}
 					logf("UPnP：外部端口 %d 已被 %s 的映射占用（desc=%s），让位", ext, m.InternalClient, m.Description)
 					continue
 				case ownerLiveSibling:
 					occupied++
+					if firstOccupant == "" {
+						firstOccupant = fmt.Sprintf("本机另一活实例（内网端口 %d 在监听）", m.InternalPort)
+					}
 					logf("UPnP：外部端口 %d 的映射指向本机另一活实例（内网端口 %d 在监听），让位", ext, m.InternalPort)
 					continue
 				}
@@ -595,8 +637,12 @@ func selectExternalPort(ctx context.Context, g portMapper, internalPort, prefer 
 			}
 		}
 		if err := g.addPortMapping(ctx, ext, localIP, internalPort); err == nil {
-			if ext == prefer && prefer != internalPort {
+			switch {
+			case ext == prefer && prefer != internalPort:
 				logf("UPnP：沿用上次成功的外部端口 %d → 内网 %d", ext, internalPort)
+			case occupied > 0:
+				// spec 要求：让位结论一行里带上占用者与最终取得的外部端口（给运维对账用）。
+				logf("UPnP：让位 %d 个候选（首个占用者 %s），最终取得外部端口 %d → 内网 %d", occupied, firstOccupant, ext, internalPort)
 			}
 			return ext, nil
 		} else {
