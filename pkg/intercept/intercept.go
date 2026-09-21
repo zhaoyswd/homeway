@@ -63,10 +63,17 @@ type Config struct {
 	// DNSIdle：DNS 会话的空闲回收（默认 10s；测试注入缩短）。
 	DNSIdle time.Duration
 	// Dial 同时服务 TCP 与 UDP 重拨（udp = Dial("udp", target)，返回已连接 socket）。
-	Dial     func(ctx context.Context, network, address string) (net.Conn, error)
-	MaxConns int
-	TCPIdle  time.Duration
-	UDPIdle  time.Duration
+	Dial func(ctx context.Context, network, address string) (net.Conn, error)
+	// LocalServices：豁免端口的本机服务承载映射（端口→Unix socket 路径；nil/未命中 =
+	// 回环 TCP 同端口）。命中的端口（files/term，openspec exit-service-uds）经 UDS
+	// 拨号——主机本地端口零占用、其它本地进程不可达；未命中的豁免端口照旧
+	// （PathProbe 死端口拿内核 RST、端口转发的 localhost 目标都不受影响）。
+	// 建后不改（dial 时并发读）：服务被摘除时不删条目——socket 文件不存在，
+	// 拨号 ENOENT 快速失败回 RST，与「端口没人听」不可区分。
+	LocalServices map[uint16]string
+	MaxConns      int
+	TCPIdle       time.Duration
+	UDPIdle       time.Duration
 	// MaxUDPSessions：UDP 会话上限（0 = 默认 4096）。TCP 有 MaxConns 保险阀，
 	// UDP 每会话 3 goroutine + 端点 + 双向缓冲——失控应用按五元组洪水时同样
 	// 需要闸（review 2026-09-21：原先 UDP 无闸，与 TCP 不对称）。超限返回
@@ -202,7 +209,16 @@ func (in *Interceptor) serveTCP(r *tcp.ForwarderRequest, dst, src netip.AddrPort
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), dialTimeout)
 	defer cancel()
-	upstream, err := in.cfg.Dial(ctx, "tcp", target.String())
+	var upstream net.Conn
+	var err error
+	if exempt {
+		if sock, ok := in.cfg.LocalServices[dst.Port()]; ok {
+			upstream, err = (&net.Dialer{}).DialContext(ctx, "unix", sock)
+		}
+	}
+	if upstream == nil && err == nil {
+		upstream, err = in.cfg.Dial(ctx, "tcp", target.String())
+	}
 	if err != nil {
 		if in.st != nil {
 			in.st.IncrFail()

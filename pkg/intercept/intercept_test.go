@@ -14,6 +14,7 @@ import (
 	"io"
 	"net"
 	"net/netip"
+	"os"
 	"strings"
 	"sync"
 	"testing"
@@ -23,6 +24,7 @@ import (
 	"gvisor.dev/gvisor/pkg/tcpip/adapters/gonet"
 
 	"github.com/zhaoyswd/homeway/pkg/wgnet"
+	"path/filepath"
 )
 
 const (
@@ -90,6 +92,11 @@ func (h *harness) dumpLogs(t *testing.T) {
 // newHarness：客户端（HandleLocal:true）+ 服务端（HandleLocal:false，挂拦截）。
 // dialChk/dialOverride 可注入（记目的 / 制造失败）。
 func newHarness(t *testing.T, dialOverride func(ctx context.Context, network, address string) (net.Conn, error)) *harness {
+	return newHarnessCfg(t, dialOverride, nil)
+}
+
+// newHarnessCfg：newHarness + Config 变异缝（LocalServices 等映射形态用例用）。
+func newHarnessCfg(t *testing.T, dialOverride func(ctx context.Context, network, address string) (net.Conn, error), mutate func(*Config)) *harness {
 	t.Helper()
 	_, cli, err := wgnet.Create([]netip.Addr{netip.MustParseAddr(cliAddr)}, 1280)
 	if err != nil {
@@ -109,13 +116,17 @@ func newHarness(t *testing.T, dialOverride func(ctx context.Context, network, ad
 		var d net.Dialer
 		return d.DialContext(ctx, network, address)
 	}
-	h.in, err = Attach(srv, Config{
+	cfgI := Config{
 		TunnelIP: netip.MustParseAddr(srvAddr),
 		Dial:     dial,
 		TCPIdle:  30 * time.Second,
 		UDPIdle:  30 * time.Second,
 		Logf:     h.logf,
-	}, nil)
+	}
+	if mutate != nil {
+		mutate(&cfgI)
+	}
+	h.in, err = Attach(srv, cfgI, nil)
 	if err != nil {
 		t.Fatalf("attach: %v", err)
 	}
@@ -229,6 +240,67 @@ func TestExemptTCP(t *testing.T) {
 	}
 	if len(h.dialed) != 1 || !strings.HasPrefix(h.dialed[0], "127.0.0.1:") {
 		t.Fatalf("豁免应转投 127.0.0.1:同端口，got %v", h.dialed)
+	}
+}
+
+// 1.1b' 豁免端口命中 LocalServices → 走 UDS 承载（exit-service-uds）：cfg.Dial 不被调
+// （dialed 为空，出口本地零 TCP 端口）、数据照常往返；未映射端口不受影响（上面 1.1b 已验）。
+func TestExemptTCPViaUnixSocket(t *testing.T) {
+	// 短目录：macOS 的 t.TempDir() 路径叠测试名会顶过 sun_path 上限（app 侧踩过同款）。
+	dir, derr := os.MkdirTemp("", "it")
+	if derr != nil {
+		t.Fatal(derr)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(dir) })
+	sock := filepath.Join(dir, "svc.sock")
+	ln, lerr := net.Listen("unix", sock)
+	if lerr != nil {
+		t.Fatal(lerr)
+	}
+	t.Cleanup(func() { _ = ln.Close() })
+	go func() {
+		for {
+			c, aerr := ln.Accept()
+			if aerr != nil {
+				return
+			}
+			go func(c net.Conn) {
+				defer c.Close()
+				buf := make([]byte, 1024)
+				for {
+					n, rerr := c.Read(buf)
+					if n > 0 {
+						if _, werr := c.Write(buf[:n]); werr != nil {
+							return
+						}
+					}
+					if rerr != nil {
+						return
+					}
+				}
+			}(c)
+		}
+	}()
+
+	h := newHarnessCfg(t, nil, func(c *Config) {
+		c.LocalServices = map[uint16]string{7802: sock}
+	})
+	c, err := h.cli.DialTCPAddrPort(netip.AddrPortFrom(netip.MustParseAddr(srvAddr), 7802))
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer c.Close()
+	if got := roundtrip(t, c, "ping-uds"); got != "ping-uds" {
+		t.Fatalf("echo = %q", got)
+	}
+	if len(h.dialed) != 0 {
+		t.Fatalf("UDS 承载不应走 cfg.Dial（TCP 拨号）：%v", h.dialed)
+	}
+	// 映射的 socket 消失（服务被摘）→ 快速失败回 RST，与端口没人听不可区分。
+	_ = ln.Close()
+	_ = os.Remove(sock)
+	if _, err := h.cli.DialTCPAddrPort(netip.AddrPortFrom(netip.MustParseAddr(srvAddr), 7802)); err == nil {
+		t.Fatal("socket 消失后应拒绝")
 	}
 }
 

@@ -7,6 +7,7 @@ import (
 	"net"
 	"net/netip"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -114,8 +115,10 @@ type Server struct {
 	pubKick       chan struct{} // 公网端点探测的"立即重测"信号（换网事件踢）
 	firstProbe    chan struct{} // 第一次端点探测结束（Run 的 token 兜底在等它；nil=探测被关）
 	filesLn       net.Listener
+	filesSock     string // files 的 UDS 路径（Close 时清 socket 文件；空 = 未起）
 	files         *files.Server
 	termLn        net.Listener
+	termSock      string // term 的 UDS 路径（同上）
 	termSrv       *term.TermService
 	// relayCtx：中继注册腿 + 控制客户端的生命周期（review #8：此前给的是
 	// context.Background()，Close 之后这两组协程与拨号循环永不退出——进程级
@@ -218,12 +221,23 @@ func Start(cfg ServeConfig) (*Server, error) {
 	// 并发/空闲两个值 = l3 上线起的生产值（原 flows 时代 ServeConfig 字段随兼容监听退役）：
 	// 64 连接自 l3-exit-intercept 上线即此值并经真机全量测试；30min 空闲是给豁免腿上的
 	// 终端会话留的（拨隧道IP:7724 的长连接，别设太短）。
+	// 本机服务承载映射（exit-service-uds）：files/term 的豁免端口改投 UDS。
+	// 静态路径、建后不改——服务监听失败时条目保留，socket 文件不存在、拨号 ENOENT
+	// 快速失败回 RST（与端口没人听不可区分）。
+	var localSvcs map[uint16]string
+	if cfg.StateDir != "" {
+		localSvcs = map[uint16]string{
+			cfg.FilesPort: filepath.Join(cfg.StateDir, "files.sock"),
+			cfg.TermPort:  filepath.Join(cfg.StateDir, "term.sock"),
+		}
+	}
 	inter, ierr := intercept.Attach(ns, intercept.Config{
-		TunnelIP: cfg.TunnelIP,
-		DNSPort:  dnsPort,
-		MaxConns: 64,
-		TCPIdle:  30 * time.Minute,
-		Logf:     dlogf,
+		TunnelIP:      cfg.TunnelIP,
+		DNSPort:       dnsPort,
+		MaxConns:      64,
+		TCPIdle:       30 * time.Minute,
+		LocalServices: localSvcs,
+		Logf:          dlogf,
 	}, s.Stats)
 	if ierr != nil {
 		if s.dnsSrv != nil { // review F4：代答先于 Attach 起在此路径上要一起收
@@ -306,28 +320,29 @@ func Start(cfg ServeConfig) (*Server, error) {
 		Pinned: cfg.BindAddr.IsValid() || resolvedIf != nil, Logf: logf,
 	})
 
-	// files 原生协议服务：只监听本机回环（客户端经内部流的 CONNECT 让后端按本机网络重拨到这里）。
+	// files 原生协议服务（exit-service-uds：UDS 承载，<state>/files.sock）。
+	// 客户端拨 隧道IP:<FilesPort>，拦截层按 LocalServices 映射转投到这里——主机本地
+	// 零端口占用、其它本地进程不可达；手机侧零改动（承载对它不可见）。
 	// 根 = 用户主目录、恒读写（协议无参数）；启动打一行根目录判据。
-	// ⚠️ 可选服务失败**不致命**：端口被别的程序占用（或同机跑了第二个实例）时，
-	// 隧道/转发照常工作，只把这条服务摘掉并说清后果 —— 整机因为 7802 起不来是最糟的取舍。
+	// ⚠️ 可选服务失败**不致命**（state 目录不可写等）：隧道/转发照常工作，只把这条
+	// 服务摘掉并说清后果 —— 整机因为 files 起不来是最糟的取舍。
 	fsrv, err := files.Open(cfg.FilesRoot)
 	if err != nil {
 		logf("⚠️ files 根目录不可用（%v）—— 文件管理会报错，其余功能不受影响", err)
 	} else {
 		fsrv.SetLogger(dlogf)
-		fln, lerr := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", cfg.FilesPort))
+		fsock, fln, lerr := listenLocalService(cfg.StateDir, "files.sock")
 		if lerr != nil {
 			fsrv.Close()
-			logf("⚠️ files 监听 127.0.0.1:%d 失败（%v）—— 文件管理会报错（别的程序占用或同机跑了第二个实例），"+
-				"其余功能不受影响", cfg.FilesPort, lerr)
+			logf("⚠️ files 监听 %s 失败（%v）—— 文件管理会报错（state 目录异常），其余功能不受影响", fsock, lerr)
 		} else {
-			s.filesLn, s.files = fln, fsrv
+			s.filesLn, s.filesSock, s.files = fln, fsock, fsrv
 			go func() {
 				if serr := fsrv.Serve(fln); serr != nil {
 					logf("files 服务收工：%v", serr)
 				}
 			}()
-			logf("files 就绪：root=%s (rw) listen=127.0.0.1:%d", fsrv.RootDir(), cfg.FilesPort)
+			logf("files 就绪：root=%s (rw) sock=%s（隧道IP:%d 经拦截层转投）", fsrv.RootDir(), fsock, cfg.FilesPort)
 		}
 	}
 
@@ -337,13 +352,13 @@ func Start(cfg ServeConfig) (*Server, error) {
 		logf("term 服务被 HOMEWAY_TERM=off 关闭")
 	} else {
 		tsrv := term.New(dlogf)
-		tln, terr := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", cfg.TermPort))
+		tsock, tln, terr := listenLocalService(cfg.StateDir, "term.sock")
 		if terr != nil {
 			// 与 files 同一取舍：可选服务起不来不影响隧道/转发。
-			logf("⚠️ term 监听 127.0.0.1:%d 失败（%v）—— 终端功能会报错，其余功能不受影响", cfg.TermPort, terr)
+			logf("⚠️ term 监听 %s 失败（%v）—— 终端功能会报错，其余功能不受影响", tsock, terr)
 			tsrv.Close()
 		} else {
-			s.termLn, s.termSrv = tln, tsrv
+			s.termLn, s.termSock, s.termSrv = tln, tsock, tsrv
 			go func() {
 				for {
 					conn, aerr := tln.Accept()
@@ -353,9 +368,9 @@ func Start(cfg ServeConfig) (*Server, error) {
 					go tsrv.ServeConn(conn)
 				}
 			}()
-			// 就绪行（判据）：终端会话端口 + shell + 历史窗口 + 能力位
-			logf("# Serving terminal sessions on port %d (shell=%s, history=%s, features=%s)",
-				cfg.TermPort, tsrv.ShellText(), tsrv.HistoryText(), term.FeaturesText())
+			// 就绪行（判据）：终端会话 socket + shell + 历史窗口 + 能力位
+			logf("# Serving terminal sessions on sock=%s (shell=%s, history=%s, features=%s)",
+				tsock, tsrv.ShellText(), tsrv.HistoryText(), term.FeaturesText())
 		}
 	}
 
@@ -377,6 +392,24 @@ func Start(cfg ServeConfig) (*Server, error) {
 	return s, nil
 }
 
+// listenLocalService：本机服务的 UDS 监听（exit-service-uds）。listen 前清死残留
+// socket 文件（进程独占 state 目录，残留只可能来自自己的异常退出——Go 的 unix
+// listener Close 不摘文件）。路径超过 sockaddr_un 上限时直接报错（重试无意义）。
+func listenLocalService(stateDir, name string) (string, net.Listener, error) {
+	sock := filepath.Join(stateDir, name)
+	if len(sock) >= 100 { // sockaddr_un.sun_path 保守上限（darwin 104 / linux 108）
+		return sock, nil, fmt.Errorf("路径超长（%d 字节 ≥ 100，sun_path 上限）", len(sock))
+	}
+	if err := os.Remove(sock); err != nil && !os.IsNotExist(err) {
+		return sock, nil, fmt.Errorf("清残留 socket 失败：%w", err)
+	}
+	ln, err := net.Listen("unix", sock)
+	if err != nil {
+		return sock, nil, err
+	}
+	return sock, ln, nil
+}
+
 // Close 收工（幂等性由各层保证；stop 函数可重复调用部分由调用方保证单次）。
 func (s *Server) Close() {
 	if s.relayCancel != nil {
@@ -393,12 +426,14 @@ func (s *Server) Close() {
 	}
 	if s.filesLn != nil {
 		s.filesLn.Close()
+		_ = os.Remove(s.filesSock) // unix listener 的 Close 不摘 socket 文件，手动清
 	}
 	if s.files != nil {
 		s.files.Close()
 	}
 	if s.termLn != nil {
 		s.termLn.Close()
+		_ = os.Remove(s.termSock)
 	}
 	if s.termSrv != nil {
 		s.termSrv.Close()
