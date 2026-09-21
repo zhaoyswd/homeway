@@ -14,7 +14,7 @@ homeway 自有代码的许可见 LICENSE（MIT）；本文件只覆盖**静态�
 
 一、随二进制分发的第三方组件
 --------------------------------------------------------------------------------
-- Go runtime（标准库与运行时） go1.24.0 — BSD-3-Clause — Copyright 2009 The Go Authors. — 全文见 ===== go =====
+- Go runtime（标准库与运行时） go1.24 — BSD-3-Clause — Copyright 2009 The Go Authors. — 全文见 ===== go =====
 - creack/pty（出口侧 pty，终端会话用） v1.1.24 — MIT — Copyright (c) 2011 Keith Rarick — 全文见 ===== pty =====
 - google/btree（B 树，gVisor 的依赖） v1.1.2 — Apache-2.0 — Copyright 2014 Google Inc. — 全文见 ===== btree =====
 - golang.org/x/crypto v0.37.0 — BSD-3-Clause — Copyright 2009 The Go Authors. — 全文见 ===== xgo =====

@@ -46,6 +46,9 @@ cd "$ROOT"
 GOMODCACHE=$(go env GOMODCACHE)
 GOVERSION=$(go env GOVERSION)
 GOROOT=$(go env GOROOT)
+# Go 版本标记读 go.mod 指令而非本机工具链：产物由 CI 按 go.mod 系列构建
+#（go-version-file: go.mod），记录工具链 patch 会让本地与 CI 的 --check 永不一致。
+GOMOD_GOVER="go$(awk '$1=="go"{print $2; exit}' go.mod)"
 
 modules=$(go list -deps -f '{{if .Module}}{{.Module.Path}} {{.Module.Version}}{{end}}' "$ENTRY" \
   | sed '/^$/d' | sort -u | grep -v "^${SELF} " || true)
@@ -72,8 +75,8 @@ collect() { # <id> <展示名> <许可名> <版本标记> <LICENSE 文件> <版�
   printf -- '- %s %s — %s — %s — 全文见 ===== %s =====\n' "$name" "$ver" "$lic" "$cr" "$id" >> "$GEN/rows"
 }
 
-# Go runtime：版权行与许可都取构建工具链自己的 LICENSE（版本随工具链，与产物一致）
-collect "go" "Go runtime（标准库与运行时）" "BSD-3-Clause" "$GOVERSION" "$GOROOT/LICENSE" ""
+# Go runtime：版权行取构建工具链自己的 LICENSE；版本标记用 go.mod 声明系列（见上）
+collect "go" "Go runtime（标准库与运行时）" "BSD-3-Clause" "$GOMOD_GOVER" "$GOROOT/LICENSE" ""
 
 missing=""
 while read -r path ver; do
