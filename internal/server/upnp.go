@@ -247,7 +247,9 @@ func firstLine(s string) string {
 }
 
 func (g *igd) addPortMapping(ctx context.Context, externalPort uint16, internalIP netip.Addr, internalPort uint16) error {
-	// 先删同名映射，保证幂等（多数路由器重复添加会返回 718 ConflictInMappingEntry）
+	// 先删同名映射，保证幂等（多数路由器重复添加会返回 718 ConflictInMappingEntry）。
+	// ⚠️ 这一步会删掉目标端口上的既有映射——安全性由调用方（selectExternalPort）的所有权
+	// 核验保证：走到这里的端口要么无映射、要么是我们自己的；被他人占用的端口在申请层已让位。
 	_ = g.deleteMapping(ctx, externalPort, "UDP")
 	// 租期：优先 1 小时（出口挂了映射会自动过期，不会在路由器里越积越多）；
 	// 有些家用路由器只接受 0（= 永久），那就退回 0 并留日志。
@@ -344,6 +346,35 @@ func atoiOr0(s string) int {
 	return n
 }
 
+// mappingOwner：一条既有映射相对本出口的归属判定结果。
+type mappingOwner int
+
+const (
+	ownerForeign      mappingOwner = iota // 别人的：另一台出口、第三方软件或手动映射——绝不动
+	ownerOurs                             // 我们自己的（陈旧或当前）：可安全「删了重建」
+	ownerLiveSibling                      // 同机器另一活实例的：不动
+)
+
+// classifyMapping：所有权三元组（描述前缀 + 内网客户端地址 + 内网端口活监听）的单一实现，
+// CleanMappings / FindOurMapping / selectExternalPort 三处共用，防口径漂移。
+// client 无效时不比对内网地址（与 CleanMappings 历史行为一致）；listenPort 是本出口的
+// 监听口——内网端口与它同号的条目跳过活监听检查（那可能就是我们自己要用的口）。
+func classifyMapping(m upnpMapping, descPrefix string, client netip.Addr, listenPort uint16) mappingOwner {
+	if !strings.HasPrefix(m.Description, descPrefix) {
+		return ownerForeign
+	}
+	if client.IsValid() {
+		ip, err := netip.ParseAddr(m.InternalClient)
+		if err != nil || ip.Unmap() != client.Unmap() {
+			return ownerForeign
+		}
+	}
+	if m.InternalPort != listenPort && portInUse(m.InternalPort) {
+		return ownerLiveSibling
+	}
+	return ownerOurs
+}
+
 // FindIGD：按内网候选找路由器（serve 启动时申请/续用端口映射用）。
 func FindIGD(ctx context.Context) (*igd, netip.Addr, error) {
 	cands := localIPv4Candidates()
@@ -385,31 +416,25 @@ func (g *igd) CleanMappings(ctx context.Context, descPrefix string, onlyPort uin
 	n := 0
 	var kept []string
 	for _, m := range list {
-		ours := strings.HasPrefix(m.Description, descPrefix)
-		if onlyClient.IsValid() {
-			ip, err := netip.ParseAddr(m.InternalClient)
-			if err != nil || ip.Unmap() != onlyClient.Unmap() {
-				ours = false
-			}
-		}
 		if onlyPort != 0 && m.ExternalPort != onlyPort {
-			ours = false
-		}
-		if !ours {
 			kept = append(kept, fmt.Sprintf("%s/%d → %s:%d (%s)", m.Protocol, m.ExternalPort,
 				m.InternalClient, m.InternalPort, m.Description))
 			continue
 		}
-		// 同机器另一个活出口的映射不能当"遗留"清掉（见 portInUse 的注释）。
-		if m.InternalPort != keepInternalPort && portInUse(m.InternalPort) {
+		switch classifyMapping(m, descPrefix, onlyClient, keepInternalPort) {
+		case ownerOurs:
+			if err := g.deleteMapping(ctx, m.ExternalPort, m.Protocol); err != nil {
+				return n, kept, err
+			}
+			n++
+		case ownerLiveSibling:
+			// 同机器另一个活出口的映射不能当"遗留"清掉（判据见 portInUse 的注释）。
 			kept = append(kept, fmt.Sprintf("%s/%d → %s:%d (%s，内网端口仍在监听，视为别的活实例)",
 				m.Protocol, m.ExternalPort, m.InternalClient, m.InternalPort, m.Description))
-			continue
+		default:
+			kept = append(kept, fmt.Sprintf("%s/%d → %s:%d (%s)", m.Protocol, m.ExternalPort,
+				m.InternalClient, m.InternalPort, m.Description))
 		}
-		if err := g.deleteMapping(ctx, m.ExternalPort, m.Protocol); err != nil {
-			return n, kept, err
-		}
-		n++
 	}
 	return n, kept, nil
 }
@@ -446,23 +471,13 @@ func (g *igd) FindOurMapping(ctx context.Context, descPrefix string, client neti
 	}
 	var fallbackExt, fallbackInt uint16
 	for _, m := range list {
-		if !strings.HasPrefix(m.Description, descPrefix) || m.Protocol != "UDP" {
-			continue
-		}
-		ip, err := netip.ParseAddr(m.InternalClient)
-		if err != nil || ip.Unmap() != client.Unmap() {
+		if m.Protocol != "UDP" || classifyMapping(m, descPrefix, client, listenPort) != ownerOurs {
 			continue
 		}
 		if m.ExternalPort == listenPort {
-			if m.InternalPort != listenPort && portInUse(m.InternalPort) {
-				continue // 同机器另一个活出口占着这个外部端口
-			}
 			return m.ExternalPort, m.InternalPort, true
 		}
 		if fallbackExt == 0 {
-			if m.InternalPort != listenPort && portInUse(m.InternalPort) {
-				continue
-			}
 			fallbackExt, fallbackInt = m.ExternalPort, m.InternalPort
 		}
 	}
@@ -523,32 +538,73 @@ func ensurePortMapping(ctx context.Context, candidates []netip.Addr, internalPor
 	return ext, localIP, nil
 }
 
-// portMapper：端口选择只依赖这两件事，抽出来便于单测（真实实现 = *igd）。
+// portMapper：端口选择只依赖这三件事，抽出来便于单测（真实实现 = *igd）。
+// addPortMapping 的「先删后加」只对**已核验所有权**的端口安全（无映射或我们自己的），
+// 别把被他人占用的外部端口传进来——核验责任在 selectExternalPort。
 type portMapper interface {
 	addPortMapping(ctx context.Context, externalPort uint16, internalIP netip.Addr, internalPort uint16) error
 	CleanMappings(ctx context.Context, descPrefix string, onlyPort uint16, onlyClient netip.Addr,
 		keepInternalPort uint16) (int, []string, error)
+	listMappings(ctx context.Context, max int) ([]upnpMapping, error)
 }
 
-// selectExternalPort：按「上次成功的端口 → 监听端口 → 监听端口+1」的顺序申请，返回成功的外部端口。
+// selectExternalPort：按「上次成功的端口 → 监听端口 → +1…+9」的顺序申请，返回成功的外部端口。
+//
+// 每个候选先核验所有权（枚举一次映射表建索引，见 classifyMapping）：
+//   - 别人的（另一台出口 / 第三方 / 手动映射）或同机活实例的 → 不删不动，让位下一候选
+//     （跨主机抢占与误删手动映射都是旧「无条件先删后加」踩出的坑）；
+//   - 无既有映射或我们自己的 → 发 AddPortMapping（后者由其内部先删后加完成幂等重建）。
+//
+// 映射表枚举失败时 fail-open：跳过核验直接申请（单出口可用性优先，家容路由器枚举报错不罕见）。
 func selectExternalPort(ctx context.Context, g portMapper, internalPort, prefer uint16, localIP netip.Addr,
 	logf func(string, ...any)) (uint16, error) {
+	list, lerr := g.listMappings(ctx, 200)
+	if lerr != nil {
+		logf("UPnP：映射表枚举失败（%v），本轮跳过所有权核验，按旧逻辑直接申请", lerr)
+	}
+	taken := make(map[uint16]upnpMapping, len(list))
+	for _, m := range list {
+		if m.Protocol == "UDP" {
+			taken[m.ExternalPort] = m
+		}
+	}
+	cands := []uint16{prefer}
+	for i := uint16(0); i <= 9; i++ {
+		cands = append(cands, internalPort+i)
+	}
 	tried := map[uint16]bool{}
-	for _, ext := range []uint16{prefer, internalPort, internalPort + 1} {
+	occupied, refused := 0, 0
+	for _, ext := range cands {
 		if ext == 0 || tried[ext] {
 			continue
 		}
 		tried[ext] = true
+		if lerr == nil {
+			if m, ok := taken[ext]; ok {
+				switch classifyMapping(m, upnpMapDesc, localIP, internalPort) {
+				case ownerForeign:
+					occupied++
+					logf("UPnP：外部端口 %d 已被 %s 的映射占用（desc=%s），让位", ext, m.InternalClient, m.Description)
+					continue
+				case ownerLiveSibling:
+					occupied++
+					logf("UPnP：外部端口 %d 的映射指向本机另一活实例（内网端口 %d 在监听），让位", ext, m.InternalPort)
+					continue
+				}
+				// ownerOurs：自己的陈旧/当前映射，addPortMapping 的先删后加即幂等重建。
+			}
+		}
 		if err := g.addPortMapping(ctx, ext, localIP, internalPort); err == nil {
 			if ext == prefer && prefer != internalPort {
 				logf("UPnP：沿用上次成功的外部端口 %d → 内网 %d", ext, internalPort)
 			}
 			return ext, nil
 		} else {
+			refused++
 			logf("UPnP：外部端口 %d 申请失败（%v），换下一个候选", ext, err)
 		}
 	}
-	return 0, fmt.Errorf("AddPortMapping 失败（外部端口 %v 都被拒）", []uint16{prefer, internalPort, internalPort + 1})
+	return 0, fmt.Errorf("外部端口候选均不可用（%d 个被其它映射占用、%d 个被路由器拒绝）", occupied, refused)
 }
 
 // localIPv4Candidates 列出本机可能用于 UPnP 的内网 IPv4 候选。
