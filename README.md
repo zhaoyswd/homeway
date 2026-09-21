@@ -90,4 +90,17 @@ go test ./...
 
 ## 许可
 
-待定（开源前必须落定；候选 MIT）。
+自有代码：**MIT**（见 `LICENSE`）。
+
+二进制里静态链接了第三方组件（Go runtime 与标准库、golang.org/x/{crypto,net,sys,time}、
+wireguard-go、wireguard/wgctrl、gVisor + google/btree、creack/pty）——它们的版权行与许可全文在
+`THIRD-PARTY-NOTICES.txt`，Release 归档包与容器镜像里各带一份（BSD-3 / MIT / Apache-2.0 都要求
+以二进制形式分发时随附声明，只写组件名不满足）。
+
+该文件由 `tools/gen-third-party-notices.sh` 从各依赖自己的 LICENSE 原文拼装（清单口径 =
+`go list -deps ./cmd/homeway`）：**改动依赖后重跑一次**，CI 的 `--check` 门禁会在它过期时挡下发布。
+
+> 沿革：`pkg/term`、`internal/server/upnp.go`、`publicendpoint.go`、`pkg/servercore/ifacebind_*.go`
+> 标着「从 fork 移植」，来源是我们自己在 tailcat fork 里**新增**的文件（上游 tailcat v0.6.0 里没有
+> 这些文件），不是上游 tailcat 代码 ⇒ 不产生 Tailscale 的 BSD-3 归属（逐行比对确认，见 tier 仓
+> `tools/tailcat/PATCHES.md`）。

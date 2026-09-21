@@ -8,4 +8,6 @@
 #   docker run -d --name homeway-relay --network host ... homeway:<tag> relay --advertise 1.2.3.4:41741
 FROM scratch
 COPY build/homeway /homeway
+# 二进制分发条款要求随附自有许可与第三方声明（生成脚本见 tools/gen-third-party-notices.sh）
+COPY LICENSE THIRD-PARTY-NOTICES.txt /
 ENTRYPOINT ["/homeway"]

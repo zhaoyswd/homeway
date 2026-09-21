@@ -21,6 +21,8 @@ jobs:
           go-version-file: go.mod
       - run: go vet ./...
       - run: go test ./...
+      # 声明文件必须与当前依赖一致（改了依赖没重跑生成脚本 ⇒ 别发版）
+      - run: bash tools/gen-third-party-notices.sh --check
 
   build:
     needs: test
@@ -57,14 +59,16 @@ jobs:
           # 用户不用先 cd 进子目录。
           mkdir -p dist
           go build -trimpath -ldflags "${LDFLAGS}" -o "dist/homeway${EXT}" ./cmd/homeway
+          # 自有许可与第三方声明一起打进归档：BSD-3/MIT/Apache-2.0 都要求二进制分发时随附声明
+          cp LICENSE THIRD-PARTY-NOTICES.txt dist/
           cd dist
           ARCH="${GOARCH}${GOARM}"
           BASE="homeway_${VERSION#v}_${GOOS}_${ARCH}"
           if [ "${GOOS}" = "windows" ]; then
-            zip -q "${BASE}.zip" "homeway${EXT}"
+            zip -q "${BASE}.zip" "homeway${EXT}" LICENSE THIRD-PARTY-NOTICES.txt
             sha256sum "${BASE}.zip" > "${BASE}.zip.sha256"
           else
-            tar czf "${BASE}.tar.gz" homeway
+            tar czf "${BASE}.tar.gz" homeway LICENSE THIRD-PARTY-NOTICES.txt
             sha256sum "${BASE}.tar.gz" > "${BASE}.tar.gz.sha256"
           fi
           ls -l
