@@ -36,6 +36,22 @@ homeway relay --state ~/.config/homeway-relay --listen :41741
 （默认出口 `~/.config/homeway` / 中继 `~/.config/homeway-relay`），token 由进程自己打印、看日志即可。
 `--state` 指到哪儿就是哪套身份 —— 想在同一台机器上再开一个独立出口，换个目录即可。
 
+## 日志（2026-09-21 起：终端只出 token 与端点信息）
+
+终端（stdout）只输出：**启动时的 token 与端点清单**（第一次端点探测结束后打；探测全失败或被关
+`--upnp=false --stun=''` 时，15s 内也会用 LAN（+中继）端点打一版，终端不会沉默），以及之后
+**IP/端口变化** 时的重打（token 内容变了才重打，含端口被占用自动退让的告警）。其余全部进文件
+（都按大小轮转、总占用有上界）：
+
+| 角色 | 文件 | 内容 |
+|---|---|---|
+| 出口 | `<state>/events.log`（2MB×3） | 摘要：绑卡/换卡、UPnP、STUN、公网端点公布、服务就绪、运行告警、token 行 |
+| 出口 | `<state>/debug.log`（8MB×2） | 细节：peer 表流水、入站新源、周期观测、会话/流量过程 |
+| 中继 | `<state>/relay.log`（2MB×3） | 全部运行日志：注册腿/会话/回收/分钟统计/告警 |
+
+`homeway exit --verbose` 把摘要+细节同时回显终端（现场排障用）。取 token：
+`grep 客户端 token <state>/events.log | tail -1`。
+
 ## macOS 安装（Gatekeeper 实情）
 
 darwin 产物带的是 **Go 链接器自动加的 ad-hoc 签名**（`codesign -dv` 显示 `Signature=adhoc`、

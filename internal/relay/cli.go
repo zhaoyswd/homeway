@@ -15,7 +15,6 @@ import (
 	"path/filepath"
 	"strings"
 	"syscall"
-	"time"
 
 	"github.com/zhaoyswd/homeway/pkg/egress"
 	"github.com/zhaoyswd/homeway/pkg/proto"
@@ -40,6 +39,8 @@ func CLI(args []string) error {
 		return fmt.Errorf("不认识的参数：%v（直接 `homeway relay [--advertise …]` 即可，没有子命令）", rest)
 	}
 
+	// 文件日志先立起来（loadSecret 的提示也有地方落）：终端从此只出 token/端点行。
+	initRelayLog(*state)
 	secret, created, err := loadSecret(*state)
 	if err != nil {
 		return err
@@ -54,17 +55,23 @@ func CLI(args []string) error {
 	if created {
 		logf("已生成中继鉴权密钥（%s/relay.key，0600）—— 重启不变，token 因此稳定", *state)
 	}
+	// 启动时带一行日志落点（只此一次；终端不再输出其它信息）。
+	if p := relayLogPath(); p != "" {
+		ulogf("日志：%s —— 终端只出 token 与端点变化", p)
+	}
 	return r.RunWithReady(ctx, func(actual netip.AddrPort) {
 		token, eps, terr := buildToken(secret, *advertise, actual.Port())
 		if terr != nil {
 			logf("⚠️ token 生成失败（%v）—— 后端可用裸地址走开放模式", terr)
 			return
 		}
-		logf("中继 token：%s", token)
-		logf("  端点 %v ｜ 后端这样用：homeway exit --relay '%s'", eps, token)
+		ulogf("中继 token：%s", token)
+		ulogf("端点：%s", strings.Join(eps, "、"))
 		if allPrivate(eps) {
-			logf("  ⚠️ 公布的地址都在内网：公网中继请加 --advertise <公网IP:端口>")
+			ulogf("⚠️ 公布的地址都在内网：公网中继请加 --advertise <公网IP:端口>")
 		}
+		// 用法提示进文件（终端不再输出）：token 里已含全部端点与密钥。
+		logf("后端这样用：homeway exit --relay '%s'", token)
 	})
 }
 
@@ -101,6 +108,7 @@ func loadSecret(stateDir string) ([32]byte, bool, error) {
 //
 // 端口以**实际监听口**为准：--advertise 只给 host 时补上实际端口；给了不同端口则按它写
 // （NAT 场景下外部口可以不同），但打一行告警 —— token 里的端口必须真的能连到我们。
+// 告警走 ulogf：它属于「token 里的端口信息」且只在配置错误时出现一次。
 func buildToken(secret [32]byte, advertise string, port uint16) (string, []string, error) {
 	var eps []proto.Endpoint
 	var addrs []string
@@ -112,7 +120,7 @@ func buildToken(secret [32]byte, advertise string, port uint16) (string, []strin
 		var pn uint16
 		_, _ = fmt.Sscanf(p, "%d", &pn)
 		if pn != port {
-			logf("⚠️ --advertise %q 的端口 %d 与实际监听口 %d 不一致：token 里写的是 %d —— 除非前面有 NAT 端口映射，否则后端连不上", a, pn, port, pn)
+			ulogf("⚠️ --advertise %q 的端口 %d 与实际监听口 %d 不一致：token 里写的是 %d —— 除非前面有 NAT 端口映射，否则后端连不上", a, pn, port, pn)
 		}
 		addrs = append(addrs, net.JoinHostPort(host, p))
 	}
@@ -193,9 +201,4 @@ func splitList(v string) []string {
 		}
 	}
 	return out
-}
-
-func logf(format string, args ...any) {
-	// 带时间戳：跨端排障（手机核日志 ↔ 中继日志）必须能对时刻（与 homewayd 同口径）。
-	fmt.Printf(time.Now().Format("2006-01-02 15:04:05.000 ")+"[homeway-relay] "+format+"\n", args...)
 }

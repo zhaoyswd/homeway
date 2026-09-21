@@ -63,11 +63,21 @@ func (s *Server) StartPublicEndpoint(ctx context.Context, opts PublicOpts) {
 		opts.Logf = func(string, ...any) {}
 	}
 	s.pubKick = make(chan struct{}, 1)
+	s.firstProbe = make(chan struct{}, 1)
 	go func() {
+		first := true
 		for {
 			wait := publicRefreshOK
 			if !s.refreshPublicEndpoint(ctx, opts) {
 				wait = publicRefreshFail
+			}
+			if first {
+				// 第一轮结束（成不成都算）：Run 的 token 兜底在等这个信号。
+				first = false
+				select {
+				case s.firstProbe <- struct{}{}:
+				default:
+				}
 			}
 			select {
 			case <-ctx.Done():
@@ -188,31 +198,39 @@ func (s *Server) refreshPublicEndpoint(ctx context.Context, opts PublicOpts) boo
 		return false
 	}
 	logf("公网端点：已公布 %v（写进 %s；下次签发 token 会带上它）", lines, publicFile)
-	s.printClientToken(opts, lines, logf)
+	s.printClientToken(lines)
 	return true
 }
 
-// printClientToken：把"客户端要粘的 token"直接打出来 —— 出口零参数启动即可用，
-// 不用再跑 `issue`。内容 = LAN 端点 + 已公布公网端点 + serve --relay 给的中继端点；
-// 只有在 token 变化时才重打（公网 IP 变了会自然重打一次）。
-func (s *Server) printClientToken(opts PublicOpts, published []string, logf func(string, ...any)) {
+// printClientToken：把"客户端要粘的 token"打上**终端**（用户流 ulogf）——出口零参数
+// 启动即可用，不用再跑 `issue`。内容 = LAN 端点 + 已公布公网端点 + serve --relay 给的
+// 中继端点；只有在 token 变化时才重打（公网 IP/端口变了会自然重打一次）。token 行与
+// 端点行同时抄进摘要日志（events.log 是排障/取 token 的落点：grep 客户端 token）。
+func (s *Server) printClientToken(published []string) {
+	port := s.bind.LocalPort()
+	if port == 0 {
+		// socket 还没开（device 异步拉起 Bind）：本轮不打，等下一轮——别端点端口打出 0。
+		return
+	}
 	var eps []proto.Endpoint
+	var labels []string
 	seen := map[string]bool{}
-	add := func(e proto.Endpoint) {
-		if e.Addr == "" || seen[e.Addr] {
+	add := func(addr, kind string) {
+		if addr == "" || seen[addr] {
 			return
 		}
-		seen[e.Addr] = true
-		eps = append(eps, e)
+		seen[addr] = true
+		eps = append(eps, proto.Endpoint{Addr: addr})
+		labels = append(labels, addr+"（"+kind+"）")
 	}
-	for _, a := range localV4Addrs(opts.Bind.LocalPort()) {
-		add(proto.Endpoint{Addr: a})
+	for _, a := range localV4Addrs(port) {
+		add(a, "内网")
 	}
 	for _, a := range published {
-		add(proto.Endpoint{Addr: a})
+		add(a, "公网")
 	}
 	if s.relayEp.Addr != "" {
-		add(s.relayEp)
+		add(s.relayEp.Addr, "中继")
 	}
 	if len(eps) == 0 {
 		return
@@ -236,9 +254,17 @@ func (s *Server) printClientToken(opts PublicOpts, published []string, logf func
 		s.tokMu.Unlock()
 		return
 	}
+	first := s.lastToken == ""
 	s.lastToken = tok
 	s.tokMu.Unlock()
-	logf("客户端 token（粘进 App 的「添加主机」即可；%d 个端点）：%s", len(eps), tok)
+	if first {
+		// 启动时带一行日志落点（只此一次；终端不再输出其它信息）。
+		if p := EventsLogPath(); p != "" {
+			ulogf("日志：%s（摘要）｜ %s（细节）", p, filepath.Join(filepath.Dir(p), debugLogName))
+		}
+	}
+	ulogf("客户端 token（粘进 App 的「添加主机」即可；%d 个端点）：%s", len(eps), tok)
+	ulogf("端点：%s", strings.Join(labels, "、"))
 }
 
 // localV4Addrs：本机物理网卡 IPv4 + 实际监听端口（LAN 候选）。

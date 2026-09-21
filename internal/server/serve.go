@@ -127,6 +127,7 @@ type Server struct {
 	// stopIntercept：过境拦截层收工（关会话通知；栈随 tunDev 生命周期回收）。
 	stopIntercept func()
 	pubKick       chan struct{} // 公网端点探测的"立即重测"信号（换网事件踢）
+	firstProbe    chan struct{} // 第一次端点探测结束（Run 的 token 兜底在等它；nil=探测被关）
 	filesLn       net.Listener
 	files         *files.Server
 	termLn        net.Listener
@@ -146,8 +147,8 @@ func Start(cfg ServeConfig) (*Server, error) {
 	if err != nil {
 		return nil, err
 	}
-	// 两级日志在 state 目录就绪后立起来：细节写 <state>/debug.log。
-	initDebugLogClose = initDebugLog(cfg.StateDir, cfg.Verbose)
+	// 文件日志立起来（CLI 已按同目录初始化过时这里幂等跳过）：摘要 events.log + 细节 debug.log。
+	initLogs(cfg.StateDir, cfg.Verbose)
 	priv, err := st.PrivateKey()
 	if err != nil {
 		return nil, err
@@ -185,7 +186,7 @@ func Start(cfg ServeConfig) (*Server, error) {
 		resolvedIf = nil
 	case BindAuto:
 		selCtx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
-		best, serr := egress.SelectBest(selCtx, egress.PhysicalCandidates(), nil, 2*time.Second, logf)
+		best, serr := egress.SelectBest(selCtx, egress.PhysicalCandidates(), nil, 2*time.Second, dlogf)
 		cancel()
 		if serr != nil {
 			logf("绑卡：自动挑卡失败（%v）—— 本轮不绑，走系统默认路由（TUN 型代理机器上请用 --bind-interface <网卡>）", serr)
@@ -212,10 +213,6 @@ func Start(cfg ServeConfig) (*Server, error) {
 	if len(secrets) > 0 {
 		s.secret = secrets[0] // 与 `issue` 同一份凭证种子（见 state.Secrets）
 	}
-	level := device.LogLevelError
-	if cfg.Verbose {
-		level = device.LogLevelVerbose
-	}
 	buildTag := cfg.BuildTag
 	if buildTag == "" {
 		buildTag = "homewayd-dev"
@@ -223,7 +220,18 @@ func Start(cfg ServeConfig) (*Server, error) {
 	sbind := &servercore.ServerBind{Logf: logf, LogfD: dlogf, Build: buildTag, BindAddr: cfg.BindAddr, BindIface: resolvedIf,
 		Caps: func() byte { return s.UDPCapFlags() }}
 	s.bind = sbind
-	s.dev = device.NewDevice(tunDev, sbind, device.NewLogger(level, "homewayd"))
+	// wireguard-go 的日志也进文件：device.NewLogger 直写 stdout（2026-09-21 前会刷终端）。
+	// ERROR 级进摘要文件；VERBOSE 只在 --verbose 时进细节文件。
+	// ⚠️ Verbosef 必须非 nil：这版 wireguard-go 的 RoutineEncryption 无条件调
+	// device.log.Verbosef（与 Logger「nil=silent」的注释矛盾），nil 会当场 panic。
+	wgLog := &device.Logger{
+		Errorf:   func(f string, a ...any) { logf("wg: "+f, a...) },
+		Verbosef: device.DiscardLogf,
+	}
+	if cfg.Verbose {
+		wgLog.Verbosef = func(f string, a ...any) { dlogf("wg: "+f, a...) }
+	}
+	s.dev = device.NewDevice(tunDev, sbind, wgLog)
 	s.Table = servercore.NewDeviceTable(servercore.NewIPCConfigurer(s.dev), secrets, servercore.DeviceConfig{
 		MaxDevices: cfg.MaxDevices,
 		TTL:        cfg.PeerTTL,
@@ -405,19 +413,8 @@ func (s *Server) Close() {
 	if s.termSrv != nil {
 		s.termSrv.Close()
 	}
-	closeDebugLog()
+	closeLogs()
 }
-
-// closeDebugLog 收工时关细节日志（幂等）。
-func closeDebugLog() {
-	if c := initDebugLogClose; c != nil {
-		c()
-		initDebugLogClose = nil
-	}
-}
-
-// initDebugLogClose Start 里挂上的细节日志收工函数（进程只有一个 Server 实例）。
-var initDebugLogClose func()
 
 // Run 阻塞直到 ctx 结束。
 func Run(ctx context.Context, cfg ServeConfig) error {
@@ -433,7 +430,8 @@ func Run(ctx context.Context, cfg ServeConfig) error {
 			return
 		}
 		if p != cfg.ListenPort {
-			logf("⚠️ 实际监听端口 %d（配置的 %d 被占用，已自动退让）—— token 里的端口以公布/签发为准", p, cfg.ListenPort)
+			// 端口变了 = token 里的端口跟着变：按用户口径这属于「IP/端口变化」，走终端。
+			ulogf("⚠️ 实际监听端口 %d（配置的 %d 被占用，已自动退让）—— token 里的端口以公布/签发为准", p, cfg.ListenPort)
 		}
 		if werr := os.WriteFile(ListenPortPath(cfg.StateDir), []byte(strconv.Itoa(int(p))+"\n"), 0o600); werr != nil {
 			logf("监听端口落盘失败（%v）—— 只是少了给人看的记录，不影响隧道", werr)
@@ -443,6 +441,26 @@ func Run(ctx context.Context, cfg ServeConfig) error {
 	label := BackendLabel(s.priv)
 	pub6 := PubFromPriv(s.priv)
 	logf("后端身份：标签 %x ｜公钥 %x…", label, pub6[:6])
+
+	// 终端兜底：第一次端点探测结束（或 15s 超时）后 token 还没打过的话，用 LAN(+中继)
+	// 端点先打一版 —— 公网探测失败/被关（--upnp=false --stun=''）时终端也不能沉默。
+	go func() {
+		timer := time.After(15 * time.Second)
+		if s.firstProbe != nil {
+			select {
+			case <-s.firstProbe:
+			case <-timer:
+			}
+		} else {
+			<-timer
+		}
+		s.tokMu.Lock()
+		printed := s.lastToken != ""
+		s.tokMu.Unlock()
+		if !printed {
+			s.printClientToken(nil)
+		}
+	}()
 
 	// 默认路径能不能承载 UDP：周期探测 + 探测应答里回报（转发流量一律走默认路由，这是它的属性）。
 	s.startUDPCapProbe(ctx, dlogf)
@@ -547,12 +565,6 @@ func wgPub(priv [32]byte) [32]byte {
 	}
 	copy(out[:], pub)
 	return out
-}
-
-func logf(format string, args ...any) {
-	// 带时间戳：跨端排障（手机核日志 ↔ 出口日志）必须能对时刻——之前没有时间戳，
-	// 只能靠叙事顺序对齐（2026-09-20 排查「直连时好时坏」时的实痛）。
-	fmt.Printf(time.Now().Format("2006-01-02 15:04:05.000 ")+"[homewayd] "+format+"\n", args...)
 }
 
 var _ = wgtypes.Key{} // 保留引用

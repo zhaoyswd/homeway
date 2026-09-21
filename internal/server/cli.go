@@ -28,7 +28,7 @@ func CLI(args []string) error {
 	stun6Server := fs.String("stun6", "stun.cloudflare.com:3478", "IPv6 路径校验用的 STUN（空 = 关）")
 	maxPeers := fs.Int("max-peers", 32, "设备表容量（同时记住的设备数上限；表满只淘汰超过活跃宽限期未刷新的失联设备）")
 	peerTTL := fs.Duration("peer-ttl", 7*24*time.Hour, "长期不活跃设备的回收期限（0 = 关闭 TTL 回收）")
-	verbose := fs.Bool("verbose", false, "打印 wireguard-go 详细日志（排障用）")
+	verbose := fs.Bool("verbose", false, "摘要+细节日志同时回显终端（现场排障用）；默认终端只出 token 与端点变化")
 	fs.Usage = func() {
 		fmt.Fprintln(os.Stderr, `用法：
   homeway                      # 零参数启动出口；启动日志里的「客户端 token」就是手机要粘的地址
@@ -44,6 +44,9 @@ func CLI(args []string) error {
 		// （抢不到 41641 就退让），还会把真出口的 UPnP 映射改成指向它自己。宁可报错。
 		return fmt.Errorf("不认识的参数：%v（直接 `homeway [--relay 'rl1…']` 即可，没有其它子命令）", rest)
 	}
+
+	// 文件日志先立起来（resolveBind 的告警也得有地方落）：events.log（摘要）+ debug.log（细节）。
+	initLogs(*stateDir, *verbose)
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
