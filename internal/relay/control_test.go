@@ -164,19 +164,33 @@ func (b *dialBackend) dialLeg(t *testing.T, sess proto.CtlSession) *net.UDPConn 
 }
 
 // readLeg：从腿上读一条数据帧并比对载荷（0xBB 帧剥壳）。
+// readLeg：腿读 **want 这一包**。中间的其它数据包（客户端在重建窗口里发的 tick 之类）
+// 会被跳过——UDP 语义下它们是合法的在途包，不该让断言变脆（review 复审：这正是
+// `want "revive" got "tick"` 那条抖动的成因）。
 func (b *dialBackend) readLeg(t *testing.T, leg *net.UDPConn, want string) string {
 	t.Helper()
 	buf := make([]byte, 2048)
-	_ = leg.SetReadDeadline(time.Now().Add(3 * time.Second))
-	n, err := leg.Read(buf)
-	if err != nil {
-		t.Fatalf("腿读（want %q）：%v", want, err)
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		_ = leg.SetReadDeadline(deadline)
+		n, err := leg.Read(buf)
+		if err != nil {
+			t.Fatalf("腿读（want %q）：%v", want, err)
+		}
+		typ, payload, derr := proto.DecodeFrame(buf[:n])
+		if derr != nil {
+			t.Fatalf("腿上帧解不开：typ=%d payload=%q err=%v（want %q）", typ, payload, derr, want)
+		}
+		if typ != proto.FrameTypeData {
+			continue // hint 等非数据帧
+		}
+		if string(payload) == want {
+			return string(payload)
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("腿上数据：want %q got payload=%q（3s 内没等到）", want, payload)
+		}
 	}
-	typ, payload, derr := proto.DecodeFrame(buf[:n])
-	if derr != nil || typ != proto.FrameTypeData || string(payload) != want {
-		t.Fatalf("腿上数据：want %q got typ=%d payload=%q err=%v", want, typ, payload, derr)
-	}
-	return string(payload)
 }
 
 // ---------- 用例 ----------

@@ -115,32 +115,57 @@ type DeviceTable struct {
 	entries map[proto.DevTag]*dentry
 	pool    *ipPool
 
-	// opMu：设备配置操作（AddPeer/RemovePeer=IpcSet）的串行锁。这些操作拿的是
-	// wireguard device 的内部锁——**绝不能在 ReceiveFunc 里同步等它**：device.Close
-	// 的收工会等 ReceiveFunc 退出、而 IpcSet 在等 device 的锁，互为环就是死锁
-	//（实测：注册恰好落在收工窗口时整套测试挂死）。applyDeviceOp 把操作丢到后台
-	// 串行执行、调用方只做有界等待。
-	opMu sync.Mutex
+	// opCh / opStart：设备配置操作（AddPeer/RemovePeer=IpcSet）的**FIFO 单消费者队列**。
+	// 这些操作拿的是 wireguard device 的内部锁——**绝不能在 ReceiveFunc 里同步等它**：
+	// device.Close 的收工会等 ReceiveFunc 退出、而 IpcSet 在等 device 的锁，互为环就是
+	// 死锁（实测：注册恰好落在收工窗口时整套测试挂死）。所以丢到后台执行、调用方只做
+	// 有界等待。
+	// ⚠️ 必须是**队列**而不是"每次起一个 goroutine 抢一把 mutex"（review 复审 a2）：
+	// Go 的 mutex 不保证 FIFO，淘汰路径的 RemovePeer 与新登记的 AddPeer 可能乱序执行，
+	// 留下"表里已登记、device 里没有该 peer"的静默分歧。单消费者串行 ⇒ 提交顺序=执行顺序。
+	opCh    chan devOp
+	opStart sync.Once
+}
+
+// devOp：一次设备配置操作（fn 执行完毕即 close(done)）。
+type devOp struct {
+	fn   func()
+	done chan struct{}
 }
 
 // devOpTimeout：applyDeviceOp 的等待上界。正常 IpcSet 是微秒级；超时只发生在
-// 「设备正在收工」的窗口——放弃等待让 ReceiveFunc 能返回（操作仍在后台排队，
-// 收工后自然完成或随设备一起消亡）。
-const devOpTimeout = 2 * time.Second
+// 「设备正在收工」的窗口——放弃等待让 ReceiveFunc 能返回（操作仍在队列里按序执行，
+// 收工后自然完成或随设备一起消亡）。var 而非 const：单测压缩到毫秒级。
+var devOpTimeout = 2 * time.Second
 
-// applyDeviceOp：后台串行执行一个设备配置操作，调用方有界等待。
+// applyDeviceOp：把操作提交到 FIFO 队列并在有限时间内等待完成。
+//
+// 两种超时语义不同，都必须留痕（review 复审 a2：旧实现超时后返回值与日志都像成功）：
+//   - 入队超时：操作**从未执行** ⇒ device 与设备表可能不一致，大声告警；
+//   - 完成超时：操作仍排在队列里按序执行，只是调用方不再等（设备收工窗口的锁竞争）。
 func (t *DeviceTable) applyDeviceOp(op func()) {
-	done := make(chan struct{})
-	go func() {
-		defer close(done)
-		t.opMu.Lock()
-		defer t.opMu.Unlock()
-		op()
-	}()
+	t.opStart.Do(func() {
+		t.opCh = make(chan devOp, 128)
+		go func() {
+			for o := range t.opCh {
+				o.fn()
+				close(o.done)
+			}
+		}()
+	})
+	o := devOp{fn: op, done: make(chan struct{})}
+	timer := time.NewTimer(devOpTimeout)
+	defer timer.Stop()
 	select {
-	case <-done:
-	case <-time.After(devOpTimeout):
-		t.logf("peer: ⚠️ 设备配置操作 %v 未完成（设备收工中的锁竞争）—— 调用方不再等待（操作已排队）", devOpTimeout)
+	case t.opCh <- o:
+	case <-timer.C:
+		t.logf("peer: ⚠️ 设备配置操作排队超时（%v）——本次**未执行**，device 与设备表可能不一致（等待下一条注册/重连对账收敛）", devOpTimeout)
+		return
+	}
+	select {
+	case <-o.done:
+	case <-timer.C:
+		t.logf("peer: ⚠️ 设备配置操作 %v 未完成（设备收工中的锁竞争）—— 调用方不再等待（操作仍在队列里按序执行）", devOpTimeout)
 	}
 }
 

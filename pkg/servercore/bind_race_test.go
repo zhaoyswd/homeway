@@ -102,6 +102,8 @@ func TestSendDropsAfterLegRemoved(t *testing.T) {
 	}
 
 	// 对照：普通未知端点仍走主 socket（不能把「回不到腿」扩大成「谁都发不出去」）。
+	// 注意判据是"**这个端口曾当过腿**"（精确到端口，不是整个中继主机）：所以对照组可以
+	// 用同一个主机的另一个端口——它从没当过腿，必须照常从主 socket 发出去。
 	other, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
 	if err != nil {
 		t.Fatal(err)

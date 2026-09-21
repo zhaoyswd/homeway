@@ -75,7 +75,15 @@ type ServerBind struct {
 	dead_  chan struct{}
 	// legRecent：最近被摘除的腿远端地址（TTL 内用于 Send 的「不回落主 socket」判定
 	// 与日志归因，review #17）。
-	legRecent  map[netip.AddrPort]time.Time
+	legRecent map[netip.AddrPort]time.Time
+	// legPorts：**曾经当过一次腿的远端地址**（中继主机 + 数据口）。Send 见到"曾是腿、
+	// 但已不是现任腿"的 endpoint 时一律丢弃，且**不受 legRecent 那 5 分钟窗口限制**：
+	// 中继的 per-client 数据口是临时端口，被系统回收后可能分给**另一个客户端的会话**，
+	// 从主 socket 发过去就落进别人的会话（review 复审 #17/R2 的残留路径；端口复用可能
+	// 发生在几小时后，5 分钟窗口盖不住）。
+	// 判据精确到端口（不是整个中继主机）：中继主机上的**其它**端口仍可正常直发，
+	// 不会把"回不到腿"扩大成"谁都发不出去"。容量有上限，满了清表重记（同 srcSeen）。
+	legPorts   map[netip.AddrPort]bool
 	legDropped atomic.Uint64 // Send 因「曾是腿地址但腿已摘」而丢弃的包数（#17 观测面）
 	pinMu      sync.Mutex
 	pinned     *net.Interface // 当前实际钉住的网卡（Open 时设置，Repin 时更新）
@@ -93,6 +101,11 @@ type ServerBind struct {
 	srcMu   sync.Mutex
 	srcSeen map[netip.AddrPort]bool
 }
+
+// legPortsMax：「曾当过腿的远端地址」表的容量上限（超过就清表重记——它只是 Send 的
+// 兜底判据与日志归因，不是 correctness 状态；真丢了也只是回到"可能发到被复用的数据口"
+// 的老行为）。
+const legPortsMax = 4096
 
 // srcSeenMax：新源记录表的容量上限。正常多客户端场景不过几百；满了说明在被扫描/
 // 洪泛，清表重来（这个表只是排障日志的去重，丢历史无 correctness 影响）。
@@ -150,6 +163,15 @@ type relayLegPkt struct {
 
 // 腿上限与空闲回收（review B1：中继侧 closeAll/moved/RELEASE 丢失都会让腿变孤儿，
 // 后端必须自持兜底——回收窗对齐中继 IdleTimeout 的 3 倍）。
+// legSweepEvery / legIdleAfter / legRecentAfter：回收节拍、空闲阈值与「最近摘除」
+// 窗口。**var 而非 const**：单测要把它们压缩到毫秒级（回收循环的启停是 a1 的回归点，
+// 不压缩就得等 30s/5min，没法测）。
+var (
+	legSweepEvery  = relayLegSweep
+	legIdleAfter   = relayLegIdle
+	legRecentAfter = legRecentTTL
+)
+
 const (
 	relayLegMax   = 64
 	relayLegIdle  = 3 * time.Minute
@@ -160,14 +182,17 @@ const (
 	legRecentTTL = 5 * time.Minute
 )
 
-// legInitLocked：腿通道与收工信号（一次）。
+// legInit：腿表/通道（一次）。**不在这里起回收循环**：回收循环按世代启停
+// （review 复审 a1——legOnce 起一次的写法在第一次 Close→Open 之后永久死掉：
+// 循环看到旧世代的 dead 已关就 return，而 Open 换了新信号却没人再起它 ⇒
+// 空闲腿永不回收、legRecent 永不过期，攒到 64 条后新会话再也拿不到腿）。
 func (b *ServerBind) legInit() {
 	b.legOnce.Do(func() {
 		b.legByR = make(map[netip.AddrPort]*relayLeg)
 		b.legByID = make(map[uint64]*relayLeg)
 		b.legCh = make(chan relayLegPkt, 128)
 		b.legRecent = make(map[netip.AddrPort]time.Time)
-		go b.legReapLoop()
+		b.legPorts = make(map[netip.AddrPort]bool)
 	})
 }
 
@@ -209,26 +234,27 @@ func (b *ServerBind) legDead() bool {
 // legReapLoop：腿空闲回收（review B1）。RELEASE 是主路径，这里是兜底——
 // 中继重启不发 RELEASE（closeAll 尽力而为）、控制连接断开丢通告等场景下，
 // 无流量超过 relayLegIdle 的腿自动拆掉（socket + 读协程 + 64KB 缓冲全释放）。
-func (b *ServerBind) legReapLoop() {
-	t := time.NewTicker(relayLegSweep)
+// dead = 本世代的收工信号（Open 启动、Close 关闭；换代后由新的 Open 再起一条）。
+func (b *ServerBind) legReapLoop(dead chan struct{}) {
+	t := time.NewTicker(legSweepEvery)
 	defer t.Stop()
 	for {
 		select {
-		case <-b.deadCh():
+		case <-dead:
 			return
 		case <-t.C:
 		}
 		now := time.Now().UnixMilli()
 		b.legMu.Lock()
 		for _, lg := range b.legByID {
-			if now-lg.last.Load() > relayLegIdle.Milliseconds() {
-				b.logf("腿（会话 #%d → %v）空闲超 %v，回收", lg.id, lg.remote, relayLegIdle)
+			if now-lg.last.Load() > legIdleAfter.Milliseconds() {
+				b.logf("腿（会话 #%d → %v）空闲超 %v，回收", lg.id, lg.remote, legIdleAfter)
 				b.removeLegLocked(lg)
 			}
 		}
 		// 「最近摘除的腿地址」过期清理（#17 的判定窗口）。
 		for ap, at := range b.legRecent {
-			if now-at.UnixMilli() > legRecentTTL.Milliseconds() {
+			if now-at.UnixMilli() > legRecentAfter.Milliseconds() {
 				delete(b.legRecent, ap)
 			}
 		}
@@ -279,10 +305,16 @@ func (b *ServerBind) RegisterLeg(id uint64, remote netip.AddrPort, marker []byte
 	}
 	b.legByID[id] = lg
 	b.legByR[remote] = lg
+	if b.legPorts != nil {
+		if len(b.legPorts) >= legPortsMax {
+			b.legPorts = make(map[netip.AddrPort]bool) // 满表清空（排障级记忆，丢了只影响归因）
+		}
+		b.legPorts[remote] = true // 记住"这个端口当过腿"（Send 的兜底丢弃判据）
+	}
 	// 同地址重拨成功：撤掉「最近摘除」标记（这个远端又有腿了，Send 正常走腿）。
 	delete(b.legRecent, remote)
 	b.legMu.Unlock()
-	go b.legReadLoop(lg, sock)
+	go b.legReadLoop(lg, sock, b.deadCh())
 	return nil
 }
 
@@ -332,7 +364,7 @@ func (b *ServerBind) removeLegLocked(lg *relayLeg) {
 // legReadLoop：一条腿的读循环（connected socket 的 Read；源恒为腿远端）。
 // 读循环退出（socket 关闭/ICMP 拒绝等）即摘腿（review #8）：Send 会刷新 last，
 // 死腿靠空闲扫描永远扫不掉 —— 不在这里摘，WG 会一直往死 socket 写。
-func (b *ServerBind) legReadLoop(lg *relayLeg, sock *net.UDPConn) {
+func (b *ServerBind) legReadLoop(lg *relayLeg, sock *net.UDPConn, dead chan struct{}) {
 	defer func() {
 		b.legMu.Lock()
 		// 只摘「仍是本人」的表项（期间可能已被 RegisterLeg 替换成新腿）。
@@ -367,7 +399,7 @@ func (b *ServerBind) legReadLoop(lg *relayLeg, sock *net.UDPConn) {
 		copy(pkt, buf[:n])
 		select {
 		case b.legCh <- relayLegPkt{pkt: pkt, src: lg.remote}:
-		case <-b.deadCh():
+		case <-dead:
 			return
 		}
 	}
@@ -536,6 +568,7 @@ func (b *ServerBind) Open(port uint16) ([]conn.ReceiveFunc, uint16, error) {
 	b.dead_ = make(chan struct{})
 	dead := b.dead_
 	b.deadMu.Unlock()
+	go b.legReapLoop(dead) // 每世代一条（a1）：Close 关信号即退出，重新 Open 再起
 	fn := func(packets [][]byte, sizes []int, eps []conn.Endpoint) (int, error) {
 		n, src, err := c.ReadFromUDPAddrPort(packets[0])
 		if err != nil {
@@ -822,9 +855,15 @@ func (b *ServerBind) Send(bufs [][]byte, ep conn.Endpoint) error {
 	// 回程必须与「后端拨出去的映射」同五元组（严格 NAT 的构造性穿透）。
 	b.legMu.RLock()
 	lg := b.legByR[e.ap]
-	recent := lg == nil && b.legRecent != nil
-	if recent {
-		_, recent = b.legRecent[e.ap]
+	recent := false
+	everLeg := false
+	if lg == nil {
+		if b.legRecent != nil {
+			_, recent = b.legRecent[e.ap]
+		}
+		if b.legPorts != nil {
+			everLeg = b.legPorts[e.ap]
+		}
 	}
 	b.legMu.RUnlock()
 	if lg != nil {
@@ -836,13 +875,14 @@ func (b *ServerBind) Send(bufs [][]byte, ep conn.Endpoint) error {
 		}
 		return nil
 	}
-	if recent {
-		// #17：该 endpoint 是「最近还挂着腿的中继数据口」。腿不在了（RELEASE 丢失/
-		// 控制空窗回收/重连对账中）却从**主 socket** 发，会打到中继主口或被复用的
-		// 数据口 —— 要么被中继当未知源丢弃，要么污染别的会话。丢弃 + 计数；等
-		// 控制重连的 SESSION 重放重建腿（或下一个入站包重学 endpoint）后自愈。
+	if recent || everLeg {
+		// #17：该 endpoint 是「中继主机上的数据口」。腿不在了（RELEASE 丢失/控制空窗回收/
+		// 重连对账中/端口已被回收给别人）却从**主 socket** 发，会打到中继主口或被复用的
+		// 数据口 —— 要么被中继当未知源丢弃，要么污染别的会话。丢弃 + 计数；等控制重连的
+		// SESSION 重放重建腿（或下一个入站包重学 endpoint）后自愈。
+		// legHost 判据不受 5 分钟窗口限制（端口复用可能发生在很久以后）。
 		if n := b.legDropped.Add(1); n <= 3 || n%1000 == 0 {
-			b.logfD("腿已摘（%v）期间丢弃出站 %d 包（等控制面重放重建腿）", e.ap, len(bufs))
+			b.logfD("腿已摘或非现任（%v）丢弃出站 %d 包（等控制面重放重建腿）", e.ap, len(bufs))
 		}
 		return nil
 	}

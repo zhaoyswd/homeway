@@ -155,16 +155,27 @@ func runControlConn(ctx context.Context, bind *servercore.ServerBind, relay neti
 	if typ != proto.RelaySubOK {
 		return false, fmt.Errorf("控制面握手被拒（type=0x%02x）", typ)
 	}
+	// relayAuthed：控制对端是否已证明持有本 token 的密钥（= 允许它指挥拨腿）。
+	// 开放模式（无 token）没有可验材料，按"测试用途"放行；token 模式下**必须**有
+	// OK-MAC —— 此前裸 1B 的 v1 形状 OK 被无条件接受 ⇒ 能应答这条 TCP 的一方只要
+	// **省略 MAC** 就绕过了 #29 的中继身份认证，再喂 SESSION 让后端往中继主机任意
+	// 端口拨腿（端口注入 + 伪造会话）。现在未认证通道只当保活用，SESSION 一律拒绝。
+	relayAuthed := relaySecret == ([32]byte{})
 	if relaySecret != ([32]byte{}) {
 		if mac, v2 := proto.DecodeRelayOKAuth(withSubtype(typ, payload)); v2 {
 			want := proto.RelayOKAuthMAC(relaySecret, nonce)
 			if subtle.ConstantTimeCompare(want, mac) != 1 {
 				return false, errors.New("控制面 OK 的中继身份校验不过（MAC 不匹配：对端不持有本 token 的密钥）")
 			}
+			relayAuthed = true
 			logf("中继控制面：中继身份已认证（OK-MAC 通过）")
+		} else {
+			// v1 形状（裸 1B）：可能是未发版的旧中继（合法但没有认证材料），也可能是
+			// 中间人降级；两者都不该拿到拨腿指挥权。合法旧中继本来也不会发 SESSION
+			//（它 ctlV2=false，走 per-client 旧路径），所以拒绝 SESSION 不会破坏兼容。
+			logf("⚠️ 中继控制面：对端未提供 OK-MAC（v1 形状，可能是旧版中继或降级攻击）"+
+				"——该通道不指挥拨腿，SESSION 一律拒绝（中继 %v）", relay)
 		}
-		// v1 形状的 OK（裸 1B）：部署矩阵里只可能是「开发构建的旧中继 + token 模式」，
-		// 不致命——SESSION 会是无 cookie 的 v1 形态，拨腿走纯标记。
 	}
 	// 重连对账（review B1）：旧腿全部作废——中继会立刻重放活跃会话（replaySessions），
 	// 按重放重建。中继重启场景 = 重放零条 = 干净清空。
@@ -175,6 +186,8 @@ func runControlConn(ctx context.Context, bind *servercore.ServerBind, relay neti
 	// 保活 + 读循环（SESSION/RELEASE）。中继侧读超时 = 3×保活+15s，留足容错。
 	keep := time.NewTicker(ctlKeepaliveEvery)
 	defer keep.Stop()
+	// refusedSessions：未认证通道被拒的 SESSION 计数（日志节流用）。
+	refusedSessions := 0
 	go func() {
 		for {
 			select {
@@ -199,22 +212,32 @@ func runControlConn(ctx context.Context, bind *servercore.ServerBind, relay neti
 		}
 		switch typ {
 		case proto.RelayCtlSession:
+			if !relayAuthed {
+				// 未认证通道不得指挥拨腿（见上方 relayAuthed）。合法旧中继不会走到这里
+				// （它不发 SESSION）；走到这里只可能是伪造/降级 ⇒ 拒绝并低频记数。
+				refusedSessions++
+				if refusedSessions <= 3 || refusedSessions%50 == 0 {
+					logf("中继控制面：拒绝未认证通道下发的 SESSION（疑似伪造/降级；累计 %d 次）", refusedSessions)
+				}
+				continue
+			}
 			sess, serr := proto.DecodeCtlSession(withSubtype(typ, payload))
 			if serr != nil {
 				logf("中继控制面：SESSION 通告畸形（%v）—— 忽略", serr)
 				continue
 			}
-			// DataPort 校验（#29）：0 与保留端口不拨（通告源不可信——伪造/错位的
-			// 通告不该让后端往奇怪的端口发包）。
-			if sess.DataPort == 0 {
-				logf("中继控制面：会话 #%d 的数据口非法（port=0）—— 忽略", sess.ID)
+			// DataPort 校验（#29）：通告源不可信——伪造/错位的通告不该让后端往奇怪的
+			// 端口发包。中继的数据口是**临时端口**（内核 32768+），0 与 <1024 的保留段
+			// 一定不是它（review 复审：此前只判 ==0，与注释不符）。
+			if sess.DataPort == 0 || sess.DataPort < 1024 {
+				logf("中继控制面：会话 #%d 的数据口非法（port=%d，保留段）—— 忽略", sess.ID, sess.DataPort)
 				continue
 			}
 			remote := netip.AddrPortFrom(relay.Addr().Unmap(), sess.DataPort)
 			// v2 会话带 cookie：拨腿首包回 LEGUP‖cookie‖MAC（中继验过才认这条腿，
 			// #3——腿身份认证的 backend 侧）。v1 通告（无 cookie）维持纯 LEGUP 标记。
-			// v2 会话带 cookie：SESSION 的 27B 形状本身就证明中继是 v2（v1 中继只会
-			// 编 11B 无 cookie 形态）；token 模式下中继身份已由 OK-MAC 认证过。
+			// SESSION 的 27B 形状本身即表明中继是 v2（v1 中继只编 11B 无 cookie 形态），
+			// 且该通道已由 OK-MAC 认证（relayAuthed）。
 			marker := []byte("LEGUP")
 			if sess.HasCookie {
 				marker = proto.LegupAuthPayload(sess.ID, sess.Cookie, legupKeyFor(relaySecret, sess.Cookie))

@@ -4,6 +4,7 @@ import (
 	"crypto/hmac"
 	"crypto/sha256"
 	"net/netip"
+	"strconv"
 )
 
 // 隧道地址派生（wg-native-stack tasks 3.7）。
@@ -46,9 +47,12 @@ func DeriveTunIP(secret [32]byte, pubkey [32]byte) netip.Addr {
 	// 同设备两地址相等守卫（review #16）：TunIP == TunnelIP 会让 hub 的分流键失效
 	//（应用回程被当核心自连送进 B 栈）。确定性扰动——再散列一次（标签后缀 ".2"），
 	// **两端必须同规则**（手机核与出口都走本函数，规则收在 proto 里即保证一致）。
-	if ip == DeriveTunnelIP(secret, pubkey) {
+	// 有界循环（review 复审：单次再散列后仍可能相等，概率 ~2^-32；循环保证一定收敛，
+	// 且标签里带计数器 ⇒ 两端同一函数、同一结果）。8 次以内几乎必然脱开；真撞满就
+	// 接受最后结果（那是 2^-256 量级，属于"身份推导本身坏了"）。
+	for i := 2; i <= 9 && ip == DeriveTunnelIP(secret, pubkey); i++ {
 		h2 := hmac.New(sha256.New, secret[:])
-		h2.Write([]byte("hw-app.2"))
+		h2.Write([]byte("hw-app." + strconv.Itoa(i)))
 		h2.Write(pubkey[:])
 		sum2 := h2.Sum(nil)
 		v2 := (uint32(sum2[2])<<8|uint32(sum2[3]))%(65535-1) + 1

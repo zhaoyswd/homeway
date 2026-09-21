@@ -25,6 +25,7 @@ import (
 	"net"
 	"net/netip"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/zhaoyswd/homeway/pkg/proto"
@@ -90,8 +91,18 @@ type Relay struct {
 	legs    map[[8]byte]*leg
 	assocs  map[assocKey]*assoc
 	rates   map[netip.Addr]*rateBucket
+	// legRates：被拒腿包的**独立**限速桶（review 复审）：与准入限流共用一张表时，
+	// 数据口上的垃圾包会吃掉同源 IP 在主口的合法配额（同 NAT 下的用户互相影响）。
+	legRates map[netip.Addr]*rateBucket
 
 	stats Stats
+
+	// 控制面计数（**每实例独立**，review 复审 nit：此前是包级全局，
+	// 同进程起两个 Relay 会互相吃配额，测试之间也会串）。
+	//   ctlHandshaking：「握手中」的并发数（认证完成即释放）；
+	//   ctlEstablished：已建立的控制连接总数（长连闸）。
+	ctlHandshaking atomic.Int32
+	ctlEstablished atomic.Int32
 
 	nextSid uint64
 	ctlLn   net.Listener
@@ -205,10 +216,11 @@ func New(cfg Config) *Relay {
 		cfg.Logf = func(string, ...any) {}
 	}
 	return &Relay{
-		cfg:    cfg,
-		legs:   map[[8]byte]*leg{},
-		assocs: map[assocKey]*assoc{},
-		rates:  map[netip.Addr]*rateBucket{},
+		cfg:      cfg,
+		legs:     map[[8]byte]*leg{},
+		assocs:   map[assocKey]*assoc{},
+		rates:    map[netip.Addr]*rateBucket{},
+		legRates: map[netip.Addr]*rateBucket{},
 	}
 }
 
@@ -264,10 +276,10 @@ func (r *Relay) Run(ctx context.Context) error {
 	if tcpLn, terr := net.Listen("tcp", ctlAddr.String()); terr == nil {
 		r.ctlLn = tcpLn
 		go r.serveControl(tcpLn)
-		go func() {
-			<-ctx.Done()
-			_ = tcpLn.Close()
-		}()
+		// 不为它单起一个"ctx 到了才关"的 goroutine：那样 Run 返回 ≠ 端口已释放
+		//（复审复现的抖动：上一个中继的 TCP 监听还占着端口，下一个中继的 UDP 退让端口
+		// 恰好撞上它 ⇒ 控制面 listen 失败、静默退回纯 UDP ⇒ 测试卡在等 CHALLENGE）。
+		// 统一在 Run 的收尾里关（见下方 readLoop 之后）。
 		r.cfg.Logf("中继控制面：TCP %v 就绪（后端拨腿模式可用）", tcpLn.Addr())
 	} else {
 		r.cfg.Logf("⚠️ 控制面 TCP %v 监听失败（%v）—— 退回纯 UDP 中继（拨腿特性缺席）", ctlAddr.String(), terr)
@@ -283,10 +295,15 @@ func (r *Relay) Run(ctx context.Context) error {
 	go r.statsLoop(ctx)
 	go func() {
 		<-ctx.Done()
-		_ = pc.Close()
-		r.closeAll()
+		_ = pc.Close() // 打断 readLoop（Run 的收尾在下面同步做）
 	}()
 	r.readLoop(ctx)
+	// Run 返回 ⇒ 本实例的监听器与会话**一定**已释放（确定性收工）：调用方（测试/嵌入方）
+	// 看到 Run 返回即可安全重用同端口，不需要"再等一会儿"。
+	if r.ctlLn != nil {
+		_ = r.ctlLn.Close()
+	}
+	r.closeAll()
 	return nil
 }
 
@@ -298,7 +315,6 @@ func (r *Relay) listen() (*net.UDPConn, error) {
 	if err == nil {
 		return pc, nil
 	}
-	_ = 0 // （TCP 控制监听在 Serve 里另起；此处保持原 UDP 退让逻辑不动）
 	r.cfg.Logf("⚠️ 监听端口 %d 被占用（%v）—— 自动往后找", want, err)
 	for p := want + 1; want != 0 && p <= want+9; p++ {
 		la := *laddr
@@ -566,11 +582,16 @@ func (r *Relay) forwardUp(client netip.AddrPort, lg *leg, typ byte, payload []by
 				// 每会话随机 cookie（review #3）：只经控制通道发给该后端，
 				// 拨腿首包必须回带 cookie+MAC 才被认作腿。
 				if _, cerr := rand.Read(a.cookie[:]); cerr != nil {
-					// 随机源失效极罕见：退回 v1（无认证）总比拒绝服务好
-					a.cookie = [16]byte{}
-				} else {
-					a.authOK = false
+					// 随机源失效（实践上不会发生）：**不**退化成全零 cookie 的"假 v2"
+					// （那会让 cookie 可预测、认证形同虚设）——拆掉本次会话让客户端
+					// 重试，下一次多半能拿到正常随机数。会话尚未入表，直接关 socket。
+					_ = sock.Close()
+					r.mu.Unlock()
+					r.bump(func(s *Stats) { s.Dropped++ })
+					r.cfg.Logf("⚠️ 中继：会话随机数不可用（%v）——已放弃本次会话，客户端重试即可", cerr)
+					return
 				}
+				a.authOK = false
 			}
 		}
 		r.assocs[key] = a
@@ -685,6 +706,7 @@ func (r *Relay) assocReadLoop(a *assoc) {
 				a.authSrc = from
 				a.backend = from
 				a.last, a.lastDown = now, now
+				sid := a.sid // 锁内取值：replaySessions 会在 r.mu 下改写 a.sid（review 复审 b2）
 				r.mu.Unlock()
 				if first {
 					r.mu.Lock()
@@ -699,17 +721,18 @@ func (r *Relay) assocReadLoop(a *assoc) {
 					}
 				}
 				if moved {
-					r.cfg.Logf("中继：会话 #%d 的后端腿重拨 → %v（cookie 认证通过，跟随）", a.sid, from)
+					r.cfg.Logf("中继：会话 #%d 的后端腿重拨 → %v（cookie 认证通过，跟随）", sid, from)
 				}
 			} else {
 				// 未认证/未知源：丢弃并计数，不改变任何状态、不续命（#3）。
 				r.stats.LegRejected++
 				n := r.stats.LegRejected
+				sid := a.sid // 同上：锁内取值
 				rateOK := r.legRateOKLocked(from.Addr())
 				r.mu.Unlock()
 				if rateOK && legRejectLog(n) {
 					r.cfg.Logf("中继：会话 #%d 收到未知源 %v 的包（%dB）—— 已拒绝（未认证不得成为腿；累计 %d 次）",
-						a.sid, from, len(pkt), n)
+						sid, from, len(pkt), n)
 				}
 				continue
 			}
@@ -743,10 +766,10 @@ func (r *Relay) assocReadLoop(a *assoc) {
 // 已认证源发生，真实后端不会被限。阈值取准入限流的 10 倍。
 func (r *Relay) legRateOKLocked(ip netip.Addr) bool {
 	now := time.Now()
-	b := r.rates[ip]
+	b := r.legRates[ip]
 	limit := r.cfg.RateLimit * 10
 	if b == nil || now.Sub(b.window) >= time.Second {
-		r.rates[ip] = &rateBucket{window: now, count: 1}
+		r.legRates[ip] = &rateBucket{window: now, count: 1}
 		return true
 	}
 	b.count++
@@ -815,7 +838,10 @@ func (r *Relay) reapLoop(ctx context.Context) {
 				why = "" // 普通空闲：走既有聚合计数，不逐条打日志
 			case a.dialUp && now.Sub(a.dialUpAt) > r.cfg.DialWait:
 				why = fmt.Sprintf("拨腿等待超 %v（通告后无 LEGUP——后端拨腿失败/通告丢失）", r.cfg.DialWait)
-			case now.Sub(a.lastDown) > r.cfg.DownSilent:
+			case !a.dialUp && now.Sub(a.lastDown) > r.cfg.DownSilent:
+				// 拨腿等待中的会话由 DialWait 看门狗负责（见上一条）：它的 lastDown 从
+				// 创建时刻起算，若 DownSilent 比 DialWait 短就会在腿还没认证上来之前被
+				// 当"半死会话"拆掉（review 复审 b1 的抖动根因；生产默认 15s < 5min 掩盖了它）。
 				why = fmt.Sprintf("下行静默超 %v（上行仍活跃——半死会话兜底）", r.cfg.DownSilent)
 			default:
 				continue
@@ -870,6 +896,11 @@ func (r *Relay) reapLoop(ctx context.Context) {
 				delete(r.rates, ip)
 			}
 		}
+		for ip, b := range r.legRates {
+			if now.Sub(b.window) > 2*time.Second {
+				delete(r.legRates, ip)
+			}
+		}
 		r.mu.Unlock()
 		if reclaim > 0 {
 			r.cfg.Logf("中继：回收 %d 条空闲分配腿（当前 %d 条）", reclaim, r.assocCount())
@@ -897,15 +928,23 @@ func (r *Relay) statsLoop(ctx context.Context) {
 	}
 }
 
+// closeAll：收工（幂等）。关全部会话 socket + 全部控制连接，并尽力给拨腿会话补发
+// RELEASE（review B1——进程即将退出，写不进 TCP 就算了；后端还有 ClearLegs+重放对账
+// 与空闲回收两层兜底）。控制连接必须显式关：accept 出来的长连不随监听器关闭而结束，
+// 不关就要等 90s 读超时，Run 也就"返回了但还挂着 socket/goroutine"。
 func (r *Relay) closeAll() {
-	// 拨腿会话补发 RELEASE（review B1，尽力而为——进程即将退出，写不进 TCP 就算了；
-	// 后端还有 ClearLegs+重放对账与空闲回收两层兜底）。
 	r.mu.Lock()
 	type rel struct {
 		lg  *leg
 		sid uint64
 	}
 	var rels []rel
+	var ctls []*ctlConn
+	for _, lg := range r.legs {
+		if lg.ctl != nil {
+			ctls = append(ctls, lg.ctl)
+		}
+	}
 	for k, a := range r.assocs {
 		if a.sid != 0 {
 			if lg := r.legs[k.label]; lg != nil {
@@ -918,6 +957,9 @@ func (r *Relay) closeAll() {
 	r.mu.Unlock()
 	for _, x := range rels {
 		r.releaseSession(x.lg, x.sid)
+	}
+	for _, cc := range ctls {
+		cc.close()
 	}
 }
 

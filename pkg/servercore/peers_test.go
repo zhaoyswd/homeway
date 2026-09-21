@@ -395,3 +395,56 @@ func TestTunIPOccupancyTracked(t *testing.T) {
 		t.Fatalf("dev2 的 TunIP %v 与 dev1 的地址撞车未被处置", pc.TunIP)
 	}
 }
+
+// 设备配置操作的顺序契约（review 复审 a2）：提交顺序 = 执行顺序。
+//
+// 为什么必须锁死：轮换路径是"先 RemovePeer(旧) 再 AddPeer(新)"、淘汰+重登记也是
+// "先摘旧再写新"。旧实现（每次操作起一个 goroutine 抢一把 mutex）在**超时后**
+// 可能让后提交的操作抢到锁先执行，留下"设备表里已登记、device 里却没有该 peer"
+// 的静默分歧（直到 TTL 才自愈）。现在单消费者 FIFO 队列从结构上排除抢跑。
+func TestApplyDeviceOpKeepsSubmissionOrder(t *testing.T) {
+	oldTimeout := devOpTimeout
+	devOpTimeout = 40 * time.Millisecond
+	defer func() { devOpTimeout = oldTimeout }()
+
+	tb := NewDeviceTable(newFakeCfg(), [][32]byte{testSecret}, DeviceConfig{MaxDevices: 2})
+	gate := make(chan struct{})
+	var mu sync.Mutex
+	var order []string
+	rec := func(s string) {
+		mu.Lock()
+		order = append(order, s)
+		mu.Unlock()
+	}
+
+	// 第一个操作卡住 → applyDeviceOp 超时返回，但它仍占着队列（尚未执行完）
+	tb.applyDeviceOp(func() { <-gate; rec("first") })
+	// 第二个操作在第一个还卡着时提交：它必须先于"第一个完成"之后执行
+	tb.applyDeviceOp(func() { rec("second") })
+
+	time.Sleep(20 * time.Millisecond)
+	mu.Lock()
+	before := append([]string(nil), order...)
+	mu.Unlock()
+	if len(before) != 0 {
+		t.Fatalf("卡住的操作未完成时后一个操作就跑了（顺序被破坏）：%v", before)
+	}
+	close(gate)
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		mu.Lock()
+		got := append([]string(nil), order...)
+		mu.Unlock()
+		if len(got) == 2 {
+			if got[0] != "first" || got[1] != "second" {
+				t.Fatalf("执行顺序错乱：%v（want [first second]）", got)
+			}
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	mu.Lock()
+	got := append([]string(nil), order...)
+	mu.Unlock()
+	t.Fatalf("操作未全部执行：%v", got)
+}

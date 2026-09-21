@@ -19,7 +19,6 @@ import (
 	"crypto/subtle"
 	"net"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/zhaoyswd/homeway/pkg/proto"
@@ -34,9 +33,8 @@ const ctlReadTimeout = 3*ctlKeepaliveEvery + 15*time.Second
 
 // ctlConn：一条已鉴权的控制连接（只允许串行写；读在专属协程）。
 type ctlConn struct {
-	c     net.Conn
-	wmu   sync.Mutex
-	label [8]byte
+	c   net.Conn
+	wmu sync.Mutex
 }
 
 func (cc *ctlConn) writeMsg(msg []byte) error {
@@ -57,11 +55,6 @@ func (cc *ctlConn) close() {
 // ctlEstablished（总数上限）约束。
 const ctlHandshakeMax = 16
 
-var (
-	ctlHandshaking atomic.Int32
-	ctlEstablished atomic.Int32
-)
-
 // serveControl：TCP 接入循环（每连接一个协程跑 handshake+readLoop）。
 func (r *Relay) serveControl(ln net.Listener) {
 	for {
@@ -69,8 +62,8 @@ func (r *Relay) serveControl(ln net.Listener) {
 		if err != nil {
 			return
 		}
-		if ctlHandshaking.Add(1) > ctlHandshakeMax {
-			ctlHandshaking.Add(-1)
+		if r.ctlHandshaking.Add(1) > ctlHandshakeMax {
+			r.ctlHandshaking.Add(-1)
 			_ = c.Close()
 			r.bump(func(s *Stats) { s.Dropped++ })
 			r.cfg.Logf("中继：并发握手上限 %d 已满，拒绝 %v（慢握手洪水防护）", ctlHandshakeMax, c.RemoteAddr())
@@ -87,7 +80,7 @@ func (r *Relay) controlConn(c net.Conn) {
 	handshaking := true
 	defer func() {
 		if handshaking {
-			ctlHandshaking.Add(-1)
+			r.ctlHandshaking.Add(-1)
 		}
 	}()
 	defer c.Close()
@@ -147,8 +140,8 @@ func (r *Relay) controlConn(c net.Conn) {
 	}
 
 	// ④ 已建立控制连接总数上限（#7/#18：认证长连各占一个读协程，要有总闸）。
-	if ctlEstablished.Add(1) > int32(r.cfg.MaxCtlConns) {
-		ctlEstablished.Add(-1)
+	if r.ctlEstablished.Add(1) > int32(r.cfg.MaxCtlConns) {
+		r.ctlEstablished.Add(-1)
 		r.bump(func(s *Stats) { s.Dropped++ })
 		r.cfg.Logf("中继：已建立控制连接达上限 %d，拒绝 %v（label %x）", r.cfg.MaxCtlConns, c.RemoteAddr(), label[:])
 		return
@@ -156,7 +149,7 @@ func (r *Relay) controlConn(c net.Conn) {
 	estab := true
 	defer func() {
 		if estab {
-			ctlEstablished.Add(-1)
+			r.ctlEstablished.Add(-1)
 		}
 	}()
 
@@ -169,7 +162,7 @@ func (r *Relay) controlConn(c net.Conn) {
 	if err := proto.CtlWriteMsg(c, okMsg); err != nil {
 		return
 	}
-	ctlHandshaking.Add(-1) // 握手完成：释放并发槽（#7）
+	r.ctlHandshaking.Add(-1) // 握手完成：释放并发槽（#7）
 	handshaking = false
 	_ = c.SetDeadline(time.Time{}) // 清握手超时；后续用 readLoop 的滚动超时
 
@@ -337,10 +330,13 @@ func (r *Relay) replaySessions(lg *leg, cc *ctlConn) {
 	for _, p := range out {
 		if err := cc.writeMsg(p.msg); err != nil {
 			cc.close()
-			// 通告失败：从失败点起回滚剩余的提升（已发出的算数——后端会拨腿，
-			// assocReadLoop 的 LEGUP 分支会完成交接）。
+			// 通告失败：**从失败那条起**回滚剩余的提升（已成功发出的算数——后端会拨腿，
+			// assocReadLoop 的 LEGUP/认证分支会完成交接）。失败这条自己也没送达，
+			// 不回滚的话它会停在「dialUp + 已提升」但后端从未收到通告的状态：
+			// 客户端上行进 pend 缓冲、要等 DialWait 看门狗 15s 后才回收
+			//（review 复审修正：此前是 out[sent+1:]，漏掉失败那条）。
 			r.mu.Lock()
-			for _, q := range out[sent+1:] {
+			for _, q := range out[sent:] {
 				if q.assoc.dialUp && q.assoc.sid != 0 && q.assoc.key.label == lg.label {
 					q.assoc.sid = 0
 					q.assoc.dialUp = false
