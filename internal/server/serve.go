@@ -15,7 +15,6 @@ import (
 	"github.com/zhaoyswd/homeway/pkg/dns"
 	"github.com/zhaoyswd/homeway/pkg/egress"
 	"github.com/zhaoyswd/homeway/pkg/files"
-	"github.com/zhaoyswd/homeway/pkg/flows"
 	"github.com/zhaoyswd/homeway/pkg/intercept"
 	"github.com/zhaoyswd/homeway/pkg/proto"
 	"github.com/zhaoyswd/homeway/pkg/servercore"
@@ -28,12 +27,10 @@ import (
 
 // 默认内部地址（隧道内，客户端 token/配置与之配套）。
 const (
-	DefaultTunnelIP   = "100.64.255.1"
-	DefaultFlowPort   = uint16(7800) // TCP CONNECT 流
-	DefaultUDPFlowPrt = uint16(7801) // UDP 数据报（DNS 等）
-	DefaultFilesPort  = uint16(7802) // files 原生协议（后端本机 127.0.0.1）
-	DefaultTermPort   = uint16(7724) // 终端会话 / agent gateway（与旧栈 tunnel 内虚拟端口同号）
-	DefaultDNSPort    = uint16(5300) // DNS 代答（任意目的 :53 改写到这里；不用 53——macOS 非 root 绑不上回环特权端口）
+	DefaultTunnelIP  = "100.64.255.1"
+	DefaultFilesPort = uint16(7802) // files 原生协议（后端本机 127.0.0.1）
+	DefaultTermPort  = uint16(7724) // 终端会话 / agent gateway（与旧栈 tunnel 内虚拟端口同号）
+	DefaultDNSPort   = uint16(5300) // DNS 代答（任意目的 :53 改写到这里；不用 53——macOS 非 root 绑不上回环特权端口）
 )
 
 // BindMode：WG socket（打洞/STUN）钉哪张物理网卡。
@@ -52,28 +49,24 @@ const (
 )
 
 type ServeConfig struct {
-	StateDir     string
-	ListenPort   uint16
-	TunnelIP     netip.Addr
-	FlowPort     uint16
-	UDPFlowPort  uint16
-	FilesPort    uint16         // files 服务在本机的监听端口（客户端经流协议 CONNECT 到它）
-	FilesRoot    string         // files 根（空 = 用户主目录；协议恒读写）
-	TermPort     uint16         // 终端会话 / agent gateway 在本机的监听端口
-	DNSPort      uint16         // DNS 代答监听端口（0 = 禁用：:53 按原目标过境重拨；cli 默认 DefaultDNSPort）
-	FlowMaxConns int            // 内部流并发上限（0 = 默认 64）
-	FlowIdle     time.Duration  // 内部流空闲回收（0 = 默认 30 分钟；终端会话腿也走这里，别设太短）
-	MaxDevices   int            // 设备表容量（0 = 32）
-	PeerTTL      time.Duration  // 长期不活跃设备的回收期限（0 = 7 天；<0 = 关闭 TTL 回收）
-	BuildTag     string         // 探测应答里回报的构建标记（空 = 用内置默认）
-	BindAddr     netip.Addr     // 非零 = 把 WG UDP socket 绑到该地址（该网卡出站；STUN 观测同 socket）
-	BindIface    *net.Interface // 非空 = 双栈监听并整条 socket 钉在该网卡（同时支持 v4/v6 客户端）
-	BindMode     BindMode       // WG socket 钉哪张卡：auto（默认，自动挑）/explicit（用 BindIface）/off（不绑）
-	UPnP         bool           // 启动后向路由器申请 UDP 端口映射并 30 分钟续期
-	STUN         string         // 非空 = 在监听 socket 上向该 STUN 服务器观测公网映射（如 stun.miwifi.com:3478）
-	STUN6        string         // 非空 = 用该服务器做 **IPv6** 路径校验（要有 AAAA，如 stun.cloudflare.com:3478）
-	Relay        string         // 非空 = 向该中继注册一条反向注册腿（host:port），NAT 后的出口由此可被客户端到达
-	Verbose      bool
+	StateDir   string
+	ListenPort uint16
+	TunnelIP   netip.Addr
+	FilesPort  uint16         // files 服务在本机的监听端口（客户端经隧道 IP 豁免转投到它）
+	FilesRoot  string         // files 根（空 = 用户主目录；协议恒读写）
+	TermPort   uint16         // 终端会话 / agent gateway 在本机的监听端口
+	DNSPort    uint16         // DNS 代答监听端口（0 = 禁用：:53 按原目标过境重拨；cli 默认 DefaultDNSPort）
+	MaxDevices int            // 设备表容量（0 = 32）
+	PeerTTL    time.Duration  // 长期不活跃设备的回收期限（0 = 7 天；<0 = 关闭 TTL 回收）
+	BuildTag   string         // 探测应答里回报的构建标记（空 = 用内置默认）
+	BindAddr   netip.Addr     // 非零 = 把 WG UDP socket 绑到该地址（该网卡出站；STUN 观测同 socket）
+	BindIface  *net.Interface // 非空 = 双栈监听并整条 socket 钉在该网卡（同时支持 v4/v6 客户端）
+	BindMode   BindMode       // WG socket 钉哪张卡：auto（默认，自动挑）/explicit（用 BindIface）/off（不绑）
+	UPnP       bool           // 启动后向路由器申请 UDP 端口映射并 30 分钟续期
+	STUN       string         // 非空 = 在监听 socket 上向该 STUN 服务器观测公网映射（如 stun.miwifi.com:3478）
+	STUN6      string         // 非空 = 用该服务器做 **IPv6** 路径校验（要有 AAAA，如 stun.cloudflare.com:3478）
+	Relay      string         // 非空 = 向该中继注册一条反向注册腿（host:port），NAT 后的出口由此可被客户端到达
+	Verbose    bool
 }
 
 func (c *ServeConfig) fill() {
@@ -83,23 +76,11 @@ func (c *ServeConfig) fill() {
 	if !c.TunnelIP.IsValid() {
 		c.TunnelIP = netip.MustParseAddr(DefaultTunnelIP)
 	}
-	if c.FlowPort == 0 {
-		c.FlowPort = DefaultFlowPort
-	}
-	if c.UDPFlowPort == 0 {
-		c.UDPFlowPort = DefaultUDPFlowPrt
-	}
 	if c.FilesPort == 0 {
 		c.FilesPort = DefaultFilesPort
 	}
 	if c.TermPort == 0 {
 		c.TermPort = DefaultTermPort
-	}
-	if c.FlowMaxConns <= 0 {
-		c.FlowMaxConns = 64
-	}
-	if c.FlowIdle <= 0 {
-		c.FlowIdle = 30 * time.Minute
 	}
 	if c.MaxDevices <= 0 {
 		c.MaxDevices = 32
@@ -109,10 +90,10 @@ func (c *ServeConfig) fill() {
 	}
 }
 
-// Server：homewayd 的完整数据面装配（netstack + WG device + ServerBind + PeerTable + flows）。
+// Server：homewayd 的完整数据面装配（netstack + WG device + ServerBind + PeerTable + 拦截层）。
 type Server struct {
 	cfg   ServeConfig
-	Stats *flows.Stats // dialok / dialfail / flows（状态面 3.6 消费）
+	Stats *intercept.Stats // dialok / dialfail / flows 计数（拦截层唯一写入方；udpcap 读 UDP 实测位）
 	Table *servercore.DeviceTable
 
 	dev           *device.Device
@@ -126,8 +107,6 @@ type Server struct {
 	lastToken     string       // 上次已写出的客户端 token（去重：没变就不再写；终端只认首轮）
 	lastPublished []string     // 最近一轮已公布的公网端点（Run 的终端兜底带上它，别打残缺版）
 	udpCap        *udpCapState // 默认路径的 UDP 能力（周期探测；探测应答里回报）
-	stopTCP       func()
-	stopUDP       func()
 	// dnsSrv：DNS 代答（dns-host-resolver）；nil = 未启用（监听失败降级或配置关闭）。
 	dnsSrv *dns.Server
 	// stopIntercept：过境拦截层收工（关会话通知；栈随 tunDev 生命周期回收）。
@@ -179,8 +158,7 @@ func Start(cfg ServeConfig) (*Server, error) {
 	}
 
 	// 过境拦截栈（l3-exit-intercept）：HandleLocal 必须关（混杂+spoofing 的前提，
-	// 见 pkg/intercept 包注释）；老 flows 客户端由「监听挪真实 127.0.0.1 + 豁免转投」
-	// 继续服务（换代完成后移除）。
+	// 见 pkg/intercept 包注释）。
 	tunDev, ns, err := wgnet.CreateOpts([]netip.Addr{cfg.TunnelIP}, 1280, wgnet.Opts{HandleLocal: false})
 	if err != nil {
 		return nil, err
@@ -202,7 +180,7 @@ func Start(cfg ServeConfig) (*Server, error) {
 			logf("绑卡：自动挑到 %s（%s）", best.Name, stateOf(best))
 		}
 	}
-	s := &Server{cfg: cfg, Stats: &flows.Stats{}}
+	s := &Server{cfg: cfg, Stats: &intercept.Stats{}}
 	// DNS 代答（dns-host-resolver）：任意目的 :53 的隧道查询改写进本机代答，
 	// 上游 = 主机系统解析（resolv.conf 跟随；启动时暂无上游不致命——空表周期
 	// 重试，期间查询落兜底，review M6）。可选服务（与 files/term 同取舍），但
@@ -231,11 +209,20 @@ func Start(cfg ServeConfig) (*Server, error) {
 			logf("dns 代答就绪：listen=127.0.0.1:%d upstream=%s", cfg.DNSPort, dsrv.UpstreamsText())
 		}
 	}
+	// 过境拦截层（l3-exit-intercept）。转发出站流量**一律走系统默认路由**（2026-09-19 定稿）：
+	// 出口机器上装了什么代理/网关就由它按自己的规则处理，我们不做路径判断——但要把
+	// 「这条路能不能承载 UDP」测出来暴露（见 udpcap.go）；TUN 型代理通常不中继 UDP
+	// （实测同会话"上行 5 包、下行 0 包"），转发出去的 UDP（QUIC 等）能不能通是这条路的
+	// 属性，而不是我们能选的。回环目标不受影响（出口自己的 files/终端就在 127.0.0.1）。
+	//
+	// 并发/空闲两个值 = l3 上线起的生产值（原 flows 时代 ServeConfig 字段随兼容监听退役）：
+	// 64 连接自 l3-exit-intercept 上线即此值并经真机全量测试；30min 空闲是给豁免腿上的
+	// 终端会话留的（拨隧道IP:7724 的长连接，别设太短）。
 	inter, ierr := intercept.Attach(ns, intercept.Config{
 		TunnelIP: cfg.TunnelIP,
 		DNSPort:  dnsPort,
-		MaxConns: cfg.FlowMaxConns,
-		TCPIdle:  cfg.FlowIdle,
+		MaxConns: 64,
+		TCPIdle:  30 * time.Minute,
 		Logf:     dlogf,
 	}, s.Stats)
 	if ierr != nil {
@@ -319,38 +306,6 @@ func Start(cfg ServeConfig) (*Server, error) {
 		Pinned: cfg.BindAddr.IsValid() || resolvedIf != nil, Logf: logf,
 	})
 
-	// 兼容期 flows 监听（l3-exit-intercept 前）：挪到真实 127.0.0.1——注册了
-	// SetTransportProtocolHandler 后 netstack 内的 listener 不再收包，老客户端
-	// 发往 隧道IP:7800/7801 的流由拦截层的豁免规则转投到这里。新客户端不再用 flows。
-	tcpLn, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", cfg.FlowPort))
-	if err != nil {
-		s.dev.Close()
-		return nil, err
-	}
-	// 转发出站流量**一律走系统默认路由**（2026-09-19 定稿）：
-	// 出口机器上装了什么代理/网关就由它按自己的规则处理，我们不做路径判断 ——
-	// 但要**把"这条路能不能承载 UDP"测出来暴露**（见 udpcap.go）：
-	// 这类 TUN 型代理通常不中继 UDP（实测同会话"上行 5 包、下行 0 包"），
-	// 所以转发出去的 UDP（QUIC 等）能不能通是这条路的属性，而不是我们能选的。
-	// 回环目标不受影响（出口自己的 files/终端就在 127.0.0.1）。
-	dial := flows.DialFunc(flows.DefaultDial)
-	s.stopTCP, err = flows.ServeTCP(tcpLn, dial, s.Stats,
-		flows.WithMaxConns(cfg.FlowMaxConns), flows.WithIdleTimeout(cfg.FlowIdle))
-	if err != nil {
-		s.dev.Close()
-		return nil, err
-	}
-	udpPC, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: int(cfg.UDPFlowPort)})
-	if err != nil {
-		s.stopTCP()
-		s.dev.Close()
-		return nil, err
-	}
-	// UDP 中继：长会话（QUIC/游戏）+ 会话级日志（建立/关闭各一行，含双向包数——
-	// 真机判断「QUIC 到底通没通」就靠这一行，逐包细节不在这里）。
-	udpOpts := []flows.UDPOption{flows.WithUDPLog(dlogf)}
-	s.stopUDP, _ = flows.ServeUDP(udpPC, s.Stats, udpOpts...)
-
 	// files 原生协议服务：只监听本机回环（客户端经内部流的 CONNECT 让后端按本机网络重拨到这里）。
 	// 根 = 用户主目录、恒读写（协议无参数）；启动打一行根目录判据。
 	// ⚠️ 可选服务失败**不致命**：端口被别的程序占用（或同机跑了第二个实例）时，
@@ -417,8 +372,8 @@ func Start(cfg ServeConfig) (*Server, error) {
 	}
 	pub := priv.PublicKey()
 	// 注意：这里是**配置端口**；端口被占用会自动退让，实际端口在下面异步落盘时打（见 listen_port.txt）。
-	logf("serve 就绪：wg=:%d（配置端口；被占用会自动退让）tunnel=%v flow=tcp:%d,udp:%d tokens=%d key=%x…",
-		cfg.ListenPort, cfg.TunnelIP, cfg.FlowPort, cfg.UDPFlowPort, len(secrets), pub[:6])
+	logf("serve 就绪：wg=:%d（配置端口；被占用会自动退让）tunnel=%v files=%d term=%d dns=%d tokens=%d key=%x…",
+		cfg.ListenPort, cfg.TunnelIP, cfg.FilesPort, cfg.TermPort, dnsPort, len(secrets), pub[:6])
 	return s, nil
 }
 
@@ -430,14 +385,8 @@ func (s *Server) Close() {
 	if s.stopIntercept != nil {
 		s.stopIntercept()
 	}
-	if s.stopUDP != nil {
-		s.stopUDP()
-	}
 	if s.dnsSrv != nil {
 		s.dnsSrv.Close()
-	}
-	if s.stopTCP != nil {
-		s.stopTCP()
 	}
 	if s.dev != nil {
 		s.dev.Close()

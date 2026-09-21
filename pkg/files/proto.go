@@ -1,6 +1,6 @@
 // Package files：files 原生协议（wg-native-stack tasks 3.4）。
 //
-// 承载：内部流上**每命令一条流**（隧道内 TCP，见 pkg/flows）。线上格式：
+// 承载：隧道内 TCP 流上**每命令一条流**（拨隧道 IP 同端口，出口豁免转投）。线上格式：
 //
 //	服务端 → 客户端（流的第一个东西，恒有）：
 //	  {"ok":true,"root":"/Users/xx","ver":1,"rw":true}\n      ← 问候帧

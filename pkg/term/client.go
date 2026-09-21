@@ -2,8 +2,9 @@
 
 // 终端服务的客户端半边（tasks 3.5；手机核 NAPI 侧在 4.2 用它）。
 //
-// 与 service.go 同包：帧协议一处定义。拨流以函数注入（生产 = flows.Client.Connect
-// 到后端本机 127.0.0.1:<TermPort>），因此不依赖 gvisor/隧道实现。
+// 与 service.go 同包：帧协议一处定义。拨流以函数注入（生产 = 拨 `隧道IP:<TermPort>`
+// 的普通 TCP，出口按豁免规则转投后端本机 127.0.0.1:<TermPort>），因此不依赖
+// gvisor/隧道实现。
 package term
 
 import (
@@ -28,7 +29,7 @@ const (
 	OpGreeting   = opGreeting
 )
 
-// StreamDial 起一条内部流（生产 = flows.Client.Connect(ctx, "127.0.0.1", TermPort)）。
+// StreamDial 起一条内部流（生产 = 拨隧道 IP 的 TermPort，出口豁免转投本机同端口）。
 type StreamDial func(ctx context.Context) (net.Conn, error)
 
 // Client 终端服务客户端（每条腿一条流；会话由后端持有，断腿不杀进程）。

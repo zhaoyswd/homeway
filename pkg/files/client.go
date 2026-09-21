@@ -1,8 +1,8 @@
 // files 协议客户端半边（手机核的任务在 tasks 4.2 用它对接 NAPI）。
 //
 // 与 Server 同包：线上格式一处定义，两端不会漂移。**不依赖 gvisor/隧道实现**——
-// 拨流是注入的函数（生产 = `flows.Client.Connect` 到后端本机 files 端口，
-// 那条 CONNECT 会被后端按本机网络重拨到 127.0.0.1:<FilesPort>）。
+// 拨流是注入的函数（生产 = 拨 `隧道IP:<FilesPort>` 的普通 TCP，出口按豁免规则
+// 转投后端本机 127.0.0.1:<FilesPort>；早期经 flows.CONNECT，随 flows 退役已直拨）。
 //
 // 语义对齐 NAPI 契约：每命令一条流（Open → 一条命令 → Close）。
 package files
@@ -15,7 +15,7 @@ import (
 	"net"
 )
 
-// StreamDial 起一条内部流（生产 = flows.Client.Connect(ctx, "127.0.0.1", FilesPort)）。
+// StreamDial 起一条内部流（生产 = 拨隧道 IP 的 FilesPort，出口豁免转投本机同端口）。
 type StreamDial func(ctx context.Context) (net.Conn, error)
 
 // Client 一次会话里的客户端（无跨命令状态；每个方法自成一条流）。

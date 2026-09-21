@@ -13,7 +13,8 @@
 //     HandlePacket 的源地址自检，把所有外来包当「自己发出的」丢弃。
 //
 // 注册 SetTransportProtocolHandler 后，netstack 原生 listener 不再收到
-// demux 失败的包——兼容期的 flows 监听必须挪到真实 127.0.0.1（见 serve.go）。
+// demux 失败的包——所以后端本机服务监听真实 127.0.0.1、靠豁免转投到达
+// （历史上兼容期 flows 监听也是这个原因挪出 netstack 的，随 flows 退役已删）。
 package intercept
 
 import (
@@ -34,7 +35,6 @@ import (
 	"gvisor.dev/gvisor/pkg/tcpip/transport/tcp"
 	"gvisor.dev/gvisor/pkg/waiter"
 
-	"github.com/zhaoyswd/homeway/pkg/flows"
 	"github.com/zhaoyswd/homeway/pkg/wgnet"
 )
 
@@ -43,8 +43,8 @@ const (
 
 	defaultMaxConns = 4096
 	defaultTCPIdle  = 6 * time.Minute
-	defaultUDPIdle  = flows.DefaultUDPIdle // 60s，与手机侧空闲回收对齐
-	defaultDNSIdle  = 10 * time.Second     // :53 会话（改写进代答）：一问一答即闲，短回收防挤占会话表（review M4）
+	defaultUDPIdle  = 60 * time.Second // 与手机侧空闲回收对齐
+	defaultDNSIdle  = 10 * time.Second // :53 会话（改写进代答）：一问一答即闲，短回收防挤占会话表（review M4）
 	dialTimeout     = 10 * time.Second
 	// defaultMaxUDPSessions：与 TCP 的 defaultMaxConns 同量级（保险阀不是整形：
 	// 正常使用远达不到，防失控应用把 goroutine/内存打满）。
@@ -79,7 +79,7 @@ type Config struct {
 type Interceptor struct {
 	cfg   Config
 	net   *wgnet.Net
-	st    *flows.Stats
+	st    *Stats
 	seq   atomic.Uint64 // UDP 会话编号（日志口径对齐旧 udp relay）
 	conns atomic.Int64
 
@@ -100,7 +100,7 @@ const udpPendingMax = 16
 
 // Attach 把拦截层挂到 wgnet 栈上（promiscuous + 双协议 handler）。
 // st 允许为 nil（无统计）。返回的 Interceptor随 wgnet 栈生命周期由调用方 Close。
-func Attach(n *wgnet.Net, cfg Config, st *flows.Stats) (*Interceptor, error) {
+func Attach(n *wgnet.Net, cfg Config, st *Stats) (*Interceptor, error) {
 	if !cfg.TunnelIP.IsValid() {
 		return nil, fmt.Errorf("intercept: 需要 TunnelIP")
 	}
@@ -207,7 +207,7 @@ func (in *Interceptor) serveTCP(r *tcp.ForwarderRequest, dst, src netip.AddrPort
 		if in.st != nil {
 			in.st.IncrFail()
 		}
-		// RST 回给客户端（应用侧表现为 connection refused，与 flows 的 ERR 同效）。
+		// RST 回给客户端（应用侧表现为 connection refused）。
 		r.Complete(true)
 		in.cfg.Logf("intercept: tcp %s %v ← %v 拨号失败：%v", kind, target, src, err)
 		return
@@ -368,8 +368,10 @@ func (in *Interceptor) serveUDP(dst, src netip.AddrPort, key string, first []byt
 	in.cfg.Logf("udp intercept: 会话 #%d %s 建立（%v ← %v）", n, kind, target, src)
 
 	// 双向逐报泵 + 空闲看门狗（共享活跃时间戳：双向任一有进展即续命，
-	// 防单方向静默误杀 QUIC/长轮询型会话）。
+	// 防单方向静默误杀 QUIC/长轮询型会话）。downSeen：real→peer 方向写过
+	// = 这条会话收到过回包（关闭时上报 IncrUDPSession，udpcap 的实测位靠它）。
 	var last atomic.Int64
+	var downSeen atomic.Bool
 	last.Store(time.Now().UnixNano())
 	var wg sync.WaitGroup
 	var once sync.Once
@@ -385,6 +387,9 @@ func (in *Interceptor) serveUDP(dst, src netip.AddrPort, key string, first []byt
 				if _, werr := to.Write(buf[:nr]); werr != nil {
 					finish()
 					return
+				}
+				if from == real {
+					downSeen.Store(true)
 				}
 				last.Store(time.Now().UnixNano())
 			}
@@ -431,6 +436,7 @@ func (in *Interceptor) serveUDP(dst, src netip.AddrPort, key string, first []byt
 	wg.Wait()
 	if in.st != nil {
 		in.st.DecrFlow()
+		in.st.IncrUDPSession(downSeen.Load())
 	}
 	in.cfg.Logf("udp intercept: 会话 #%d 关闭（%v ← %v）", n, target, src)
 }
