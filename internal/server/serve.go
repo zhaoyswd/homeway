@@ -12,6 +12,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/zhaoyswd/homeway/pkg/dns"
 	"github.com/zhaoyswd/homeway/pkg/egress"
 	"github.com/zhaoyswd/homeway/pkg/files"
 	"github.com/zhaoyswd/homeway/pkg/flows"
@@ -32,6 +33,7 @@ const (
 	DefaultUDPFlowPrt = uint16(7801) // UDP 数据报（DNS 等）
 	DefaultFilesPort  = uint16(7802) // files 原生协议（后端本机 127.0.0.1）
 	DefaultTermPort   = uint16(7724) // 终端会话 / agent gateway（与旧栈 tunnel 内虚拟端口同号）
+	DefaultDNSPort    = uint16(5300) // DNS 代答（任意目的 :53 改写到这里；不用 53——macOS 非 root 绑不上回环特权端口）
 )
 
 // BindMode：WG socket（打洞/STUN）钉哪张物理网卡。
@@ -58,6 +60,7 @@ type ServeConfig struct {
 	FilesPort    uint16         // files 服务在本机的监听端口（客户端经流协议 CONNECT 到它）
 	FilesRoot    string         // files 根（空 = 用户主目录；协议恒读写）
 	TermPort     uint16         // 终端会话 / agent gateway 在本机的监听端口
+	DNSPort      uint16         // DNS 代答监听端口（0 = 禁用：:53 按原目标过境重拨；cli 默认 DefaultDNSPort）
 	FlowMaxConns int            // 内部流并发上限（0 = 默认 64）
 	FlowIdle     time.Duration  // 内部流空闲回收（0 = 默认 30 分钟；终端会话腿也走这里，别设太短）
 	MaxDevices   int            // 设备表容量（0 = 32）
@@ -124,6 +127,8 @@ type Server struct {
 	udpCap      *udpCapState // 默认路径的 UDP 能力（周期探测；探测应答里回报）
 	stopTCP     func()
 	stopUDP     func()
+	// dnsSrv：DNS 代答（dns-host-resolver）；nil = 未启用（监听失败降级或配置关闭）。
+	dnsSrv *dns.Server
 	// stopIntercept：过境拦截层收工（关会话通知；栈随 tunDev 生命周期回收）。
 	stopIntercept func()
 	pubKick       chan struct{} // 公网端点探测的"立即重测"信号（换网事件踢）
@@ -197,13 +202,45 @@ func Start(cfg ServeConfig) (*Server, error) {
 		}
 	}
 	s := &Server{cfg: cfg, Stats: &flows.Stats{}}
+	// DNS 代答（dns-host-resolver）：任意目的 :53 的隧道查询改写进本机代答，
+	// 上游 = 主机系统解析（resolv.conf 跟随；启动时暂无上游不致命——空表周期
+	// 重试，期间查询落兜底，review M6）。可选服务（与 files/term 同取舍），但
+	// 降级后果如实写：监听失败（被占）时 DNSPort 传 0（禁改写）——手机声明的
+	// DNS 是隧道 IP，豁免落到 127.0.0.1:53 无人监听 ⇒ **手机系统解析全断**
+	// （只有应用写死公共 DNS 的查询还有明文过境）。这是硬依赖：靠启动自验证
+	// 的告警行发现，靠进程重启恢复（KeepAlive/launchd 兜）。
+	var dnsPort uint16
+	if cfg.DNSPort != 0 {
+		dsrv, derr := dns.Listen(dns.Config{
+			Addr:  fmt.Sprintf("127.0.0.1:%d", cfg.DNSPort),
+			Logf:  logf,
+			DLogf: dlogf,
+		})
+		if derr != nil {
+			logf("⚠️ dns 代答监听失败（%v）——隧道侧 DNS 将全断（隧道IP:53 豁免无人应答），其余功能不受影响；请检查端口占用并重启", derr)
+		} else {
+			// 自验证先于就绪行（review M2）：经监听器真发一条查询，失败=告警
+			// 可达（老实现的失败分支是死代码）。失败不禁用改写——上游会跟随
+			// 主机恢复，翻转改写会让 DNS 在两种模式间抖动。
+			if serr := dsrv.SelfCheck(); serr != nil {
+				logf("⚠️ dns 代答自验证未通过（%v）——上游此刻不可达（会跟随主机恢复/空表周期重试），期间查询按 SERVFAIL/兜底处理", serr)
+			}
+			s.dnsSrv = dsrv
+			dnsPort = cfg.DNSPort
+			logf("dns 代答就绪：listen=127.0.0.1:%d upstream=%s", cfg.DNSPort, dsrv.UpstreamsText())
+		}
+	}
 	inter, ierr := intercept.Attach(ns, intercept.Config{
 		TunnelIP: cfg.TunnelIP,
+		DNSPort:  dnsPort,
 		MaxConns: cfg.FlowMaxConns,
 		TCPIdle:  cfg.FlowIdle,
 		Logf:     dlogf,
 	}, s.Stats)
 	if ierr != nil {
+		if s.dnsSrv != nil { // review F4：代答先于 Attach 起在此路径上要一起收
+			s.dnsSrv.Close()
+		}
 		tunDev.Close()
 		return nil, ierr
 	}
@@ -394,6 +431,9 @@ func (s *Server) Close() {
 	}
 	if s.stopUDP != nil {
 		s.stopUDP()
+	}
+	if s.dnsSrv != nil {
+		s.dnsSrv.Close()
 	}
 	if s.stopTCP != nil {
 		s.stopTCP()

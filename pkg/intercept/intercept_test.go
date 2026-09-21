@@ -345,3 +345,134 @@ func TestUDPSessionCap(t *testing.T) {
 		t.Fatalf("超上限的会话竟然通了（%d 字节）——MaxUDPSessions 没拦住", n)
 	}
 }
+
+// dns-host-resolver：任意目的 :53 改写到 127.0.0.1:DNSPort（单元级映射断言）。
+func TestTargetDNSRewrite(t *testing.T) {
+	in := &Interceptor{cfg: Config{TunnelIP: netip.MustParseAddr(srvAddr), DNSPort: 5300}}
+	for _, dst := range []string{srvAddr + ":53", foreignDst + ":53", "8.8.8.8:53"} {
+		tgt, exempt := in.target(netip.MustParseAddrPort(dst))
+		if !exempt || tgt.String() != "127.0.0.1:5300" {
+			t.Fatalf("%s 应改写到 127.0.0.1:5300，got %v exempt=%v", dst, tgt, exempt)
+		}
+	}
+	// 非 53 的隧道 IP 豁免照旧
+	if tgt, exempt := in.target(netip.MustParseAddrPort(srvAddr + ":7802")); !exempt || tgt.String() != "127.0.0.1:7802" {
+		t.Fatalf("豁免语义应保持，got %v exempt=%v", tgt, exempt)
+	}
+	// 其它目的端口不受影响
+	if tgt, exempt := in.target(netip.MustParseAddrPort(foreignDst + ":443")); exempt || tgt.String() != foreignDst+":443" {
+		t.Fatalf("过境语义应保持，got %v exempt=%v", tgt, exempt)
+	}
+	// DNSPort=0 = 禁用改写
+	in.cfg.DNSPort = 0
+	if _, exempt := in.target(netip.MustParseAddrPort(foreignDst + ":53")); exempt {
+		t.Fatal("DNSPort=0 不应改写 :53")
+	}
+}
+
+// dns-host-resolver 端到端：客户端发往「任意 IP:53」的 UDP 查询被改写进本机代答端口。
+func TestDNSRewriteUDP(t *testing.T) {
+	echo := echoUDP(t)
+	h := newHarness(t, func(ctx context.Context, network, address string) (net.Conn, error) {
+		var d net.Dialer
+		return d.DialContext(ctx, network, address)
+	})
+	h.in.cfg.DNSPort = echo.Port() // 发包前设置，无并发
+	pc, err := h.cli.DialUDPAddrPort(
+		netip.AddrPortFrom(netip.MustParseAddr(cliAddr), 0),
+		netip.MustParseAddrPort(foreignDst+":53"), // 写死公共 DNS 形态的目的
+	)
+	if err != nil {
+		t.Fatalf("udp dial: %v", err)
+	}
+	defer pc.Close()
+	pc.SetDeadline(time.Now().Add(10 * time.Second))
+	if _, err := pc.Write([]byte("dns-q")); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	buf := make([]byte, 1024)
+	n, err := pc.Read(buf)
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	if string(buf[:n]) != "dns-q" {
+		t.Fatalf("echo = %q", string(buf[:n]))
+	}
+	if len(h.dialed) != 1 || h.dialed[0] != echo.String() {
+		t.Fatalf("应改写拨到 %v，got %v", echo, h.dialed)
+	}
+}
+
+// dns-host-resolver 端到端：TCP :53 同样改写（截断重试路径）。
+func TestDNSRewriteTCP(t *testing.T) {
+	echo := echoTCP(t)
+	h := newHarness(t, func(ctx context.Context, network, address string) (net.Conn, error) {
+		var d net.Dialer
+		return d.DialContext(ctx, network, address)
+	})
+	h.in.cfg.DNSPort = echo.Port()
+	c, err := h.cli.DialTCPAddrPort(netip.MustParseAddrPort(foreignDst + ":53"))
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer c.Close()
+	if got := roundtrip(t, c, "dns-tcp"); got != "dns-tcp" {
+		t.Fatalf("echo = %q", got)
+	}
+	if len(h.dialed) != 1 || h.dialed[0] != echo.String() {
+		t.Fatalf("应改写拨到 %v，got %v", echo, h.dialed)
+	}
+}
+
+// dns-host-resolver M4：DNS 会话用 DNSIdle（默认 10s）回收，普通 UDP 仍按 UDPIdle。
+// 同五元组第二次发包时，DNS 会话已回收重建（dial 计数 +1），普通会话未回收（计数不变）。
+func TestDNSUDPSessionShortIdle(t *testing.T) {
+	echo := echoUDP(t)
+	h := newHarness(t, func(ctx context.Context, network, address string) (net.Conn, error) {
+		var d net.Dialer
+		return d.DialContext(ctx, network, echo.String()) // 全部重定向到回显（含 transit 对照腿）
+	})
+	h.in.cfg.DNSPort = echo.Port() // 发包前设置，无并发（同 TestUDPSessionCap 手法）
+	h.in.cfg.DNSIdle = 300 * time.Millisecond
+
+	dialPort := func(port int) *gonet.UDPConn {
+		pc, err := h.cli.DialUDPAddrPort(
+			netip.AddrPortFrom(netip.MustParseAddr(cliAddr), 0),
+			netip.MustParseAddrPort(fmt.Sprintf("%s:%d", foreignDst, port)),
+		)
+		if err != nil {
+			t.Fatalf("udp dial: %v", err)
+		}
+		t.Cleanup(func() { pc.Close() })
+		return pc
+	}
+	send := func(pc *gonet.UDPConn, msg string) {
+		pc.SetDeadline(time.Now().Add(5 * time.Second))
+		if _, err := pc.Write([]byte(msg)); err != nil {
+			t.Fatalf("write: %v", err)
+		}
+		buf := make([]byte, 256)
+		if _, err := pc.Read(buf); err != nil {
+			h.dumpLogs(t)
+			t.Fatalf("read: %v", err)
+		}
+	}
+
+	dnsPC := dialPort(53)
+	send(dnsPC, "dns-1")
+	base := len(h.dialed)
+	time.Sleep(600 * time.Millisecond) // 超过 DNSIdle（300ms），未超过 UDPIdle（30s）
+	send(dnsPC, "dns-2")
+	if got := len(h.dialed) - base; got != 1 {
+		t.Fatalf("DNS 会话应在短 idle 后回收重建（dial +1）, got +%d", got)
+	}
+
+	plainPC := dialPort(5399)
+	send(plainPC, "plain-1")
+	base = len(h.dialed)
+	time.Sleep(600 * time.Millisecond)
+	send(plainPC, "plain-2")
+	if got := len(h.dialed) - base; got != 0 {
+		t.Fatalf("普通 UDP 会话不应在 DNSIdle 内回收, got +%d", got)
+	}
+}

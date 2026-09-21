@@ -28,6 +28,7 @@ func CLI(args []string) error {
 	stun6Server := fs.String("stun6", "stun.cloudflare.com:3478", "IPv6 路径校验用的 STUN（空 = 关）")
 	maxPeers := fs.Int("max-peers", 32, "设备表容量（同时记住的设备数上限；表满只淘汰超过活跃宽限期未刷新的失联设备）")
 	peerTTL := fs.Duration("peer-ttl", 7*24*time.Hour, "长期不活跃设备的回收期限（0 = 关闭 TTL 回收）")
+	dnsPort := fs.Uint("dns-port", uint(DefaultDNSPort), "DNS 代答监听端口（任意目的 :53 的隧道查询改写到这里，上游=主机系统解析；0 = 关闭代答，:53 按原目标过境重拨）")
 	verbose := fs.Bool("verbose", false, "摘要+细节日志同时回显终端（现场排障用）；默认终端只出 token 与端点变化")
 	fs.Usage = func() {
 		fmt.Fprintln(os.Stderr, `用法：
@@ -38,6 +39,9 @@ func CLI(args []string) error {
 		fs.PrintDefaults()
 	}
 	fs.Parse(args)
+	if *dnsPort > 65535 {
+		return fmt.Errorf("--dns-port 超出端口范围：%d（1–65535；0 = 关闭代答）", *dnsPort)
+	}
 	if rest := fs.Args(); len(rest) > 0 {
 		// 没有子命令：多出来的位置参数一定是写错了。
 		// 这条是**实测踩出来的**：`homeway foo` 会被当成裸启动，真的起一个出口
@@ -67,6 +71,7 @@ func CLI(args []string) error {
 		Relay:      *relayServer,
 		MaxDevices: *maxPeers,
 		PeerTTL:    *peerTTL,
+		DNSPort:    uint16(*dnsPort),
 	})
 }
 

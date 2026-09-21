@@ -44,6 +44,7 @@ const (
 	defaultMaxConns = 4096
 	defaultTCPIdle  = 6 * time.Minute
 	defaultUDPIdle  = flows.DefaultUDPIdle // 60s，与手机侧空闲回收对齐
+	defaultDNSIdle  = 10 * time.Second     // :53 会话（改写进代答）：一问一答即闲，短回收防挤占会话表（review M4）
 	dialTimeout     = 10 * time.Second
 	// defaultMaxUDPSessions：与 TCP 的 defaultMaxConns 同量级（保险阀不是整形：
 	// 正常使用远达不到，防失控应用把 goroutine/内存打满）。
@@ -56,6 +57,11 @@ const (
 // Config：拦截层配置。Dial/ListenUDP 可注入（测试）；nil 用系统默认直连。
 type Config struct {
 	TunnelIP netip.Addr // 出口隧道 IP（dst == 它 → 豁免转投 127.0.0.1:同端口）
+	// DNSPort：DNS 代答监听端口。非 0 时任意目的 :53 改写到 127.0.0.1:DNSPort
+	//（dns-host-resolver；0 = 禁用）。
+	DNSPort uint16
+	// DNSIdle：DNS 会话的空闲回收（默认 10s；测试注入缩短）。
+	DNSIdle time.Duration
 	// Dial 同时服务 TCP 与 UDP 重拨（udp = Dial("udp", target)，返回已连接 socket）。
 	Dial     func(ctx context.Context, network, address string) (net.Conn, error)
 	MaxConns int
@@ -145,8 +151,16 @@ func (in *Interceptor) Close() {
 	in.closeOnce.Do(func() { close(in.closed) })
 }
 
-// target：原始目的 → 实际重拨目标（豁免映射）。
+// target：原始目的 → 实际重拨目标（豁免映射 + DNS 端口改写，dns-host-resolver）。
+//
+// DNS 改写：任意目的地址的 :53（TCP/UDP 共用本函数）→ 127.0.0.1:DNSPort。
+// 不筛目的地址——应用写死公共 DNS（8.8.8.8 等）的查询同样进代答，否则 v6
+// 过滤对这些查询出现泄漏面。不用 53 端口监听：macOS 非 root 绑不上回环
+// 特权端口；绑 0.0.0.0:53 则是开放解析器。DNSPort=0 = 禁用改写。
 func (in *Interceptor) target(dst netip.AddrPort) (target netip.AddrPort, exempt bool) {
+	if in.cfg.DNSPort != 0 && dst.Port() == 53 {
+		return netip.AddrPortFrom(loopback4(), in.cfg.DNSPort), true
+	}
 	if dst.Addr() == in.cfg.TunnelIP {
 		return netip.AddrPortFrom(loopback4(), dst.Port()), true
 	}
@@ -295,6 +309,17 @@ func (in *Interceptor) serveUDP(dst, src netip.AddrPort, key string, first []byt
 	if exempt {
 		kind = "exempt"
 	}
+	// DNS 会话用更短的空闲回收（review M4）：stub resolver 每查询换源端口时
+	// :53 五元组会话高频新建，60s 全局 idle 会把 4096 会话表堆满、挤掉非 DNS
+	// UDP（QUIC/游戏）。DNS 一问一答即闲，10s 足够覆盖重传窗口。
+	idle := in.cfg.UDPIdle
+	if in.cfg.DNSPort != 0 && target.Port() == in.cfg.DNSPort && target.Addr() == loopback4() {
+		if in.cfg.DNSIdle > 0 {
+			idle = in.cfg.DNSIdle
+		} else {
+			idle = defaultDNSIdle
+		}
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), dialTimeout)
 	defer cancel()
 	network := "udp4"
@@ -376,7 +401,7 @@ func (in *Interceptor) serveUDP(dst, src netip.AddrPort, key string, first []byt
 		defer wg.Done()
 		// 节拍自适应：idle 短（测试 300ms）时用 idle/3，别等 30s 的读切片。
 		interval := readSlice
-		if v := in.cfg.UDPIdle / 3; v < interval {
+		if v := idle / 3; v < interval {
 			interval = v
 		}
 		if interval < 20*time.Millisecond {
@@ -392,7 +417,7 @@ func (in *Interceptor) serveUDP(dst, src netip.AddrPort, key string, first []byt
 			case <-done: // 泵已退：看门狗同退，别拖 wg.Wait（关闭日志要等 wg.Wait）
 				return
 			case <-t.C:
-				if time.Since(time.Unix(0, last.Load())) > in.cfg.UDPIdle {
+				if time.Since(time.Unix(0, last.Load())) > idle {
 					finish()
 					return
 				}
