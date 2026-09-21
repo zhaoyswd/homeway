@@ -198,14 +198,17 @@ func (s *Server) refreshPublicEndpoint(ctx context.Context, opts PublicOpts) boo
 		return false
 	}
 	logf("公网端点：已公布 %v（写进 %s；下次签发 token 会带上它）", lines, publicFile)
+	s.tokMu.Lock()
+	s.lastPublished = lines
+	s.tokMu.Unlock()
 	s.printClientToken(lines)
 	return true
 }
 
-// printClientToken：把"客户端要粘的 token"打上**终端**（用户流 ulogf）——出口零参数
-// 启动即可用，不用再跑 `issue`。内容 = LAN 端点 + 已公布公网端点 + serve --relay 给的
-// 中继端点；只有在 token 变化时才重打（公网 IP/端口变了会自然重打一次）。token 行与
-// 端点行同时抄进摘要日志（events.log 是排障/取 token 的落点：grep 客户端 token）。
+// printClientToken：把"客户端要粘的 token"打出去 —— **终端只打第一轮**（进程生命周期内
+// 不再重打：端点变化后终端冒出第二串 token 只会让人拿错，2026-09-21 用户口径），之后的
+// 端点变化只在摘要文件重写一份（取最新 token：grep 客户端 token events.log | tail -1）。
+// 内容 = LAN 端点 + 已公布公网端点 + serve --relay 给的中继端点。
 func (s *Server) printClientToken(published []string) {
 	port := s.bind.LocalPort()
 	if port == 0 {
@@ -258,13 +261,17 @@ func (s *Server) printClientToken(published []string) {
 	s.lastToken = tok
 	s.tokMu.Unlock()
 	if first {
-		// 启动时带一行日志落点（只此一次；终端不再输出其它信息）。
+		// 终端首轮（进程内仅此一次）：带一行日志落点，之后终端对 token/端点保持沉默。
 		if p := EventsLogPath(); p != "" {
-			ulogf("日志：%s（摘要）｜ %s（细节）", p, filepath.Join(filepath.Dir(p), debugLogName))
+			tokenToTerminal("日志：%s（摘要）｜ %s（细节）", p, filepath.Join(filepath.Dir(p), debugLogName))
 		}
+		tokenToTerminal("客户端 token（粘进 App 的「添加主机」即可；%d 个端点）：%s", len(eps), tok)
+		tokenToTerminal("端点：%s", strings.Join(labels, "、"))
+	} else {
+		// 端点变化轮：只进摘要文件（--verbose 会回显终端，那是显式调试模式）。
+		tokenToFile("客户端 token（端点已变化；粘进 App 的「添加主机」即可；%d 个端点）：%s", len(eps), tok)
+		tokenToFile("端点：%s", strings.Join(labels, "、"))
 	}
-	ulogf("客户端 token（粘进 App 的「添加主机」即可；%d 个端点）：%s", len(eps), tok)
-	ulogf("端点：%s", strings.Join(labels, "、"))
 }
 
 // localV4Addrs：本机物理网卡 IPv4 + 实际监听端口（LAN 候选）。

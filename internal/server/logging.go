@@ -1,7 +1,9 @@
 // Package server：三级日志（2026-09-21 用户口径：终端只出 token 与 IP 信息）。
 //
-//	ulogf —— 用户流（终端）：**只**放 token/端点公告行（启动一次 + IP/端口变化时重打）；
-//	         同时抄送一份进摘要文件（排障/取 token 都靠文件：grep 客户端 token events.log）。
+//	ulogf —— 用户流（终端）：**只**放 token/端点公告行，且进程生命周期内只打**第一轮**
+//	         （之后端点变化只在摘要文件重写一份，终端绝不重打——终端冒出第二串 token
+//	         只会让人困惑，2026-09-21 用户口径）；首轮同时抄送一份进摘要文件
+//	         （排障/取最新 token 都靠文件：grep 客户端 token events.log | tail -1）。
 //	logf  —— 摘要级（<state>/events.log）：网卡/绑卡、IP（STUN/公网端点）、UPnP、
 //	         各服务就绪行、运行期告警。2026-09-21 前这些打终端，现全部收进文件。
 //	dlogf —— 细节级（<state>/debug.log）：peer 表流水、入站新源、周期观测、盲打、
@@ -106,6 +108,13 @@ func ulogf(format string, args ...any) {
 		_, _ = w.Write([]byte(line + "\n"))
 	}
 }
+
+// token 公告的两条流：终端（首轮专用，ulogf 本身兼抄一份进文件）与文件（端点变化轮，
+// 终端沉默）。包级变量只为测试可替换 —— printClientToken 是唯一生产调用方。
+var (
+	tokenToTerminal = ulogf
+	tokenToFile     = logf
+)
 
 // logf：摘要级 —— events.log（--verbose 时回显终端）。
 func logf(format string, args ...any) {

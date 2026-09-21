@@ -115,18 +115,19 @@ type Server struct {
 	Stats *flows.Stats // dialok / dialfail / flows（状态面 3.6 消费）
 	Table *servercore.DeviceTable
 
-	dev         *device.Device
-	bind        *servercore.ServerBind
-	bindIface   *net.Interface // 本轮实际钉住的网卡（auto 挑出来的或显式给的；nil = 不绑）
-	priv        [32]byte       // WG 静态私钥（中继注册腿要用它做挑战响应）
-	secret      [32]byte       // token 凭证种子（打客户端 token 用）
-	relayEp     proto.Endpoint // serve --relay 给的中继端点（打客户端 token 时带上）
-	relayWanted bool           // --relay 解析成功：token 未并入中继端点前不打印（只打最终形态）
-	tokMu       sync.Mutex
-	lastToken   string       // 上次打印过的客户端 token（变了才重打）
-	udpCap      *udpCapState // 默认路径的 UDP 能力（周期探测；探测应答里回报）
-	stopTCP     func()
-	stopUDP     func()
+	dev           *device.Device
+	bind          *servercore.ServerBind
+	bindIface     *net.Interface // 本轮实际钉住的网卡（auto 挑出来的或显式给的；nil = 不绑）
+	priv          [32]byte       // WG 静态私钥（中继注册腿要用它做挑战响应）
+	secret        [32]byte       // token 凭证种子（打客户端 token 用）
+	relayEp       proto.Endpoint // serve --relay 给的中继端点（打客户端 token 时带上）
+	relayWanted   bool           // --relay 解析成功：token 未并入中继端点前不打印（只打最终形态）
+	tokMu         sync.Mutex
+	lastToken     string       // 上次已写出的客户端 token（去重：没变就不再写；终端只认首轮）
+	lastPublished []string     // 最近一轮已公布的公网端点（Run 的终端兜底带上它，别打残缺版）
+	udpCap        *udpCapState // 默认路径的 UDP 能力（周期探测；探测应答里回报）
+	stopTCP       func()
+	stopUDP       func()
 	// dnsSrv：DNS 代答（dns-host-resolver）；nil = 未启用（监听失败降级或配置关闭）。
 	dnsSrv *dns.Server
 	// stopIntercept：过境拦截层收工（关会话通知；栈随 tunDev 生命周期回收）。
@@ -482,23 +483,44 @@ func Run(ctx context.Context, cfg ServeConfig) error {
 	pub6 := PubFromPriv(s.priv)
 	logf("后端身份：标签 %x ｜公钥 %x…", label, pub6[:6])
 
-	// 终端兜底：第一次端点探测结束（或 15s 超时）后 token 还没打过的话，用 LAN(+中继)
-	// 端点先打一版 —— 公网探测失败/被关（--upnp=false --stun=''）时终端也不能沉默。
+	// 终端兜底：终端一辈子只打一轮 token（2026-09-21 用户口径），所以这一轮必须打
+	// 「此刻能拿到的最好版本」——等第一轮公网探测结束（成不成都算）再决定；探测被关
+	// （--upnp=false --stun=''，firstProbe==nil）时 15s 后兜底。打印仍被 relay 闸/端口闸
+	// 拦下的话每秒重试一小会儿（中继注册腿偶尔慢于探测轮，别急着放弃）。
 	go func() {
-		timer := time.After(15 * time.Second)
 		if s.firstProbe != nil {
 			select {
 			case <-s.firstProbe:
-			case <-timer:
+			case <-ctx.Done():
+				return
 			}
 		} else {
-			<-timer
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(15 * time.Second):
+			}
 		}
-		s.tokMu.Lock()
-		printed := s.lastToken != ""
-		s.tokMu.Unlock()
-		if !printed {
-			s.printClientToken(nil)
+		for i := 0; i < 10; i++ {
+			s.tokMu.Lock()
+			printed := s.lastToken != ""
+			pub := s.lastPublished
+			s.tokMu.Unlock()
+			if printed {
+				return
+			}
+			s.printClientToken(pub)
+			s.tokMu.Lock()
+			printed = s.lastToken != ""
+			s.tokMu.Unlock()
+			if printed {
+				return
+			}
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(1 * time.Second):
+			}
 		}
 	}()
 
