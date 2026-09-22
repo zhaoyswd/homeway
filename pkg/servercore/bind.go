@@ -3,6 +3,7 @@ package servercore
 import (
 	"context"
 	"crypto/rand"
+	"errors"
 	"fmt"
 	"net"
 	"net/netip"
@@ -92,6 +93,12 @@ type ServerBind struct {
 	legDropped atomic.Uint64 // Send 因「曾是腿地址但腿已摘」而丢弃的包数（#17 观测面）
 	pinMu      sync.Mutex
 	pinned     *net.Interface // 当前实际钉住的网卡（Open 时设置，Repin 时更新）
+	// recvErrAt/recvErrMu：主 socket 读错误的限流时刻（noteRecvErr）。
+	recvErrMu sync.Mutex
+	recvErrAt time.Time
+	// readFrom/readFromMu：读接缝（测试注入用；nil = 真实系统调用）。
+	readFromMu sync.Mutex
+	readFrom   func(c *net.UDPConn, buf []byte) (int, netip.AddrPort, error)
 
 	// srcSeen：入站**新源**首包的排障记录。
 	// 背景（2026-09-20 排查「直连时好时坏」）：出口对陌生/解不开的包零记录，
@@ -423,6 +430,9 @@ func (b *ServerBind) legReceiveFunc(dead chan struct{}) conn.ReceiveFunc {
 				return 0, net.ErrClosed
 			}
 			// 腿上的包与主 socket 同构（中继按 0xBB 帧封装后转发）——走同一条解析。
+			// ⚠️ processPacket 必须保持不返回 error（当前全路径 nil）——一旦返回，
+			// 这行会把错误交回 wg-go，腿侧读 goroutine 死亡 = 主 socket 同款的永久
+			// 失聪；届时要在此做与主路径同款的慢转处理（评审④标记）。
 			n, err := b.processPacket(packets, sizes, eps, lp.pkt, lp.src)
 			if err != nil {
 				return 0, err
@@ -575,18 +585,56 @@ func (b *ServerBind) Open(port uint16) ([]conn.ReceiveFunc, uint16, error) {
 	b.deadMu.Unlock()
 	go b.legReapLoop(dead) // 每世代一条（a1）：Close 关信号即退出，重新 Open 再起
 	fn := func(packets [][]byte, sizes []int, eps []conn.Endpoint) (int, error) {
-		n, src, err := c.ReadFromUDPAddrPort(packets[0])
-		if err != nil {
-			return 0, err
+		for {
+			n, src, err := b.readOnce(c, packets[0])
+			if err != nil {
+				// 收工（BindUpdate 的 Close→Open / 终局 Close 关掉 socket）：错误交回，
+				// wireguard-go 的读 goroutine 干净退出。
+				if errors.Is(err, net.ErrClosed) {
+					return 0, err
+				}
+				// 非收工类读错误（网卡抖动/Surge 干扰下的 ENETDOWN 一族）：绝不交回——
+				// wireguard-go 的 RoutineReceiveIncoming 对 non-Temporary 错误直接 return，
+				// 读 goroutine 死亡 ⇒ 主 socket 永久失聪（客户端包持续到达却无人读，
+				// 整出口静默瘫痪到重启；与手机侧 Bind 同病，2026-09-23 一并修）。
+				// 原地慢转重试，限流记一行。
+				b.noteRecvErr(err)
+				time.Sleep(300 * time.Millisecond)
+				continue
+			}
+			if src.Addr().Is4In6() {
+				src = netip.AddrPortFrom(src.Addr().Unmap(), src.Port())
+			}
+			buf := make([]byte, n)
+			copy(buf, packets[0][:n])
+			return b.processPacket(packets, sizes, eps, buf, src)
 		}
-		if src.Addr().Is4In6() {
-			src = netip.AddrPortFrom(src.Addr().Unmap(), src.Port())
-		}
-		buf := make([]byte, n)
-		copy(buf, packets[0][:n])
-		return b.processPacket(packets, sizes, eps, buf, src)
 	}
 	return []conn.ReceiveFunc{fn, b.legReceiveFunc(dead)}, actual, nil
+}
+
+// readOnce 一次 socket 读（生产 = 真实系统调用；测试经 readFrom 接缝注入错误序列）。
+func (b *ServerBind) readOnce(c *net.UDPConn, buf []byte) (int, netip.AddrPort, error) {
+	b.readFromMu.Lock()
+	rf := b.readFrom
+	b.readFromMu.Unlock()
+	if rf != nil {
+		return rf(c, buf)
+	}
+	return c.ReadFromUDPAddrPort(buf)
+}
+
+// noteRecvErr 主 socket 读错误的限流记录（每 5s 一行——坏 socket 上每 300ms 一报，
+// 不限流会刷爆日志）。
+func (b *ServerBind) noteRecvErr(err error) {
+	b.recvErrMu.Lock()
+	defer b.recvErrMu.Unlock()
+	now := time.Now()
+	if now.Sub(b.recvErrAt) < 5*time.Second {
+		return
+	}
+	b.recvErrAt = now
+	b.logf("⚠️ 主 socket 读错误（%v）：原地重试（不交回 wg-go，防读 goroutine 死亡失聪）", err)
 }
 
 // processPacket：一个入站 UDP 包的完整解析（主 socket 与中继数据腿共用）。

@@ -8,9 +8,13 @@ package servercore
 //	#38 Close 幂等；收工后 RegisterLeg no-op
 
 import (
+	"fmt"
 	"net"
 	"net/netip"
+	"strings"
 	"sync"
+	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
@@ -179,5 +183,94 @@ func TestCloseIdempotentAndRegisterAfterClose(t *testing.T) {
 	b.legMu.Unlock()
 	if n != 0 {
 		t.Fatalf("收工后的注册留下了 %d 条腿", n)
+	}
+}
+
+// TestMainSocketReceiveSurvivesNonCloseErrors 主 socket ReceiveFunc 的「非收工类读
+// 错误不交回 wg-go」契约（与 tier 仓 wtransport.Bind 同病同修，2026-09-23）：注入
+// 2 次 ENETDOWN 类错误期间 fn 不返回；之后真实收包恢复；Close 后带错误返回（收工
+// 语义不变）。
+func TestMainSocketReceiveSurvivesNonCloseErrors(t *testing.T) {
+	var logs []string
+	b := &ServerBind{Logf: func(f string, a ...any) { logs = append(logs, fmt.Sprintf(f, a...)) }}
+	fns, _, err := b.Open(0)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	fn := fns[0]
+
+	deadErr := &net.OpError{Op: "read", Net: "udp", Err: syscall.ENETDOWN}
+	var calls atomic.Int32
+	b.readFromMu.Lock()
+	b.readFrom = func(c *net.UDPConn, buf []byte) (int, netip.AddrPort, error) {
+		if calls.Add(1) <= 2 {
+			return 0, netip.AddrPort{}, deadErr
+		}
+		return c.ReadFromUDPAddrPort(buf)
+	}
+	b.readFromMu.Unlock()
+
+	packets := make([][]byte, 1)
+	packets[0] = make([]byte, 1500)
+	sizes := make([]int, 1)
+	eps := make([]conn.Endpoint, 1)
+
+	type res struct {
+		n   int
+		err error
+	}
+	done := make(chan res, 1)
+	go func() {
+		n, err := fn(packets, sizes, eps)
+		done <- res{n, err}
+	}()
+	select {
+	case r := <-done:
+		t.Fatalf("fn 在非收工类错误下返回了（n=%d err=%v）", r.n, r.err)
+	case <-time.After(600 * time.Millisecond):
+	}
+
+	// 真实收包恢复
+	peer, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatalf("peer: %v", err)
+	}
+	defer peer.Close()
+	port := b.LocalPort()
+	if _, err := peer.WriteToUDP([]byte("ok"), &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: int(port)}); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	select {
+	case r := <-done:
+		if r.err != nil || r.n != 1 || string(packets[0][:sizes[0]]) != "ok" {
+			t.Fatalf("未恢复收包：n=%d err=%v data=%q", r.n, r.err, packets[0][:sizes[0]])
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("3s 内未恢复收包")
+	}
+
+	// 收工语义
+	done2 := make(chan error, 1)
+	go func() {
+		_, err := fn(packets, sizes, eps)
+		done2 <- err
+	}()
+	_ = b.Close()
+	select {
+	case err := <-done2:
+		if err == nil {
+			t.Fatal("Close 后 fn 应返回错误")
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("Close 后 3s 未返回")
+	}
+	errLogs := 0
+	for _, l := range logs {
+		if strings.Contains(l, "读错误") {
+			errLogs++
+		}
+	}
+	if errLogs != 1 {
+		t.Fatalf("读错误限流日志应恰 1 行，实际 %d：%v", errLogs, logs)
 	}
 }
