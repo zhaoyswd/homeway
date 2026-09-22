@@ -345,9 +345,9 @@ func (in *Interceptor) serveUDP(dst, src netip.AddrPort, key string, first []byt
 		netProto = ipv6.ProtocolNumber
 	}
 	// 已连接 UDP 端点：本地 = 原目的地址（spoofing 允许绑外来地址），对端 = 原源。
-	peer, err := gonet.DialUDP(in.net.Stack(),
-		&tcpip.FullAddress{Addr: tcpip.AddrFromSlice(dst.Addr().AsSlice()), Port: dst.Port()},
-		&tcpip.FullAddress{Addr: tcpip.AddrFromSlice(src.Addr().AsSlice()), Port: src.Port()},
+	peer, err := dialUDPShared(in.net.Stack(),
+		tcpip.FullAddress{Addr: tcpip.AddrFromSlice(dst.Addr().AsSlice()), Port: dst.Port()},
+		tcpip.FullAddress{Addr: tcpip.AddrFromSlice(src.Addr().AsSlice()), Port: src.Port()},
 		netProto)
 	if err != nil {
 		if in.st != nil {
@@ -461,6 +461,43 @@ func (in *Interceptor) serveUDP(dst, src netip.AddrPort, key string, first []byt
 		}
 	}
 	in.cfg.Logf("udp intercept: 会话 #%d 关闭（%v ← %v）", n, target, src)
+}
+
+// dialUDPShared：与 gonet.DialUDP 同流程（本地 = spoof 的原目的地址、对端 = 原源），
+// 唯一差别是 Bind 前开 SO_REUSEADDR/SO_REUSEPORT——同一 (dst,port) 的并发五元组
+// 会话都要绑同一个「本地=原目的地址:端口」：stub resolver 每查询换源端口、QUIC
+// 多条连接打同一目的地址，都是这个形态。不共享则第二条流起 bind EADDRINUSE、
+// 整条流被丢（2026-09-23 实测：手机 DNS 建会话 96% 失败，每个新域名熬解析器
+// 多轮超时，出口侧 bind udp <隧道IP>:53: port is in use 十分钟刷 503 次）。
+// 共享的 demux 正确性由 Connect 后按全四元组注册保证（各流的端点互不抢占）。
+// 「出口自己不在 netstack 里监听 UDP」⇒ 不存在与不设 reuse 的端点互斥的来源，
+// 共享语义只属于本函数创建的 spoof 端点。
+func dialUDPShared(s *stack.Stack, local, remote tcpip.FullAddress, netProto tcpip.NetworkProtocolNumber) (*gonet.UDPConn, error) {
+	var wq waiter.Queue
+	ep, terr := s.NewEndpoint(header.UDPProtocolNumber, netProto, &wq)
+	if terr != nil {
+		return nil, fmt.Errorf("new endpoint: %v", terr)
+	}
+	so := ep.SocketOptions()
+	so.SetReuseAddress(true)
+	so.SetReusePort(true)
+	if terr := ep.Bind(local); terr != nil {
+		ep.Close()
+		return nil, fmt.Errorf("bind udp %v: %v", fullAddrPort(local), terr)
+	}
+	if terr := ep.Connect(remote); terr != nil {
+		ep.Close()
+		return nil, fmt.Errorf("connect udp %v: %v", fullAddrPort(remote), terr)
+	}
+	return gonet.NewUDPConn(&wq, ep), nil
+}
+
+func fullAddrPort(a tcpip.FullAddress) string {
+	addr, ok := netip.AddrFromSlice(a.Addr.AsSlice())
+	if !ok {
+		return fmt.Sprintf(":%d", a.Port)
+	}
+	return netip.AddrPortFrom(addr.Unmap(), a.Port).String()
 }
 
 // ---------- 双向桥（TCP）----------

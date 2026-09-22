@@ -64,8 +64,11 @@ type harness struct {
 	cli, srv *wgnet.Net
 	in       *Interceptor
 	st       *Stats // 每个 harness 都挂计数器（UDP 归宿/拨号计数的断言用）
-	dialed   []string
-	dialErr  map[string]error
+	// dialMu：dialed 的并发写保护——并发 UDP 会话（同目的多源端口回归用例）
+	// 会在多条 serveUDP goroutine 里同时拨号。
+	dialMu  sync.Mutex
+	dialed  []string
+	dialErr map[string]error
 
 	logMu sync.Mutex
 	logs  []string
@@ -110,7 +113,9 @@ func newHarnessCfg(t *testing.T, dialOverride func(ctx context.Context, network,
 	crossWire(t, cli, srv)
 	h := &harness{cli: cli, srv: srv, dialErr: map[string]error{}, st: &Stats{}}
 	dial := func(ctx context.Context, network, address string) (net.Conn, error) {
+		h.dialMu.Lock()
 		h.dialed = append(h.dialed, address)
+		h.dialMu.Unlock()
 		if dialOverride != nil {
 			return dialOverride(ctx, network, address)
 		}
@@ -658,4 +663,102 @@ func TestDNSUDPSessionShortIdle(t *testing.T) {
 	if got := len(h.dialed) - base; got != 0 {
 		t.Fatalf("普通 UDP 会话不应在 DNSIdle 内回收, got +%d", got)
 	}
+}
+
+// assertNoEndpointFail：拦截层日志里不得出现「建端点失败」——端口共享一旦失效
+// （比如某类端点没带 reuse 旗标），先于超时暴露原因。
+func assertNoEndpointFail(t *testing.T, h *harness) {
+	t.Helper()
+	h.logMu.Lock()
+	defer h.logMu.Unlock()
+	for _, l := range h.logs {
+		if strings.Contains(l, "建端点失败") {
+			t.Fatalf("拦截层出现建端点失败（同目的端口共享失效）：%s", l)
+		}
+	}
+}
+
+// 同一 (dst,port) 的并发多源端口 UDP 会话（2026-09-23 事故回归，transit 形态）：
+// stub resolver 每查询换源端口、QUIC 多条连接打同一目的地址，都会产生「多条
+// 五元组同时 spoof 绑定同一本地地址:端口」。修复前第二条流起 bind "port is in
+// use"、整条流被丢——实测手机 DNS 建会话 96% 失败，每个新域名都要熬解析器
+// 多轮超时（出口日志 bind udp <隧道IP>:53: port is in use 十分钟 503 次）。
+// 用 UDPIdle=30s（harness 默认）保证写第 i 条时前面 0..i-1 的会话全部存活。
+func TestUDPConcurrentSameDstTransit(t *testing.T) {
+	echo := echoUDP(t)
+	h := newHarness(t, func(ctx context.Context, network, address string) (net.Conn, error) {
+		var d net.Dialer
+		return d.DialContext(ctx, network, echo.String())
+	})
+	const flows = 8
+	dst := netip.MustParseAddrPort(foreignDst + ":53") // 与 DNS 同端口最有代表性（QUIC 是 :443，同理）
+	pcs := make([]*gonet.UDPConn, flows)
+	for i := range pcs {
+		pc, err := h.cli.DialUDPAddrPort(
+			netip.AddrPortFrom(netip.MustParseAddr(cliAddr), 0),
+			dst,
+		)
+		if err != nil {
+			t.Fatalf("udp dial #%d: %v", i, err)
+		}
+		defer pc.Close()
+		pcs[i] = pc
+	}
+	for i, pc := range pcs {
+		pc.SetDeadline(time.Now().Add(10 * time.Second))
+		if _, err := pc.Write([]byte(fmt.Sprintf("flow-%d", i))); err != nil {
+			t.Fatalf("write #%d: %v", i, err)
+		}
+	}
+	for i, pc := range pcs {
+		buf := make([]byte, 1024)
+		n, err := pc.Read(buf)
+		if err != nil {
+			h.dumpLogs(t)
+			t.Fatalf("read #%d: %v（会话建立失败或应答丢失）", i, err)
+		}
+		if got := string(buf[:n]); got != fmt.Sprintf("flow-%d", i) {
+			t.Fatalf("flow #%d echo = %q", i, got)
+		}
+	}
+	assertNoEndpointFail(t, h)
+}
+
+// 事故原样（DNS 改写腿）：手机系统解析器把 :53 查询打到隧道 IP，多条查询
+// 并发/背靠背到达——目的改写进代答后同样共享 (隧道IP,53) 的 spoof 绑定。
+func TestUDPConcurrentDNSRewrite(t *testing.T) {
+	echo := echoUDP(t)
+	h := newHarnessCfg(t, nil, func(c *Config) { c.DNSPort = echo.Port() })
+	const flows = 8
+	dst := netip.MustParseAddrPort(srvAddr + ":53") // 手机解析器的实际目的
+	pcs := make([]*gonet.UDPConn, flows)
+	for i := range pcs {
+		pc, err := h.cli.DialUDPAddrPort(
+			netip.AddrPortFrom(netip.MustParseAddr(cliAddr), 0),
+			dst,
+		)
+		if err != nil {
+			t.Fatalf("udp dial #%d: %v", i, err)
+		}
+		defer pc.Close()
+		pcs[i] = pc
+	}
+	for i, pc := range pcs {
+		pc.SetDeadline(time.Now().Add(10 * time.Second))
+		if _, err := pc.Write([]byte(fmt.Sprintf("q-%d", i))); err != nil {
+			t.Fatalf("write #%d: %v", i, err)
+		}
+	}
+	for i, pc := range pcs {
+		buf := make([]byte, 1024)
+		n, err := pc.Read(buf)
+		if err != nil {
+			h.dumpLogs(t)
+			t.Fatalf("read #%d: %v（DNS 会话建立失败或应答丢失）", i, err)
+		}
+		if got := string(buf[:n]); got != fmt.Sprintf("q-%d", i) {
+			t.Fatalf("dns flow #%d echo = %q", i, got)
+		}
+	}
+	assertNoEndpointFail(t, h)
 }
