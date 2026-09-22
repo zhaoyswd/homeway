@@ -455,6 +455,10 @@ func listenLocalService(stateDir, name string) (string, net.Listener, os.FileInf
 // removeSockOwn：只删「还是自己 bind 出来的那个文件」。路径已被别的实例接管
 // （SameFile 不匹配）时不动它——旧实现按路径无条件删，会在双实例场景把后来
 // 接管者的活 socket 摘掉，让它在无任何报错的情况下永久不可达。
+// ⚠️ 已知局限（2026-09-22 CI 实证）：身份比对是 best-effort——若接管者在旧文件
+// 被删后立刻 bind 且文件系统把刚释放的 inode 号复用给新 socket（linux tmpfs 常见），
+// SameFile 会误判为同一个文件而误删。Go 运行时自己的 unlink-on-close 同构实现有
+// 同样的理论洞；触发需要「双实例接管 + inode 立刻复用」叠加，接受此残余风险。
 func removeSockOwn(path string, own os.FileInfo) {
 	if own == nil {
 		_ = os.Remove(path) // 没拿到身份（防御）：退回按路径删

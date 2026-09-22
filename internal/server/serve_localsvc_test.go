@@ -120,6 +120,16 @@ func TestRemoveSockOwnNotOthers(t *testing.T) {
 	// A 让位（不删文件——模拟被抢占前的形态）：直接模拟 = A 收线（listener 关、
 	// SetUnlinkOnClose(false) 已由 listenLocalService 设置，文件保留）。
 	lnA.Close()
+	// 烧掉刚释放的 inode 号：linux tmpfs 常把刚释放的 inode 原样复用给下一个同路径
+	// socket 文件，os.SameFile(ownA, B 的文件) 会被复用骗成真——那是 removeSockOwn
+	// 身份比对固有的 best-effort 局限（不是本测试要验证的行为）。造删一个一次性文件
+	// 让 B 拿到不同 inode，测试跨平台确定性。
+	burn, berr := os.CreateTemp(dir, "burn-*")
+	if berr != nil {
+		t.Fatal(berr)
+	}
+	burn.Close()
+	_ = os.Remove(burn.Name())
 	// B 接管路径。
 	_, lnB, ownB, err := listenLocalService(dir, "svc.sock")
 	if err != nil {
