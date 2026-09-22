@@ -26,6 +26,7 @@ func CLI(args []string) error {
 	upnp := fs.Bool("upnp", true, "向路由器申请 UDP 端口映射（默认开；--upnp=false 关）")
 	stunServer := fs.String("stun", "stun.cloudflare.com:3478", "STUN 服务器（观测 IPv4 公网映射；空 = 关）")
 	stun6Server := fs.String("stun6", "stun.cloudflare.com:3478", "IPv6 路径校验用的 STUN（空 = 关）")
+	ddns := fs.String("ddns", "", "DDNS 域名（如 home.example.com）：token 额外带上 host:端口 条目（既有端点全保留），手机重连/重赛跑时解析取当前地址——端点漂移后不再需要重取 token。域名记录由你的 DDNS 设施（路由器自带/脚本/DNS API）维护，出口只读不自更")
 	maxPeers := fs.Int("max-peers", 32, "设备表容量（同时记住的设备数上限；表满只淘汰超过活跃宽限期未刷新的失联设备）")
 	peerTTL := fs.Duration("peer-ttl", 7*24*time.Hour, "长期不活跃设备的回收期限（0 = 关闭 TTL 回收）")
 	dnsPort := fs.Uint("dns-port", uint(DefaultDNSPort), "DNS 代答监听端口（任意目的 :53 的隧道查询改写到这里，上游=主机系统解析；0 = 关闭代答，:53 按原目标过境重拨）")
@@ -41,6 +42,9 @@ func CLI(args []string) error {
 	fs.Parse(args)
 	if *dnsPort > 65535 {
 		return fmt.Errorf("--dns-port 超出端口范围：%d（1–65535；0 = 关闭代答）", *dnsPort)
+	}
+	if *ddns != "" && strings.ContainsAny(*ddns, ":/ ") {
+		return fmt.Errorf("--ddns 只要裸域名（不带端口/路径）：%q", *ddns)
 	}
 	if rest := fs.Args(); len(rest) > 0 {
 		// 没有子命令：多出来的位置参数一定是写错了。
@@ -68,6 +72,7 @@ func CLI(args []string) error {
 		UPnP:       *upnp,
 		STUN:       *stunServer,
 		STUN6:      *stun6Server,
+		DDNS:       *ddns,
 		Relay:      *relayServer,
 		MaxDevices: *maxPeers,
 		PeerTTL:    *peerTTL,

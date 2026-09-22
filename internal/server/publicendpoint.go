@@ -19,10 +19,12 @@ import (
 	"net/netip"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
 	"github.com/zhaoyswd/homeway/pkg/egress"
+	"github.com/zhaoyswd/homeway/pkg/probe"
 	"github.com/zhaoyswd/homeway/pkg/proto"
 	"github.com/zhaoyswd/homeway/pkg/servercore"
 )
@@ -54,9 +56,13 @@ func ListenPortPath(stateDir string) string { return filepath.Join(stateDir, "li
 // PublicEndpointPath：公布文件路径（内容 = 已公布的公网端点，供人查）。
 func PublicEndpointPath(stateDir string) string { return filepath.Join(stateDir, publicFile) }
 
-// StartPublicEndpoint 起后台循环（非阻塞）。
+// StartPublicEndpoint 起后台循环（非阻塞）。--ddns 自检挂在本循环同拍（endpoint-freshness）。
 func (s *Server) StartPublicEndpoint(ctx context.Context, opts PublicOpts) {
 	if !opts.UPnP && opts.STUN == "" {
+		if s.cfg.DDNS != "" {
+			logf("DDNS：公网端点探测未开（--upnp=false --stun=''），自检没有观测可比对、跳过；"+
+				"token 的域名条目端口按实际监听口")
+		}
 		return
 	}
 	if opts.Logf == nil {
@@ -71,6 +77,7 @@ func (s *Server) StartPublicEndpoint(ctx context.Context, opts PublicOpts) {
 			if !s.refreshPublicEndpoint(ctx, opts) {
 				wait = publicRefreshFail
 			}
+			s.runDDNSSelfCheck(opts) // 与探测同拍（换网 kick 轮也会跑到）
 			if first {
 				// 第一轮结束（成不成都算）：Run 的 token 兜底在等这个信号。
 				first = false
@@ -205,18 +212,11 @@ func (s *Server) refreshPublicEndpoint(ctx context.Context, opts PublicOpts) boo
 	return true
 }
 
-// printClientToken：把"客户端要粘的 token"打出去 —— **终端只打第一轮**（进程生命周期内
-// 不再重打：端点变化后终端冒出第二串 token 只会让人拿错，2026-09-21 用户口径），之后的
-// 端点变化只在摘要文件重写一份（取最新 token：grep 客户端 token events.log | tail -1）。
-// 内容 = LAN 端点 + 已公布公网端点 + serve --relay 给的中继端点。
-func (s *Server) printClientToken(published []string) {
-	port := s.bind.LocalPort()
-	if port == 0 {
-		// socket 还没开（device 异步拉起 Bind）：本轮不打，等下一轮——别端点端口打出 0。
-		return
-	}
-	var eps []proto.Endpoint
-	var labels []string
+// tokenEndpoints：token 端点列表的统一组装（endpoint-freshness tasks 2.2 从 printClientToken
+// 抽出——probe 应答的端点列表（probeProbeEndpoints）与 token 打印共用同一口径）。
+// 顺序：LAN → 已公布公网 → --ddns 域名条目（叠加不踢除，B-1 拍板）→ 中继。
+// domain 条目端口口径 = 已公布公网端点的外部端口；无公网观测时回退实际监听口。
+func (s *Server) tokenEndpoints(published []string, listenPort uint16) (eps []proto.Endpoint, labels []string) {
 	seen := map[string]bool{}
 	add := func(addr, kind string) {
 		if addr == "" || seen[addr] {
@@ -226,21 +226,61 @@ func (s *Server) printClientToken(published []string) {
 		eps = append(eps, proto.Endpoint{Addr: addr})
 		labels = append(labels, addr+"（"+kind+"）")
 	}
-	for _, a := range localV4Addrs(port) {
+	for _, a := range localV4Addrs(listenPort) {
 		add(a, "内网")
 	}
 	for _, a := range published {
 		add(a, "公网")
 	}
+	if s.cfg.DDNS != "" {
+		p := ddnsEntryPort(published, listenPort)
+		if p != 0 {
+			add(net.JoinHostPort(s.cfg.DDNS, strconv.Itoa(int(p))), "域名")
+		} else {
+			// listenPort=0 的调用形态（探测应答的即时快照）：域名条目这轮缺席，下一轮补上。
+			dlogf("域名条目：本轮拿不到端口（socket 未开？），token/列表暂不带 --ddns 条目")
+		}
+	}
 	if s.relayEp.Addr != "" {
 		add(s.relayEp.Addr, "中继")
 	}
+	return eps, labels
+}
+
+// ddnsEntryPort：--ddns 域名条目的端口 = 已公布公网 v4 端点的外部端口；
+// 无公网端点观测（--upnp=false --stun=''）时回退实际监听口（让位退让后的真实口）。
+func ddnsEntryPort(published []string, listenPort uint16) uint16 {
+	for _, line := range published {
+		if ap, err := netip.ParseAddrPort(line); err == nil && ap.Addr().Is4() && ap.Port() != 0 {
+			return ap.Port()
+		}
+	}
+	return listenPort
+}
+
+// printClientToken：把"客户端要粘的 token"打出去 —— **终端只打第一轮**（进程生命周期内
+// 不再重打：端点变化后终端冒出第二串 token 只会让人拿错，2026-09-21 用户口径），之后的
+// 端点变化只在摘要文件重写一份（取最新 token：grep 客户端 token events.log | tail -1）。
+// 内容 = LAN 端点 + 已公布公网端点 + --ddns 域名条目（若有）+ serve --relay 给的中继端点。
+func (s *Server) printClientToken(published []string) {
+	port := s.bind.LocalPort()
+	if port == 0 {
+		// socket 还没开（device 异步拉起 Bind）：本轮不打，等下一轮——别端点端口打出 0。
+		return
+	}
+	eps, labels := s.tokenEndpoints(published, port)
 	if len(eps) == 0 {
 		return
 	}
 	// 指定了 --relay：中继端点没并入前不打 token —— 先打一版不带中继的只会
 	// 误导（用户粘了它，蜂窝下就没人能连上）（2026-09-20 用户口径）。
-	if s.relayWanted && !seen[s.relayEp.Addr] {
+	var hasRelay bool
+	for _, e := range eps {
+		if e.Addr == s.relayEp.Addr {
+			hasRelay = true
+		}
+	}
+	if s.relayWanted && !hasRelay {
 		return
 	}
 	tok, err := proto.EncodeToken(proto.Token{
@@ -272,6 +312,31 @@ func (s *Server) printClientToken(published []string) {
 		tokenToFile("客户端 token（端点已变化；粘进 App 的「添加主机」即可；%d 个端点）：%s", len(eps), tok)
 		tokenToFile("端点：%s", strings.Join(labels, "、"))
 	}
+}
+
+// probeProbeEndpoints：探测应答端点列表段的来源（endpoint-freshness task 2.2）。
+// 与 token 打印同源（lastPublished = 最近一轮已公布公网端点）；只含公网 v4/v6——
+// 不含 LAN（应答无认证，不把 RFC1918 地址从 token 凭证扩散给任意 pad 请求者；LAN 本就在
+// token 里）、不含域名条目（消费侧逐地址投递，用不了 host）。nil = 未公布过（老出口形态）。
+func (s *Server) probeProbeEndpoints() []netip.AddrPort {
+	s.tokMu.Lock()
+	published := append([]string(nil), s.lastPublished...)
+	s.tokMu.Unlock()
+	var out []netip.AddrPort
+	for _, line := range published {
+		ap, err := netip.ParseAddrPort(line)
+		if err != nil || !ap.IsValid() || ap.Port() == 0 {
+			continue
+		}
+		if !egress.IsPublicAddr(ap.Addr()) {
+			continue
+		}
+		if len(out) >= probe.MaxEndpoints {
+			break
+		}
+		out = append(out, ap)
+	}
+	return out
 }
 
 // localV4Addrs：本机物理网卡 IPv4 + 实际监听端口（LAN 候选）。

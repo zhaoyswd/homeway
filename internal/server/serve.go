@@ -68,6 +68,7 @@ type ServeConfig struct {
 	UPnP       bool           // 启动后向路由器申请 UDP 端口映射并 30 分钟续期
 	STUN       string         // 非空 = 在监听 socket 上向该 STUN 服务器观测公网映射（如 stun.miwifi.com:3478）
 	STUN6      string         // 非空 = 用该服务器做 **IPv6** 路径校验（要有 AAAA，如 stun.cloudflare.com:3478）
+	DDNS       string         // 非空 = DDNS 域名（endpoint-freshness）：token 叠加 host:端口 条目（不解析不踢除；域名记录由用户 DDNS 设施维护）
 	Relay      string         // 非空 = 向该中继注册一条反向注册腿（host:port），NAT 后的出口由此可被客户端到达
 	Verbose    bool
 }
@@ -109,6 +110,8 @@ type Server struct {
 	tokMu         sync.Mutex
 	lastToken     string       // 上次已写出的客户端 token（去重：没变就不再写；终端只认首轮）
 	lastPublished []string     // 最近一轮已公布的公网端点（Run 的终端兜底带上它，别打残缺版）
+	// ddns：--ddns 自检的滚动状态（只在公网端点探测 goroutine 读写；nil = 未配置 --ddns）。
+	ddns *ddnsCheckState
 	udpCap        *udpCapState // 默认路径的 UDP 能力（周期探测；探测应答里回报）
 	// dnsSrv：DNS 代答（dns-host-resolver）；nil = 未启用（监听失败降级或配置关闭）。
 	dnsSrv *dns.Server
@@ -188,6 +191,10 @@ func Start(cfg ServeConfig) (*Server, error) {
 		}
 	}
 	s := &Server{cfg: cfg, Stats: &intercept.Stats{}}
+	if cfg.DDNS != "" {
+		s.ddns = &ddnsCheckState{}
+		logf("DDNS：已配置 --ddns %s（token 叠加域名条目、既有端点全保留；自检随公网端点探测同拍跑）", cfg.DDNS)
+	}
 	// DNS 代答（dns-host-resolver）：任意目的 :53 的隧道查询改写进本机代答，
 	// 上游 = 主机系统解析（resolv.conf 跟随；启动时暂无上游不致命——空表周期
 	// 重试，期间查询落兜底，review M6）。可选服务（与 files/term 同取舍），但
@@ -261,7 +268,8 @@ func Start(cfg ServeConfig) (*Server, error) {
 		buildTag = "homewayd-dev"
 	}
 	sbind := &servercore.ServerBind{Logf: logf, LogfD: dlogf, Build: buildTag, BindAddr: cfg.BindAddr, BindIface: resolvedIf,
-		Caps: func() byte { return s.UDPCapFlags() }}
+		Caps:          func() byte { return s.UDPCapFlags() },
+		ProbeEndpoints: s.probeProbeEndpoints}
 	s.bind = sbind
 	// wireguard-go 的日志也进文件：device.NewLogger 直写 stdout（2026-09-21 前会刷终端）。
 	// ERROR 级进摘要文件；VERBOSE 只在 --verbose 时进细节文件。

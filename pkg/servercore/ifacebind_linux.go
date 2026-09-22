@@ -10,8 +10,8 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-// pinSocketToIface：Linux 用 SO_BINDTODEVICE 钉网卡。
-func pinSocketToIface(conn *net.UDPConn, ifi *net.Interface) error {
+// PinSocketToIface：Linux 用 SO_BINDTODEVICE 钉网卡。
+func PinSocketToIface(conn *net.UDPConn, ifi *net.Interface) error {
 	raw, err := conn.SyscallConn()
 	if err != nil {
 		return err

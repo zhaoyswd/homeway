@@ -34,6 +34,11 @@ type ServerBind struct {
 	// Caps：探测应答里回报的能力位（bit0 = 出口默认路径可承载 UDP；nil 或未探过 = 0）。
 	// 用函数而不是值：UDP 能力是**周期性探测**的结论，运行期会变（换网/代理开关）。
 	Caps func() byte
+	// ProbeEndpoints：探测应答端点列表段的来源（endpoint-freshness；nil = 不带列表）。
+	// 回调钩子（与 Caps 同款——servercore 不能反向 import internal/server）：返回当前可公布
+	// 的公网端点（v4 外口 + stun6 验证过的 v6），与 token 打印同源。应答侧自带防放大约束
+	//（请求 pad 够才附列表），这里只管给数据。
+	ProbeEndpoints func() []netip.AddrPort
 	// OnLegFrame：腿上帧的**额外**分派钩子（中继控制帧走这里；返回 true = 已消费，不进 device）。
 	// 已有的固定处理（data/reg/control-hint）在内，钩子只收 type ≥ 3 的帧与显式未处理的分支。
 	OnLegFrame func(typ byte, payload []byte, src netip.AddrPort) bool
@@ -140,7 +145,7 @@ func (b *ServerBind) RepinTo(ifi *net.Interface) (*net.Interface, error) {
 		b.pinned = nil
 		return nil, nil
 	}
-	if err := pinSocketToIface(c, ifi); err != nil {
+	if err := PinSocketToIface(c, ifi); err != nil {
 		return nil, err
 	}
 	b.pinned = ifi
@@ -532,7 +537,7 @@ func (b *ServerBind) Open(port uint16) ([]conn.ReceiveFunc, uint16, error) {
 		}
 	}
 	if b.BindIface != nil {
-		if err := pinSocketToIface(c, b.BindIface); err != nil {
+		if err := PinSocketToIface(c, b.BindIface); err != nil {
 			// 钉不上卡**不致命**：继续按未绑卡运行，并把后果说清楚（公网端点公布会自动变保守：
 			// 只有 PinnedIface()!=nil 时才允许"外口≠监听口"的拼法）。
 			b.logf("⚠️ 钉网卡 %s 失败（%v）—— 继续以未绑卡运行：STUN 观测可能被 TUN 型代理污染，"+
@@ -543,11 +548,11 @@ func (b *ServerBind) Open(port uint16) ([]conn.ReceiveFunc, uint16, error) {
 			b.pinMu.Unlock()
 		}
 	} else if laddr.IP != nil {
-		// 绑了源地址还要把 socket 钉在该网卡上（见 pinSocketToIface 的注释）：
+		// 绑了源地址还要把 socket 钉在该网卡上（见 PinSocketToIface 的注释）：
 		// 否则默认路由被 TUN 型代理抢走时，STUN 观测到的是代理的映射而不是路由器上的真实映射。
 		if ip, ok := netip.AddrFromSlice(laddr.IP); ok {
 			if ifi := ifaceForAddr(ip.Unmap()); ifi != nil {
-				if err := pinSocketToIface(c, ifi); err != nil {
+				if err := PinSocketToIface(c, ifi); err != nil {
 					b.logf("⚠️ 钉网卡 %s 失败（%v）—— 继续以未绑卡运行（公网端点公布变保守）", ifi.Name, err)
 				} else {
 					b.pinMu.Lock()
@@ -597,11 +602,17 @@ func (b *ServerBind) processPacket(packets [][]byte, sizes []int, eps []conn.End
 
 	// 参照点探测（tasks 3.6）：明文一问一答，不进 WG、不登记 peer、不碰会话状态。
 	// 客户端在「全部候选失败」时用它做三档归因（本机 / 链路 / 后端）。
+	// 端点列表段（endpoint-freshness）：请求 pad 够的探测顺带拿到出口当前公网端点——
+	// 手机侧旁路探测由此持续保鲜学习缓存；老请求方拿不到列表（RespondEx 内的 pad 契约）。
 	caps := byte(0)
 	if b.Caps != nil {
 		caps = b.Caps()
 	}
-	if resp := probe.Respond(buf, src, b.Build, caps); resp != nil {
+	var probeEps []netip.AddrPort
+	if b.ProbeEndpoints != nil {
+		probeEps = b.ProbeEndpoints()
+	}
+	if resp := probe.RespondEx(buf, src, b.Build, caps, probeEps); resp != nil {
 		b.noteNewSrc(src, "参照点探测", len(buf))
 		if c := b.c.Load(); c != nil {
 			_, _ = c.WriteToUDPAddrPort(resp, src)

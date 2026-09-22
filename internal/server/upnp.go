@@ -20,6 +20,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/zhaoyswd/homeway/pkg/servercore"
 	"golang.org/x/net/ipv4"
 )
 
@@ -125,7 +126,7 @@ func ssdpLocation(ctx context.Context, localIP netip.Addr) (string, error) {
 			// macOS 上光设 IP_MULTICAST_IF 还不够：默认路由被 TUN 型代理（Surge 等）抢走时，
 			// 发往 239.255.255.250 的报文仍按默认路由选路，直接 `no route to host`
 			// （实测 2026-09-19）。用 IP_BOUND_IF / SO_BINDTODEVICE 把整条 socket 钉在该网卡上。
-			if err := bindSocketToIface(conn, ifi); err != nil {
+			if err := servercore.PinSocketToIface(conn, ifi); err != nil {
 				return "", fmt.Errorf("把 SSDP socket 钉在 %v: %w", ifi.Name, err)
 			}
 		}
