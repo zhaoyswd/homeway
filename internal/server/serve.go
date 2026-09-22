@@ -590,7 +590,14 @@ func Run(ctx context.Context, cfg ServeConfig) error {
 	if cfg.UPnP {
 		ctx2, cancel := context.WithTimeout(context.Background(), 8*time.Second)
 		if g, local, err := FindIGD(ctx2); err == nil {
-			if ext, internal, ok := g.FindOurMapping(ctx2, upnpMapDesc, local, cfg.ListenPort); ok {
+			// 认领用**实际监听口**（映射的内网口是按实际口申请的——监听口被占会 +1…+9 退让）。
+			// 传配置口时自己的映射会撞上 InternalPort≠listenPort + portInUse(实际口)=自己
+			// ⇒ 判 ownerLiveSibling 认领失败 ⇒ 缩租期静默跳过（评审整改 2026-09-22）。
+			port := s.bind.LocalPort()
+			if port == 0 {
+				port = cfg.ListenPort // socket 从没开起来的极端形态：退回配置口（多半也认领不到）
+			}
+			if ext, internal, ok := g.FindOurMapping(ctx2, upnpMapDesc, local, port); ok {
 				if err := g.ReAddShortLease(ctx2, ext, local, internal, 300); err == nil {
 					logf("UPnP：退出前把映射 外部 %d 的租期缩到 5 分钟（快速重启仍会沿用这个端口）", ext)
 				}
