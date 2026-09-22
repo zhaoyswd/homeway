@@ -242,7 +242,14 @@ func (s *Server) tokenEndpoints(published []string, listenPort uint16) (eps []pr
 		}
 	}
 	if s.relayEp.Addr != "" {
-		add(s.relayEp.Addr, "中继")
+		// 中继腿必须带 Relay 标记（add() 不透传 relay——此前 token 里中继端点被标成
+		// direct，客户端的直连/中继分桶（赛跑窗口、relay 升级、添加探测的 relay_only
+		// 档）全部失效；2026-09-23 添加主机连通性验证时抓到）。去重语义与 add 一致。
+		if !seen[s.relayEp.Addr] {
+			seen[s.relayEp.Addr] = true
+			eps = append(eps, proto.Endpoint{Addr: s.relayEp.Addr, Relay: true})
+			labels = append(labels, s.relayEp.Addr+"（中继）")
+		}
 	}
 	return eps, labels
 }

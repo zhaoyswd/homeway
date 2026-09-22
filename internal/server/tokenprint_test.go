@@ -14,6 +14,7 @@ import (
 	"sync"
 	"testing"
 
+	"github.com/zhaoyswd/homeway/pkg/proto"
 	"github.com/zhaoyswd/homeway/pkg/servercore"
 )
 
@@ -84,4 +85,45 @@ func TestPrintClientTokenTerminalOnce(t *testing.T) {
 		t.Fatalf("再次变化：终端应仍 2 行、文件累计 4 行，实际 term=%d file=%d", len(term), len(file))
 	}
 	mu.Unlock()
+}
+
+// 回归（2026-09-23，add-host-connectivity）：token 里的中继腿必须带 Relay 标记——
+// 此前 add() 不透传，中继端点被标成 direct，客户端的直连/中继分桶（赛跑窗口、
+// relay 升级、添加探测的 relay_only 档）全部失效。
+func TestTokenEndpointsRelayFlag(t *testing.T) {
+	s := &Server{}
+	s.relayEp = proto.Endpoint{Addr: "198.51.100.9:41741", Relay: true}
+	eps, labels := s.tokenEndpoints([]string{"203.0.113.7:41641"}, 41641)
+	var relaySeen, directSeen bool
+	for _, e := range eps {
+		if e.Relay {
+			relaySeen = true
+			if e.Addr != s.relayEp.Addr {
+				t.Fatalf("relay 标记落在错误端点上：%q", e.Addr)
+			}
+		} else {
+			directSeen = true
+		}
+	}
+	if !relaySeen || !directSeen {
+		t.Fatalf("直连/中继标记分桶缺失：eps=%+v labels=%v", eps, labels)
+	}
+	// 端点列表可往返（EncodeToken→DecodeToken 后 Relay 仍为 true）。
+	tokStr, err := proto.EncodeToken(proto.Token{
+		PeerID:    [32]byte{1},
+		Secret:    [32]byte{2},
+		Endpoints: eps,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	decoded, err := proto.DecodeToken(tokStr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, e := range decoded.Endpoints {
+		if e.Addr == s.relayEp.Addr && !e.Relay {
+			t.Fatal("编码往返后中继标记丢失")
+		}
+	}
 }

@@ -40,6 +40,7 @@ func run(args []string) int {
 	if onlyVersion(rest) {
 		return 0
 	}
+	relay.Version = version // 探测应答的构建标记（add-host-connectivity）
 
 	var err error
 	switch role {

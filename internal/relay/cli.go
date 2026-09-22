@@ -20,6 +20,10 @@ import (
 	"github.com/zhaoyswd/homeway/pkg/proto"
 )
 
+// Version：二进制版本串（cmd/homeway/main.go 把 -ldflags 注入的 main.version 赋进来；
+// 探测应答的构建标记由此取值，add-host-connectivity）。
+var Version string
+
 // CLI 解析中继参数并启动，阻塞到进程收到 SIGINT/SIGTERM。
 func CLI(args []string) error {
 	fs := flag.NewFlagSet("homeway relay", flag.ExitOnError)
@@ -50,6 +54,7 @@ func CLI(args []string) error {
 	r := New(Config{
 		Addr:   *listen,
 		Secret: secret,
+		Build:  Version,
 		Logf:   logf,
 	})
 	if created {

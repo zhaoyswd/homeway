@@ -28,6 +28,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/zhaoyswd/homeway/pkg/probe"
 	"github.com/zhaoyswd/homeway/pkg/proto"
 	"golang.org/x/crypto/curve25519"
 )
@@ -78,7 +79,10 @@ type Config struct {
 	// MaxCtlConns：已建立控制连接总数上限（0 = 默认 64；review #7——此前只有
 	// 「握手中」的并发闸，认证后的长连不设限，被灌满后每个连接各挂一个读协程）。
 	MaxCtlConns int
-	Logf        func(format string, args ...any)
+	// Build：探测应答里回报的构建标记（add-host-connectivity；空 = "relay-dev"）。
+	// 与出口侧 ServerBind.Build 同语义——客户端（添加主机的连通性验证）排障对照用。
+	Build string
+	Logf  func(format string, args ...any)
 }
 
 // Relay 中继实例。
@@ -214,6 +218,9 @@ func New(cfg Config) *Relay {
 	}
 	if cfg.Logf == nil {
 		cfg.Logf = func(string, ...any) {}
+	}
+	if cfg.Build == "" {
+		cfg.Build = "relay-dev"
 	}
 	return &Relay{
 		cfg:      cfg,
@@ -361,6 +368,13 @@ func (r *Relay) readLoop(ctx context.Context) {
 
 // handlePacket：一条入包的分派。
 func (r *Relay) handlePacket(_ context.Context, src netip.AddrPort, pkt []byte) {
+	// 参照点探测（add-host-connectivity）：与出口侧同款语义的明文一问一答——客户端
+	// （添加主机等场景）借此验证中继腿可达。无状态、不进帧协议分派、不受后端注册
+	// 准入约束；防放大不变量由 probe.Respond 协议层保证（应答 ≤ 请求 + 45B）。
+	if resp := probe.Respond(pkt, src, r.cfg.Build, 0); resp != nil {
+		_, _ = r.pc.WriteToUDPAddrPort(resp, src)
+		return
+	}
 	label, typ, payload, err := proto.DecodeTagged(pkt)
 	if err != nil {
 		// 不带标签的包（比如误发到中继端口的 WG）：直接丢
