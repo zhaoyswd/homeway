@@ -110,7 +110,7 @@ func TestListenLocalServiceLiveOccupant(t *testing.T) {
 	c.Close()
 }
 
-// Close 的身份比对：路径被别的实例接管后，旧实例的收线不得删掉新实例的 socket。
+// Close 的身份比对：路径被别的实例接管后，旧实例的收线不得删掉新实例的文件。
 func TestRemoveSockOwnNotOthers(t *testing.T) {
 	dir := shortDir(t)
 	sock, lnA, ownA, err := listenLocalService(dir, "svc.sock")
@@ -120,31 +120,39 @@ func TestRemoveSockOwnNotOthers(t *testing.T) {
 	// A 让位（不删文件——模拟被抢占前的形态）：直接模拟 = A 收线（listener 关、
 	// SetUnlinkOnClose(false) 已由 listenLocalService 设置，文件保留）。
 	lnA.Close()
-	// 烧掉刚释放的 inode 号：linux tmpfs 常把刚释放的 inode 原样复用给下一个同路径
-	// socket 文件，os.SameFile(ownA, B 的文件) 会被复用骗成真——那是 removeSockOwn
-	// 身份比对固有的 best-effort 局限（不是本测试要验证的行为）。造删一个一次性文件
-	// 让 B 拿到不同 inode，测试跨平台确定性。
-	burn, berr := os.CreateTemp(dir, "burn-*")
-	if berr != nil {
-		t.Fatal(berr)
+	// 确定性构造「路径已被接管」：替身文件在 A 的 inode **仍占用时**先创建（保证 inode ≠ A），
+	// 再删原路径、改名占位——rename 不产生新 inode，任何文件系统的分配顺序都骗不过它。
+	// （直接让真 B bind 会踩 inode 复用：linux 上刚释放的 inode 号常被发给下一个同路径
+	// socket，SameFile 被骗成真——那是 removeSockOwn 身份比对固有的 best-effort 局限，
+	// 不是本测试要验证的防线逻辑，见其注释。）
+	standin, serr := os.CreateTemp(dir, "takeover-*")
+	if serr != nil {
+		t.Fatal(serr)
 	}
-	burn.Close()
-	_ = os.Remove(burn.Name())
-	// B 接管路径。
-	_, lnB, ownB, err := listenLocalService(dir, "svc.sock")
-	if err != nil {
-		t.Fatalf("B 接管: %v", err)
+	standin.Close()
+	if err := os.Remove(sock); err != nil {
+		t.Fatal(err)
 	}
-	defer lnB.Close()
-	defer removeSockOwn(sock, ownB)
-	// A 的收线动作（晚到的 Close）：不得删掉 B 的 socket。
+	if err := os.Rename(standin.Name(), sock); err != nil {
+		t.Fatal(err)
+	}
+	// A 的收线动作（晚到的 Close）：不得删掉接管者的文件。
 	removeSockOwn(sock, ownA)
 	if _, err := os.Stat(sock); err != nil {
-		t.Fatalf("B 的 socket 被 A 的收线删掉了: %v", err)
+		t.Fatalf("接管者的文件被 A 的收线删掉了: %v", err)
 	}
-	// B 自己的收线正常删除。
+	// 清场后 B 真实接管（活监听）：自己的收线正常删除。
+	if err := os.Remove(sock); err != nil {
+		t.Fatal(err)
+	}
+	_, lnB, ownB, err := listenLocalService(dir, "svc.sock")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lnB.Close()
 	removeSockOwn(sock, ownB)
 	if _, err := os.Stat(sock); !os.IsNotExist(err) {
 		t.Fatalf("B 收线后文件应被删: %v", err)
 	}
 }
+
