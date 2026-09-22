@@ -175,7 +175,3 @@ wireguard-go、wireguard/wgctrl、gVisor + google/btree、creack/pty）——它
 
 该文件由 `tools/gen-third-party-notices.sh` 从各依赖自己的 LICENSE 原文拼装（清单口径 =
 `go list -deps ./cmd/homeway`）：**改动依赖后重跑一次**，CI 的 `--check` 门禁会在它过期时挡下发布。
-
-> 沿革：`pkg/term`、`internal/server/upnp.go`、`publicendpoint.go`、`pkg/servercore/ifacebind_*.go`
-> 标着「从 fork 移植」，来源是我们自己在 tailcat fork 里**新增**的文件（上游 tailcat v0.6.0 里没有
-> 这些文件），不是上游 tailcat 代码 ⇒ 不产生 Tailscale 的 BSD-3 归属（逐行比对确认）。
