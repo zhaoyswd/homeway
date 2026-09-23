@@ -218,38 +218,40 @@ func (s *Server) refreshPublicEndpoint(ctx context.Context, opts PublicOpts) boo
 // domain 条目端口口径 = 已公布公网端点的外部端口；无公网观测时回退实际监听口。
 func (s *Server) tokenEndpoints(published []string, listenPort uint16) (eps []proto.Endpoint, labels []string) {
 	seen := map[string]bool{}
-	add := func(addr, kind string) {
-		if addr == "" || seen[addr] {
+	// add 收**整个 Endpoint**（review 2：签名只收字符串时 Relay 靠调用点记得带——
+	// 57012ad 就是这么丢的标记，token 里中继腿恒标 direct，客户端分桶全失效一
+	// 天半）。结构流动，真源只有 s.relayEp 一处。
+	add := func(e proto.Endpoint, kind string) {
+		if e.Addr == "" || seen[e.Addr] {
+			// 中继地址与已有直连端点重合（--relay 指向出口自己地址的退化形态）：
+			// 按先到的直连形态保留——那个地址物理上就是出口的 WG socket，打腿帧
+			// 必被丢，标 relay 反而必坏。取舍见 tokenprint_test 的反例钉住的契约。
+			if e.Relay {
+				dlogf("中继端点 %s 与已有直连端点相同，按直连处理（中继腿不生效）", e.Addr)
+			}
 			return
 		}
-		seen[addr] = true
-		eps = append(eps, proto.Endpoint{Addr: addr})
-		labels = append(labels, addr+"（"+kind+"）")
+		seen[e.Addr] = true
+		eps = append(eps, e)
+		labels = append(labels, e.Addr+"（"+kind+"）")
 	}
 	for _, a := range localV4Addrs(listenPort) {
-		add(a, "内网")
+		add(proto.Endpoint{Addr: a}, "内网")
 	}
 	for _, a := range published {
-		add(a, "公网")
+		add(proto.Endpoint{Addr: a}, "公网")
 	}
 	if s.cfg.DDNS != "" {
 		p := ddnsEntryPort(published, listenPort)
 		if p != 0 {
-			add(net.JoinHostPort(s.cfg.DDNS, strconv.Itoa(int(p))), "域名")
+			add(proto.Endpoint{Addr: net.JoinHostPort(s.cfg.DDNS, strconv.Itoa(int(p)))}, "域名")
 		} else {
 			// listenPort=0 的调用形态（探测应答的即时快照）：域名条目这轮缺席，下一轮补上。
 			dlogf("域名条目：本轮拿不到端口（socket 未开？），token/列表暂不带 --ddns 条目")
 		}
 	}
 	if s.relayEp.Addr != "" {
-		// 中继腿必须带 Relay 标记（add() 不透传 relay——此前 token 里中继端点被标成
-		// direct，客户端的直连/中继分桶（赛跑窗口、relay 升级、添加探测的 relay_only
-		// 档）全部失效；2026-09-23 添加主机连通性验证时抓到）。去重语义与 add 一致。
-		if !seen[s.relayEp.Addr] {
-			seen[s.relayEp.Addr] = true
-			eps = append(eps, proto.Endpoint{Addr: s.relayEp.Addr, Relay: true})
-			labels = append(labels, s.relayEp.Addr+"（中继）")
-		}
+		add(s.relayEp, "中继")
 	}
 	return eps, labels
 }
@@ -281,6 +283,9 @@ func (s *Server) printClientToken(published []string) {
 	}
 	// 指定了 --relay：中继端点没并入前不打 token —— 先打一版不带中继的只会
 	// 误导（用户粘了它，蜂窝下就没人能连上）（2026-09-20 用户口径）。
+	// ⚠️ hasRelay 按**地址**比对而非按 flag：中继地址与直连端点重合的退化形态下
+	// （tokenEndpoints 去重按直连保留）它仍为 true、闸门放行——这是有意的
+	// fail-open：改成按 flag 判会让退化形态永久早退，连直连 token 都拿不到。
 	var hasRelay bool
 	for _, e := range eps {
 		if e.Addr == s.relayEp.Addr {

@@ -127,3 +127,87 @@ func TestTokenEndpointsRelayFlag(t *testing.T) {
 		}
 	}
 }
+
+// printClientToken 集成（review 4 加固）：--relay 形态下终端首轮打出的 token 必须带
+// 恰好一条 relay 端点、端点行含「（中继）」——这条路径才是用户真正粘走的产物，且覆盖
+// printClientToken 的 hasRelay 闸门（此前测试从未设 relayWanted，闸门路径零覆盖）。
+func TestPrintClientTokenRelayIntegrated(t *testing.T) {
+	var mu sync.Mutex
+	var term []string
+	tokenToTerminal = func(f string, a ...any) {
+		mu.Lock()
+		defer mu.Unlock()
+		term = append(term, fmt.Sprintf(f, a...))
+	}
+	tokenToFile = func(string, ...any) {}
+	t.Cleanup(func() { tokenToTerminal = ulogf; tokenToFile = logf })
+
+	b := &servercore.ServerBind{Logf: func(string, ...any) {}}
+	if _, _, err := b.Open(0); err != nil {
+		t.Fatal(err)
+	}
+	defer b.Close()
+	s := &Server{bind: b, priv: [32]byte{1}, secret: [32]byte{2}}
+	s.relayEp = proto.Endpoint{Addr: "198.51.100.9:41741", Relay: true}
+	s.relayWanted = true
+
+	s.printClientToken([]string{"203.0.113.7:41641"})
+	mu.Lock()
+	defer mu.Unlock()
+	if len(term) != 2 {
+		t.Fatalf("首轮应恰好 token+端点两行，实际 %d 行：%v", len(term), term)
+	}
+	if !strings.Contains(term[1], "（中继）") {
+		t.Fatalf("端点行应含（中继）标注：%v", term[1])
+	}
+	// 从 token 行抠出串解回，断言恰好 1 条 relay + ≥1 条 direct。
+	i := strings.Index(term[0], "hmw1")
+	if i < 0 {
+		t.Fatalf("token 行没有 hmw1 串：%v", term[0])
+	}
+	rest := term[0][i:]
+	end := strings.IndexAny(rest, " \t")
+	if end > 0 {
+		rest = rest[:end]
+	}
+	tok, err := proto.DecodeToken(rest)
+	if err != nil {
+		t.Fatalf("终端 token 解码失败：%v", err)
+	}
+	var relayN, directN int
+	for _, e := range tok.Endpoints {
+		if e.Relay {
+			relayN++
+		} else {
+			directN++
+		}
+	}
+	if relayN != 1 || directN < 1 {
+		t.Fatalf("端点标记分布应 1 relay + ≥1 direct，实际 %d/%d：%+v", relayN, directN, tok.Endpoints)
+	}
+}
+
+// 去重边界反例（review 3）：中继地址与公网端点重合（--relay 指向出口自己地址的退化
+// 形态）→ 地址保留为 direct、不出现 relay 条目。把取舍钉成契约，防后人「顺手改成不丢」。
+func TestTokenEndpointsRelayAddrCollision(t *testing.T) {
+	s := &Server{}
+	s.relayEp = proto.Endpoint{Addr: "203.0.113.7:41641", Relay: true}
+	eps, _ := s.tokenEndpoints([]string{"203.0.113.7:41641"}, 41641)
+	if len(eps) == 0 {
+		t.Fatal("端点表不应为空")
+	}
+	for _, e := range eps {
+		if e.Relay {
+			t.Fatalf("退化形态下不应出现 relay 条目（direct 优先，物理上就是出口自己的 WG socket）：%+v", eps)
+		}
+	}
+	found := false
+	for _, e := range eps {
+		if e.Addr == "203.0.113.7:41641" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("重合地址本身必须保留：%+v", eps)
+	}
+}
