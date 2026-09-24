@@ -3,6 +3,7 @@ module github.com/zhaoyswd/homeway
 go 1.24
 
 require (
+	github.com/BurntSushi/toml v1.4.1-0.20240526193622-a339e1f7089c
 	github.com/creack/pty v1.1.24
 	golang.org/x/crypto v0.37.0
 	golang.org/x/net v0.39.0

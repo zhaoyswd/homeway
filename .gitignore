@@ -1,3 +1,9 @@
 /dist/
 /build/
 *.test
+
+# libghostty-vt 构建产物（tools/build-vt.sh 产；见 third_party/libghostty-vt/README.tier.md）
+third_party/libghostty-vt/prebuilt/
+third_party/libghostty-vt/.zig-cache/
+# zig 的包缓存（build.zig.zon 声明，zig 构建时自动取回；不随 vendor 入库）
+third_party/libghostty-vt/zig-pkg/
