@@ -1,0 +1,25 @@
+* [33m22adc7d[m 文件管理进页空态闪烁修复：探测轮直接落地 root + 连接成功即置加载态
+* [33m500d73f[m term-vt-backend 立项：vt 后端化 + surface 协议 + agent 检测搭载（四工件 + 两个 spike 入库）
+* [33m0686f49[m 终端进页白屏修复：reveal 从「connect 受理」改为「回放已落 vt」+ 遮罩补不透明底
+* [33mb321d71[m demand-driven-recovery 第四轮评审收尾（中×2 + 低×7 + C 表）：
+* [33m3d18c50[m demand-driven-recovery 实施（三轮评审整改后）：隧道健康判定从「探测得通」改为「有包要过时过得去」
+* [33m044c9a2[m 评审整改（dsh review 1.4 条）：EndpointCache.Merge 不再按地址去重吃掉类型位
+* [33m5a1b4bd[m add-host-connectivity 实施（真机四判据全过 + 服务会话形态回归）：
+* [33m88df15d[m 常驻通知残留修复（App 侧兜底撤）+ 端口转发入口文案微调
+* [33m1131d5e[m 根因修复：接收函数对非收工类读错误不得交回 wireguard-go（读 goroutine 死亡=Bind 永久失聪）+ 阶梯计数归一（评审整改轮）
+* [33ma991c02[m 修测试轮挖出的三个问题：冻结唤醒服务会话死亡（整会话重建）/15s 超时 UI 闩锁/端点缓存落盘竞态
+* [33m1209846[m 修单测断言：错误文案 homewayd→homeway（UI 文案轮 394992c 把旧名清干净了但两处测试没跟上）
+* [33m6ba6221[m files/term 桥修复的评审整改轮（F1/F3/F4/F7/F8 全落）+ 根因测试钉住
+* [33m19ba865[m term-host-split 终版分层落地（第五轮，用户拍板：永生层 + 页面数据袋 + 列表页预加载）
+* [33mc285dea[m term-host-split 第 4 轮评审整改（三条不变量失守修复，交叉推演自查补漏）：
+* [33m9ea19c5[m term-host-split 第 3 轮评审整改（修正第 2 轮整改引入的回归，高危全修）：
+* [33m33e4fb6[m term-host-split 实现评审整改轮（第 2 轮 dsh 评审，高危全修）：
+* [33mc36b754[m term-host-split 主体实施（段一~段四一次性完成，开发全绿、真机判据统一推迟）：
+* [33m4885514[m term-host-split 段〇 spike（tasks 0.2）：XComponent 每页唯一 id + native 三回调打点
+* [33m394992c[m 终端白屏修复轮（2026-09-22）+ UI 文案轮入库 = term-host-split 重构基线：
+* [33m03ca409[m 修：换网事件被 1.2s 网络标签缓存吞掉——netAvailable/netLost 全拿旧标签、切换静默丢失（2026-09-22 真机：WiFi→蜂窝切网后恢复阶梯一次没跑，隧道死在旧 socket 直到回前台才发现已断）
+* [33m095365b[m endpoint-freshness 手机核侧：旁路探测+域名重解析+真实往返落验证+缓存落盘合并（15/16，真机待设备解锁）
+* [33mcca536e[m upnp-port-yield 二轮评审整改：「固化不回缩」降级为「优先沿用」措辞（用户拍板）+ 三轮精修
+* [33m5f8effc[m 评审整改轮（2026-09-22，过去 12h 未评审需求的 dsh 外部评审 8 组中 tier 侧 3 组+工件组的合理意见一轮修正；homeway 侧同批见其仓 87de861）：
+* [33m793bb71[m AGENTS：部署口径升 v0.5.0（两台出口已部署实测）——三台出口表 Mac/阿里云行、部署口径段整段重写（四项变更清单+sock 判据行）；新坑两条：pkill -f 'homeway exit' 匹配 ssh 自身命令行自杀（rc=255 实测两次，正解 pkill -x homeway）、阿里云重起双角色后 ssh 挂住属已知（nohup 持 fd）。部署实录（2026-09-22 01:50-01:57）：tag v0.5.0→CI 六平台产物→双平台 sha256 校验→Mac kill+rm+cp+nohup（token 一轮首轮即当轮最好版、UPnP 续用、files/term sock= 就绪行、lsof 无 7802/7724）→阿里云 pkill -x+install/mv 原子替换+双角色重起（sock= 判据、relay 注册腿 1、ss 无 7802/7724）→手机端到端：服务会话路径 files dialok（01:54）+ VPN 隧道路径（attached/隧道桥 unix/via=direct 6ms/RREG/01:57 files exempt dialok）全绿。
+* [33m72a1803[m 补入库：upnp-port-yield change 工件（2026-09-21 立项）——同公网 IP 多台出口抢外部 41641 永久乒乓的根因=addPortMapping 先删后加不查所有者（portInUse 只护同机）；修复=申请前按所有权三元组核验（desc 前缀+内网客户端+内网端口活监听）让位 +1…+9、让位固化不回缩、枚举失败 fail-open；新 capability exit-upnp-port-mapping。代码实现已在 homeway 仓（所有权核验/让位/fail-open 均落地，server 包测试绿）随本批一并提交；tasks 勾选待工件随实现同步。

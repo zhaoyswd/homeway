@@ -58,7 +58,7 @@ func TestClassifyAgent(t *testing.T) {
 			procs: fixture(procInfo{pid: 200, ppid: 100, pgid: 200, cpu: 5000,
 				args: "/usr/local/bin/codex"}),
 			prevCPU: 5000, outBytes: 0,
-			want: agentCodex, wantSt: stateWaiting,
+			want: agentCodex, wantSt: stateIdle,
 		},
 		{
 			// 2026-09-18 实测：用户 opencode 会话卡永久 running 的根因——MCP
@@ -69,7 +69,7 @@ func TestClassifyAgent(t *testing.T) {
 				procInfo{pid: 301, ppid: 300, pgid: 300, cpu: 7040, args: "uv tool uvx mcp-server-foo"},
 			),
 			prevCPU: 12000, outBytes: 0,
-			want: agentOpencode, wantSt: stateWaiting,
+			want: agentOpencode, wantSt: stateIdle,
 		},
 		{
 			// 闪烁级重绘（几十字节/次）不触发输出腿。
@@ -77,7 +77,7 @@ func TestClassifyAgent(t *testing.T) {
 			procs: fixture(procInfo{pid: 200, ppid: 100, pgid: 200, cpu: 5000,
 				args: "/usr/local/bin/codex"}),
 			prevCPU: 5000, outBytes: 50,
-			want: agentCodex, wantSt: stateWaiting,
+			want: agentCodex, wantSt: stateIdle,
 		},
 		{
 			// 磁滞：任务刚停（窗口已排空），本拍是第 1 拍安静（quiet=1 ≤ 阈值）→ 维持。
@@ -99,7 +99,9 @@ func TestClassifyAgent(t *testing.T) {
 			procs: fixture(procInfo{pid: 200, ppid: 100, pgid: 200, cpu: 5000,
 				args: "/usr/local/bin/codex"}),
 			prevCPU: 5000, outBytes: 0, prevState: stateRunning, prevQuiet: 2,
-			want: agentCodex, wantSt: stateWaiting,
+			// 新语义：agent + 安静 + 无屏幕证据 ⇒ idle（旧口径这里是 waiting；
+			// waiting 现在只作 blocked 的 legacy 折价，见 agent.go 的 legacyState）。
+			want: agentCodex, wantSt: stateIdle,
 		},
 		{
 			name: "npx 包装（node 跑 codex.js）",
@@ -124,7 +126,7 @@ func TestClassifyAgent(t *testing.T) {
 			procs: fixture(procInfo{pid: 400, ppid: 100, pgid: 400, cpu: 50,
 				args: "openclaw chat"}),
 			prevCPU: 0, outBytes: 0,
-			want: agentOpenclaw, wantSt: stateWaiting,
+			want: agentOpenclaw, wantSt: stateIdle,
 		},
 		{
 			name:    "前台是别的程序且安静 → other/idle",

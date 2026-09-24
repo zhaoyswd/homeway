@@ -37,6 +37,21 @@ const (
 	opReplayDone byte = 0x0A
 	opOK         byte = 0x0B
 	opGreeting   byte = 0x0C
+	// surface 协议（任务 2.2；契约见 design D2）。0x08 是历史保留位，绝不复用。
+	opSnapshot      byte = 0x0D // S→C 全量帧（可分片）
+	opSnapshotDone  byte = 0x0E // S→C 快照完成标志（= surface 版 REPLAY-DONE）
+	opSurfaceDiff   byte = 0x0F // S→C 脏行差分（可分片）
+	opFetchRows     byte = 0x10 // C→S 请求 / S→C 应答（可分片）
+	opInput         byte = 0x11 // C→S 抽象输入（键/文本/滚轮/焦点）
+	opTheme         byte = 0x12 // C→S 客户端主题上报（默认色/深浅）
+	opClipboard     byte = 0x13 // S↔C OSC 52 转发（写/读请求/读应答）
+	opNotify        byte = 0x14 // S→C OSC 9 通知转发
+	opFetchSnapshot byte = 0x15 // C→S 断档/拒收后请求全量
+
+	// opExplain 是**诊断用**的 EXPLAIN 请求/应答（任务 4.8 的 `homeway term explain <会话名>`）。
+	// 放在 0x16 是刻意的：0x0D–0x15 留给 surface 协议（design D2 的 op 分配），
+	// 诊断帧不占那条线，也不会被 surface 客户端误读。
+	opExplain byte = 0x16
 )
 
 // GREETING 的 features 位（客户端不认识的位忽略）。
@@ -46,8 +61,10 @@ const (
 	featModes  = 1 << 2
 	featAgent  = 1 << 3
 	featTitle  = 1 << 4
+	// featSurface 是 surface 能力位（任务 2.1）：客户端见位才在 HELLO 尾随 capability 块。
+	featSurfaceBit = 1 << 5
 
-	termFeatures = featList | featReplay | featModes | featAgent | featTitle
+	termFeatures = featList | featReplay | featModes | featAgent | featTitle | featSurfaceBit
 )
 
 // agent / state 枚举（与 App 侧一一对应）。
@@ -191,6 +208,16 @@ func decHello(p []byte) (cols, rows uint16, create bool, name string, err error)
 	return cols, rows, create, name, nil
 }
 
+// helloTail 取 HELLO 载荷里 name 之后的**尾随字节**（capability 块所在）。
+// 旧客户端不发尾随字节 ⇒ 返回空，向后兼容（decHello 本来就只读 name 之前的部分）。
+func helloTail(p []byte, name string) []byte {
+	off := 6 + len(name)
+	if off >= len(p) {
+		return nil
+	}
+	return p[off:]
+}
+
 func encResize(cols, rows uint16) []byte {
 	p := make([]byte, 4)
 	binary.LittleEndian.PutUint16(p[0:2], cols)
@@ -289,4 +316,22 @@ func decName(p []byte) (string, error) {
 		return "", fmt.Errorf("%w: name %d > %d", errTermFrame, n, len(p)-1)
 	}
 	return string(p[1 : 1+n]), nil
+}
+
+// decError 解 ERROR 载荷（CLI 要把错误码与文案分开呈现）。
+func decError(p []byte) (code, msg string, err error) {
+	if len(p) < 1 {
+		return "", "", fmt.Errorf("%w: error len %d", errTermFrame, len(p))
+	}
+	n := int(p[0])
+	if len(p) < 1+n+2 {
+		return "", "", fmt.Errorf("%w: error code len %d", errTermFrame, n)
+	}
+	code = string(p[1 : 1+n])
+	ml := int(binary.LittleEndian.Uint16(p[1+n : 3+n]))
+	if len(p) < 3+n+ml {
+		return "", "", fmt.Errorf("%w: error msg len %d", errTermFrame, ml)
+	}
+	msg = string(p[3+n : 3+n+ml])
+	return code, msg, nil
 }

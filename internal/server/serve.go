@@ -108,11 +108,11 @@ type Server struct {
 	relayEp       proto.Endpoint // serve --relay 给的中继端点（打客户端 token 时带上）
 	relayWanted   bool           // --relay 解析成功：token 未并入中继端点前不打印（只打最终形态）
 	tokMu         sync.Mutex
-	lastToken     string       // 上次已写出的客户端 token（去重：没变就不再写；终端只认首轮）
-	lastPublished []string     // 最近一轮已公布的公网端点（Run 的终端兜底带上它，别打残缺版）
+	lastToken     string   // 上次已写出的客户端 token（去重：没变就不再写；终端只认首轮）
+	lastPublished []string // 最近一轮已公布的公网端点（Run 的终端兜底带上它，别打残缺版）
 	// ddns：--ddns 自检的滚动状态（只在公网端点探测 goroutine 读写；nil = 未配置 --ddns）。
-	ddns *ddnsCheckState
-	udpCap        *udpCapState // 默认路径的 UDP 能力（周期探测；探测应答里回报）
+	ddns   *ddnsCheckState
+	udpCap *udpCapState // 默认路径的 UDP 能力（周期探测；探测应答里回报）
 	// dnsSrv：DNS 代答（dns-host-resolver）；nil = 未启用（监听失败降级或配置关闭）。
 	dnsSrv *dns.Server
 	// stopIntercept：过境拦截层收工（关会话通知；栈随 tunDev 生命周期回收）。
@@ -268,7 +268,7 @@ func Start(cfg ServeConfig) (*Server, error) {
 		buildTag = "homewayd-dev"
 	}
 	sbind := &servercore.ServerBind{Logf: logf, LogfD: dlogf, Build: buildTag, BindAddr: cfg.BindAddr, BindIface: resolvedIf,
-		Caps:          func() byte { return s.UDPCapFlags() },
+		Caps:           func() byte { return s.UDPCapFlags() },
 		ProbeEndpoints: s.probeProbeEndpoints}
 	s.bind = sbind
 	// wireguard-go 的日志也进文件：device.NewLogger 直写 stdout（2026-09-21 前会刷终端）。
@@ -368,7 +368,7 @@ func Start(cfg ServeConfig) (*Server, error) {
 	if term.Disabled() {
 		logf("term 服务被 HOMEWAY_TERM=off 关闭")
 	} else {
-		tsrv := term.New(dlogf)
+		tsrv := term.New(dlogf, cfg.StateDir)
 		tsock, tln, town, terr := listenLocalService(cfg.StateDir, "term.sock")
 		if terr != nil {
 			// 与 files 同一取舍：可选服务起不来不影响隧道/转发。
@@ -387,9 +387,10 @@ func Start(cfg ServeConfig) (*Server, error) {
 					go tsrv.ServeConn(conn)
 				}
 			}()
-			// 就绪行（判据）：终端会话 socket + shell + 历史窗口 + 能力位
-			logf("# Serving terminal sessions on sock=%s (shell=%s, history=%s, features=%s)",
-				tsock, tsrv.ShellText(), tsrv.HistoryText(), term.FeaturesText())
+			// 就绪行（判据）：终端会话 socket + shell + 历史窗口 + 能力位 + 服务端 vt 现状
+			// （vt=off 是 HOMEWAY_TERM_VT 逃生口生效的判据，见 task 1.3）。
+			logf("# Serving terminal sessions on sock=%s (shell=%s, history=%s, features=%s, vt=%s)",
+				tsock, tsrv.ShellText(), tsrv.HistoryText(), term.FeaturesText(), term.VTText())
 		}
 	}
 

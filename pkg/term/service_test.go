@@ -35,7 +35,7 @@ func startTestTermServiceShell(t *testing.T, shellCmd string) (*termService, net
 	t.Setenv("HOMEWAY_TERM_HISTORY", "65536")
 	t.Setenv("HOMEWAY_TERM_REPLAY", "32768")
 	t.Setenv("HOMEWAY_TERM_DETECT", "off")
-	svc := New(nil)
+	svc := New(nil, "")
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatalf("listen: %v", err)

@@ -19,14 +19,17 @@ import (
 	"os"
 	"os/exec"
 	"os/user"
+	"path/filepath"
 	"regexp"
 	"runtime"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/creack/pty"
+	"github.com/zhaoyswd/homeway/pkg/term/manifest"
 )
 
 // termPlatformSupported 报告本平台是否支持终端服务（unix = 是；windows 见 *_windows.go）。
@@ -57,6 +60,13 @@ type termConfig struct {
 	replayEpoch string // all | last
 	maxSessions int
 	detect      bool
+	// scrollbackLines 服务端 vt 的回滚行数上限（HOMEWAY_TERM_SCROLLBACK_LINES，默认 10000）。
+	//
+	// **内存预算口径（任务 1.3 定，7.4 验收）**：每会话常驻 ≈ 1MiB 字节环（history）+ vt 峰值
+	// （回滚行数上限 × 每行 cell 开销，含样式/字素簇；粗算 10000 行 × 视口宽 × ~16B ≈ 十几 MiB
+	// 量级的最坏值，实测曲线看 7.4）；整服务上限 = maxSessions（默认 16）× 每会话常驻。
+	// 所以调大回滚行数要连带看会话上限——两个都是乘法项。
+	scrollbackLines int
 }
 
 // termDisabledByEnv：HOMEWAY_TERM=off 是唯一的关闭方式（刻意不做 CLI 旗标）。
@@ -78,13 +88,14 @@ func termEnvInt(name string, def int) int {
 
 func termConfigFromEnv() termConfig {
 	cfg := termConfig{
-		port:        uint16(termEnvInt("HOMEWAY_TERM_PORT", termDefaultPort)),
-		shell:       strings.TrimSpace(os.Getenv("HOMEWAY_TERM_SHELL")),
-		history:     termEnvInt("HOMEWAY_TERM_HISTORY", termDefaultHistory),
-		replay:      termEnvInt("HOMEWAY_TERM_REPLAY", termDefaultReplay),
-		replayEpoch: strings.ToLower(strings.TrimSpace(os.Getenv("HOMEWAY_TERM_REPLAY_EPOCH"))),
-		maxSessions: termEnvInt("HOMEWAY_TERM_MAX_SESSIONS", termDefaultMaxSessions),
-		detect:      !strings.EqualFold(strings.TrimSpace(os.Getenv("HOMEWAY_TERM_DETECT")), "off"),
+		port:            uint16(termEnvInt("HOMEWAY_TERM_PORT", termDefaultPort)),
+		shell:           strings.TrimSpace(os.Getenv("HOMEWAY_TERM_SHELL")),
+		history:         termEnvInt("HOMEWAY_TERM_HISTORY", termDefaultHistory),
+		replay:          termEnvInt("HOMEWAY_TERM_REPLAY", termDefaultReplay),
+		replayEpoch:     strings.ToLower(strings.TrimSpace(os.Getenv("HOMEWAY_TERM_REPLAY_EPOCH"))),
+		maxSessions:     termEnvInt("HOMEWAY_TERM_MAX_SESSIONS", termDefaultMaxSessions),
+		detect:          !strings.EqualFold(strings.TrimSpace(os.Getenv("HOMEWAY_TERM_DETECT")), "off"),
+		scrollbackLines: termEnvInt("HOMEWAY_TERM_SCROLLBACK_LINES", vtDefaultScrollbackLines),
 	}
 	if cfg.replayEpoch != "last" {
 		cfg.replayEpoch = "all"
@@ -274,20 +285,46 @@ type termService struct {
 	logf      Logf
 	stopCh    chan struct{}
 	closeOnce sync.Once
+	// manifests 是 agent 检测规则表（nil = HOMEWAY_TERM_DETECT=off，不做屏幕证据）。
+	manifests *manifest.Loader
 
 	mu       sync.Mutex
 	sessions map[string]*termSession
 }
 
-func New(logf Logf) *termService {
+// New 起终端服务。stateDir 是出口 state 目录（本地 manifest 覆盖目录在
+// <stateDir>/agent-detection/；空串 = 只用内嵌 manifest）。
+func New(logf Logf, stateDir string) *termService {
 	s := &termService{
 		cfg:      termConfigFromEnv(),
 		logf:     logf,
 		stopCh:   make(chan struct{}),
 		sessions: map[string]*termSession{},
 	}
+	// 剪贴板写回调是**进程级**的（上游只给 userdata id）⇒ 全局装一次，按 id 分派到会话。
+	installClipboardForwarder()
+	if s.cfg.detect {
+		override := ""
+		if stateDir != "" {
+			override = filepath.Join(stateDir, manifest.OverrideDirName)
+		}
+		s.manifests = manifest.NewLoader(override)
+		if logf != nil {
+			for _, w := range s.manifests.Warnings() {
+				logf("term: ⚠️ 检测规则加载告警：%s", w)
+			}
+			logf("term: 检测规则已加载 %d 份（覆盖目录 %s）", len(s.manifests.IDs()), overrideDesc(override))
+		}
+	}
 	go s.sampleLoop()
 	return s
+}
+
+func overrideDesc(dir string) string {
+	if dir == "" {
+		return "无（只用内嵌）"
+	}
+	return dir
 }
 
 func (s *termService) Port() uint16      { return s.cfg.port }
@@ -295,6 +332,14 @@ func (s *termService) ShellText() string { return loginShell() }
 
 // Disabled 报告环境变量是否显式关闭了终端服务（HOMEWAY_TERM=off）。
 func Disabled() bool { return termDisabledByEnv() }
+
+// VTText 报告服务端 vt 的现状（就绪行与诊断用）：off = 环境变量全局关闭，none = 本构建不带。
+func VTText() string {
+	if vtGloballyDisabled() {
+		return "off（HOMEWAY_TERM_VT）"
+	}
+	return "on"
+}
 
 // FeaturesText 本构建支持的终端能力位（就绪行里打出来，供运维核对）。
 func FeaturesText() string {
@@ -313,6 +358,9 @@ func FeaturesText() string {
 	}
 	if termFeatures&featTitle != 0 {
 		out = append(out, "title")
+	}
+	if termFeatures&featSurfaceBit != 0 {
+		out = append(out, "surface")
 	}
 	return strings.Join(out, ",")
 }
@@ -350,16 +398,41 @@ type termSession struct {
 	created time.Time
 	pid     int
 
-	mu        sync.Mutex
-	ptmx      *os.File
-	cmd       *exec.Cmd
-	ring      []byte
-	start     int64 // ring[0] 对应的绝对偏移
-	written   int64 // 累计输出字节数（ring 末端）
-	epochs    []termEpoch
-	scan      termScan
-	agent     byte
-	state     byte
+	mu      sync.Mutex
+	ptmx    *os.File
+	cmd     *exec.Cmd
+	ring    []byte
+	start   int64 // ring[0] 对应的绝对偏移
+	written int64 // 累计输出字节数（ring 末端）
+	epochs  []termEpoch
+	scan    termScan
+	// vt 是会话屏态的唯一持有者（surface/检测的真源）；nil = 本会话 legacy-only。
+	// 由 term_vt.go / term_vt_off.go 按构建提供（design D1/D7）。
+	vt *sessionVT
+	// contentSeq 每批 PTY 输出自增：状态机卫生用它做「空闲会话零开销」的短路判据（任务 4.7）。
+	surfaceWake chan struct{}
+	// darkTheme / clipCache / lastNotified：surface 通道的会话侧缓存（任务 2.7）。
+	darkTheme bool
+	clipCache string
+	// clipCachePub 是 clipCache 的原子发布副本：剪贴板读回调在 vt.Write 内部同步触发
+	// （此时会话锁被 pump 持有），**不能取会话锁**去读 clipCache。
+	clipCachePub atomic.Pointer[string]
+	lastNotified string
+	// vtID 是服务端 vt 在回调注册表里的 id（剪贴板回调按它分派）。
+	vtID uintptr
+	// surfaceActive 是「当前有 surface 腿」的无锁标志（剪贴板回调在锁内触发，只能读原子量）。
+	surfaceActive atomic.Bool
+	// clipChan 承接程序写剪贴板的内容（锁外投递，见 clipboardRouter）。
+	clipChan chan string
+
+	contentSeq     uint64
+	lastScanSeq    uint64
+	hygiene        stateHygiene
+	lastScreenRule string // 上一拍命中的规则 id（agent 变化时用于清证据判定）
+	agent          byte
+	state          byte
+	// stateV2 是新枚举口径的当前状态（state 是它的 legacy 折价，见 agent.go 的 legacyState）。
+	stateV2   byte
 	prevCPU   int64
 	prevQuiet int // 截至上一采样的连续安静拍数（classifyAgent 磁滞输入）
 	// outBuckets：按绝对秒键的输出字节桶（定长环形，countOutLocked 写、
@@ -418,6 +491,20 @@ type termClient struct {
 	wmu  sync.Mutex
 	off  int64
 	live bool
+	// leg 是 surface 投递状态（仅 surface 腿非 nil）。
+	leg *surfaceLeg
+	// surface 表示这条腿声明了 surface 能力（任务 2.1 的能力协商置位）。
+	// 任务 4.8 的枚举兼容靠它分流：**新枚举只发给声明了 surface 能力的腿**，
+	// legacy 腿收到折价后的兼容值（旧 App 显示零回退）。M1 阶段恒 false。
+	surface bool
+}
+
+// stateForLeg 按腿的能力选状态枚举值（任务 4.8 的兼容契约）。
+func stateForLeg(surface bool, stateV2, legacy byte) byte {
+	if surface {
+		return stateV2
+	}
+	return legacy
 }
 
 func (c *termClient) frame(op byte, payload []byte) error {
@@ -539,6 +626,11 @@ func (s *termSession) deliverLocked() {
 	if c == nil || !c.live {
 		return
 	}
+	if c.surface {
+		// surface 腿的画面由投递循环（快照/差分）负责；这里**绝不**发原始字节 DATA
+		// ——那正是 surface 要消灭的路径，混着发会让客户端收到两套语义的内容。
+		return
+	}
 	for {
 		if c.off < s.start {
 			c.off = s.start // 客户端太慢、历史被覆盖：跳到可用起点（宁可丢也不阻塞）
@@ -561,8 +653,17 @@ func (s *termSession) deliverLocked() {
 func (s *termSession) detachLocked(c *termClient) {
 	if s.attached == c {
 		s.attached = nil
+		s.surfaceActive.Store(false)
 		// 焦点交还：TUI 停动画（空闲闪烁不再进字节环）。
 		s.focusNudgeLocked(false)
+	}
+	if c.surface && c.leg != nil && s.svc.logf != nil {
+		// surface 腿的计数器摘要（任务 2.9）：7.4 的真机流量对照要读这些数。
+		st := c.leg.statsSnapshot()
+		s.svc.logf("term: 会话 %s surface 腿断开｜快照=%d 差分=%d 降级=%d 背压=%d 分片=%d 下行=%dB "+
+			"FETCH 命中=%d 落空=%d 写超时=%d",
+			s.name, st.snapshots, st.diffs, st.degrades, st.backpressure, st.fragments,
+			st.bytesOut, st.fetchHits, st.fetchMiss, st.writeTimeout)
 	}
 	c.close()
 	if s.svc.logf != nil {
@@ -572,7 +673,8 @@ func (s *termSession) detachLocked(c *termClient) {
 
 func (s *termSession) pushStateLocked() {
 	if c := s.attached; c != nil {
-		if err := c.frame(opState, encState(s.agent, s.state, s.scan.title)); err != nil {
+		st := stateForLeg(c.surface, s.stateV2, s.state)
+		if err := c.frame(opState, encState(s.agent, st, s.scan.title)); err != nil {
 			s.detachLocked(c)
 		}
 	}
@@ -609,10 +711,31 @@ func (s *termSession) attachLocked(c *termClient) error {
 	}
 	s.attached = c
 	c.live = false
+	if c.surface {
+		// surface 腿：ATTACHED（带几何/模式/名称）之后**不发回放**，由投递循环发全量快照。
+		// 回放（原始字节重放）正是 surface 要消灭的那类正确性问题——快照是精确屏态。
+		if err := c.frame(opAttached, encAttached(s.cols, s.rows, s.scan.modes, s.agent,
+			stateForLeg(true, s.stateV2, s.state), s.name)); err != nil {
+			s.detachLocked(c)
+			return err
+		}
+		c.live = true
+		c.off = s.written
+		if c.leg != nil {
+			c.leg.markNeedSnapshot("attach")
+		}
+		s.surfaceActive.Store(true)
+		if s.svc.logf != nil {
+			// 判据行：协商结果（surface 腿接管）+ 几何，供运维核对双轨。
+			s.svc.logf("term: 会话 %s surface 腿接管（%dx%d 全量快照待发）", s.name, s.cols, s.rows)
+		}
+		return nil
+	}
 	start, truncated := s.replayStartLocked()
 	c.off = start
 
-	if err := c.frame(opAttached, encAttached(s.cols, s.rows, s.scan.modes, s.agent, s.state, s.name)); err != nil {
+	if err := c.frame(opAttached, encAttached(s.cols, s.rows, s.scan.modes, s.agent,
+		stateForLeg(c.surface, s.stateV2, s.state), s.name)); err != nil {
 		s.detachLocked(c)
 		return err
 	}
@@ -704,6 +827,10 @@ func (s *termSession) finish(reason int32, text string) {
 	}
 	s.ring = nil // 释放历史缓冲
 	s.mu.Unlock()
+	if s.vtID != 0 {
+		unregisterVTSession(s.vtID)
+	}
+	s.vt.Close() // 释放服务端 vt（幂等；无 vt 的构建是空操作）
 
 	s.svc.remove(s.name, s)
 }
@@ -726,12 +853,24 @@ func (s *termSession) pump() {
 			now := time.Now()
 			s.appendLocked(buf[:n])
 			s.scan.write(buf[:n])
+			// 屏态 vt 与 ring 同锁喂入：ring 仍是 legacy 回放源与诊断，vt 是 surface/检测真源。
+			// （surface 投递的「锁内取脏行快照、锁外编码发送」在 2.x 的投递路径上做。）
+			s.vt.Write(buf[:n])
+			s.contentSeq++ // 内容序号：检测侧的空闲短路判据（任务 4.7）
+			// surface 投递：只做唤醒（实际取快照/压缩/发送在投递循环里，绝不占着 pump 的锁）。
+			if c := s.attached; c != nil && c.surface {
+				s.wakeSurface()
+			}
 			s.countOutLocked(n, now)
 			s.lastOut = now
 			s.lastActive = now
 			if s.scan.changed {
 				s.scan.changed = false
 				s.pushStateLocked()
+				// 裸 OSC 9 通知转发（surface 腿）：双语义判别已在 termScan 里做完（9;4 是 progress）。
+				if c := s.attached; c != nil && c.surface {
+					go s.notifyFromScan()
+				}
 			}
 			s.deliverLocked()
 			s.mu.Unlock()
@@ -794,28 +933,137 @@ func (s *termSession) sample(now time.Time, procs []procInfo) {
 		return
 	}
 	fg := foregroundPgid(s.ptmx.Fd())
+	agentChanged := false
+
+	// 身份腿先跑：屏幕证据的短路判据要「agent 已知/是否变化」（任务 4.7）。
+	prevAgent := s.agent
+	ev, scanned := s.screenEvidenceLocked(now, procs, fg)
+	agentChanged = s.agent != prevAgent
+
 	v := classifyAgent(agentProbe{
 		procs:     procs,
 		fgPgid:    fg,
 		prevCPU:   s.prevCPU,
 		outBytes:  s.outBytesLocked(now),
-		prevState: s.state,
+		prevState: s.stateV2,
 		prevQuiet: s.prevQuiet,
 		shellPID:  s.pid,
 		now:       now,
+		screen:    ev,
+		oscStatus: s.scan.OSCStatus(),
 	})
 	if v.cpu >= 0 {
 		s.prevCPU = v.cpu
 	}
 	s.prevQuiet = v.quiet
-	if v.agent != s.agent || v.state != s.state {
-		s.agent, s.state = v.agent, v.state
-		if s.svc.logf != nil {
-			s.svc.logf("term: 会话 %s 状态 %s/%s（fg=%d procs=%d）",
-				s.name, agentName(v.agent), stateName(v.state), fg, len(procs))
-		}
-		s.pushStateLocked()
+	if v.agent != prevAgent {
+		// 前景 agent 变了：旧进程留下的 OSC 证据（progress / 21337 直报 / 标题的判定资格）
+		// 不得参与新进程的判定（term-agent-state「agent 切换清证据」）。
+		s.scan.clearOSCEvidence()
+		agentChanged = true
 	}
+	if scanned {
+		s.lastScanSeq = s.contentSeq
+	}
+
+	// 状态机卫生（任务 4.7）：working→普通 idle 先按住（确认窗），blocked 定期重发。
+	processExited := v.agent == agentUnknown && v.stateV2 == stateV2Idle
+	visibleIdle := ev != nil && ev.visibleIdle
+	visibleBlocker := ev != nil && ev.visibleBlocker
+	if v.stateV2 != s.stateV2 {
+		if s.hygiene.shouldHoldWorkingToIdle(s.stateV2, v.stateV2, visibleIdle, visibleBlocker,
+			agentChanged, processExited, now) {
+			return // 本拍按住不发（暂态空屏被确认窗吸收）
+		}
+	}
+	publish := v.stateV2 != s.stateV2 || v.agent != prevAgent
+	if !publish && s.hygiene.shouldRepublishBlocked(s.stateV2, now) {
+		publish = true // blocked 持续期间定期重发，保持消费方新鲜
+	}
+	if !publish {
+		return
+	}
+	s.agent, s.stateV2 = v.agent, v.stateV2
+	s.state = legacyState(v.stateV2)
+	if s.svc.logf != nil {
+		// 状态行带**依据**（哪条腿 + 规则/版本/来源），规格要求可追溯。
+		s.svc.logf("term: 会话 %s 状态 %s/%s（fg=%d procs=%d 依据=%s）",
+			s.name, agentName(v.agent), stateNameV2(v.stateV2), fg, len(procs), v.evidence)
+	}
+	s.pushStateLocked()
+}
+
+// screenEvidenceLocked 取本拍的屏幕证据（任务 4.6/4.7）。**必须持 mu**。
+//
+// 返回 (证据, 是否真的扫了屏)。以下情况返回 nil：
+//   - 本会话没有 vt（legacy-only）或引擎不可用（HOMEWAY_TERM_DETECT=off）
+//   - 空闲短路命中（状态 idle + agent 已知 + 内容序号未变）⇒ 零开销
+//   - 前台不是 agent（shell/other 的 blocked/idle 判定没有规则依据，交给输出/CPU 腿）
+func (s *termSession) screenEvidenceLocked(now time.Time, procs []procInfo, fgPgid int) (*screenEvidence, bool) {
+	if s.svc.manifests == nil || s.vt == nil || s.vt.Terminal() == nil {
+		return nil, false
+	}
+	agentKnown := s.agent != agentShell && s.agent != agentOther && s.agent != agentUnknown
+	if s.hygiene.shouldSkipScreenScan(s.stateV2, agentKnown, false, false, s.contentSeq, s.lastScanSeq, now) {
+		return nil, false
+	}
+	// 用规则表按**进程名**选 manifest（身份腿的 agent 枚举 → 进程名）。
+	procName := foregroundAgentName(procs, fgPgid, func(n string) bool {
+		_, ok := s.svc.manifests.ForProcess(n)
+		return ok
+	})
+	if procName == "" {
+		return nil, false
+	}
+	comp, ok := s.svc.manifests.ForProcess(procName)
+	if !ok {
+		return nil, false
+	}
+	term := s.vt.Terminal()
+	// 标题走 termScan（单一来源，design D1），progress 也是——不用 vt 的标题查询。
+	res := comp.Evaluate(manifest.Input{
+		// 只喂**一屏**（视口）纯文本：契约是「最近约一屏」，不是整条回滚。
+		Screen:      term.ScreenText(),
+		OSCTitle:    s.scan.TitleEvidence(),
+		OSCProgress: progressPayload(s.scan.Progress()),
+	})
+	ev := &screenEvidence{
+		state:          stateV2FromManifest(res.State),
+		visibleIdle:    res.VisibleIdle,
+		visibleBlocker: res.VisibleBlocker,
+		visibleWorking: res.VisibleWorking,
+		version:        comp.Manifest.Version,
+		source:         string(comp.Manifest.Source),
+		fallback:       res.FallbackReason,
+	}
+	if res.MatchedRule != nil {
+		ev.ruleID = res.MatchedRule.ID
+	}
+	return ev, true
+}
+
+// progressPayload 把 progress 还原成 OSC 9;4 的载荷形态（region osc_progress 的判据是 `^4;0` 这类前缀）。
+func progressPayload(p termProgress) string {
+	if !p.ok {
+		return ""
+	}
+	if p.value < 0 {
+		return "4;" + strconv.Itoa(p.state)
+	}
+	return "4;" + strconv.Itoa(p.state) + ";" + strconv.Itoa(p.value)
+}
+
+// stateV2FromManifest 把 manifest 的状态映射到 stateV2。
+func stateV2FromManifest(st manifest.State) byte {
+	switch st {
+	case manifest.StateWorking:
+		return stateV2Working
+	case manifest.StateBlocked:
+		return stateV2Blocked
+	case manifest.StateIdle:
+		return stateV2Idle
+	}
+	return stateV2Unknown
 }
 
 // ---- 连接处理 ----
@@ -835,6 +1083,18 @@ func (s *termService) ServeConn(c net.Conn) {
 	switch f.op {
 	case opList:
 		_ = client.frame(opList, []byte(s.listJSON()))
+	case opExplain:
+		name, derr := decName(f.payload)
+		if derr != nil {
+			_ = client.frame(opError, encError("bad_name", derr.Error()))
+			return
+		}
+		out, eerr := s.explainJSON(name)
+		if eerr != nil {
+			_ = client.frame(opError, encError(eerr.code, eerr.msg))
+			return
+		}
+		_ = client.frame(opExplain, []byte(out))
 	case opKill:
 		name, derr := decName(f.payload)
 		if derr != nil {
@@ -851,6 +1111,23 @@ func (s *termService) ServeConn(c net.Conn) {
 		if derr != nil {
 			_ = client.frame(opError, encError("bad_hello", derr.Error()))
 			return
+		}
+		// 能力协商（任务 2.1）：HELLO 尾随 capability 块 → 这条腿走 surface 还是 legacy。
+		// 畸形块用**独立错误码**（不得复用「协议版本不匹配」路径，规格要求二者可区分）。
+		caps, present, caperr := decCapability(helloTail(f.payload, name))
+		if caperr != nil {
+			_ = client.frame(opError, encError("bad_capability", caperr.Error()))
+			return
+		}
+		if present && wantsSurface(caps) {
+			if !surfaceCapable() {
+				// 本会话/本构建没有服务端 vt ⇒ 明确报错，让客户端回落 legacy（不是静默降级）。
+				_ = client.frame(opError, encError("surface_unavailable",
+					"本出口没有服务端 vt（HOMEWAY_TERM_VT=off 或平台不支持）"))
+				return
+			}
+			client.surface = true
+			client.leg = newSurfaceLeg()
 		}
 		if !termNameRx.MatchString(name) {
 			_ = client.frame(opError, encError("invalid_name", "会话名只能是 [A-Za-z0-9._-]{1,64}"))
@@ -957,10 +1234,33 @@ func (s *termService) spawnLocked(name string, cols, rows uint16) (*termSession,
 		rows:       rows,
 	}
 	ss.epochs = append(ss.epochs, termEpoch{off: 0, cols: cols, rows: rows})
+	// 服务端 vt：失败只让**本会话**退化为 legacy（surface 客户端 attach 会得到明确错误码），
+	// 既有 legacy 会话与其它会话都不受影响（term-surface-protocol 的降级场景）。
+	if sv, verr := newSessionVT(s.cfg, cols, rows); verr == nil {
+		// 查询应答写回 PTY：程序问终端（DA1/DSR/DECRQM/OSC 10-11），由服务端 vt 按真实模式答。
+		// 不装这条腿，vim/htop/tmux 这类启动探测终端的程序会卡住（legacy 模式下是客户端 vt 在做）。
+		ptmxForSink := ptmx
+		sv.SetResponseSink(func(p []byte) { _, _ = ptmxForSink.Write(p) })
+		// 剪贴板双向（OSC 52）：写 → CLIPBOARD 帧转给客户端；读 → 命中客户端最近上报的缓存。
+		sv.EnableClipboardWrite()
+		sv.EnableClipboardRead()
+		if id := sv.RegistryID(); id != 0 {
+			ss.vtID = id
+			registerVTSession(id, ss)
+		}
+		ss.vt = sv
+	} else if s.logf != nil {
+		s.logf("term: 会话 %s 无服务端 vt（%v）→ 该会话仅 legacy 原始字节模式", name, verr)
+	}
 	if s.logf != nil {
 		s.logf("term: 新建会话 %s（pid=%d %dx%d shell=%s）", name, ss.pid, cols, rows, shell)
 	}
 	go ss.pump()
+	if surfaceCapable() {
+		ss.surfaceWake = make(chan struct{}, 1)
+		ss.clipChan = make(chan string, 8)
+		go ss.surfaceLoop()
+	}
 	return ss, nil
 }
 
@@ -976,6 +1276,7 @@ func (s *termSession) resize(cols, rows uint16) {
 	}
 	_ = pty.Setsize(s.ptmx, &pty.Winsize{Cols: cols, Rows: rows})
 	s.noteSizeLocked(cols, rows)
+	s.vt.Resize(cols, rows) // vt 回滚重排（surface 的 Replace 语义依赖它）
 }
 
 // sentinelRepaint 尺寸哨兵：sentinel → 真实尺寸，两次 SIGWINCH 逼 TUI 重绘当前屏。
@@ -1005,6 +1306,11 @@ func (s *termService) stream(ss *termSession, client *termClient, c net.Conn) {
 		return
 	}
 	ss.sentinelRepaint()
+	if client.surface {
+		// 尺寸哨兵要在**快照下发前**完成（design D3）：哨兵刚发完，投递循环还在合并窗里，
+		// 所以这里唤醒后取到的快照已经是远端按最终尺寸重绘过的屏。
+		ss.wakeSurface()
+	}
 
 	defer func() {
 		ss.mu.Lock()
@@ -1036,7 +1342,32 @@ func (s *termService) stream(ss *termSession, client *termClient, c net.Conn) {
 				_ = client.frame(opError, encError("bad_resize", derr.Error()))
 				continue
 			}
+			if client.surface {
+				// surface：vt 重排 + 哨兵 + 下一帧全量（隐含重建镜像 + 重置 revision）。
+				ss.handleSurfaceResize(client, cols, rows)
+				continue
+			}
 			ss.resize(cols, rows)
+		case opInput:
+			if client.surface {
+				ss.handleInput(client, f.payload)
+			}
+		case opTheme:
+			if client.surface {
+				ss.handleTheme(f.payload)
+			}
+		case opClipboard:
+			if client.surface {
+				ss.handleClipboardAnswer(f.payload)
+			}
+		case opFetchRows:
+			if client.surface {
+				ss.handleFetchRows(client, f.payload)
+			}
+		case opFetchSnapshot:
+			if client.surface {
+				ss.handleFetchSnapshot(client)
+			}
 		case opKill:
 			name, derr := decName(f.payload)
 			if derr != nil {
@@ -1050,10 +1381,75 @@ func (s *termService) stream(ss *termSession, client *termClient, c net.Conn) {
 			}
 		case opList:
 			_ = client.frame(opList, []byte(s.listJSON()))
+		case opExplain:
+			name, derr := decName(f.payload)
+			if derr != nil {
+				_ = client.frame(opError, encError("bad_name", derr.Error()))
+				continue
+			}
+			out, eerr := s.explainJSON(name)
+			if eerr != nil {
+				_ = client.frame(opError, encError(eerr.code, eerr.msg))
+				continue
+			}
+			_ = client.frame(opExplain, []byte(out))
 		default:
 			_ = client.frame(opError, encError("bad_op", fmt.Sprintf("未知帧 0x%02x", f.op)))
 		}
 	}
+}
+
+// cwdLocked 取会话工作目录（vt 从 OSC 7 解析；剥成文件系统路径）。
+// 无 vt（legacy-only）或 shell 未上报时返回空串——列表里该字段缺省不显示。
+func (s *termSession) cwdLocked() string {
+	if s.vt == nil || s.vt.Terminal() == nil {
+		return ""
+	}
+	return vtPwdPath(s.vt.Terminal().Pwd())
+}
+
+// explainJSON 对运行中的会话取实时快照跑一次 explain（任务 4.8 的在线模式）。
+//
+// 依据链与离线模式**同一套代码**（runExplain），所以两边结论一定一致（规格要求
+// 「explain 与列表判定一致」）。
+func (s *termService) explainJSON(name string) (string, *termErr) {
+	if s.manifests == nil {
+		return "", termErrf("detect_off", "本出口的检测被 HOMEWAY_TERM_DETECT=off 关闭")
+	}
+	s.mu.Lock()
+	ss := s.sessions[name]
+	s.mu.Unlock()
+	if ss == nil {
+		return "", termErrf("no_session", "会话 %s 不存在", name)
+	}
+	ss.mu.Lock()
+	defer ss.mu.Unlock()
+	if ss.vt == nil || ss.vt.Terminal() == nil {
+		return "", termErrf("no_vt", "会话 %s 没有服务端 vt（legacy-only），没有屏幕证据可判", name)
+	}
+	screen := ss.vt.Terminal().PlainText()
+	agent := foregroundAgentNameFor(s.manifests, s, ss)
+	if agent == "" {
+		return "", termErrf("no_agent", "会话 %s 前台不是已知 agent，没有规则可跑", name)
+	}
+	out := runExplain(s.manifests, agent, screen, name)
+	b, err := json.Marshal(out)
+	if err != nil {
+		return "", termErrf("marshal", "explain 输出编码失败：%v", err)
+	}
+	return string(b), nil
+}
+
+// foregroundAgentNameFor 取会话前台进程名（explain 的选表依据）。
+func foregroundAgentNameFor(l *manifest.Loader, svc *termService, ss *termSession) string {
+	if ss.ptmx == nil {
+		return ""
+	}
+	procs := readProcs()
+	return foregroundAgentName(procs, foregroundPgid(ss.ptmx.Fd()), func(n string) bool {
+		_, ok := l.ForProcess(n)
+		return ok
+	})
 }
 
 // kill 主动结束会话（SIGHUP → 宽限 → SIGKILL）；由 pump 的收尾负责回 ENDED。
@@ -1104,11 +1500,18 @@ func (s *termService) listJSON() string {
 		LastActiveMs int64  `json:"lastActiveMs"`
 		Attached     bool   `json:"attached"`
 		Agent        string `json:"agent"`
-		State        string `json:"state"`
-		Title        string `json:"title"`
-		Cols         uint16 `json:"cols"`
-		Rows         uint16 `json:"rows"`
-		Pid          int    `json:"pid"`
+		// State 是**兼容字段**：对旧客户端保持既有取值语义（blocked 显示为既有的
+		// 「等待操作」= waiting），绝不出现「未知」回退（任务 4.8 的枚举兼容）。
+		State string `json:"state"`
+		// StateV2 是新枚举（working/blocked/idle/unknown）：旧客户端忽略未知 JSON 字段，
+		// 新客户端读它区分「跑完」与「等批准」。
+		StateV2 string `json:"stateV2"`
+		Title   string `json:"title"`
+		// Cwd 是会话内 shell 经 OSC 7 上报的工作目录（缺省不显示）。
+		Cwd  string `json:"cwd,omitempty"`
+		Cols uint16 `json:"cols"`
+		Rows uint16 `json:"rows"`
+		Pid  int    `json:"pid"`
 	}
 	s.mu.Lock()
 	out := make([]entry, 0, len(s.sessions))
@@ -1123,7 +1526,9 @@ func (s *termService) listJSON() string {
 				Attached:     ss.attached != nil,
 				Agent:        agentName(ss.agent),
 				State:        stateName(ss.state),
+				StateV2:      stateNameV2(ss.stateV2),
 				Title:        ss.scan.title,
+				Cwd:          ss.cwdLocked(),
 				Cols:         ss.cols,
 				Rows:         ss.rows,
 				Pid:          ss.pid,
@@ -1138,3 +1543,7 @@ func (s *termService) listJSON() string {
 	}
 	return string(b)
 }
+
+// vtDefaultScrollbackLines 是服务端 vt 回滚行数上限的默认值（与 pkg/term/vt 保持一致；
+// 这里复制一份常量是为了让不带 vt 的构建（term_vt_off.go）也能引用默认值）。
+const vtDefaultScrollbackLines = 10000

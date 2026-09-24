@@ -27,3 +27,6 @@ func (s *termService) Close()               {}
 
 // FeaturesText Windows 桩：无能力位。
 func FeaturesText() string { return "" }
+
+// VTText Windows 桩：无服务端 vt（与 armv7/CGO_ENABLED=0 变体同款语义）。
+func VTText() string { return "none（本平台不带）" }

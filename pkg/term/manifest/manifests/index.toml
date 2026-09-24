@@ -1,0 +1,122 @@
+# index.toml — 进程名 → manifest 的映射表（我们自己的产物，非上游文件）
+#
+# 口径说明（任务 4.4/4.5）：
+#   - `id` / `path` 两列照 herdr 的**远程目录索引**（https://herdr.dev/agent-detection/index.toml，
+#     2026-09-23 取，22 条）；那个索引只用于「目录 → 文件」，没有进程名。
+#   - `processes` 是我们加的列：出口要在**前台进程名**上直接选 manifest，而 herdr 把这层映射写在
+#     Rust 代码里（src/detect/mod.rs 的 lookup_agent）。这里把它搬成数据，出口改规则不必改 Go。
+#   - 进程名匹配按**可执行名 basename** 做（`/usr/local/bin/codex` → `codex`），带空格的名字
+#     （如 "kimi code"）是给 `npx` 之类 runner 形态准备的，与 herdr 的取值逐条对齐。
+#
+# ⚠️ 与上游的偏差只有这一处（多一列 processes），移植时**不要**顺手改 id/path。
+schema_version = 1
+
+[[agents]]
+id = "amp"
+path = "amp.toml"
+processes = ["amp", "amp-local"]
+
+[[agents]]
+id = "agy"
+path = "antigravity.toml"
+processes = ["agy", "antigravity", "antigravity-cli"]
+
+[[agents]]
+id = "claude"
+path = "claude.toml"
+processes = ["claude", "claude-code"]
+
+[[agents]]
+id = "cline"
+path = "cline.toml"
+processes = ["cline", ".cline"]
+
+[[agents]]
+id = "codex"
+path = "codex.toml"
+processes = ["codex"]
+
+[[agents]]
+id = "cursor"
+path = "cursor.toml"
+processes = ["cursor", "cursor-agent"]
+
+[[agents]]
+id = "devin"
+path = "devin.toml"
+processes = ["devin", "devin-cli", "devin cli"]
+
+[[agents]]
+id = "droid"
+path = "droid.toml"
+processes = ["droid"]
+
+[[agents]]
+id = "gemini"
+path = "gemini.toml"
+processes = ["gemini"]
+
+[[agents]]
+id = "grok"
+path = "grok.toml"
+processes = ["grok", "grok-build"]
+
+[[agents]]
+id = "hermes"
+path = "hermes.toml"
+processes = ["hermes", "hermes-agent"]
+
+[[agents]]
+id = "kilo"
+path = "kilo.toml"
+processes = ["kilo", "kilo-code", "kilo code"]
+
+[[agents]]
+id = "kimi"
+path = "kimi.toml"
+processes = ["kimi", "kimi-code", "kimi code"]
+
+[[agents]]
+id = "kiro"
+path = "kiro.toml"
+processes = ["kiro", "kiro-cli"]
+
+[[agents]]
+id = "letta"
+path = "letta.toml"
+processes = ["letta", "letta-code", "letta code"]
+
+[[agents]]
+id = "maki"
+path = "maki.toml"
+processes = ["maki"]
+
+[[agents]]
+id = "muse"
+path = "muse.toml"
+processes = ["muse", "muse-code", "muse-cli"]
+
+[[agents]]
+id = "opencode"
+path = "opencode.toml"
+processes = ["opencode", "opencode2", "open-code"]
+
+[[agents]]
+id = "pi"
+path = "pi.toml"
+processes = ["pi"]
+
+[[agents]]
+id = "qodercli"
+path = "qodercli.toml"
+processes = ["qodercli", "qoderclicn", "qoder", "qodercn"]
+
+[[agents]]
+id = "qwen"
+path = "qwen.toml"
+processes = ["qwen", "qwen-code", "qwen code"]
+
+[[agents]]
+id = "copilot"
+path = "github-copilot.toml"
+processes = ["copilot", "github-copilot", "ghcs"]
