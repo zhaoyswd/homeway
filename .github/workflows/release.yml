@@ -12,6 +12,8 @@ name: release
 #     armv7 等 zig 0.16.0 std 的 lseek 位宽 bug 修复后回归 cgo（design D7）。
 # vt 静态库不入库（prebuilt/ gitignore）：构建/测试前先跑 tools/build-vt.sh（钉 zig 0.16.0）。
 # 手动试跑：Actions 页点 "Run workflow"（只跑构建+冒烟，不发 Release）。
+# 注意：push main **不触发**本 workflow（触发只有 v* tag 与 workflow_dispatch）——迁移/守卫类
+# 改动（CI 自身、clientcore、surface）后先用 workflow_dispatch 手动把两条腿跑绿再发版（exec-r4 中-3）。
 on:
   push:
     tags: ['v*']
@@ -29,16 +31,18 @@ jobs:
         with:
           go-version-file: go.mod
       # go directive 守卫（core-homeway-merge 2.4）：手机核（clientcore）被 OHOS Go 1.24.5 钉死
-      # （私有构建机 GOTOOLCHAIN=local，directive 高于 1.24 即拒绝构建），而公开 CI 若放行，
-      # 任何上调都会「公开 CI 全绿、只在私有构建机炸」。需要更高 Go 时走 clientcore 嵌套子模块
-      # 预案（openspec core-homeway-merge design D2），不是直接上调本仓 directive。
-      - name: go directive 守卫（>1.24 即红）
+      # （私有构建机 GOTOOLCHAIN=local，go1.24.5 拒绝一切高于自身补丁版的 directive），而公开 CI
+      # 若放行，任何上调都会「公开 CI 全绿、只在私有构建机炸」。需要更高 Go 时走 clientcore 嵌套
+      # 子模块预案（openspec core-homeway-merge design D2），不是直接上调本仓 directive。
+      # 判据为**补丁级**（exec-r4 中-1）：OHOS 构建机 go1.24.5 而非任意 1.24.x——directive 1.24.6+
+      # 同样必须红（go1.24.5 会报 requires go >= 1.24.6 拒绝构建）。
+      - name: go directive 守卫（>1.24.5 即红）
         run: |
           set -euo pipefail
           directive="$(awk '$1=="go"{print $2; exit}' go.mod)"
           case "$directive" in
-            1.24|1.24.*) echo "ok: go directive = ${directive}（≤1.24，OHOS Go 1.24.5 绑定满足）" ;;
-            *) echo "error: go.mod go directive = ${directive} > 1.24——clientcore 被 OHOS Go 1.24.5 硬钉（见上方注释），请走嵌套子模块预案而非上调" >&2; exit 1 ;;
+            1.24|1.24.0|1.24.[1-5]) echo "ok: go directive = ${directive}（≤1.24.5，OHOS 构建机 go1.24.5 绑定满足）" ;;
+            *) echo "error: go.mod go directive = ${directive} > 1.24.5——OHOS 构建机工具链是 go1.24.5（不是任意 1.24.x），clientcore 被硬钉（见上方注释），请走嵌套子模块预案而非上调" >&2; exit 1 ;;
           esac
       # go test 会链接 pkg/term/vt（cgo）⇒ 先产本目标的 libghostty-vt 静态库
       - name: Install zig 0.16.0（tools/build-vt.sh 钉的版本；装到 ~/zig-0.16.0 供其发现）
@@ -56,13 +60,13 @@ jobs:
       # 无 tag 面（出口侧）五门：clientcore 子树全部文件带 //go:build cshared，无 tag 时整包被
       # build constraints 排除，且 CGO_ENABLED=0 下加 tag 也救不了（cgo 文件被整体排除）⇒ 统一
       # 排除式包列表（core-homeway-merge 2.4；clientcore 的测试由 clientcore job 的 cshared 面守）。
-      - run: go vet $(go list ./... | grep -v '/clientcore')
-      - run: go test $(go list ./... | grep -v '/clientcore')
+      - run: go vet $(go list ./... | grep -vE '/clientcore(/|$)')
+      - run: go test $(go list ./... | grep -vE '/clientcore(/|$)')
       # off 变体（CGO_ENABLED=0 / armv7）与 windows 桩也必须一直可编：armv7/windows 的发版产物
       # 就编在这条路径上，别等 build job 才发现烂了（term_vt_off 断编 2026-09-27 的教训）。
-      - run: CGO_ENABLED=0 go build $(go list ./... | grep -v '/clientcore')
-      - run: CGO_ENABLED=0 go vet $(go list ./... | grep -v '/clientcore')
-      - run: GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build $(go list ./... | grep -v '/clientcore')
+      - run: CGO_ENABLED=0 go build $(go list ./... | grep -vE '/clientcore(/|$)')
+      - run: CGO_ENABLED=0 go vet $(go list ./... | grep -vE '/clientcore(/|$)')
+      - run: GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build $(go list ./... | grep -vE '/clientcore(/|$)')
       # surface 宿主测试（core-homeway-merge 2.2）：解码四件套 + golden fixture 的跨语言判据，
       # 纯标准库 + zlib，秒级；golden 样例已提交在同仓 surface/test/golden。
       - name: surface 宿主测试（surface 四件套 + golden fixture）

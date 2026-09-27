@@ -716,7 +716,9 @@ func TestUDPConcurrentSameDstTransit(t *testing.T) {
 		// 单流超时重传**一次**（UDP 客户端的真实语义，QUIC/普通套接字都自带重传）：并发建会话
 		// 窗口里偶发丢一拍应答（本机实测 8 条流并发时；intercept_test.go 原 10s 超时档，与
 		// TestUDPConcurrentDNSRewrite 的 ed9b991 同款 flake），生产路径由应用层重传兜底。
-		// 重传一次不掩盖「整条会话丢流」——那会连重传一起超时，照样失败。
+		// 重传一次不掩盖**整会话丢流**（那会连重传一起超时，照样失败）；单个首拍应答丢失会被
+		// 一次重传吃掉——建会话窗口 pending 重放的产品回归由 intercept.go 生产路径保证
+		// （:98/:368），测试侧留观察窗（exec-r4 低-1）。
 		for attempt := 0; ; attempt++ {
 			pc.SetDeadline(time.Now().Add(5 * time.Second))
 			if attempt > 0 { // 首拍已在上面的并发写入循环里发过；这里只做重传

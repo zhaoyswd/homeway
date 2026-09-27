@@ -406,7 +406,11 @@ func TestSpeedBridgeHostBehavior(t *testing.T) {
 			// 成功路径的整轮收数用的就是它——不要发第二次。
 			_ = speedtest.WriteRequest(bw, speedtest.RoleRecv, 100*time.Millisecond, 150*time.Millisecond)
 			_ = bw.Flush()
-			gerr := speedtest.ReadGreeting(bufio.NewReader(c))
+			// greeting 与后续帧共用同一个 bufio.Reader：ReadGreeting 若自建临时 reader，
+			// 首次 Read 会把 greeting 之后的帧字节一并吸进缓冲，reader 丢弃后字节永久丢失，
+			// 后续读帧从中间开始 ⇒ 帧魔数不符（linux 上概率红，exec-r4 高-1）。
+			br := bufio.NewReader(c)
+			gerr := speedtest.ReadGreeting(br)
 			_ = c.SetDeadline(time.Time{})
 
 			if tc.wantLinkDown {
@@ -420,7 +424,6 @@ func TestSpeedBridgeHostBehavior(t *testing.T) {
 					t.Fatalf("greeting 应透传：%v", gerr)
 				}
 				// 完整收一轮小窗口（协议在真实宿主透传下可用；请求已发过，不再重发）
-				br := bufio.NewReader(c)
 				ctrl := make([]byte, 1024)
 				for {
 					tt, _, n, payload, rerr := speedtest.ReadFrameLoose(br, ctrl)

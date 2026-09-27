@@ -63,7 +63,7 @@ echo "surface-host-test: 编译宿主测试（${CXX}）"
   surface/test/host/surface_selection_test.cpp \
   -o "$OUT_DIR/surface_selection_test"
 
-echo "surface-golden: 运行（样例目录 ${GOLDEN_DIR}）"
+echo "surface-host-test(golden): 运行（样例目录 ${GOLDEN_DIR}）"
 "$OUT_DIR/surface_golden_test" "$GOLDEN_DIR"
 echo "surface-scroll: 运行（回滚模型判据）"
 "$OUT_DIR/surface_scroll_test"
