@@ -589,7 +589,30 @@ func DiscardPayload(br *bufio.Reader, n int) error {
 	return discardPayload(br, n)
 }
 
+// discardPool data 计数路径的丢弃缓冲（64KB）。io.CopyN(io.Discard, …) 受 io.Discard
+// 内部 8KB 读粒度限制，64KB 载荷要 ~8 次 read 系统调用（tunnel-speedtest 下行读端是
+// 管线最慢一环，2026-09-28 整改）；这里整块读（请求长度 ≥ bufio 缓冲 ⇒ 直读旁路、
+// 零缓冲拷贝），热路径每 64KB 帧降到 ~2-3 次。出口收上行（serveSend）同路径受益。
+var discardPool = sync.Pool{
+	New: func() any {
+		b := make([]byte, 64<<10)
+		return &b
+	},
+}
+
 func discardPayload(br *bufio.Reader, n int) error {
-	_, err := io.CopyN(io.Discard, br, int64(n))
-	return err
+	bp := discardPool.Get().(*[]byte)
+	buf := *bp
+	defer discardPool.Put(bp)
+	for n > 0 {
+		c := n
+		if c > len(buf) {
+			c = len(buf)
+		}
+		if _, err := io.ReadFull(br, buf[:c]); err != nil {
+			return err
+		}
+		n -= c
+	}
+	return nil
 }
