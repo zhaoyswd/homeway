@@ -133,8 +133,9 @@ hmw1GiFSJPXiArlX…        ← 复制冒号后面这一整串
 
 ### macOS 安装（Gatekeeper 实情）
 
-darwin 产物带的是 **Go 链接器自动加的 ad-hoc 签名**（`codesign -dv` 显示 `Signature=adhoc`、
-`TeamIdentifier=not set`，`codesign --verify --strict` 通过）；CI 里**没有**额外签名/公证步骤。
+darwin 产物带 **ad-hoc 签名**（`codesign -dv` 显示 `Signature=adhoc`、`TeamIdentifier=not set`，
+`codesign --verify --strict` 通过）：arm64 由链接器自动加，amd64（`-arch` 交叉链不自动签）由 CI
+显式补签；CI 里**没有**开发者身份签名/公证步骤。
 
 - **用 `curl`/`wget` 下载 → 直接能跑**（文件不带隔离标记）。
 - **用浏览器下载（Safari/Chrome）→ 文件带 `com.apple.quarantine`，macOS 直接 SIGKILL**

@@ -113,6 +113,12 @@ jobs:
           # 构建口径核验：带 vt 的目标必须真带 CGO，纯 Go 目标必须不带（防静默回落）
           want=$([ "${{ matrix.vt }}" = "cgo" ] && echo 1 || echo 0)
           go version -m "dist/homeway${EXT}" | grep -q "CGO_ENABLED=${want}"
+          # darwin ad-hoc 签名：只有**本机架构**的链接产物 ld 才自动签，-arch 交叉链出的
+          # x86_64 是未签名（2026-09-27 CI 实测）；不签在 Apple Silicon/Rosetta 上直接被杀
+          #（OS_REASON_CODESIGNING 前科）。必须在打包**前**签，归档里才是签好的。
+          if [ "${GOOS}" = "darwin" ]; then
+            codesign --force --sign - "dist/homeway"
+          fi
           # 自有许可与第三方声明一起打进归档：BSD-3/MIT/Apache-2.0 都要求二进制分发时随附声明
           cp LICENSE THIRD-PARTY-NOTICES.txt dist/
           cd dist
@@ -126,7 +132,7 @@ jobs:
             sha256sum "${BASE}.tar.gz" > "${BASE}.tar.gz.sha256"
           fi
           ls -l
-      - name: darwin ad-hoc 签名核验（D7；真机冒烟在发版后于主力 Mac 手动做）
+      - name: darwin ad-hoc 签名核验（真机冒烟在发版后于主力 Mac 手动做）
         if: matrix.goos == 'darwin'
         run: codesign -dv dist/homeway 2>&1 | grep -q 'Signature=adhoc'
       - uses: actions/upload-artifact@v4
