@@ -169,9 +169,42 @@ go test ./...
 自有代码：**MIT License**（见 [`LICENSE`](LICENSE)）。
 
 二进制里静态链接了第三方组件（Go runtime 与标准库、golang.org/x/{crypto,net,sys,time}、
-wireguard-go、wireguard/wgctrl、gVisor + google/btree、creack/pty）——它们的版权行与许可全文在
+wireguard-go、wireguard/wgctrl、gVisor + google/btree、creack/pty、BurntSushi/toml，以及
+vendored 的 libghostty-vt 与 herdr 检测规则 manifests）——它们的版权行与许可全文在
 [`THIRD-PARTY-NOTICES.txt`](THIRD-PARTY-NOTICES.txt)，Release 归档包与容器镜像里各带一份
 （BSD-3 / MIT / Apache-2.0 都要求以二进制形式分发时随附声明，只写组件名不满足）。
 
 该文件由 `tools/gen-third-party-notices.sh` 从各依赖自己的 LICENSE 原文拼装（清单口径 =
-`go list -deps ./cmd/homeway`）：**改动依赖后重跑一次**，CI 的 `--check` 门禁会在它过期时挡下发布。
+发版矩阵逐平台 `go list -deps` 的并集，再加两个 vendored 组件）：**改动依赖后重跑一次**，
+CI 的 `--check` 门禁会在它过期时挡下发布。
+
+## 构建与发版
+
+二进制是**单文件**（exit / relay / term 按子命令区分）。构建配方在 `.github/workflows/release.yml`
+（openspec term-vt-backend D7），本地复现口径：
+
+**1. 装 zig 0.16.0**（vendor 基线钉死的版本，`tools/build-vt.sh` 只认它）：解压到 `~/zig-0.16.0/`，
+或用 `ZIG=<路径>` 指定。首次产库需要联网（zig 自动拉取包依赖）。
+
+**2. 产 vt 静态库**（`prebuilt/` 不入库，克隆后必跑）：
+
+```bash
+./tools/build-vt.sh                # 四个目标全产
+./tools/build-vt.sh darwin-arm64   # 单目标（本地开发）
+```
+
+**3. 编译**（发版矩阵六个目标；带 vt = darwin/linux × amd64/arm64，需 CGO=1）：
+
+| 目标 | 配方 |
+|---|---|
+| 本机（mac/linux，x86_64/arm64） | `go build -o homeway ./cmd/homeway`（CGO_ENABLED=1） |
+| linux 交叉（musl 静态） | `CGO_ENABLED=1 CC="zig cc -target x86_64-linux-musl" GOOS=linux GOARCH=amd64 go build -ldflags "-extldflags -static" …` |
+| darwin 交叉 amd64（在 arm Mac 上） | `CGO_ENABLED=1 CC="clang -arch x86_64" GOARCH=amd64 go build …` |
+| linux/armv7、windows | `CGO_ENABLED=0` 纯 Go——无 vt 的 legacy 变体（构建标签隔离，见 `pkg/term/term_vt_off.go`） |
+
+⚠️ **不要用 zig cc 交叉 darwin**：zig 的 macOS libc 桩没有 libresolv，Go 的 net 包链接必炸
+（2026-09-27 实测）；darwin 产物在 macOS 上编。
+
+发版 = 推 tag（`git tag v0.x.y && git push origin v0.x.y`），CI 自动出六个平台的 Release 归档：
+linux 产物 musl 静态（smoke 核验 statically linked）；darwin 产物带 ad-hoc 签名（CI 内
+`codesign` 核验），真机冒烟在发版后于主力 Mac 手动 gate（Mac 是主力出口）。

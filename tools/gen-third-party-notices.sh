@@ -26,6 +26,7 @@ RELEASE_TARGETS="darwin/arm64 darwin/amd64 linux/amd64 linux/arm64 linux/arm win
 # 模块 → "<节 id>|<展示名>|<许可名>|<版权行兜底：仅当 LICENSE 里没有 Copyright 行时用>"
 meta() {
   case "$1" in
+    github.com/BurntSushi/toml)        echo "toml|BurntSushi/toml（检测规则 manifest 解析）|MIT|" ;;
     github.com/creack/pty)             echo "pty|creack/pty（出口侧 pty，终端会话用）|MIT|" ;;
     github.com/google/btree)           echo "btree|google/btree（B 树，gVisor 的依赖）|Apache-2.0|Copyright 2014 Google Inc." ;;
     golang.org/x/crypto)               echo "xgo|golang.org/x/crypto|BSD-3-Clause|" ;;
@@ -109,7 +110,7 @@ sort -u "$LIST" | awk '{plat[$1" "$2]=plat[$1" "$2]" "$3} END{for (k in plat) pr
     fi
     IFS='|' read -r id name lic fallback <<< "$m"
     dir="$GOMODCACHE/$(cache_dir "$path")@$ver"
-    file=$(ls "$dir"/LICENSE* 2>/dev/null | head -1 || true)
+    file=$(ls "$dir"/LICENSE* "$dir"/COPYING* 2>/dev/null | head -1 || true)
     if [ -z "$file" ]; then
       echo "  ${path} ${ver}（模块缓存里没有 LICENSE 文件：${dir}）" >> "$GEN/missing"
       continue
@@ -126,6 +127,16 @@ $(cat "$GEN/missing")
 EOF
   exit 1
 fi
+
+# vendored 组件（不是 go module，go list 看不见；term-vt-backend 任务 6.2）：
+# - libghostty-vt：vt 静态库链接进 4 个 cgo 目标（darwin×2 / linux×2；armv7、windows 无 vt）。
+# - herdr 检测规则 manifests：go:embed 进所有带 term 服务的平台（windows 是桩，无 term）。
+# herdr 的 Apache-2.0 原文取 gVisor 模块缓存的 LICENSE（规范文本同源；许可分节按 md5 去重，
+# 两者自动共用一个分节——与 x/ 系列共用 ===== go ===== 同款机制）。
+gv_lic=$(ls "$GOMODCACHE"/gvisor.dev/gvisor@*/LICENSE 2>/dev/null | head -1)
+[ -n "$gv_lic" ] || { echo "error: 模块缓存里找不到 gVisor LICENSE（Apache-2.0 原文的本地来源）" >&2; exit 1; }
+collect "libghostty-vt" "libghostty-vt（vendored：会话屏态仿真器；上游 44f2a44 + herdr 补丁 0002/0004/0005/0006）" "MIT" "1.3.2-44f2a44+patches" "$ROOT/third_party/libghostty-vt/LICENSE" "" "darwin linux（仅 cgo 目标）"
+collect "herdr-manifests" "herdr 检测规则 manifests（src/detect/manifests 移植，携署名）" "Apache-2.0" "44f2a44" "$gv_lic" "（github.com/herdrdev/herdr）" "darwin linux"
 
 {
   cat <<'EOF'

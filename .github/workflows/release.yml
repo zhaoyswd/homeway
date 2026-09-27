@@ -1,7 +1,16 @@
 name: release
 
 # 发版 = 推 tag：`git tag v0.x.y && git push origin v0.x.y`
-# 纯 Go 静态交叉编译（CGO_ENABLED=0），单 ubuntu runner 出全部平台产物；linux/amd64 上冒烟后再发 Release。
+# 构建配方（openspec term-vt-backend D7）：终端的服务端 vt 依赖 vendored libghostty-vt（C 库），
+# 带 vt 的目标必须 CGO_ENABLED=1——
+#   - darwin×2：macos runner，Apple clang 原生（amd64 用 -arch 交叉）。不用 zig cc 交叉 darwin：
+#     zig 的 macOS libc 桩没有 libresolv，Go 的 net 包链接必炸（2026-09-27 实测）。产物自带
+#     ad-hoc 签名（CI 内 codesign 核验）；真机冒烟在发版后于主力 Mac 手动 gate（Mac 是主力出口）。
+#   - linux×2：ubuntu runner，zig cc musl 静态交叉（spike 已在阿里云真机验证；smoke 核验
+#     statically linked）。
+#   - armv7 / windows：无 vt 纯 Go 变体（CGO_ENABLED=0，构建标签隔离见 pkg/term/term_vt_off.go）；
+#     armv7 等 zig 0.16.0 std 的 lseek 位宽 bug 修复后回归 cgo（design D7）。
+# vt 静态库不入库（prebuilt/ gitignore）：构建/测试前先跑 tools/build-vt.sh（钉 zig 0.16.0）。
 # 手动试跑：Actions 页点 "Run workflow"（只跑构建+冒烟，不发 Release）。
 on:
   push:
@@ -19,46 +28,91 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
+      # go test 会链接 pkg/term/vt（cgo）⇒ 先产本目标的 libghostty-vt 静态库
+      - name: Install zig 0.16.0（tools/build-vt.sh 钉的版本；装到 ~/zig-0.16.0 供其发现）
+        run: |
+          set -euo pipefail
+          arch="$(uname -m | sed 's/^arm64$/aarch64/')"
+          os="$(uname -s | sed 's/^Darwin$/macos/;s/^Linux$/linux/')"
+          url="$(curl -fsSL https://ziglang.org/download/index.json | jq -r --arg k "${arch}-${os}" '."0.16.0"[$k].tarball')"
+          echo "zig tarball: ${url}"
+          curl -fsSL "$url" -o /tmp/zig.tar.xz
+          mkdir -p "$HOME/zig-0.16.0"
+          tar -xJf /tmp/zig.tar.xz -C "$HOME/zig-0.16.0" --strip-components=1
+          "$HOME/zig-0.16.0/zig" version | grep -qx '0.16.0'
+      - run: bash tools/build-vt.sh linux-amd64
       - run: go vet ./...
       - run: go test ./...
+      # off 变体（CGO_ENABLED=0 / armv7）与 windows 桩也必须一直可编：armv7/windows 的发版产物
+      # 就编在这条路径上，别等 build job 才发现烂了（term_vt_off 断编 2026-09-27 的教训）。
+      - run: CGO_ENABLED=0 go build ./...
+      - run: CGO_ENABLED=0 go vet ./...
+      - run: GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build ./...
       # 声明文件必须与当前依赖一致（改了依赖没重跑生成脚本 ⇒ 别发版）
       - run: bash tools/gen-third-party-notices.sh --check
 
   build:
     needs: test
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
         include:
-          - { goos: darwin,  goarch: arm64 }
-          - { goos: darwin,  goarch: amd64 }
-          - { goos: linux,   goarch: arm64 }
-          - { goos: linux,   goarch: amd64 }
-          - { goos: linux,   goarch: arm,   goarm: '7' }
-          - { goos: windows, goarch: amd64 }
+          # ---- 带 vt 的 cgo 目标（D7）----
+          - { os: macos-latest,  goos: darwin,  goarch: arm64, vt: cgo }
+          - { os: macos-latest,  goos: darwin,  goarch: amd64, vt: cgo, cc: "clang -arch x86_64" }
+          - { os: ubuntu-latest, goos: linux,   goarch: amd64, vt: cgo, zig: x86_64-linux-musl, static: "yes" }
+          - { os: ubuntu-latest, goos: linux,   goarch: arm64, vt: cgo, zig: aarch64-linux-musl, static: "yes" }
+          # ---- 无 vt 的纯 Go 变体（D7）----
+          - { os: ubuntu-latest, goos: linux,   goarch: arm, goarm: "7", vt: none }
+          - { os: ubuntu-latest, goos: windows, goarch: amd64, vt: none }
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
+      - name: Install zig 0.16.0
+        if: matrix.vt == 'cgo'
+        run: |
+          set -euo pipefail
+          arch="$(uname -m | sed 's/^arm64$/aarch64/')"
+          os="$(uname -s | sed 's/^Darwin$/macos/;s/^Linux$/linux/')"
+          url="$(curl -fsSL https://ziglang.org/download/index.json | jq -r --arg k "${arch}-${os}" '."0.16.0"[$k].tarball')"
+          echo "zig tarball: ${url}"
+          curl -fsSL "$url" -o /tmp/zig.tar.xz
+          mkdir -p "$HOME/zig-0.16.0"
+          tar -xJf /tmp/zig.tar.xz -C "$HOME/zig-0.16.0" --strip-components=1
+          "$HOME/zig-0.16.0/zig" version | grep -qx '0.16.0'
       - name: Build
         env:
           GOOS: ${{ matrix.goos }}
           GOARCH: ${{ matrix.goarch }}
           GOARM: ${{ matrix.goarm }}
-          CGO_ENABLED: 0
+          CGO_ENABLED: ${{ matrix.vt == 'cgo' && '1' || '0' }}
+          CC: ${{ matrix.zig != '' && format('zig cc -target {0}', matrix.zig) || matrix.cc }}
         run: |
           set -euo pipefail
           VERSION="${GITHUB_REF##*/}"          # tag 名；手动试跑时是分支名
           LDFLAGS="-s -w -X main.version=${VERSION}"
+          # linux 走 musl 静态：解压即跑，不挑发行版 libc（D7）
+          if [ "${{ matrix.static }}" = "yes" ]; then
+            LDFLAGS="${LDFLAGS} -extldflags -static"
+          fi
+          # 带 vt 的目标先产 libghostty-vt 静态库（prebuilt/ 不入库）；zig cc 需要 zig 在 PATH
+          if [ "${{ matrix.vt }}" = "cgo" ]; then
+            bash tools/build-vt.sh "${GOOS}-${GOARCH}"
+            export PATH="$HOME/zig-0.16.0:$PATH"
+          fi
           # windows 的 -o 不会自动补 .exe，显式带上（否则打包时找不到文件）
           EXT=""
           [ "${GOOS}" = "windows" ] && EXT=".exe"
-          # 单二进制（exit / relay 按子命令区分）。产物直接放包根：解出来就是可执行文件，
+          # 单二进制（exit / relay / term 按子命令区分）。产物直接放包根：解出来就是可执行文件，
           # 用户不用先 cd 进子目录。
           mkdir -p dist
           go build -trimpath -ldflags "${LDFLAGS}" -o "dist/homeway${EXT}" ./cmd/homeway
+          # 构建口径核验：带 vt 的目标必须真带 CGO，纯 Go 目标必须不带（防静默回落）
+          want=$([ "${{ matrix.vt }}" = "cgo" ] && echo 1 || echo 0)
+          go version -m "dist/homeway${EXT}" | grep -q "CGO_ENABLED=${want}"
           # 自有许可与第三方声明一起打进归档：BSD-3/MIT/Apache-2.0 都要求二进制分发时随附声明
           cp LICENSE THIRD-PARTY-NOTICES.txt dist/
           cd dist
@@ -72,6 +126,9 @@ jobs:
             sha256sum "${BASE}.tar.gz" > "${BASE}.tar.gz.sha256"
           fi
           ls -l
+      - name: darwin ad-hoc 签名核验（D7；真机冒烟在发版后于主力 Mac 手动做）
+        if: matrix.goos == 'darwin'
+        run: codesign -dv dist/homeway 2>&1 | grep -q 'Signature=adhoc'
       - uses: actions/upload-artifact@v4
         if: matrix.goos != 'windows'
         with:
@@ -83,6 +140,7 @@ jobs:
         with:
           name: homeway-windows-zip
           path: dist/*.zip*
+          if-no-files-found: error
 
   smoke:
     needs: build
@@ -95,6 +153,8 @@ jobs:
         run: |
           set -euo pipefail
           tar xzf homeway_*_linux_amd64.tar.gz
+          # musl 静态是 linux 产物的发版口径（D7）：不挑发行版 libc，解压即跑
+          file ./homeway | grep -q 'statically linked'
           ./homeway --version | grep -q '^homeway '
           ./homeway relay --version | grep -q '^homeway '
           ./homeway --help >/dev/null 2>&1 || true
