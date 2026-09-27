@@ -1,4 +1,4 @@
-//go:build !windows
+//go:build !windows && (darwin || linux) && (amd64 || arm64) && cgo
 
 // term_surface_golden_test.go — 任务 2.8 的**跨仓 golden fixture**（生成半边）。
 //
@@ -277,9 +277,13 @@ func buildGoldenSamples(t *testing.T, fixture string) (snapFrames, diffFrames []
 	}
 	enc := vtEncodeRows(dirtyNow)
 	out.diffScroll = term.Scrollbar()
+	diffModes, _, _ := surfaceModesOf(term.Modes())
 	diffBody := encDiffBody(diffBody{
 		Geometry: surfaceGeometry{Cols: cols, Rows: rows, Revision: out.rev},
 		Cursor:   out.diffCursor,
+		Modes:    diffModes,
+		Scroll: scrollbar{Total: out.diffScroll.Total, Offset: out.diffScroll.Offset,
+			Len: uint16(out.diffScroll.Len)},
 		Rows:     enc,
 		RowCount: uint16(len(dirtyNow)),
 	})

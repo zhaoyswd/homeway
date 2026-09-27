@@ -224,16 +224,30 @@ func EncodeFocus(gained bool) []byte {
 // EncodePaste 把一段文本按**当前括号粘贴模式**包装（文本事件带粘贴语义，design D4）。
 // bracketed = true 时包 \x1b[200~…\x1b[201~（粘贴内容里的 ESC 原样保留，与终端惯例一致）。
 func EncodePaste(text string, bracketed bool) []byte {
-	if text == "" {
+	return EncodePastePart(text, bracketed, true, true)
+}
+
+// EncodePastePart 编一段**可能被分帧**的粘贴文本（2026-09-24 评审整改，P0-3）。
+//
+// 大文本（>64KiB 帧长上限）必须拆成多帧上行，而括号粘贴的 200~/201~ **只能在整个序列的
+// 首尾各一次**——拆成多个完整块会让程序把一次粘贴当成多次（每次都可能触发自动提交）。
+// 所以开/闭由调用方按「本片是不是首片/末片」控制：open = 首片、close = 末片。
+// bracketed=false 时 open/close 都被忽略（非括号粘贴模式直接原样写）。
+func EncodePastePart(text string, bracketed, open, close bool) []byte {
+	if text == "" && !open && !close {
 		return nil
 	}
 	if !bracketed {
 		return []byte(text)
 	}
 	out := make([]byte, 0, len(text)+12)
-	out = append(out, "\x1b[200~"...)
+	if open {
+		out = append(out, "\x1b[200~"...)
+	}
 	out = append(out, text...)
-	out = append(out, "\x1b[201~"...)
+	if close {
+		out = append(out, "\x1b[201~"...)
+	}
 	return out
 }
 

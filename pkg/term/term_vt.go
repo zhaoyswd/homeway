@@ -24,6 +24,15 @@ var errVTUnavailable = errors.New("term: 服务端 vt 不可用")
 // sessionVT 一个会话的服务端 vt（薄包装：让 service.go 不依赖构建标签）。
 type sessionVT struct {
 	t *vt.Terminal
+	// base/hasBase 是**上一次成功下发**（快照或差分）的屏态基线。
+	//
+	// 为什么需要它（2026-09-24 评审整改，P0）：光标移动、鼠标上报模式开关（?1000h）、
+	// DECTCEM 光标显隐、DECCKM、括号粘贴这些**都不产生脏行**——只看「有没有脏行」会
+	// 一个字节都不发（真机后果：方向键/行内编辑光标不动；触摸路由按旧模式位判，
+	// TUI 开鼠标上报后手势一直错到下一次行变化）。有了基线，本拍与上一拍比光标/模式位/
+	// 回滚条，任一变化就发帧（差分体已带这三样）。
+	base    SurfaceState
+	hasBase bool
 }
 
 // vtGloballyDisabled 报告 `HOMEWAY_TERM_VT=off`（全局逃生口：整服务退化为 legacy）。
@@ -113,12 +122,39 @@ func (s *sessionVT) SetTheme(fg, bg [3]uint8) {
 	s.t.SetDefaultColors(fg, bg)
 }
 
-// Terminal 暴露底层 vt 给 surface/检测路径（任务 2.x/4.x 用）；无 vt 时返回 nil。
+// Terminal 暴露底层 vt；无 vt 时返回 nil。
+//
+// 只允许 **cgo 侧**代码（测试）用：off 变体里 pkg/term/vt 没有 Terminal 类型，共享代码
+// 点名它就编不过——生产路径一律走下面的 facade（ScreenText/Pwd/PlainText/…）。
 func (s *sessionVT) Terminal() *vt.Terminal {
 	if s == nil {
 		return nil
 	}
 	return s.t
+}
+
+// ScreenText 当前视口纯文本（检测引擎的一屏输入；无 vt 返回空串）。
+func (s *sessionVT) ScreenText() string {
+	if !s.Available() {
+		return ""
+	}
+	return s.t.ScreenText()
+}
+
+// Pwd vt 侧解析到的 shell 工作目录原始值（OSC 7；配 vtPwdPath 剥成路径）。
+func (s *sessionVT) Pwd() string {
+	if !s.Available() {
+		return ""
+	}
+	return s.t.Pwd()
+}
+
+// PlainText 整屏纯文本（explain 的屏幕证据；无 vt 返回空串）。
+func (s *sessionVT) PlainText() string {
+	if !s.Available() {
+		return ""
+	}
+	return s.t.PlainText()
 }
 
 // vtPwdPath 把 vt 的 OSC 7 原始值剥成文件系统路径（无 vt 的构建里恒为空）。
@@ -161,27 +197,6 @@ func (s *sessionVT) SurfaceMirror(cols, rows uint16, viewports int) []byte {
 	return vt.EncodeGrid(cols, uint16(len(rs)), rs)
 }
 
-// surfaceCursorOf 把 vt 的光标快照打成 wire 形态。
-//
-// 单独抽出来是为了**单一映射**：会话下发（SurfaceCursor）与 golden 样例生成都用它，
-// 否则「样例里的光标」与「线上发出去的光标」可能各按一套 flag 位映射，golden 就白做了。
-func surfaceCursorOf(c vt.Cursor) surfaceCursor {
-	out := surfaceCursor{X: c.X, Y: c.Y, Shape: uint8(c.Shape)}
-	if c.Visible {
-		out.Flags |= cursorFlagVisible
-	}
-	if c.Blinking {
-		out.Flags |= cursorFlagBlinking
-	}
-	if c.WideTail {
-		out.Flags |= cursorFlagWideTail
-	}
-	if c.Password {
-		out.Flags |= cursorFlagPassword
-	}
-	return out
-}
-
 // SurfaceCursor 光标快照（含形状与可见性）。差分帧（任务 3.10）与快照帧共用它。
 func (s *sessionVT) SurfaceCursor() surfaceCursor {
 	if !s.Available() {
@@ -190,12 +205,9 @@ func (s *sessionVT) SurfaceCursor() surfaceCursor {
 	return surfaceCursorOf(s.t.Cursor())
 }
 
-// SurfaceModes 模式位（legacy termMode* 布局，客户端已有这套位）+ kitty/modifyOtherKeys 扩展位。
-func (s *sessionVT) SurfaceModes() (modes uint32, kitty, misc uint8) {
-	if !s.Available() {
-		return 0, 0, 0
-	}
-	m := s.t.Modes()
+// surfaceModesOf 把 vt 的模式位打成 wire 形态（**单一映射**：会话下发与 golden 样例共用，
+// 与 surfaceCursorOf 同款理由——两处各按一套位映射的话 golden 就白做了）。
+func surfaceModesOf(m vt.Modes) (modes uint32, kitty, misc uint8) {
 	if m.CursorKeysApp {
 		modes |= termModeDECCKM
 	}
@@ -226,6 +238,14 @@ func (s *sessionVT) SurfaceModes() (modes uint32, kitty, misc uint8) {
 	return modes, m.KittyFlags, misc
 }
 
+// SurfaceModes 模式位（legacy termMode* 布局，客户端已有这套位）+ kitty/modifyOtherKeys 扩展位。
+func (s *sessionVT) SurfaceModes() (modes uint32, kitty, misc uint8) {
+	if !s.Available() {
+		return 0, 0, 0
+	}
+	return surfaceModesOf(s.t.Modes())
+}
+
 // SurfaceAltScreen 报告当前是否备用屏（差分降级与 FETCH-ROWS 抑制都要它）。
 func (s *sessionVT) SurfaceAltScreen() bool {
 	if !s.Available() {
@@ -234,31 +254,72 @@ func (s *sessionVT) SurfaceAltScreen() bool {
 	return s.t.Modes().Screen == vt.ScreenAlternate
 }
 
-// SurfaceDiff 取本拍的脏行 patch。full=true 表示「别发差分，发全量」（全局脏/降级）。
-//
-// **不消费脏状态**：调用方在差分成功下发后才调 SurfaceClean（锁内取快照、锁外编码发送，
-// 中途失败则下一拍重来——宁可重复下发，不能半新半旧，design D2 的背压规则同理）。
-func (s *sessionVT) SurfaceDiff(cols, rows uint16) (encoded []byte, count uint16, full bool) {
+// SurfaceStateNow 读当前屏态（锁内调用；不消费脏状态）。
+func (s *sessionVT) SurfaceStateNow() SurfaceState {
 	if !s.Available() {
-		return nil, 0, true
+		return SurfaceState{}
 	}
-	if d := s.t.Update(); d == vt.DirtyFull {
-		return nil, 0, true
+	modes, _, _ := s.SurfaceModes()
+	sb := s.t.Scrollbar()
+	return SurfaceState{
+		Cursor: s.t.Cursor(),
+		Modes:  modes,
+		Total:  sb.Total,
+		Offset: sb.Offset,
+		Len:    uint16(sb.Len),
+		Alt:    modes&termModeAltScreen != 0,
 	}
+}
+
+// CommitSurfaceBaseline 在一次快照/差分**成功下发后**记基线（调用方锁内调用）。
+func (s *sessionVT) CommitSurfaceBaseline(st SurfaceState) {
+	s.base, s.hasBase = st, true
+}
+
+// ResetSurfaceBaseline 清基线（换腿/新 attach 时用：新腿从全量快照开始）。
+func (s *sessionVT) ResetSurfaceBaseline() {
+	s.base, s.hasBase = SurfaceState{}, false
+}
+
+// SurfaceUpdate 取本拍要发的差分（锁内调用）。
+//
+// 返回：
+//   - enc/count：脏行 patch（**count 可以为 0**：只有光标/模式位/回滚条变了——差分体里
+//     这三样都带，所以「空行 patch」是一帧合法且有意义的更新）；
+//   - st：本拍屏态（发送成功后调 CommitSurfaceBaseline(st)）；
+//   - needFull：必须走全量（首次基线缺失 / 备用屏进出——离开备用屏要重建主屏镜像）；
+//   - changed：本拍有没有要发的东西（false = 整拍跳过）。
+//
+// **不消费脏状态**：调用方在帧成功下发后才调 SurfaceClean（锁内取快照、锁外编码发送，
+// 中途失败则下一拍重来——宁可重复下发，不能半新半旧，design D2 的背压规则同理）。
+//
+// ⚠️ 2026-09-24 整改（评审 P0）：旧实现把 `Update()==DirtyFull` 直接判为「发全量」，而
+// **滚动（最常见的输出形态）正是 DirtyFull**（整屏行都移动了）⇒ 每行输出都发带 10 视口
+// 镜像的全量快照（实测 ≈1.4KB/行 vs ANSI ≈20B/行）。现在 DirtyFull 也走行差分（全视口行，
+// 不带镜像）——全量只留给「语义上真的需要重建」的场合（首次/备用屏进出/裁剪/背压/客户端请求）。
+// 同理删掉了「差分体积 ≥ 整屏编码 ⇒ 降级」的旧自限：那条判据拿**不含镜像的视口编码**当基准，
+// 而实际全量还要加镜像 ⇒ 视口稀疏时把几乎所有更新都误判成「差分更贵」。
+func (s *sessionVT) SurfaceUpdate() (encoded []byte, count uint16, st SurfaceState, needFull, changed bool) {
+	if !s.Available() {
+		return nil, 0, SurfaceState{}, true, true
+	}
+	s.t.Update() // 把 render state 拉到最新；DirtyFull 时 DirtyRows 会给出全部视口行
 	dirty := s.t.DirtyRows()
-	if len(dirty) == 0 {
-		return nil, 0, false
+	st = s.SurfaceStateNow()
+	if !s.hasBase {
+		return nil, 0, st, true, true
 	}
-	// 差分自限：条数超过整屏、或编码体积不小于整屏 ⇒ 直接降级全量（协议自己兜底）。
-	if len(dirty) >= int(rows) {
-		return nil, 0, true
+	if st.Alt != s.base.Alt {
+		// 备用屏进出：整屏语义变了（且「离开备用屏」要求重建主屏镜像）⇒ 全量。
+		return nil, 0, st, true, true
 	}
-	enc := vt.EncodeRows(dirty)
-	grid := s.t.Rows()
-	if len(grid) > 0 && len(enc) >= len(vt.EncodeGrid(cols, rows, grid)) {
-		return nil, 0, true
+	cursorChanged := st.Cursor != s.base.Cursor
+	modesChanged := st.Modes != s.base.Modes
+	scrollChanged := st.Total != s.base.Total || st.Offset != s.base.Offset || st.Len != s.base.Len
+	if len(dirty) == 0 && !cursorChanged && !modesChanged && !scrollChanged {
+		return nil, 0, st, false, false
 	}
-	return enc, uint16(len(dirty)), false
+	return vt.EncodeRows(dirty), uint16(len(dirty)), st, false, true
 }
 
 // SurfaceClean 在差分/快照**成功下发后**消费脏标记。
@@ -312,7 +373,11 @@ func (s *sessionVT) EncodeInput(ev inputEvent) []byte {
 			Text:   ev.Text,
 		})
 	case inputKindText:
-		return vt.EncodePaste(ev.Text, ev.Paste && s.bracketedPaste())
+		if !ev.Paste || !s.bracketedPaste() {
+			return []byte(ev.Text)
+		}
+		// 括号粘贴：开/闭标记只在整段粘贴的首/末片各一次（跨帧分片见 textPaste*Bit 的注释）。
+		return vt.EncodePastePart(ev.Text, true, !ev.PasteCont, !ev.PasteMore)
 	case inputKindMouse:
 		return s.t.EncodeMouse(vt.MouseEvent{
 			Action: vt.MouseAction(ev.Action),

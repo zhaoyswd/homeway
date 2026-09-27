@@ -26,11 +26,15 @@ func (s *termSession) wakeSurface() {
 	}
 }
 
-// surfaceLoop 投递循环（每会话一条；会话结束时随 stopCh 退出）。
+// surfaceLoop 投递循环（每会话一条；会话结束或服务关闭时退出）。
 func (s *termSession) surfaceLoop() {
 	for {
 		select {
 		case <-s.svc.stopCh:
+			return
+		case <-s.surfaceStop:
+			// 会话结束（finish）：收工。旧实现只 select 服务级 stopCh ⇒ 每建删一个会话就
+			// 漏一个常驻 goroutine（7.4 的「20 会话建删无泄漏」会抓到）。
 			return
 		case text := <-s.clipChan:
 			// 剪贴板写（OSC 52）：立即下发，不参与脏行合并窗。
@@ -39,6 +43,20 @@ func (s *termSession) surfaceLoop() {
 			ok := c != nil && c.surface && c.leg != nil
 			s.mu.Unlock()
 			if ok && !c.leg.sendClipboard(c, encClipboard(clipKindWrite, text)) {
+				s.mu.Lock()
+				if s.attached == c {
+					s.detachLocked(c)
+				}
+				s.mu.Unlock()
+			}
+			continue
+		case payload := <-s.stateChan:
+			// 状态帧（S→C）：在**锁外**写 socket（见 pushStateLocked 的锁纪律注释）。
+			s.mu.Lock()
+			c := s.attached
+			ok := c != nil && c.surface && c.leg != nil
+			s.mu.Unlock()
+			if ok && !c.leg.sendState(c, payload) {
 				s.mu.Lock()
 				if s.attached == c {
 					s.detachLocked(c)
@@ -58,6 +76,8 @@ func (s *termSession) surfaceLoop() {
 				goto flush
 			case <-s.svc.stopCh:
 				return
+			case <-s.surfaceStop:
+				return
 			}
 		}
 	flush:
@@ -73,8 +93,8 @@ func (s *termSession) flushSurface() {
 		s.mu.Unlock()
 		return
 	}
-	vt := s.vt
-	if vt == nil || !vt.Available() {
+	sv := s.vt
+	if sv == nil || !sv.Available() {
 		s.mu.Unlock()
 		return
 	}
@@ -83,7 +103,7 @@ func (s *termSession) flushSurface() {
 
 	// 回滚裁剪检测（任务 3.3）：total 变小 ⇒ 绝对行号滑动 ⇒ 本拍强制全量重建镜像与基线。
 	// 放在 takeSnapshotFlag 之前，这样它置的 needSnapshot 会被本拍消费。
-	if c.leg.noteScrollbar(vt.SurfaceScrollbar().Total) {
+	if c.leg.noteScrollbar(sv.SurfaceScrollbar().Total) {
 		// 判据行：回滚裁剪（page 粒度）导致行号滑动 ⇒ 重建基线（客户端缓存随之作废）。
 		if s.svc.logf != nil {
 			s.svc.logf("term: 会话 %s 回滚裁剪 ⇒ 强制全量重建（绝对行号已滑动）", s.name)
@@ -95,30 +115,36 @@ func (s *termSession) flushSurface() {
 	var (
 		op      byte
 		payload []byte
+		state   SurfaceState
 		skip    bool
 	)
 	if forceSnap {
-		op, payload = opSnapshot, s.buildSnapshotLocked(vt, cols, rows, title)
+		op = opSnapshot
+		payload, state = s.buildSnapshotLocked(sv, cols, rows, title)
 	} else {
-		enc, count, full := vt.SurfaceDiff(cols, rows)
+		enc, count, st, needFull, changed := sv.SurfaceUpdate()
 		switch {
-		case count == 0 && !full:
-			skip = true // 没有脏行（可能是别人先消费了脏状态）
-		case full:
+		case !changed:
+			// 整拍无变化（无脏行、光标/模式位/回滚条都没动）：跳过。
+			skip = true
+		case needFull:
 			c.leg.mu.Lock()
 			c.leg.stats.degrades++
 			c.leg.mu.Unlock()
-			op, payload = opSnapshot, s.buildSnapshotLocked(vt, cols, rows, title)
+			op = opSnapshot
+			payload, state = s.buildSnapshotLocked(sv, cols, rows, title)
 		default:
+			// count 可以为 0：只有光标/模式位/回滚条变了——差分体带这三样，是一帧合法更新。
 			op = opSurfaceDiff
 			payload = encDiffBody(diffBody{
 				Geometry: surfaceGeometry{Cols: cols, Rows: rows, Revision: c.leg.currentRevision()},
-				// 光标取**同一拍**（SurfaceDiff 已经把 render state 更新过了，这里读的就是本帧的
-				// 光标；顺序反了会拿到上一拍的位置）。
-				Cursor:   vt.SurfaceCursor(),
+				Cursor:   surfaceCursorOf(st.Cursor),
+				Modes:    st.Modes,
+				Scroll:   scrollbar{Total: st.Total, Offset: st.Offset, Len: st.Len},
 				Rows:     enc,
 				RowCount: count,
 			})
+			state = st
 		}
 	}
 	s.mu.Unlock()
@@ -142,41 +168,45 @@ func (s *termSession) flushSurface() {
 		s.mu.Unlock()
 		return
 	}
-	// 成功下发后才消费脏标记：中途失败则下一拍重来（宁可重复，不能半新半旧）。
+	// 成功下发后才消费脏标记并推进屏态基线：中途失败则下一拍重来（宁可重复，不能半新半旧）。
+	// 基线用**本拍取快照时的 state**（不是现在重读——那之间可能又来了输出，会把没发过的
+	// 变化记成已发）。
 	s.mu.Lock()
-	vt.SurfaceClean()
+	sv.SurfaceClean()
+	sv.CommitSurfaceBaseline(state)
 	s.mu.Unlock()
 }
 
 // buildSnapshotLocked 组一次全量快照的体（**必须持会话锁**）。
 //
 // 推进 revision：客户端据此判定「快照之后收到的差分是新一代」（SNAPSHOT 隐含重置 revision 基线）。
-func (s *termSession) buildSnapshotLocked(vt *sessionVT, cols, rows uint16, title string) []byte {
+// 同时返回本拍屏态（发送成功后由调用方 CommitSurfaceBaseline）。
+func (s *termSession) buildSnapshotLocked(sv *sessionVT, cols, rows uint16, title string) ([]byte, SurfaceState) {
 	rev := s.attached.leg.nextRevision()
-	modes, kitty, misc := vt.SurfaceModes()
-	sb := vt.SurfaceScrollbar()
+	st := sv.SurfaceStateNow()
+	modes, kitty, misc := sv.SurfaceModes()
 	body := snapshotBody{
 		Geometry: surfaceGeometry{Cols: cols, Rows: rows, Revision: rev},
-		Cursor:   vt.SurfaceCursor(),
+		Cursor:   surfaceCursorOf(st.Cursor),
 		Modes:    modes,
 		Kitty:    kitty,
 		Misc:     misc,
 		Title:    title,
-		Scroll:   scrollbar{Total: sb.Total, Offset: sb.Offset, Len: uint16(sb.Len)},
-		Grid:     vt.SurfaceGrid(cols, rows),
+		Scroll:   scrollbar{Total: st.Total, Offset: st.Offset, Len: st.Len},
+		Grid:     sv.SurfaceGrid(cols, rows),
 		// 镜像窗口：主屏才有意义（备用屏返回空，design D3 要求抑制）。
-		Mirror: vt.SurfaceMirror(cols, rows, mirrorViewports),
+		Mirror: sv.SurfaceMirror(cols, rows, mirrorViewports),
 	}
 	// 记下这一代的 total：回滚裁剪（page 粒度，探针实测 4000 行时 total 从 2001 掉到 1719）
 	// 会让**绝对行号滑动** ⇒ 客户端缓存的镜像/拉取行全部失锚。判据用「total 变小」——
 	// total 只在裁剪时减少（写入时只增或持平），比盯页边界可靠。
 	if s.attached != nil && s.attached.leg != nil {
 		s.attached.leg.mu.Lock()
-		s.attached.leg.lastSnapTotal = sb.Total
+		s.attached.leg.lastSnapTotal = st.Total
 		s.attached.leg.hasSnapTotal = true
 		s.attached.leg.mu.Unlock()
 	}
-	return encSnapshotBody(body)
+	return encSnapshotBody(body), st
 }
 
 // handleFetchRows 处理 FETCH-ROWS 请求（任务 2.6）：锁内取行、锁外下发。
@@ -347,7 +377,8 @@ func sessionByVTID(id uintptr) *termSession {
 //
 // 为什么需要路由：上游的剪贴板写回调是进程级的（回调只带 userdata = 我们注册的整数 id），
 // 所以这里维护 id → 会话的映射，收到内容后转成 CLIPBOARD 帧发给该会话的 surface 腿。
-// （无 vt 的构建里 clipboardRouter 是空实现，见 term_vt_off.go 的同名声明。）
+// （两个构建变体共用这份定义：无 vt 的构建里 installClipboardForwarder 是空操作 ⇒
+// 注册表为空，回调不会被触发。）
 // clipboardReadRouter 是「程序读剪贴板」的同步应答（任务 2.7 的读方向）。
 //
 // ⚠️ 这个回调在 vt.Write 内部**同步**触发，而 pump 调 vt.Write 时正持着会话锁

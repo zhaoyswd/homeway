@@ -14,7 +14,7 @@ func termDisabledByEnv() bool { return false }
 type termService struct{}
 
 // New 构造（Windows 桩）。
-func New(logf Logf) *termService { return &termService{} }
+func New(logf Logf, stateDir string) *termService { return &termService{} }
 
 // Disabled 报告环境变量是否显式关闭了终端服务（桩平台恒 false）。
 func Disabled() bool { return false }

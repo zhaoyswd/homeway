@@ -31,6 +31,8 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io"
+
+	"github.com/zhaoyswd/homeway/pkg/term/vt"
 )
 
 const (
@@ -44,10 +46,14 @@ const (
 	// （真机对照：legacy 跟随、surface 不动），且「IME 候选窗锚定随光标帧」没有可用输入。
 	// v3（2026-09-24，任务 3.3）：SNAPSHOT 在 misc 之后补了**回滚条**（total/offset/len，18 字节）。
 	// 原因：客户端要把镜像窗口/按需拉取锚到绝对行号空间、要算「距缓存顶多远」触发预取。
+	// v4（2026-09-24，评审整改）：SURFACE-DIFF 补**模式位**（u32）与**回滚条**（18 字节），
+	// 并把「空行 patch」合法化。原因：① 光标/模式位变化不产生脏行（旧实现整拍不发 ⇒ 方向键
+	// 光标不动、触摸路由按旧模式判）；② 输出追加时回滚条必须每拍更新（客户端据此跟住绝对
+	// 行号并检测裁剪）。布局变了就升版本（教训见下）。
 	// **布局变了就必须升版本**——实测教训：先只改了字段没升版本，结果「出口二进制是旧布局、
 	// 版本号一样」的错位让客户端静默错解（快照网格截断刷屏），版本门本来能当场拦住。
 	// ⇒ 两端必须同升（本 change 的部署口径本就是出口+App 一起走，见 tasks 6.3）。
-	surfaceVer byte = 3
+	surfaceVer byte = 4
 
 	// fragChunk 是**单个分片**里 gzip 数据的字节上限（评审 H2 定的 60KiB）。
 	// 加 1 字节分片头后 61441 < 65535（u16 帧长上限），留足余量。
@@ -217,6 +223,41 @@ const (
 	miscModifyOtherKeys = 1 << 0
 )
 
+// SurfaceState 是一拍屏态摘要（光标 + 模式位 + 回滚条）——surface 帧里「不属于任何一行」
+// 但每拍都可能变的那部分状态。差分与快照共用它。
+//
+// 放在共享面（而不是只有 cgo 变体才编的 term_vt.go）：无 vt 的构建（term_vt_off.go）的
+// facade 同签名返回零值，共享代码才不必带构建标签。
+type SurfaceState struct {
+	Cursor vt.Cursor
+	Modes  uint32
+	Total  uint64
+	Offset uint64
+	Len    uint16
+	Alt    bool
+}
+
+// surfaceCursorOf 把 vt 的光标快照打成 wire 形态。
+//
+// 单独抽出来是为了**单一映射**：会话下发（SurfaceCursor）与 golden 样例生成都用它，
+// 否则「样例里的光标」与「线上发出去的光标」可能各按一套 flag 位映射，golden 就白做了。
+func surfaceCursorOf(c vt.Cursor) surfaceCursor {
+	out := surfaceCursor{X: c.X, Y: c.Y, Shape: uint8(c.Shape)}
+	if c.Visible {
+		out.Flags |= cursorFlagVisible
+	}
+	if c.Blinking {
+		out.Flags |= cursorFlagBlinking
+	}
+	if c.WideTail {
+		out.Flags |= cursorFlagWideTail
+	}
+	if c.Password {
+		out.Flags |= cursorFlagPassword
+	}
+	return out
+}
+
 // encSnapshotBody 组 SNAPSHOT 体。
 func encSnapshotBody(s snapshotBody) []byte {
 	out := make([]byte, 0, 32+len(s.Title)+len(s.Grid)+len(s.Mirror))
@@ -313,22 +354,29 @@ func decSnapshotBody(p []byte) (snapshotBody, error) {
 	return s, nil
 }
 
-// diffBody 是 SURFACE-DIFF 解压后的体：脏行 patch + revision + **本拍光标**。
+// diffBody 是 SURFACE-DIFF 解压后的体：脏行 patch + revision + **本拍光标/模式位/回滚条**。
 //
 // 只发脏行（同一套行编码），客户端按 Y 覆盖到自己的网格上；revision 断档由客户端请求全量。
 //
 // 光标为什么在差分里（surfaceVer 2，任务 3.10）：光标是**每拍都可能变**的状态——打字、方向键、
 // TUI 输入框都会移动它，而它不体现在任何一行 cell 的内容里（行内编辑时行内容可能完全不变）。
 // 只随快照发的后果是「光标停在 attach 那一刻」；6 字节换每帧正确，远比让客户端去猜便宜。
+//
+// 模式位/回滚条为什么也在差分里（surfaceVer 4，2026-09-24 评审整改）：模式位（鼠标上报/
+// 备用屏/括号粘贴/DECCKM）同样不产生脏行，而客户端要用它做触摸路由；回滚条每拍都在变
+// （输出追加 ⇒ total/offset 增长），客户端靠它跟住绝对行号、算预取触发、检测裁剪。
+// **RowCount 可以为 0**：那是「只有状态变了、没有行变」的合法更新（旧实现把它整拍丢掉）。
 type diffBody struct {
 	Geometry surfaceGeometry
 	Cursor   surfaceCursor // 本拍视口光标（与快照同一套字段/取值口径）
-	Rows     []byte        // 行编码（[y:2][格流…] 的序列）
+	Modes    uint32        // 本拍模式位（与快照同一套位）
+	Scroll   scrollbar     // 本拍回滚条（与快照同一套字段）
+	Rows     []byte        // 行编码（[y:2][格流…] 的序列；RowCount=0 时为空）
 	RowCount uint16
 }
 
 func encDiffBody(d diffBody) []byte {
-	out := make([]byte, 0, 22+len(d.Rows))
+	out := make([]byte, 0, 44+len(d.Rows))
 	out = append(out, surfaceVer)
 	out = appendU32(out, d.Geometry.Revision)
 	out = appendU16(out, d.Geometry.Cols)
@@ -338,6 +386,11 @@ func encDiffBody(d diffBody) []byte {
 	out = appendU16(out, d.Cursor.X)
 	out = appendU16(out, d.Cursor.Y)
 	out = append(out, d.Cursor.Flags, d.Cursor.Shape)
+	// 模式位 + 回滚条（v4）：位序与快照体一致（modes → total/offset/len）。
+	out = appendU32(out, d.Modes)
+	out = appendU64(out, d.Scroll.Total)
+	out = appendU64(out, d.Scroll.Offset)
+	out = appendU16(out, d.Scroll.Len)
 	out = append(out, d.Rows...)
 	return out
 }
@@ -371,6 +424,18 @@ func decDiffBody(p []byte) (diffBody, error) {
 		return d, err
 	}
 	if d.Cursor.Shape, err = r.u8(); err != nil {
+		return d, err
+	}
+	if d.Modes, err = r.u32(); err != nil {
+		return d, err
+	}
+	if d.Scroll.Total, err = r.u64(); err != nil {
+		return d, err
+	}
+	if d.Scroll.Offset, err = r.u64(); err != nil {
+		return d, err
+	}
+	if d.Scroll.Len, err = r.u16(); err != nil {
 		return d, err
 	}
 	d.Rows = r.rest()
@@ -580,8 +645,15 @@ const (
 	inputKindFocus byte = 3 // 焦点：[gained:1]
 )
 
-// textPasteBit 是文本事件的粘贴语义位（括号粘贴按模式包装，design D4）。
-const textPasteBit byte = 1 << 0
+// 文本事件的语义位（design D4；跨帧分片的粘贴见 v4 整改）。
+const (
+	// textPasteBit：本片是粘贴内容（按括号粘贴模式包装）。
+	textPasteBit byte = 1 << 0
+	// textPasteMoreBit：后面还有同一段粘贴的后续片（**闭合标记推迟到末片**）。
+	textPasteMoreBit byte = 1 << 1
+	// textPasteContBit：本片是同一段粘贴的后续片（**开标记已在首片发过**）。
+	textPasteContBit byte = 1 << 2
+)
 
 // inputEvent 一次抽象输入（wire 形态；服务端按 vt 真实模式编码）。
 type inputEvent struct {
@@ -591,9 +663,14 @@ type inputEvent struct {
 	Action byte
 	Text   string
 	Paste  bool
-	Button byte
-	X, Y   uint16
-	Gained bool
+	// PasteMore/PasteCont：粘贴被拆成多帧时的续接语义（见 textPaste*Bit 的注释）。
+	// 大文本（>64KiB 帧长上限）必须分帧，而括号粘贴的 200~/201~ **只能在整个序列首尾各一次**
+	// ——拆成多个完整块会让程序把一次粘贴当成多次。
+	PasteMore bool
+	PasteCont bool
+	Button    byte
+	X, Y      uint16
+	Gained    bool
 }
 
 func encInputEvent(ev inputEvent) []byte {
@@ -610,7 +687,13 @@ func encInputEvent(ev inputEvent) []byte {
 	case inputKindText:
 		var flags byte
 		if ev.Paste {
-			flags = textPasteBit
+			flags |= textPasteBit
+		}
+		if ev.PasteMore {
+			flags |= textPasteMoreBit
+		}
+		if ev.PasteCont {
+			flags |= textPasteContBit
 		}
 		out = append(out, flags)
 		out = appendU16(out, uint16(len(ev.Text)))
@@ -663,6 +746,8 @@ func decInputEvent(p []byte) (inputEvent, error) {
 			return ev, err
 		}
 		ev.Paste = flags&textPasteBit != 0
+		ev.PasteMore = flags&textPasteMoreBit != 0
+		ev.PasteCont = flags&textPasteContBit != 0
 		n, err := r.u16()
 		if err != nil {
 			return ev, err

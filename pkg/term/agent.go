@@ -75,6 +75,9 @@ type screenEvidence struct {
 	visibleIdle    bool
 	visibleBlocker bool
 	visibleWorking bool
+	// skipUpdate：命中的规则带 skip_state_update（历史查看器/选择器类覆盖屏）——
+	// 屏幕不反映 agent 真实状态 ⇒ 状态冻结（见 sample 的 freeze 分支）。
+	skipUpdate bool
 	// 依据（进状态行日志：规则 id / manifest 版本 / 来源）——规格要求「状态行日志带规则/版本/来源依据」。
 	ruleID   string
 	version  string

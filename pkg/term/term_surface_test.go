@@ -1,4 +1,4 @@
-//go:build !windows
+//go:build !windows && (darwin || linux) && (amd64 || arm64) && cgo
 
 // term_surface_test.go — surface 协议的服务端判据（任务 2.1–2.7、2.10）。
 //
@@ -10,7 +10,10 @@ package term
 
 import (
 	"encoding/binary"
+	"io"
+	"net"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -520,21 +523,25 @@ func TestSurfaceFetchSnapshotAdvancesRevision(t *testing.T) {
 	t.Fatal("没收到新的全量快照")
 }
 
-// 整屏变化 ⇒ 自动降级为全量（差分自限）。
-func TestSurfaceDiffDegradesOnFullScreenChange(t *testing.T) {
+// 整屏变化（滚动/清屏 + 满屏输出）**不再**降级为全量——它走「全视口行差分」。
+//
+// 2026-09-24 评审整改（P0）：旧实现把 `Update()==DirtyFull` 直接判为「发全量」，而滚动
+// （最常见的输出形态）正是 DirtyFull ⇒ 每行输出都发带 10 视口镜像的全量快照（实测
+// ≈1.4KB/行 vs ANSI ≈20B/行）。全量只留给「语义上真的需要重建」的场合。
+func TestSurfaceFullScreenChangeSendsDiff(t *testing.T) {
 	svc, ln := startTestTermService(t)
 	defer svc.Close()
 	defer ln.Close()
 	c, _ := attachSurface(t, ln, "sf9", 80, 24)
 	defer c.Close()
 
-	// 用一条清屏 + 满屏输出的命令制造整屏变化。
+	// 用一条清屏 + 满屏输出的命令制造整屏变化（必然滚动 ⇒ DirtyFull）。
 	writeTermFrame(t, c, opInput, encInputEvent(inputEvent{
 		Kind: inputKindText, Text: "clear; for i in $(seq 1 30); do echo FILL-$i; done\r",
 	}))
 	deadline := time.Now().Add(5 * time.Second)
-	sawSnapshot := false
-	for time.Now().Before(deadline) {
+	sawDiff := false
+	for time.Now().Before(deadline) && !sawDiff {
 		_ = c.SetReadDeadline(time.Now().Add(2 * time.Second))
 		f, err := readTermFrame(c)
 		if err != nil {
@@ -542,23 +549,304 @@ func TestSurfaceDiffDegradesOnFullScreenChange(t *testing.T) {
 		}
 		switch f.op {
 		case opSnapshot:
+			t.Fatal("整屏变化不该降级为全量（滚动走全视口行差分）——这条正是 P0 整改的判据")
+		case opSurfaceDiff:
 			body := surfaceReaderFrom(t, c, f)
-			if _, err := decSnapshotBody(body); err != nil {
+			d, err := decDiffBody(body)
+			if err != nil {
 				t.Fatal(err)
 			}
-			if f2 := readTermFrameT(t, c); f2.op != opSnapshotDone {
-				t.Fatalf("期望 SNAPSHOT-DONE，收到 0x%02x", f2.op)
+			if d.RowCount == 0 {
+				t.Fatal("整屏变化的差分不该是空行集（rowCount=0）")
 			}
-			sawSnapshot = true
-		case opSurfaceDiff, opState, opNotify:
+			// v4：差分必须带模式位与回滚条（客户端据此更新触摸路由与绝对行号）。
+			if d.Scroll.Total == 0 {
+				t.Error("差分体应带回滚条（v4）")
+			}
+			sawDiff = true
+		case opState, opNotify:
 		}
-		if sawSnapshot {
+	}
+	if !sawDiff {
+		t.Fatal("整屏变化后没收到差分")
+	}
+}
+
+// 光标移动/模式位变化（无脏行）必须发帧——差分判定的**单测**（P0-1）。
+//
+// 为什么是单测而不是端到端：端到端要经 shell 回显，命令行的回显本身会产生脏行，
+// 「空行集差分」会被行变化掩盖（实测：回显与 printf 的输出落在同一合并窗里）。
+// 判定逻辑全在 SurfaceUpdate 里，这里直接钉死它。
+func TestSurfaceUpdateSendsCursorAndModeChanges(t *testing.T) {
+	sv, err := newSessionVT(termConfig{scrollbackLines: 1000}, 20, 4)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sv.Close()
+	sv.Write([]byte("hello"))
+
+	// 建立基线（等价于一次全量快照成功下发）：先把脏状态消费掉再记屏态。
+	sv.SurfaceUpdate()
+	sv.SurfaceClean()
+	base := sv.SurfaceStateNow()
+	sv.CommitSurfaceBaseline(base)
+
+	// ① 无变化 ⇒ 整拍跳过（不能空转刷帧）。
+	if _, _, _, needFull, changed := sv.SurfaceUpdate(); needFull || changed {
+		t.Fatalf("无变化应整拍跳过（needFull=%v changed=%v）", needFull, changed)
+	}
+
+	// ② 只移动光标 ⇒ changed、不降级、**空行集**（count=0）。
+	sv.Write([]byte("\x1b[2D"))
+	enc, count, st2, needFull, changed := sv.SurfaceUpdate()
+	if !changed || needFull {
+		t.Fatalf("只移光标应发帧且不降级（changed=%v needFull=%v）", changed, needFull)
+	}
+	if count != 0 || len(enc) != 0 {
+		t.Fatalf("只移光标应是空行集（count=%d enc=%d）", count, len(enc))
+	}
+	if st2.Cursor == base.Cursor {
+		t.Error("本拍光标应与基线不同（否则判据没生效）")
+	}
+	sv.CommitSurfaceBaseline(st2)
+
+	// ③ 只开鼠标上报 ⇒ changed 且模式位带 mouse1000（触摸路由靠它）。
+	sv.Write([]byte("\x1b[?1000h"))
+	_, _, st3, needFull3, changed3 := sv.SurfaceUpdate()
+	if !changed3 || needFull3 {
+		t.Fatalf("模式位变化应发帧且不降级（changed=%v needFull=%v）", changed3, needFull3)
+	}
+	if st3.Modes&termModeMouse1000 == 0 {
+		t.Errorf("模式位应带 mouse1000，实际 %#x", st3.Modes)
+	}
+	sv.CommitSurfaceBaseline(st3)
+
+	// ④ 滚动输出（DirtyFull）⇒ 走差分（不降级），且带脏行。
+	sv.Write([]byte("a\r\nb\r\nc\r\n"))
+	enc4, count4, _, needFull4, changed4 := sv.SurfaceUpdate()
+	if !changed4 || needFull4 {
+		t.Fatalf("滚动输出应走差分（changed=%v needFull=%v）——P0 整改的核心判据", changed4, needFull4)
+	}
+	if count4 == 0 || len(enc4) == 0 {
+		t.Fatal("滚动输出应有脏行（全视口行差分）")
+	}
+
+	// ⑤ 备用屏进出 ⇒ 必须全量（离开时要重建主屏镜像）。
+	sv.Write([]byte("\x1b[?1049h"))
+	if _, _, _, needFull5, _ := sv.SurfaceUpdate(); !needFull5 {
+		t.Error("进备用屏应要求全量")
+	}
+}
+
+// 备用屏进出**自己**触发全量（不是靠客户端 FETCH-SNAPSHOT 去要）。
+//
+// 与 TestSurfaceSnapshotAltScreenNoMirror 的分工：那条验「备用屏快照不带镜像」，
+// 这条验「模式位变化（进备用屏）本身就是全量触发条件」——离开备用屏时要靠这次全量
+// 重建主屏镜像（design D3 的 M4）。
+//
+// 用专门的 shell（读一行输入就进备用屏）：测试默认 shell 是 `cat`，敲进去的文本只会被回显、
+// 不会被解释成转义序列。
+func TestSurfaceAltScreenSwitchSendsSnapshot(t *testing.T) {
+	svc, ln := startTestTermServiceShell(t, "read -r _l; printf '\\033[?1049h'; sleep 3")
+	defer svc.Close()
+	defer ln.Close()
+	c, _ := attachSurface(t, ln, "sf15", 80, 24)
+	defer c.Close()
+
+	writeTermFrame(t, c, opInput, encInputEvent(inputEvent{Kind: inputKindText, Text: "go\r"}))
+	deadline := time.Now().Add(4 * time.Second)
+	for time.Now().Before(deadline) {
+		_ = c.SetReadDeadline(time.Now().Add(2 * time.Second))
+		f, err := readTermFrame(c)
+		if err != nil {
 			break
 		}
+		if f.op != opSnapshot {
+			continue // 回显产生的差分等中间帧
+		}
+		body := surfaceReaderFrom(t, c, f)
+		s, err := decSnapshotBody(body)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if f2 := readTermFrameT(t, c); f2.op != opSnapshotDone {
+			t.Fatalf("期望 SNAPSHOT-DONE，收到 0x%02x", f2.op)
+		}
+		if s.Modes&termModeAltScreen == 0 {
+			t.Fatalf("这次快照还没进备用屏（模式位 %#x）——进备用屏应自己触发全量", s.Modes)
+		}
+		return
 	}
-	if !sawSnapshot {
-		t.Error("整屏变化应触发全量降级（差分自限）")
+	t.Fatal("进备用屏没有自动触发全量快照")
+}
+
+// 空闲期不该出现**空行集**差分（guard 住「空转刷帧」）。
+//
+// 注意：测试 shell 自带 200ms ticker（有真实输出 ⇒ 合法差分），所以这里不判「完全没帧」，
+// 只判「没有 count=0 的差分」——空行集差分只该由光标/模式位/回滚条变化触发。
+func TestSurfaceIdleSendsNoEmptyDiff(t *testing.T) {
+	svc, ln := startTestTermService(t)
+	defer svc.Close()
+	defer ln.Close()
+	c, _ := attachSurface(t, ln, "sf16", 80, 24)
+	defer c.Close()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		_ = c.SetReadDeadline(time.Now().Add(300 * time.Millisecond))
+		f, err := readTermFrame(c)
+		if err != nil {
+			continue // 读超时/瞬时错误：还没帧
+		}
+		if f.op == opSurfaceDiff {
+			body := surfaceReaderFrom(t, c, f)
+			d, derr := decDiffBody(body)
+			if derr != nil {
+				t.Fatal(derr)
+			}
+			if d.RowCount == 0 {
+				t.Fatal("空闲期出现了空行集差分（应整拍跳过）")
+			}
+		}
 	}
+}
+
+// 分片组不被打断（P1-5）：并发 sendFrames 时，一个帧组必须连续到达。
+func TestSurfaceFragmentsNotInterleaved(t *testing.T) {
+	conn := newSlowFirstWriteConn()
+	cl := &termClient{conn: conn}
+	leg := newSurfaceLeg()
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+	// A：一个「多片」快照组（第一片写出时让出，模拟慢链路）。
+	go func() {
+		defer wg.Done()
+		leg.sendFrames(cl, opSnapshot, [][]byte{{1, 'a'}, {1, 'b'}, {0, 'c'}})
+	}()
+	// B：另一条腿的帧（FETCH 应答/通知/状态都走这条路）。
+	go func() {
+		defer wg.Done()
+		leg.sendFrames(cl, opFetchRows, [][]byte{{0, 'f'}})
+	}()
+	wg.Wait()
+
+	ops := conn.ops(t)
+	// A 的三片必须连续（0d 0d 0d），B 只有一片 ⇒ 合法形态只有两种：0d0d0d10 或 100d0d0d。
+	joined := string(ops)
+	if joined != "\x0d\x0d\x0d\x10" && joined != "\x10\x0d\x0d\x0d" {
+		t.Fatalf("分片组被其它帧打断：ops=%x（应为一组连续）", ops)
+	}
+}
+
+// slowFirstWriteConn 第一次写时阻塞 20ms（把「写慢」的窗口撑开），并把每帧的 op 记下来。
+type slowFirstWriteConn struct {
+	mu     sync.Mutex
+	buf    []byte
+	writes int
+}
+
+func newSlowFirstWriteConn() *slowFirstWriteConn { return &slowFirstWriteConn{} }
+
+func (c *slowFirstWriteConn) Write(p []byte) (int, error) {
+	c.mu.Lock()
+	c.writes++
+	first := c.writes == 1
+	c.mu.Unlock()
+	if first {
+		time.Sleep(20 * time.Millisecond)
+	}
+	c.mu.Lock()
+	c.buf = append(c.buf, p...)
+	c.mu.Unlock()
+	return len(p), nil
+}
+
+// ops 把写下的字节流解成帧 op 序列（只读 op，跳过载荷）。
+func (c *slowFirstWriteConn) ops(t *testing.T) []byte {
+	t.Helper()
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	var out []byte
+	for off := 0; off+3 <= len(c.buf); {
+		out = append(out, c.buf[off])
+		n := int(c.buf[off+1]) | int(c.buf[off+2])<<8
+		off += 3 + n
+	}
+	return out
+}
+
+func (c *slowFirstWriteConn) Read([]byte) (int, error)         { return 0, io.EOF }
+func (c *slowFirstWriteConn) Close() error                     { return nil }
+func (c *slowFirstWriteConn) LocalAddr() net.Addr              { return nil }
+func (c *slowFirstWriteConn) RemoteAddr() net.Addr             { return nil }
+func (c *slowFirstWriteConn) SetDeadline(time.Time) error      { return nil }
+func (c *slowFirstWriteConn) SetReadDeadline(time.Time) error  { return nil }
+func (c *slowFirstWriteConn) SetWriteDeadline(time.Time) error { return nil }
+
+// 大文本粘贴分帧（P0-3）：括号粘贴的 200~/201~ **只能在整个序列首尾各一次**。
+//
+// 客户端把 >64KiB 的粘贴拆成多帧（u16 帧长上限），若每帧都自己包一对 200~/201~，程序会把
+// 一次粘贴当成多次（每次都可能触发自动提交）。所以首片带 more、末片带 cont，服务端据此
+// 把开/闭各只发一次。
+func TestSurfacePasteFragmentsWrapOnce(t *testing.T) {
+	sv, err := newSessionVT(termConfig{scrollbackLines: 1000}, 20, 4)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sv.Close()
+	sv.Write([]byte("\x1b[?2004h")) // 开括号粘贴模式
+
+	var out []byte
+	out = append(out, sv.EncodeInput(inputEvent{
+		Kind: inputKindText, Text: "AAA", Paste: true, PasteMore: true})...)
+	out = append(out, sv.EncodeInput(inputEvent{
+		Kind: inputKindText, Text: "BBB", Paste: true, PasteMore: true, PasteCont: true})...)
+	out = append(out, sv.EncodeInput(inputEvent{
+		Kind: inputKindText, Text: "CCC", Paste: true, PasteCont: true})...)
+	if want := "\x1b[200~AAABBBCCC\x1b[201~"; string(out) != want {
+		t.Fatalf("分帧粘贴的包装应只在首尾各一次：\n得到 %q\n期望 %q", out, want)
+	}
+
+	// 单帧粘贴（未拆）行为不变：开+文+闭。
+	if got := sv.EncodeInput(inputEvent{Kind: inputKindText, Text: "X", Paste: true}); string(got) != "\x1b[200~X\x1b[201~" {
+		t.Fatalf("单帧粘贴包装变了：%q", got)
+	}
+	// 非粘贴文本原样。
+	if got := sv.EncodeInput(inputEvent{Kind: inputKindText, Text: "Y"}); string(got) != "Y" {
+		t.Fatalf("非粘贴文本不该被包装：%q", got)
+	}
+	// 未开括号粘贴模式：粘贴文本也原样（不包装）。
+	sv2, err := newSessionVT(termConfig{scrollbackLines: 1000}, 20, 4)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sv2.Close()
+	sv2.Write([]byte("hi"))
+	if got := sv2.EncodeInput(inputEvent{Kind: inputKindText, Text: "Z", Paste: true}); string(got) != "Z" {
+		t.Fatalf("未开括号粘贴模式时不该包装：%q", got)
+	}
+}
+
+// 会话结束后 surfaceLoop 必须退出（P1-12：否则每建删一个会话漏一个 goroutine）。
+func TestSurfaceLoopExitsOnSessionFinish(t *testing.T) {
+	stop := make(chan struct{})
+	sessionStop := make(chan struct{})
+	ended := make(chan struct{})
+	s := &termSession{
+		svc:         &termService{stopCh: stop},
+		surfaceWake: make(chan struct{}, 1),
+		clipChan:    make(chan string, 8),
+		stateChan:   make(chan []byte, 1),
+		surfaceStop: sessionStop,
+	}
+	go func() { s.surfaceLoop(); close(ended) }()
+	close(sessionStop) // finish() 的收工动作
+	select {
+	case <-ended:
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("会话收工后 surfaceLoop 仍在跑（goroutine 泄漏）")
+	}
+	close(stop)
 }
 
 // ---- 2.6 RESIZE 与 FETCH-ROWS ----

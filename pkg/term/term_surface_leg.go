@@ -56,6 +56,14 @@ type surfaceStats struct {
 // surfaceLeg 一条 surface 腿的投递状态。
 type surfaceLeg struct {
 	mu sync.Mutex
+	// sendMu 保证**一个帧组（分片序列 + 收尾帧）不被打断**。
+	//
+	// 为什么需要它（2026-09-24 评审整改，P1）：sendFrames 原先不持任何发送锁，而它有三个
+	// 并发来源——投递循环（快照/差分）、stream 读循环（FETCH-ROWS 应答）、`go notifyFromScan()`
+	// （通知）。实测能构造出 `0d 0d 10 0d 0d`（FETCH 帧插进快照两片之间）⇒ 客户端判
+	// 「分片组被其它 op 打断」⇒ 拒收 + 请求全量（用户滚动 + 会话输出时概率最高）。
+	// c.frame 的 wmu 只保证**单帧**不撕裂，管不了跨帧的组原子性。
+	sendMu sync.Mutex
 
 	// revision 是差分对账的世代号：每发一次全量 +1；差分沿用当前值。
 	// 客户端发现断档就 FETCH-SNAPSHOT（服务端不重传旧差分）。
@@ -146,12 +154,19 @@ func (l *surfaceLeg) statsSnapshot() surfaceStats {
 	return l.stats
 }
 
-// sendFrames 把一串帧按顺序写出（调用方保证锁外）。
+// sendFrames 把一串帧按顺序写出（调用方保证锁外）。**整组持 sendMu**（见字段注释）。
 //
 // 写失败（含超时）⇒ 返回 false，调用方负责断腿。分片计数与字节数在这里累加。
 func (l *surfaceLeg) sendFrames(c *termClient, op byte, payloads [][]byte) bool {
+	l.sendMu.Lock()
+	defer l.sendMu.Unlock()
+	return l.sendFramesLocked(c, op, payloads)
+}
+
+// sendFramesLocked 是 sendFrames 的实体（调用方已持 sendMu；sendSnapshot 要跨「分片 + DONE」）。
+func (l *surfaceLeg) sendFramesLocked(c *termClient, op byte, payloads [][]byte) bool {
 	start := time.Now()
-	for i, p := range payloads {
+	for _, p := range payloads {
 		if len(p) > surfaceMaxFrame {
 			// 服务端**硬保证**单帧 ≤ 64KiB：真出现说明分片逻辑坏了，宁可断腿也不发截断帧
 			// （截断对 surface 是非法化语义，评审 H2）。
@@ -166,7 +181,6 @@ func (l *surfaceLeg) sendFrames(c *termClient, op byte, payloads [][]byte) bool 
 			l.mu.Unlock()
 			return false
 		}
-		_ = i
 	}
 	cost := time.Since(start)
 	l.mu.Lock()
@@ -182,9 +196,14 @@ func (l *surfaceLeg) sendFrames(c *termClient, op byte, payloads [][]byte) bool 
 // sendSnapshot 下发一次全量快照（锁外调用）：压缩 → 分片 → 逐帧写 → SNAPSHOT-DONE。
 //
 // body 是**未压缩**的 SNAPSHOT 体；体积超上限时返回 false（调用方断腿/重试）。
+// 整组（含 DONE）持 sendMu：DONE 与分片之间被别的帧插进来，客户端虽能容忍，但语义上
+// 「这一代快照」应当是一段连续字节。
 func (l *surfaceLeg) sendSnapshot(c *termClient, body []byte) bool {
 	if len(body) > perLegPendingCap {
-		// 单帧超上限：标记需要全量并在下一拍重试（此时屏幕内容通常已变小）。
+		// 单帧超上限：标记需要全量并在下一拍重试。
+		// ⚠️ 这不是「内容会自己变小」的乐观假设——内容不会自己变小；真正的兜底是
+		// 下一拍 `takeSnapshotFlag` 消费它之前若有差分成功下发，则快照被取消；
+		// 若持续超限，客户端侧 60KiB 分片契约仍能承载（这里只拦 4MiB 级病态体）。
 		l.markNeedSnapshot("backpressure")
 		return true
 	}
@@ -193,7 +212,9 @@ func (l *surfaceLeg) sendSnapshot(c *termClient, body []byte) bool {
 		return false
 	}
 	frags := fragmentPayload(gz)
-	if !l.sendFrames(c, opSnapshot, frags) {
+	l.sendMu.Lock()
+	defer l.sendMu.Unlock()
+	if !l.sendFramesLocked(c, opSnapshot, frags) {
 		return false
 	}
 	// 完成标志：客户端据此解除渲染抑制（surface 版 REPLAY-DONE）。
@@ -257,4 +278,13 @@ func (l *surfaceLeg) sendClipboard(c *termClient, payload []byte) bool {
 // sendNotify 下发裸 OSC 9 通知（S→C）。
 func (l *surfaceLeg) sendNotify(c *termClient, payload []byte) bool {
 	return l.sendFrames(c, opNotify, [][]byte{payload})
+}
+
+// sendState 下发 STATE 帧（S→C）。
+//
+// 走 sendFrames 的意义有二：① 拿到 sendMu（不会插进别人的分片组）；② 写超时/失败的
+// 断腿语义与其它帧一致。**这也是把 STATE 移出会话锁的落点**（2026-09-24 评审整改，P2）：
+// 旧实现 `pushStateLocked` 在会话锁内直接 c.frame ⇒ 慢链路下最多把 PTY pump 堵 5s（写超时）。
+func (l *surfaceLeg) sendState(c *termClient, payload []byte) bool {
+	return l.sendFrames(c, opState, [][]byte{payload})
 }

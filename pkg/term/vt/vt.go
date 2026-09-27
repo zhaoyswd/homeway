@@ -69,16 +69,6 @@ const (
 	ScreenAlternate Screen = 1
 )
 
-// CursorShape 是光标形状（render state 的 CURSOR_VISUAL_STYLE）。
-type CursorShape uint8
-
-const (
-	CursorBar         CursorShape = 0 // DECSCUSR 5/6
-	CursorBlock       CursorShape = 1 // DECSCUSR 1/2
-	CursorUnderline   CursorShape = 2 // DECSCUSR 3/4
-	CursorBlockHollow CursorShape = 3
-)
-
 // Modes 是一次模式位快照。字段命名对齐 vt 的 DEC/ANSI 模式号（注释里给出）。
 //
 // 为什么不用 legacy 的 termMode* 位掩码：那是 legacy 协议的下行编码格式，属另一层的事；
@@ -111,16 +101,6 @@ type Modes struct {
 	// modifyOtherKeys mode 2——后者正是 vendor 补丁 0002 暴露的查询（design D4 的输入编码依赖它）。
 	KittyFlags      uint8
 	ModifyOtherKeys bool
-}
-
-// Cursor 是光标快照。X/Y 是**视口**坐标（render state 口径，回滚偏移已折算）。
-type Cursor struct {
-	X, Y     uint16
-	Visible  bool
-	Blinking bool
-	Password bool
-	WideTail bool
-	Shape    CursorShape
 }
 
 // Terminal 是一个会话的服务端仿真器。

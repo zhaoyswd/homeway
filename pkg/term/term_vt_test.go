@@ -1,4 +1,4 @@
-//go:build !windows
+//go:build !windows && (darwin || linux) && (amd64 || arm64) && cgo
 
 // term_vt_test.go — 会话屏态 vt 化的判据（任务 1.3）。
 //

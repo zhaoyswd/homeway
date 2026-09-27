@@ -24,16 +24,6 @@ import "unsafe"
 */
 import "C"
 
-// Scrollbar 是终端的可滚动区域状态（滚动条口径：total/offset/len 单位都是行）。
-type Scrollbar struct {
-	Total  uint64
-	Offset uint64
-	Len    uint64
-}
-
-// AtBottom 报告视口是否贴着底部（= 跟随输出）。
-func (s Scrollbar) AtBottom() bool { return s.Offset+s.Len >= s.Total }
-
 // Scrollbar 读当前滚动条状态（诊断与镜像窗口都用它）。
 func (t *Terminal) Scrollbar() Scrollbar {
 	t.mu.Lock()
