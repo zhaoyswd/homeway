@@ -91,6 +91,24 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
+      # wtransport 的集成测试引 pkg/term（→ term/vt 的 cgo）⇒ 该包测试二进制链接
+      # libghostty-vt（exec-r4 后 CI 实跑暴露：cmd/clientcore 面不引 vt，缺库只在
+      # go test 炸 `-lghostty-vt`）。与 test/build job 同法：先装 zig 0.16.0 再产
+      # **本机目标**的静态库（目标 = $(go env GOOS)-$(go env GOARCH)：ubuntu 腿
+      # linux-amd64、macos 腿 darwin-arm64——vt 一律 zig 产，build job 的 darwin 腿
+      # 同款；Apple clang 只用于编 Go 二进制本体，与 vt 无关）。
+      - name: Install zig 0.16.0（tools/build-vt.sh 钉的版本；装到 ~/zig-0.16.0 供其发现）
+        run: |
+          set -euo pipefail
+          arch="$(uname -m | sed 's/^arm64$/aarch64/')"
+          os="$(uname -s | sed 's/^Darwin$/macos/;s/^Linux$/linux/')"
+          url="$(curl -fsSL https://ziglang.org/download/index.json | jq -r --arg k "${arch}-${os}" '."0.16.0"[$k].tarball')"
+          echo "zig tarball: ${url}"
+          curl -fsSL "$url" -o /tmp/zig.tar.xz
+          mkdir -p "$HOME/zig-0.16.0"
+          tar -xJf /tmp/zig.tar.xz -C "$HOME/zig-0.16.0" --strip-components=1
+          "$HOME/zig-0.16.0/zig" version | grep -qx '0.16.0'
+      - run: bash tools/build-vt.sh "$(go env GOOS)-$(go env GOARCH)"
       - run: go build -tags cshared ./clientcore/...
       - run: go vet -tags cshared ./clientcore/...
       - run: go test -tags cshared ./clientcore/...

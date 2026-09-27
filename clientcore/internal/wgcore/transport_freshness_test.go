@@ -83,7 +83,9 @@ func newFreshTransport(t *testing.T, lc *logCap, domainEps []DomainEndpoint, dom
 	return tr, cache, dir
 }
 
-// waitFor：轮询断言（重解析/采纳都是异步生效的）。
+// waitFor：轮询断言（重解析/采纳都是异步生效的）。调用点的预算给到 10s：条件在
+// 空闲机器上毫秒级达成，预算只兜慢 runner（共享 CI 上一发 UDP 收包处理被调度拖过
+// 旧的 3s 即假失败——exec-r4 后慢机整改同口径）。
 func waitFor(t *testing.T, d time.Duration, cond func() bool, what string) {
 	t.Helper()
 	deadline := time.Now().Add(d)
@@ -130,7 +132,7 @@ func TestDomainResolveRefreshesCandidates(t *testing.T) {
 			return []netip.Addr{netip.MustParseAddr("192.0.2.99")}, nil // 漂移后的新地址
 		})
 	tr.Rearm()
-	waitFor(t, 3*time.Second, func() bool { return bindHas(tr, "192.0.2.99:41641") }, "新解析地址进候选")
+	waitFor(t, 10*time.Second, func() bool { return bindHas(tr, "192.0.2.99:41641") }, "新解析地址进候选")
 	if bindHas(tr, "192.0.2.1:41641") {
 		t.Fatal("旧解析地址应被替换（t.static 已刷新——否则 Merge 会一直带回旧解析）")
 	}
@@ -147,7 +149,7 @@ func TestDomainResolveFailureKeepsLast(t *testing.T) {
 			return nil, fmt.Errorf("dns unavailable")
 		})
 	tr.Rearm()
-	waitFor(t, 3*time.Second, func() bool { return lc.has("域名重解析") }, "解析失败留痕")
+	waitFor(t, 10*time.Second, func() bool { return lc.has("域名重解析") }, "解析失败留痕")
 	if !bindHas(tr, "192.0.2.1:41641") {
 		t.Fatal("解析失败应退回上次解析结果")
 	}
@@ -195,13 +197,13 @@ func TestLateDomainResolveSoftRearmOnRelay(t *testing.T) {
 		{Addr: netip.MustParseAddrPort("192.0.2.10:41641")},
 		{Addr: relaySrc, Relay: true},
 	})
-	waitFor(t, 3*time.Second, func() bool {
+	waitFor(t, 10*time.Second, func() bool {
 		_, relay, ok := tr.core.Bind().Adopted()
 		return ok && relay
 	}, "中继采纳")
 
 	tr.refreshDomainLocked(context.Background()) // 晚到的解析结果
-	waitFor(t, 3*time.Second, func() bool { return lc.has("节流软赛跑补投") }, "补投软赛跑")
+	waitFor(t, 10*time.Second, func() bool { return lc.has("节流软赛跑补投") }, "补投软赛跑")
 	if !lc.has("RARM 软赛跑") {
 		t.Fatal("补投应实际触发 RearmSoft")
 	}
@@ -261,7 +263,7 @@ func TestNotePathAliveSkipsRelay(t *testing.T) {
 
 	// 直连来源：NotePathAlive 落验证。
 	directSrc := injectAdopt(t, tr, false)
-	waitFor(t, 3*time.Second, func() bool {
+	waitFor(t, 10*time.Second, func() bool {
 		_, relay, ok := tr.core.Bind().Adopted()
 		return ok && !relay
 	}, "直连采纳")
@@ -280,7 +282,7 @@ func TestNotePathAliveSkipsRelay(t *testing.T) {
 	before := len(cache.Entries(time.Now()))
 	relaySrc := injectAdopt(t, tr, true)
 	tr.core.Bind().SetCandidates([]wtransport.Candidate{{Addr: relaySrc, Relay: true}})
-	waitFor(t, 3*time.Second, func() bool {
+	waitFor(t, 10*time.Second, func() bool {
 		_, relay, ok := tr.core.Bind().Adopted()
 		return ok && relay
 	}, "中继采纳")

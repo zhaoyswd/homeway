@@ -14,6 +14,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"github.com/zhaoyswd/homeway/clientcore/internal/wtransport"
@@ -54,12 +55,24 @@ func onceClose(close func()) func() {
 	return func() { once.Do(close) }
 }
 
+// svcTestBudgets 一轮阶梯的预算三元组（pre=起查探测 / verify=档位动作后验证 / action=本地动作）。
+type svcTestBudgets struct {
+	pre, verify, action time.Duration
+}
+
 func TestServiceSessionRecoverLadder(t *testing.T) {
-	// 缩短阶梯预算（包内 var；测试串行无并发改写），结束恢复生产值。
+	// 阶梯预算（包内 var；测试串行无并发改写——巡检 60s 一拍、本用例全程秒级），
+	// 结束恢复生产值。按阶段设（exec-r4 后 CI 慢机整改：旧的全局 800ms/1.5s/0.5s
+	// 在 GitHub 共享 runner 上不够——慢机上暖机后的一发隧道内往返被调度拖过 800ms，
+	// ①「零档位动作」即假失败；且②的验证探测要容纳 WG 首发握手丢失后的 5s 重发
+	// ——REG 重注册与握手 initiation 在出口侧跨 goroutine 竞争，慢机上首发被丢不罕见）：
+	//	①健康路径用生产值（3s/10s/2s）——测试预算不该比生产更苛刻，语义才诚实；
+	//	②③的死路径（起查探测必超时、③验证必超时）只等超时本身，维持毫秒级省墙钟；
+	//	②的验证探测与①同宽（恢复真发生时远快于预算，预算只是兜底慢机）。
 	oldPre, oldVerify, oldAct := recoverPreProbeTimeout, recoverVerifyTimeout, recoverActionTimeout
-	recoverPreProbeTimeout = 800 * time.Millisecond
-	recoverVerifyTimeout = 1500 * time.Millisecond
-	recoverActionTimeout = 500 * time.Millisecond
+	setBudgets := func(b svcTestBudgets) {
+		recoverPreProbeTimeout, recoverVerifyTimeout, recoverActionTimeout = b.pre, b.verify, b.action
+	}
 	t.Cleanup(func() {
 		recoverPreProbeTimeout, recoverVerifyTimeout, recoverActionTimeout = oldPre, oldVerify, oldAct
 	})
@@ -147,7 +160,26 @@ func TestServiceSessionRecoverLadder(t *testing.T) {
 		return strings.Contains(string(b), needle)
 	}
 
+	// ①的前置：会话必须**真健康**再起查。ready 不保证这一点——暖机超时按软失败
+	// 也会走到 ready（见 run()），此时会话可能还没握上手，①的「零档位动作」就成了
+	// 对着病会话的空头断言（慢机上暖机软失败不罕见）。用生产同款判据（拨 1 号端口
+	// 收 RST）轮询到健康为止；这发探测无副作用（健康会话上一个纯往返）。
+	healthDeadline := time.Now().Add(15 * time.Second)
+	for {
+		pctx, pcancel := context.WithTimeout(context.Background(), 3*time.Second)
+		perr := currentSess().PathProbe(pctx)
+		pcancel()
+		if perr == nil {
+			break
+		}
+		if time.Now().After(healthDeadline) {
+			t.Fatalf("①前置失败：会话 15s 内未达健康（暖机软失败后也未恢复；末次探测 %v）", perr)
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+
 	// ① 健康：探测先行，零档位动作。
+	setBudgets(svcTestBudgets{pre: 3 * time.Second, verify: 10 * time.Second, action: 2 * time.Second})
 	serviceCur.recoverStaleSession(currentSess(), "集成①")
 	if !logHas("RECOVER 已恢复（R2 换源 起查，原因=集成①，零档位动作") {
 		t.Fatal("①健康路径应零档位动作（探测先行命中）")
@@ -157,6 +189,10 @@ func TestServiceSessionRecoverLadder(t *testing.T) {
 	if out := sbind.Table.GC(time.Now().Add(2 * time.Minute)); len(out) != 1 {
 		t.Fatalf("GC 应回收 1 条：%+v", out)
 	}
+	// ② 起查必超时（设备记录已回收、包发出去无应答）——起查预算短等超时本身即可；
+	// 验证探测给生产宽度：RefreshReg 的 REG 与握手 initiation 在出口侧跨 goroutine
+	// 竞争，首发被丢要等 WG 的 5s 重发（recover.go 生产注释同款考量）。
+	setBudgets(svcTestBudgets{pre: 800 * time.Millisecond, verify: 10 * time.Second, action: 2 * time.Second})
 	serviceCur.recoverStaleSession(currentSess(), "集成②")
 	if !logHas("RECOVER 恢复于 R2 换源（原因=集成②") {
 		t.Fatal("②设备回收后应由 R2 档恢复（补注册+丢会话+换源）")
@@ -165,8 +201,10 @@ func TestServiceSessionRecoverLadder(t *testing.T) {
 		t.Fatalf("②恢复后设备表应回到 1 条：%d", sbind.Table.Len())
 	}
 
-	// ③ 出口死透：R1→R3 全档失败（-1），判据行留痕，不重建不 panic。
+	// ③ 出口死透：R1→R3 全档失败（-1），判据行留痕，不重建不 panic。死路径上
+	// 探测只会超时（收不到任何应答），预算短等超时本身即可，省墙钟。
 	closeSrv()
+	setBudgets(svcTestBudgets{pre: 800 * time.Millisecond, verify: 1500 * time.Millisecond, action: 2 * time.Second})
 	serviceCur.recoverStaleSession(currentSess(), "集成③")
 	if !logHas("RECOVER 走完 R1→R3 仍未恢复（起跑=R2 换源，原因=集成③") {
 		t.Fatal("③出口死透应走完全档并报 -1")

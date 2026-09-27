@@ -184,9 +184,22 @@ func TestRecoverAfterDeviceRecordReaped(t *testing.T) {
 	}
 
 	// ⑦ 清采纳档（Rearm = R3 的动作原语）：采纳被清，赛跑重启后重新采纳同一直连地址。
-	tr.Rearm()
-	if _, _, ok := core.Bind().Adopted(); ok {
-		t.Fatal("Rearm 应清采纳（valid=false）")
+	// 观察式断言（慢机整改）：⑥ 的拨号刚关连接，FIN/RST 尾包可能恰好落在 Rearm 之后——
+	// 收包路径按设计会立刻重新采纳活路径（bind.go 收包点置 valid=true，产品行为正确），
+	// 慢机上 Rearm 与断言之间的窗口被调度拉宽后这个竞争肉眼可见。轮询窗口内捕捉到
+	// 一次 valid=false 即证明 Rearm 确实清了采纳（尾包落地后下一轮必能观察到）。
+	rearmed := false
+	rearmDeadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(rearmDeadline) {
+		tr.Rearm()
+		if _, _, ok := core.Bind().Adopted(); !ok {
+			rearmed = true
+			break
+		}
+		time.Sleep(100 * time.Millisecond) // 等在途尾包落地后再试一轮
+	}
+	if !rearmed {
+		t.Fatal("Rearm 应清采纳（5s 内未观察到 valid=false——每轮 Rearm 后立即被在途包重新采纳）")
 	}
 	if err := dial(20 * time.Second); err != nil {
 		t.Fatalf("Rearm 后重赛跑应重新建立会话：%v", err)
