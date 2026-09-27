@@ -21,6 +21,7 @@ import (
 	"github.com/zhaoyswd/homeway/pkg/intercept"
 	"github.com/zhaoyswd/homeway/pkg/proto"
 	"github.com/zhaoyswd/homeway/pkg/servercore"
+	"github.com/zhaoyswd/homeway/pkg/speedtest"
 	"github.com/zhaoyswd/homeway/pkg/term"
 	"github.com/zhaoyswd/homeway/pkg/wgnet"
 	"golang.org/x/crypto/curve25519"
@@ -30,10 +31,11 @@ import (
 
 // 默认内部地址（隧道内，客户端 token/配置与之配套）。
 const (
-	DefaultTunnelIP  = "100.64.255.1"
-	DefaultFilesPort = uint16(7802) // files 原生协议（后端本机 127.0.0.1）
-	DefaultTermPort  = uint16(7724) // 终端会话 / agent gateway（与旧栈 tunnel 内虚拟端口同号）
-	DefaultDNSPort   = uint16(5300) // DNS 代答（任意目的 :53 改写到这里；不用 53——macOS 非 root 绑不上回环特权端口）
+	DefaultTunnelIP      = "100.64.255.1"
+	DefaultFilesPort     = uint16(7802) // files 原生协议（后端本机 127.0.0.1）
+	DefaultTermPort      = uint16(7724) // 终端会话 / agent gateway（与旧栈 tunnel 内虚拟端口同号）
+	DefaultSpeedtestPort = uint16(7803) // 测速服务（tunnel-speedtest：内存收发、不落盘）
+	DefaultDNSPort       = uint16(5300) // DNS 代答（任意目的 :53 改写到这里；不用 53——macOS 非 root 绑不上回环特权端口）
 )
 
 // BindMode：WG socket（打洞/STUN）钉哪张物理网卡。
@@ -52,25 +54,26 @@ const (
 )
 
 type ServeConfig struct {
-	StateDir   string
-	ListenPort uint16
-	TunnelIP   netip.Addr
-	FilesPort  uint16         // files 服务在本机的监听端口（客户端经隧道 IP 豁免转投到它）
-	FilesRoot  string         // files 根（空 = 用户主目录；协议恒读写）
-	TermPort   uint16         // 终端会话 / agent gateway 在本机的监听端口
-	DNSPort    uint16         // DNS 代答监听端口（0 = 禁用：:53 按原目标过境重拨；cli 默认 DefaultDNSPort）
-	MaxDevices int            // 设备表容量（0 = 32）
-	PeerTTL    time.Duration  // 长期不活跃设备的回收期限（0 = 7 天；<0 = 关闭 TTL 回收）
-	BuildTag   string         // 探测应答里回报的构建标记（空 = 用内置默认）
-	BindAddr   netip.Addr     // 非零 = 把 WG UDP socket 绑到该地址（该网卡出站；STUN 观测同 socket）
-	BindIface  *net.Interface // 非空 = 双栈监听并整条 socket 钉在该网卡（同时支持 v4/v6 客户端）
-	BindMode   BindMode       // WG socket 钉哪张卡：auto（默认，自动挑）/explicit（用 BindIface）/off（不绑）
-	UPnP       bool           // 启动后向路由器申请 UDP 端口映射并 30 分钟续期
-	STUN       string         // 非空 = 在监听 socket 上向该 STUN 服务器观测公网映射（如 stun.miwifi.com:3478）
-	STUN6      string         // 非空 = 用该服务器做 **IPv6** 路径校验（要有 AAAA，如 stun.cloudflare.com:3478）
-	DDNS       string         // 非空 = DDNS 域名（endpoint-freshness）：token 叠加 host:端口 条目（不解析不踢除；域名记录由用户 DDNS 设施维护）
-	Relay      string         // 非空 = 向该中继注册一条反向注册腿（host:port），NAT 后的出口由此可被客户端到达
-	Verbose    bool
+	StateDir      string
+	ListenPort    uint16
+	TunnelIP      netip.Addr
+	FilesPort     uint16         // files 服务在本机的监听端口（客户端经隧道 IP 豁免转投到它）
+	FilesRoot     string         // files 根（空 = 用户主目录；协议恒读写）
+	TermPort      uint16         // 终端会话 / agent gateway 在本机的监听端口
+	SpeedtestPort uint16         // 测速服务在本机的监听端口（StateDir 为空时该服务不启用）
+	DNSPort       uint16         // DNS 代答监听端口（0 = 禁用：:53 按原目标过境重拨；cli 默认 DefaultDNSPort）
+	MaxDevices    int            // 设备表容量（0 = 32）
+	PeerTTL       time.Duration  // 长期不活跃设备的回收期限（0 = 7 天；<0 = 关闭 TTL 回收）
+	BuildTag      string         // 探测应答里回报的构建标记（空 = 用内置默认）
+	BindAddr      netip.Addr     // 非零 = 把 WG UDP socket 绑到该地址（该网卡出站；STUN 观测同 socket）
+	BindIface     *net.Interface // 非空 = 双栈监听并整条 socket 钉在该网卡（同时支持 v4/v6 客户端）
+	BindMode      BindMode       // WG socket 钉哪张卡：auto（默认，自动挑）/explicit（用 BindIface）/off（不绑）
+	UPnP          bool           // 启动后向路由器申请 UDP 端口映射并 30 分钟续期
+	STUN          string         // 非空 = 在监听 socket 上向该 STUN 服务器观测公网映射（如 stun.miwifi.com:3478）
+	STUN6         string         // 非空 = 用该服务器做 **IPv6** 路径校验（要有 AAAA，如 stun.cloudflare.com:3478）
+	DDNS          string         // 非空 = DDNS 域名（endpoint-freshness）：token 叠加 host:端口 条目（不解析不踢除；域名记录由用户 DDNS 设施维护）
+	Relay         string         // 非空 = 向该中继注册一条反向注册腿（host:port），NAT 后的出口由此可被客户端到达
+	Verbose       bool
 }
 
 func (c *ServeConfig) fill() {
@@ -85,6 +88,9 @@ func (c *ServeConfig) fill() {
 	}
 	if c.TermPort == 0 {
 		c.TermPort = DefaultTermPort
+	}
+	if c.SpeedtestPort == 0 {
+		c.SpeedtestPort = DefaultSpeedtestPort
 	}
 	if c.MaxDevices <= 0 {
 		c.MaxDevices = 32
@@ -127,6 +133,10 @@ type Server struct {
 	termSock      string      // term 的 UDS 路径（同上）
 	termOwn       os.FileInfo // 同 filesOwn
 	termSrv       *term.TermService
+	speedLn       net.Listener
+	speedSock     string      // 测速的 UDS 路径（同上）
+	speedOwn      os.FileInfo // 同 filesOwn
+	speedSrv      *speedtest.Server
 	// relayCtx：中继注册腿 + 控制客户端的生命周期（review #8：此前给的是
 	// context.Background()，Close 之后这两组协程与拨号循环永不退出——进程级
 	// 无所谓，但测试里每次都泄漏 goroutine）。
@@ -232,14 +242,15 @@ func Start(cfg ServeConfig) (*Server, error) {
 	// 并发/空闲两个值 = l3 上线起的生产值（原 flows 时代 ServeConfig 字段随兼容监听退役）：
 	// 64 连接自 l3-exit-intercept 上线即此值并经真机全量测试；30min 空闲是给豁免腿上的
 	// 终端会话留的（拨隧道IP:7724 的长连接，别设太短）。
-	// 本机服务承载映射（exit-service-uds）：files/term 的豁免端口改投 UDS。
+	// 本机服务承载映射（exit-service-uds）：files/term/测速 的豁免端口改投 UDS。
 	// 静态路径、建后不改——服务监听失败时条目保留，socket 文件不存在、拨号 ENOENT
 	// 快速失败回 RST（与端口没人听不可区分）。
 	var localSvcs map[uint16]string
 	if cfg.StateDir != "" {
 		localSvcs = map[uint16]string{
-			cfg.FilesPort: filepath.Join(cfg.StateDir, "files.sock"),
-			cfg.TermPort:  filepath.Join(cfg.StateDir, "term.sock"),
+			cfg.FilesPort:     filepath.Join(cfg.StateDir, "files.sock"),
+			cfg.TermPort:      filepath.Join(cfg.StateDir, "term.sock"),
+			cfg.SpeedtestPort: filepath.Join(cfg.StateDir, "speedtest.sock"),
 		}
 	}
 	inter, ierr := intercept.Attach(ns, intercept.Config{
@@ -394,6 +405,33 @@ func Start(cfg ServeConfig) (*Server, error) {
 		}
 	}
 
+	// 测速服务（tunnel-speedtest：UDS 承载 <state>/speedtest.sock，内存收发、不落盘）。
+	// 客户端拨 隧道IP:<SpeedtestPort>，拦截层按 LocalServices 映射转投；服务端限额
+	// 并发 ≤8、单连接 30s 硬超时，超限拒绝并计数。
+	// StateDir 为空 = 无处放 socket，整段不启用——否则会静默退化成「回环 TCP 同端口」
+	// 语义（tunnel-speedtest design D2）。
+	if cfg.StateDir == "" {
+		logf("speedtest 服务未启用（未配置 state 目录）")
+	} else {
+		ssrv := speedtest.NewServer(dlogf)
+		ssock, sln, sown, slerr := listenLocalService(cfg.StateDir, "speedtest.sock")
+		if slerr != nil {
+			// 与 files/term 同一取舍：可选服务起不来不影响隧道/转发。
+			logf("⚠️ speedtest 监听 %s 失败（%v）—— 测速功能会报错（state 目录异常/被其它实例占用），其余功能不受影响", ssock, slerr)
+		} else {
+			s.speedLn, s.speedSock, s.speedOwn, s.speedSrv = sln, ssock, sown, ssrv
+			go func() {
+				verr := ssrv.Serve(sln)
+				// 同 files：Accept 退出就摘监听，别留「文件在、无人收」的监听点。
+				sln.Close()
+				if verr != nil {
+					logf("speedtest 服务收工：%v", verr)
+				}
+			}()
+			logf("speedtest 就绪：sock=%s（隧道IP:%d 经拦截层转投；内存收发不落盘）", ssock, cfg.SpeedtestPort)
+		}
+	}
+
 	// 生命周期 ctx 在装配起点建（收工由 Close 取消，#8）。
 	s.relayCtx, s.relayCancel = context.WithCancel(context.Background())
 	if err := s.dev.Up(); err != nil { // FINDINGS 0.1-1
@@ -407,8 +445,8 @@ func Start(cfg ServeConfig) (*Server, error) {
 	}
 	pub := priv.PublicKey()
 	// 注意：这里是**配置端口**；端口被占用会自动退让，实际端口在下面异步落盘时打（见 listen_port.txt）。
-	logf("serve 就绪：wg=:%d（配置端口；被占用会自动退让）tunnel=%v files=%d term=%d dns=%d tokens=%d key=%x…",
-		cfg.ListenPort, cfg.TunnelIP, cfg.FilesPort, cfg.TermPort, dnsPort, len(secrets), pub[:6])
+	logf("serve 就绪：wg=:%d（配置端口；被占用会自动退让）tunnel=%v files=%d term=%d speedtest=%d dns=%d tokens=%d key=%x…",
+		cfg.ListenPort, cfg.TunnelIP, cfg.FilesPort, cfg.TermPort, cfg.SpeedtestPort, dnsPort, len(secrets), pub[:6])
 	return s, nil
 }
 
@@ -501,6 +539,13 @@ func (s *Server) Close() {
 	}
 	if s.termSrv != nil {
 		s.termSrv.Close()
+	}
+	if s.speedLn != nil {
+		s.speedLn.Close()
+		removeSockOwn(s.speedSock, s.speedOwn)
+	}
+	if s.speedSrv != nil {
+		s.speedSrv.Close() // 断开在跑的测速会话（内存态，无盘面残留）
 	}
 	closeLogs()
 }
