@@ -1,20 +1,22 @@
 module github.com/zhaoyswd/homeway
 
-go 1.24
+go 1.24.0
+
+toolchain go1.24.5
 
 require (
 	github.com/BurntSushi/toml v1.4.1-0.20240526193622-a339e1f7089c
 	github.com/creack/pty v1.1.24
-	golang.org/x/crypto v0.37.0
-	golang.org/x/net v0.39.0
-	golang.org/x/sys v0.32.0
+	golang.org/x/crypto v0.48.0
+	golang.org/x/net v0.50.0
+	golang.org/x/sys v0.41.0
 	golang.zx2c4.com/wireguard v0.0.0-20260522210424-ecfc5a8d5446
 	golang.zx2c4.com/wireguard/wgctrl v0.0.0-20241231184526-a9ab2273dd10
 	gvisor.dev/gvisor v0.0.0-20250503011706-39ed1f5ac29c
 )
 
 require (
-	github.com/google/btree v1.1.2 // indirect
-	golang.org/x/time v0.7.0 // indirect
+	github.com/google/btree v1.1.3 // indirect
+	golang.org/x/time v0.14.0 // indirect
 	golang.zx2c4.com/wintun v0.0.0-20230126152724-0fa3db229ce2 // indirect
 )

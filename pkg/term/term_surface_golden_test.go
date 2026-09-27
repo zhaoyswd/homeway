@@ -6,12 +6,12 @@
 // 客户端的 surface_codec.cpp、App 核的帧子集）——新增 op 会放大漂移风险。这里生成一组**共享样例**
 // （每个 op 一例），两端各自解码并断言同一份结果。
 //
-// 产物（提交在 tier 仓；客户端宿主测试读它）：
+// 产物（提交在本仓 surface/test/golden；宿主测试 surface/test/host 读它）：
 //
-//	terminal/src/test/golden/manifest.tsv   name<TAB>op<TAB>cols<TAB>rows<TAB>revision<TAB>digest<TAB>title
-//	terminal/src/test/golden/<name>.bin     分片序列：[u32 片数]{[u32 长度][字节]}…
+//	surface/test/golden/manifest.tsv   name<TAB>op<TAB>cols<TAB>rows<TAB>revision<TAB>digest<TAB>title
+//	surface/test/golden/<name>.bin     分片序列：[u32 片数]{[u32 长度][字节]}…
 //
-// 生成：TIER_REPO=<tier 仓路径> go test ./pkg/term/ -run TestSurfaceGolden -update
+// 生成：go test ./pkg/term/ -run TestSurfaceGolden -update
 // 校验：同命令（不带 -update）——服务端先自解一遍；客户端在宿主上再解一遍（两边同一份文件）。
 //
 // 摘要口径（两端必须逐字节一致）：FNV-1a 64 of「行以 \n 连接、占位格跳过、空符号补空格、行尾裁空白」。
@@ -33,15 +33,12 @@ import (
 // updateGolden 由 `go test ./pkg/term/ -update` 置位（go test 只接受注册过的自定义 flag）。
 var updateGolden = flag.Bool("update", false, "重新生成 golden 样例（跨仓共享）")
 
-const goldenDirEnv = "TIER_REPO"
-
+// goldenDir 样例目录（surface 迁入本仓后不再跨仓取 tier 检出）：go test 的工作目录是包目录
+// pkg/term，同仓相对路径在任何机器上都成立（原先按 TIER_REPO 指私有仓 + 硬编码本机默认，
+// 换机器会静默 SKIP——迁移收掉）。注意要退两级：pkg/term → pkg → 仓库根。
 func goldenDir(t *testing.T) string {
 	t.Helper()
-	repo := os.Getenv(goldenDirEnv)
-	if repo == "" {
-		repo = "/Users/zhaozhe/Documents/projects/tier" // 本机默认（跨仓路径；别处用环境变量）
-	}
-	return filepath.Join(repo, "terminal", "src", "test", "golden")
+	return filepath.Join("..", "..", "surface", "test", "golden")
 }
 
 // goldenDigest 与客户端 C++ 的 digestText 同一算法（改一处必须同步改另一处——这正是被钉住的东西）。

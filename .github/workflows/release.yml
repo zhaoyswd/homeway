@@ -28,6 +28,18 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
+      # go directive 守卫（core-homeway-merge 2.4）：手机核（clientcore）被 OHOS Go 1.24.5 钉死
+      # （私有构建机 GOTOOLCHAIN=local，directive 高于 1.24 即拒绝构建），而公开 CI 若放行，
+      # 任何上调都会「公开 CI 全绿、只在私有构建机炸」。需要更高 Go 时走 clientcore 嵌套子模块
+      # 预案（openspec core-homeway-merge design D2），不是直接上调本仓 directive。
+      - name: go directive 守卫（>1.24 即红）
+        run: |
+          set -euo pipefail
+          directive="$(awk '$1=="go"{print $2; exit}' go.mod)"
+          case "$directive" in
+            1.24|1.24.*) echo "ok: go directive = ${directive}（≤1.24，OHOS Go 1.24.5 绑定满足）" ;;
+            *) echo "error: go.mod go directive = ${directive} > 1.24——clientcore 被 OHOS Go 1.24.5 硬钉（见上方注释），请走嵌套子模块预案而非上调" >&2; exit 1 ;;
+          esac
       # go test 会链接 pkg/term/vt（cgo）⇒ 先产本目标的 libghostty-vt 静态库
       - name: Install zig 0.16.0（tools/build-vt.sh 钉的版本；装到 ~/zig-0.16.0 供其发现）
         run: |
@@ -41,18 +53,55 @@ jobs:
           tar -xJf /tmp/zig.tar.xz -C "$HOME/zig-0.16.0" --strip-components=1
           "$HOME/zig-0.16.0/zig" version | grep -qx '0.16.0'
       - run: bash tools/build-vt.sh linux-amd64
-      - run: go vet ./...
-      - run: go test ./...
+      # 无 tag 面（出口侧）五门：clientcore 子树全部文件带 //go:build cshared，无 tag 时整包被
+      # build constraints 排除，且 CGO_ENABLED=0 下加 tag 也救不了（cgo 文件被整体排除）⇒ 统一
+      # 排除式包列表（core-homeway-merge 2.4；clientcore 的测试由 clientcore job 的 cshared 面守）。
+      - run: go vet $(go list ./... | grep -v '/clientcore')
+      - run: go test $(go list ./... | grep -v '/clientcore')
       # off 变体（CGO_ENABLED=0 / armv7）与 windows 桩也必须一直可编：armv7/windows 的发版产物
       # 就编在这条路径上，别等 build job 才发现烂了（term_vt_off 断编 2026-09-27 的教训）。
-      - run: CGO_ENABLED=0 go build ./...
-      - run: CGO_ENABLED=0 go vet ./...
-      - run: GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build ./...
+      - run: CGO_ENABLED=0 go build $(go list ./... | grep -v '/clientcore')
+      - run: CGO_ENABLED=0 go vet $(go list ./... | grep -v '/clientcore')
+      - run: GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build $(go list ./... | grep -v '/clientcore')
+      # surface 宿主测试（core-homeway-merge 2.2）：解码四件套 + golden fixture 的跨语言判据，
+      # 纯标准库 + zlib，秒级；golden 样例已提交在同仓 surface/test/golden。
+      - name: surface 宿主测试（surface 四件套 + golden fixture）
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq && sudo apt-get install -y -qq zlib1g-dev
+          bash tools/surface-host-test.sh
       # 声明文件必须与当前依赖一致（改了依赖没重跑生成脚本 ⇒ 别发版）
       - run: bash tools/gen-third-party-notices.sh --check
 
+  # clientcore 面（core-homeway-merge 2.4）：-tags cshared 构建测试；与无 tag 面互斥共存。
+  # 不发 dylib 发行产物——桌面消费形态是守护进程直接 import 包（思路 B），darwin 的
+  # c-shared 构建只是「//export 面可编可见」的冒烟。
+  clientcore:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - run: go build -tags cshared ./clientcore/...
+      - run: go vet -tags cshared ./clientcore/...
+      - run: go test -tags cshared ./clientcore/...
+      - name: c-shared 构建冒烟（//export 面完整可见；不发 dylib 产物）
+        if: runner.os == 'macOS'
+        run: |
+          set -euo pipefail
+          go build -buildmode=c-shared -tags cshared -o /tmp/libclientcore-smoke.so ./clientcore/cmd/clientcore
+          want="$(grep -rh '^//export' clientcore/cmd/clientcore/*.go | sort -u | wc -l | tr -d ' ')"
+          got="$(nm -g /tmp/libclientcore-smoke.so | grep -c ' T _Tailcat' || true)"
+          echo "//export 面：源 ${want} 个 / nm T 符号 ${got} 个"
+          [ "$want" -eq "$got" ]
+
   build:
-    needs: test
+    needs: [test, clientcore]
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false

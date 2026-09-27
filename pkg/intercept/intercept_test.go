@@ -711,14 +711,30 @@ func TestUDPConcurrentSameDstTransit(t *testing.T) {
 		}
 	}
 	for i, pc := range pcs {
+		want := fmt.Sprintf("flow-%d", i)
 		buf := make([]byte, 1024)
-		n, err := pc.Read(buf)
-		if err != nil {
-			h.dumpLogs(t)
-			t.Fatalf("read #%d: %v（会话建立失败或应答丢失）", i, err)
-		}
-		if got := string(buf[:n]); got != fmt.Sprintf("flow-%d", i) {
-			t.Fatalf("flow #%d echo = %q", i, got)
+		// 单流超时重传**一次**（UDP 客户端的真实语义，QUIC/普通套接字都自带重传）：并发建会话
+		// 窗口里偶发丢一拍应答（本机实测 8 条流并发时；intercept_test.go 原 10s 超时档，与
+		// TestUDPConcurrentDNSRewrite 的 ed9b991 同款 flake），生产路径由应用层重传兜底。
+		// 重传一次不掩盖「整条会话丢流」——那会连重传一起超时，照样失败。
+		for attempt := 0; ; attempt++ {
+			pc.SetDeadline(time.Now().Add(5 * time.Second))
+			if attempt > 0 { // 首拍已在上面的并发写入循环里发过；这里只做重传
+				if _, err := pc.Write([]byte(want)); err != nil {
+					t.Fatalf("write #%d: %v", i, err)
+				}
+			}
+			n, err := pc.Read(buf)
+			if err == nil {
+				if got := string(buf[:n]); got != want {
+					t.Fatalf("flow #%d echo = %q", i, got)
+				}
+				break
+			}
+			if attempt > 0 {
+				h.dumpLogs(t)
+				t.Fatalf("read #%d: %v（重传一次仍无应答，会话建立失败）", i, err)
+			}
 		}
 	}
 	assertNoEndpointFail(t, h)

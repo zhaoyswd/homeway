@@ -1,0 +1,6 @@
+session-cjk	0x0d	100	32	1	10b66dc267f7a16d		1	0	5	1	1	32	0	32
+session-cjk-diff	0x0d	100	32	1	5faf260dfecad32a		2	16	5	1	1	32	0	32
+session-git-log	0x0d	100	32	1	a12c925c98437452		1	0	31	1	1	44	12	32
+session-git-log-diff	0x0d	100	32	1	ccdcf6e50509c281		2	16	31	1	1	44	12	32
+session-hexdump	0x0d	100	32	1	2e9afa462a7ff385		1	0	24	1	1	32	0	32
+session-hexdump-diff	0x0d	100	32	1	f93d7ff4bca72ae8		2	16	24	1	1	32	0	32
