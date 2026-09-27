@@ -6,8 +6,9 @@
 // （127.0.0.1:7723 → 隧道 → 出口 term 端口，见 app_termbridge.go）说帧协议即可：
 // 每次操作开一条短连接、发一帧、读回复、关连接。JSON 进 JSON 出（NAPI 侧整体挪出 JS 线程）。
 //
-// ⚠️ 帧布局必须与 homeway `pkg/term/frames.go` 逐字段一致（双向契约，无编译期
-// 锚定——升级帧格式时两侧同改）。这里只实现一次性操作需要的子集：
+// 帧操作码与协议版本经 import `pkg/term` 编译期锚定（core-homeway-merge 任务 2.6，
+// 此前是手抄常量）；帧编解码（3 字节头）与 ERROR/KILL 载荷布局仍是本文件的手抄子集，
+// 升级帧格式时须与 homeway `pkg/term/frames.go` 两侧同改。这里只实现一次性操作需要的子集：
 // GREETING / LIST / KILL / OK / ERROR。
 package main
 
@@ -23,18 +24,11 @@ import (
 	"io"
 	"net"
 	"time"
+
+	"github.com/zhaoyswd/homeway/pkg/term"
 )
 
-// 帧操作码（子集；完整表见 homeway pkg/term/frames.go 与 exit-terminal 设计 D4）。
 const (
-	termOpList     byte = 0x04 // C→S 请求；S→C 回复（payload 是 JSON）
-	termOpKill     byte = 0x05
-	termOpError    byte = 0x06
-	termOpOK       byte = 0x0B
-	termOpGreeting byte = 0x0C
-
-	termProtoVer = 1
-
 	termDialTimeout = 15 * time.Second
 	termIOTimeout   = 15 * time.Second
 )
@@ -109,14 +103,14 @@ func termDial(authHex, sock string) (net.Conn, *termError) {
 				"也可能是本机隧道的回程地址已失效（出口日志会看到 no candidates available for endpoint）。"+
 				"先重连一次 VPN；若仍不行，请把出口升级到增强版 tailcat。详情：%v", err)
 	}
-	if code != termOpGreeting {
+	if code != term.OpGreeting {
 		_ = conn.Close()
 		return nil, termErrf("term_foreign_service",
 			"出口 %d 端口上不是终端服务（收到帧 0x%02x）", termServicePort(), code)
 	}
-	if len(payload) < 5 || payload[0] != termProtoVer {
+	if len(payload) < 5 || payload[0] != term.ProtoVer {
 		_ = conn.Close()
-		return nil, termErrf("term_version", "出口终端服务协议版本不匹配（本端 %d）", termProtoVer)
+		return nil, termErrf("term_version", "出口终端服务协议版本不匹配（本端 %d）", term.ProtoVer)
 	}
 	return conn, nil
 }
@@ -127,7 +121,7 @@ func termList(authHex, sock string) (map[string]any, *termError) {
 		return nil, terr
 	}
 	defer conn.Close()
-	if err := termWriteFrame(conn, termOpList, nil); err != nil {
+	if err := termWriteFrame(conn, term.OpList, nil); err != nil {
 		return nil, termErrf("io", "发送 LIST 失败：%v", err)
 	}
 	code, payload, err := termReadFrame(conn)
@@ -135,7 +129,7 @@ func termList(authHex, sock string) (map[string]any, *termError) {
 		return nil, termErrf("io", "读取 LIST 回复失败：%v", err)
 	}
 	switch code {
-	case termOpList:
+	case term.OpList:
 		var out map[string]any
 		if err := json.Unmarshal(payload, &out); err != nil {
 			return nil, termErrf("bad_reply", "LIST 回复不是合法 JSON：%v", err)
@@ -147,7 +141,7 @@ func termList(authHex, sock string) (map[string]any, *termError) {
 			out["sessions"] = []any{}
 		}
 		return out, nil
-	case termOpError:
+	case term.OpError:
 		return nil, termDecodeError(payload)
 	default:
 		return nil, termErrf("bad_reply", "LIST 回复帧意外（0x%02x）", code)
@@ -164,7 +158,7 @@ func termKill(name string, authHex, sock string) (map[string]any, *termError) {
 	payload := make([]byte, 1+len(name))
 	payload[0] = byte(len(name))
 	copy(payload[1:], name)
-	if err := termWriteFrame(conn, termOpKill, payload); err != nil {
+	if err := termWriteFrame(conn, term.OpKill, payload); err != nil {
 		return nil, termErrf("io", "发送 KILL 失败：%v", err)
 	}
 	code, reply, err := termReadFrame(conn)
@@ -172,9 +166,9 @@ func termKill(name string, authHex, sock string) (map[string]any, *termError) {
 		return nil, termErrf("io", "读取 KILL 回复失败：%v", err)
 	}
 	switch code {
-	case termOpOK:
+	case term.OpOK:
 		return map[string]any{"killed": name}, nil
-	case termOpError:
+	case term.OpError:
 		return nil, termDecodeError(reply)
 	default:
 		return nil, termErrf("bad_reply", "KILL 回复帧意外（0x%02x）", code)

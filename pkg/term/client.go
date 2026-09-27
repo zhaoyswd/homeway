@@ -13,7 +13,9 @@ import (
 	"net"
 )
 
-// 供外部使用的帧类型（与 frames.go 的内部常量一一对应）。
+// 供外部使用的帧类型与协议版本（与 frames.go 的内部常量一一对应）。
+// ProtoVer 供客户端校验 GREETING 版本（core-homeway-merge 任务 2.6：clientcore
+// 的 app_term.go 经 import 锚定，不再手抄）。
 const (
 	OpHello      = opHello
 	OpData       = opData
@@ -27,6 +29,8 @@ const (
 	OpReplayDone = opReplayDone
 	OpOK         = opOK
 	OpGreeting   = opGreeting
+
+	ProtoVer = termProtoVer
 )
 
 // StreamDial 起一条内部流（生产 = 拨隧道 IP 的 TermPort，出口豁免转投本机同端口）。
