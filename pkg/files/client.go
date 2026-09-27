@@ -33,6 +33,18 @@ type Session struct {
 }
 
 // Open 起一条流并读问候帧。
+// CodeStreamOpen：**流开场失败**（拨号之后读问候那一段）的稳定错误码。
+//
+// 为什么要单列一个码（而不是继续用 op_failed）：op_failed 同时表示「出口侧的真实操作失败」与
+// 「请求已送达但响应丢了」，二者都**不能**被下游当成「通道不可达」——手机核（tier 仓
+// cmd/tailcat/app_files_native.go 的 normalizeOpStreamErr）会把「流开场失败」归一成
+// bridge_down 交给 App 的自动重试，前提是它必须**证明请求未送达**。靠文案前缀认阶段是脆的
+// （改文案即静默失效），所以这里给一个可以判等的码。
+//
+// 契约：这个码只在 Open（问候阶段）使用；call 阶段（发请求/读响应）保持 op_failed 不变
+// （那时请求可能已经送达，重放有重复副作用风险）。改本码要同步改核侧的归一化与它的单测。
+const CodeStreamOpen = "stream_open"
+
 func (c *Client) Open(ctx context.Context) (*Session, error) {
 	if c.Dial == nil {
 		return nil, errors.New("files: Client.Dial 未配置")
@@ -45,16 +57,16 @@ func (c *Client) Open(ctx context.Context) (*Session, error) {
 	line, err := br.ReadBytes('\n')
 	if err != nil {
 		conn.Close()
-		return nil, Errf("op_failed", "读问候帧失败：%v", err)
+		return nil, Errf(CodeStreamOpen, "读问候帧失败：%v", err)
 	}
 	var g Greeting
 	if err := unmarshalLine(line, &g); err != nil {
 		conn.Close()
-		return nil, Errf("op_failed", "问候帧不是 JSON：%v", err)
+		return nil, Errf(CodeStreamOpen, "问候帧不是 JSON：%v", err)
 	}
 	if !g.Ok {
 		conn.Close()
-		return nil, Errf("op_failed", "问候帧失败")
+		return nil, Errf(CodeStreamOpen, "问候帧失败")
 	}
 	return &Session{conn: conn, br: br, Root: g.Root, Ver: g.Ver, ReadOnly: !g.RW}, nil
 }
