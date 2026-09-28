@@ -18,7 +18,8 @@ tier 仓（`github.com/zhaoyswd/tier`）的 `AGENTS.md` + `docs/agents/` 分册�
 - **go directive ≤ 1.24（OHOS 绑定，勿升）**：`clientcore/` 编译面钉 OHOS Go 1.24.5
   （`GOTOOLCHAIN=local`），上游 x/* 依赖一旦 directive ≥1.25 就编不过——升版本只能取
   **directive ≤1.24 的最高版**（core-homeway-merge §2.1 实证：x/crypto v0.48 / x/net v0.50 /
-  x/sys v0.41 是上限，0.49/0.51/0.42 起 = go 1.25.0）。CI 有 directive 守卫步兜底。
+  x/sys v0.41 是上限，0.49/0.51/0.42 起 = go 1.25.0）。CI 有 directive 守卫步兜底
+  （release.yml 仅 tag / workflow_dispatch 触发，main 直推不拦——日常直推前须本地跑双面测试）。
 - **改 `clientcore/` 后**：tier 侧要 `tools/tailcat/build-core.sh` → 重新 `assembleHsp` 才进装机产物
   （tier 仓的活，这里只提醒别以为改完就生效）。NAPI 导出面（`//export ClientCore*`）四处同步的
   机器门在 tier 仓 `tools/docs/check-napi-sync.sh`。
