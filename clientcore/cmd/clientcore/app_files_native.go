@@ -61,7 +61,7 @@ type nativeFilesSession struct {
 //
 // sock = 桥 socket 路径、authHex = 桥鉴权首包 blob（两者都来自状态 JSON：
 // bridgeFilesSock / bridgeAuth；隧道宿主经 IPC 拿、服务会话宿主直接读
-// TailcatServiceStatus）——app-bridge-uds 起承载是沙箱内 UDS，鉴权保留为纵深。
+// ClientCoreServiceStatus）——app-bridge-uds 起承载是沙箱内 UDS，鉴权保留为纵深。
 func nativeFilesDial(ctx context.Context, authHex, sock string) (net.Conn, error) {
 	if sock == "" {
 		return nil, filesErrf("bridge_down", "文件通道暂时不可用（桥未就绪：VPN 未连接且服务会话未就绪，或正在恢复）")

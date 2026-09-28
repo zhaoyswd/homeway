@@ -234,19 +234,19 @@ type speedParams struct {
 	Streams  int    `json:"streams"`  // 并行流数（0 = 4）
 }
 
-//export TailcatSpeedTestStart
-func TailcatSpeedTestStart(cParams *C.char) *C.char {
+//export ClientCoreSpeedTestStart
+func ClientCoreSpeedTestStart(cParams *C.char) *C.char {
 	raw := C.GoString(cParams)
 	return speedMarshal(speedStart(raw))
 }
 
-//export TailcatSpeedTestStatus
-func TailcatSpeedTestStatus() *C.char {
+//export ClientCoreSpeedTestStatus
+func ClientCoreSpeedTestStatus() *C.char {
 	return speedMarshal(speed.snapshot())
 }
 
-//export TailcatSpeedTestCancel
-func TailcatSpeedTestCancel() *C.char {
+//export ClientCoreSpeedTestCancel
+func ClientCoreSpeedTestCancel() *C.char {
 	speed.cancelActive()
 	return speedMarshal(map[string]any{"ok": true})
 }

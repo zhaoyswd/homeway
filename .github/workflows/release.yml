@@ -118,7 +118,7 @@ jobs:
           set -euo pipefail
           go build -buildmode=c-shared -tags cshared -o /tmp/libclientcore-smoke.so ./clientcore/cmd/clientcore
           want="$(grep -rh '^//export' clientcore/cmd/clientcore/*.go | sort -u | wc -l | tr -d ' ')"
-          got="$(nm -g /tmp/libclientcore-smoke.so | grep -c ' T _Tailcat' || true)"
+          got="$(nm -g /tmp/libclientcore-smoke.so | grep -c ' T _ClientCore' || true)"
           echo "//export 面：源 ${want} 个 / nm T 符号 ${got} 个"
           [ "$want" -eq "$got" ]
 

@@ -17,7 +17,7 @@
 //
 // 导出风格与 tun 导出同构（Start 快速返回 + 轮询 Status；Stop 同步等待收工）：
 //
-//	TailcatServiceStart / TailcatServiceStop / TailcatServiceStatus
+//	ClientCoreServiceStart / ClientCoreServiceStop / ClientCoreServiceStatus
 //
 // ⚠️ 坑 56 纪律：本文件禁 log.Fatal*（c-shared 里会 os.Exit 杀死宿主 App 进程），
 // 失败一律走状态机的 failed + reason。
@@ -194,7 +194,7 @@ func (s *serviceSession) isDone() bool {
 	}
 }
 
-// serviceStartFromJSON TailcatServiceStart 的逻辑体（导出壳只做 C 字符串转换；
+// serviceStartFromJSON ClientCoreServiceStart 的逻辑体（导出壳只做 C 字符串转换；
 // 纯 Go 形态供单测直接调用）。
 // 返回码：0 已启动（幂等：starting/ready 下重复调用直接 0）｜-1 上一个实例还在收工｜
 // -2 服务日志文件打不开｜-3 配置不是合法 JSON｜-4 token 为空。
@@ -269,8 +269,8 @@ func serviceStartFromJSON(config string) int {
 	return 0
 }
 
-//export TailcatServiceStart
-func TailcatServiceStart(cConfig *C.char) C.int {
+//export ClientCoreServiceStart
+func ClientCoreServiceStart(cConfig *C.char) C.int {
 	return C.int(serviceStartFromJSON(C.GoString(cConfig)))
 }
 
@@ -605,7 +605,7 @@ func (s *serviceSession) closeLog() {
 	}
 }
 
-// serviceStopInternal TailcatServiceStop 的逻辑体（纯 Go 形态供单测）。
+// serviceStopInternal ClientCoreServiceStop 的逻辑体（纯 Go 形态供单测）。
 // 返回 0 = 已收工（或本就没在跑）｜-1 = 等待超时（旧实例仍在收尾；此后 Start 会
 // 一直 -1 直到它真正退出 —— 防止同钥匙双会话，调用方应重试 Stop）。
 func serviceStopInternal() int {
@@ -627,7 +627,7 @@ func serviceStopInternal() int {
 	}
 }
 
-// serviceStatusJSON TailcatServiceStatus 的数据源。
+// serviceStatusJSON ClientCoreServiceStatus 的数据源。
 // bridgeAuth = 桥鉴权首包 blob 的 hex（魔数+令牌）：只经本进程内存到 ArkTS，
 // 不落盘、不进日志/诊断报告（隧道宿主的同名键经 IPC 状态通道分发，语义相同）。
 func serviceStatusJSON() string {
@@ -683,8 +683,8 @@ func serviceStatusJSON() string {
 	return string(b)
 }
 
-//export TailcatServiceStop
-func TailcatServiceStop() C.int { return C.int(serviceStopInternal()) }
+//export ClientCoreServiceStop
+func ClientCoreServiceStop() C.int { return C.int(serviceStopInternal()) }
 
-//export TailcatServiceStatus
-func TailcatServiceStatus() *C.char { return cstr(serviceStatusJSON()) }
+//export ClientCoreServiceStatus
+func ClientCoreServiceStatus() *C.char { return cstr(serviceStatusJSON()) }

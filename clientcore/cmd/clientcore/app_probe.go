@@ -21,8 +21,8 @@ import (
 	"github.com/zhaoyswd/homeway/pkg/proto"
 )
 
-//export TailcatProbeAddr
-func TailcatProbeAddr(cToken *C.char) *C.char {
+//export ClientCoreProbeAddr
+func ClientCoreProbeAddr(cToken *C.char) *C.char {
 	raw := strings.TrimSpace(C.GoString(cToken))
 	tok, err := proto.DecodeToken(raw)
 	if err != nil {

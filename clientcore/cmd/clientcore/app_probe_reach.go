@@ -44,14 +44,14 @@ type reachResult struct {
 	Relay bool   `json:"relay"`
 }
 
-//export TailcatProbeReach
-func TailcatProbeReach(cToken *C.char) *C.char {
+//export ClientCoreProbeReach
+func ClientCoreProbeReach(cToken *C.char) *C.char {
 	return cstr(probeReachJSON(C.GoString(cToken)))
 }
 
 // probeReachJSON：token → 并发探测 → JSON（纯 Go 主体，测试直调这里）。
 // 成功 `{"ok":true,"peer":"…","endpoints":["a:41641","relay:…"],"results":[{"ep","rtt_ms",
-// "build","relay"},…]}`（peer/endpoints 与 TailcatProbeAddr 同款——「仍然添加」路径上
+// "build","relay"},…]}`（peer/endpoints 与 ClientCoreProbeAddr 同款——「仍然添加」路径上
 // App 仍可用它自动命名与展示；results 只含应答端点，死端点静默）；
 // 解析失败 `{"error":"…"}`。
 func probeReachJSON(tokenRaw string) string {

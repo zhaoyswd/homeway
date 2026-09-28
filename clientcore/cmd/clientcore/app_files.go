@@ -6,7 +6,7 @@
 // 真正的实现在 app_files_native.go（files 原生协议，wg-native-stack tasks 4.2）；
 // 旧的 SFTP-over-SSH 实现已随 4.4 删除（历史见 git log 与 HANDOFF）。
 //
-// 出入口只有 TailcatFilesCall 一个 cgo 导出：JSON 进、JSON 出，操作名分发——
+// 出入口只有 ClientCoreFilesCall 一个 cgo 导出：JSON 进、JSON 出，操作名分发——
 // connect/close/list/stat/mkdir/readText/readImage/download/upload/transfers/cancel
 // （分发名与语义一个字都没变，ArkTS 零改动）。
 package main
@@ -95,7 +95,7 @@ func marshalFiles(res filesResult, ferr *filesError) string {
 	return string(b)
 }
 
-//export TailcatFilesCall
-func TailcatFilesCall(cOp *C.char) *C.char {
+//export ClientCoreFilesCall
+func ClientCoreFilesCall(cOp *C.char) *C.char {
 	return cstr(filesDispatch(C.GoString(cOp)))
 }

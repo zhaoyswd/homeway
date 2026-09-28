@@ -258,7 +258,7 @@ func startSession(cfg tunConfig, run *tunRun, logf Logf) (exitSession, error) {
 	if err != nil {
 		return nil, err
 	}
-	run.setClient(sess) // 供 stop 打断暖机、以及 TailcatTunRecover 下推恢复阶梯
+	run.setClient(sess) // 供 stop 打断暖机、以及 ClientCoreTunRecover 下推恢复阶梯
 	return sess, nil
 }
 

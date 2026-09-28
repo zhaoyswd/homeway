@@ -45,8 +45,8 @@ func termErrf(code, format string, args ...any) *termError {
 	return &termError{Code: code, Msg: fmt.Sprintf(format, args...)}
 }
 
-//export TailcatTermCall
-func TailcatTermCall(cOp *C.char) *C.char {
+//export ClientCoreTermCall
+func ClientCoreTermCall(cOp *C.char) *C.char {
 	raw := C.GoString(cOp)
 	var op map[string]any
 	if err := json.Unmarshal([]byte(raw), &op); err != nil {

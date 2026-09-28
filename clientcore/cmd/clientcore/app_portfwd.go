@@ -14,7 +14,7 @@
 //	TargetIp 为 IP  → DialTCP：经出口 OnTCPForward 拨任意可达目标（出口侧视角解析路由）。
 //
 // 生命周期挂 tunRun 世代：attached 时 setPortForwards 首启，运行中可经
-// TailcatTunSetPortForwards 整表热替换（不重连隧道），runTun2Tailcat 收工时
+// ClientCoreTunSetPortForwards 整表热替换（不重连隧道），runTun2Tailcat 收工时
 // stopPortForwards（先关监听器，再由世代收尾关客户端，残留转发连接随之断掉）。
 // 单条监听失败只记状态、不阻断隧道（与「软失败不回滚」的两阶段启动哲学一致）。
 package main
@@ -60,7 +60,7 @@ type pfState struct {
 // setPortForwards 把本世代的端口转发**整体重置**为 fwds 这张表：停掉旧监听器、
 // 按新表逐条起 127.0.0.1 监听器。三个消费方共用这一条路——
 //   - attach 时首启（tunmode 的 tunRun，pfLn 为空的特例）；
-//   - 运行中改映射（TailcatTunSetPortForwards，热生效，不重连隧道）；
+//   - 运行中改映射（ClientCoreTunSetPortForwards，热生效，不重连隧道）；
 //   - 世代收工（stopPortForwards = setPortForwards(nil)）。
 //
 // 整个重置持 pfMu：与 pfStatusJSON（状态查询）互斥，重配期间查询要么看到全旧、
@@ -103,7 +103,7 @@ func (t *tunRunner) stopPortForwards() {
 	t.setPortForwards(nil)
 }
 
-// tunSetPortForwardsJSON 是 TailcatTunSetPortForwards 的实现：把新映射表热应用到
+// tunSetPortForwardsJSON 是 ClientCoreTunSetPortForwards 的实现：把新映射表热应用到
 // 当前世代（不重连隧道）。入参 JSON 形如 {"portForwards":[{listen,targetIp,targetPort}]}，
 // 与 tunConfig 的同名字段同一形状（扩展侧拼装逻辑只有一份）。
 // 返回 0 = 已应用；-1 = 当前没有**已接管数据面**的世代（改动会随下次连接的 tunConfig
@@ -171,11 +171,11 @@ func tunSetPortForwardsJSON(cfg string) int {
 	return 0
 }
 
-// TailcatTunSetPortForwards 运行中更新端口映射表（热生效）：App 侧保存/删除映射后
+// ClientCoreTunSetPortForwards 运行中更新端口映射表（热生效）：App 侧保存/删除映射后
 // 经状态通道的 pfSet 命令到这里，不再要求「断开重连」。见 app_portfwd.go 头注释。
 //
-//export TailcatTunSetPortForwards
-func TailcatTunSetPortForwards(cCfg *C.char) C.int {
+//export ClientCoreTunSetPortForwards
+func ClientCoreTunSetPortForwards(cCfg *C.char) C.int {
 	return C.int(tunSetPortForwardsJSON(C.GoString(cCfg)))
 }
 

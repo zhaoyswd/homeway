@@ -103,7 +103,7 @@ type tunRun struct {
 	// endpointCacheDir 端点学习缓存目录（新栈：三层来源缓存；空 = 不学）。
 	endpointCacheDir string
 
-	// cl 本世代的出口会话（wgcore.Transport）。换网/挂起唤醒时扩展经 TailcatTunRecover
+	// cl 本世代的出口会话（wgcore.Transport）。换网/挂起唤醒时扩展经 ClientCoreTunRecover
 	// 下推恢复阶梯（recover.go），就地重握手/换源/重赛跑，不必拆掉整条隧道重建。
 	// tr 本世代的 runner：tunStatusJSON 读它的统计/链路快照；stop 路径打斷暖机。
 	// clClosed 记录"客户端已被关闭"这件事（**不能用 sync.Once 表达**，理由见 closeClientOnce）。
@@ -154,7 +154,7 @@ var (
 // 链路巡检固定 60s：探测的存在意义是保活（NAT 映射 / 对端路径信任）与可达性判定
 // （连续 3 次无响应 → 不健康 → 自愈重建）——都是写给隧道的，不该被 UI 消费驱动。
 // 界面新鲜度与探测节拍解耦：扩展前台时每 5s 读一次状态快照（路径/延迟是上次探测的
-// 结果，流量是实时计数），纯读、不触发新探测；App 回到前台时经 TailcatTunSetForeground
+// 结果，流量是实时计数），纯读、不触发新探测；App 回到前台时经 ClientCoreTunSetForeground
 // 踢一次立即探测，让链路数据在用户注视恢复的 1–2s 内新鲜（连接完成时另有一次立即探测）。
 const patrolInterval = 60 * time.Second
 
@@ -199,7 +199,7 @@ var (
 
 func init() { tunForeground.Store(true) }
 
-// setTunForeground 由扩展经 NAPI（TailcatTunSetForeground）调用：回到前台时踢一次
+// setTunForeground 由扩展经 NAPI（ClientCoreTunSetForeground）调用：回到前台时踢一次
 // 巡检——固定间隔下，用户回到界面时链路快照可能已落后最多 60s，踢一下让新数据在
 // 1–2s 内就位（扩展侧回前台也会立即读一次快照，两者互补）。
 func setTunForeground(fg bool) {
@@ -576,7 +576,7 @@ func tunStageSnapshot() (tunStage, string, string, bool) {
 	return stageNow, stageCode, stageReason, stageMeowed
 }
 
-// tunRunningValue 是 TailcatTunRunning 的唯一实现：**只有接上数据面且健康**才算 1。
+// tunRunningValue 是 ClientCoreTunRunning 的唯一实现：**只有接上数据面且健康**才算 1。
 // 语义比原先收紧（原先只看单飞锁）：prepare 阶段锁已经持有，但那时隧道还不能承载流量。
 func tunRunningValue() int {
 	// 注意：这三个信号（单飞锁/健康位/阶段）各自原子、**合起来不是一致快照** ⇒ 转换瞬间可能
@@ -755,7 +755,7 @@ func runTun2Tailcat(cfg tunConfig, run *tunRun) error {
 		return fmt.Errorf("新栈启动失败：%w", serr)
 	}
 	logf("传输：新栈（wg-native-stack）")
-	run.setClient(cl) // 供 stop 打断暖机、以及 TailcatTunRecover 下推恢复阶梯
+	run.setClient(cl) // 供 stop 打断暖机、以及 ClientCoreTunRecover 下推恢复阶梯
 	// 任何退出路径（硬失败/坏 fd/attach 超时/收到停止信号）都要回收客户端：DERP/WG 连接
 	// 不会因为函数返回而自己消失，漏掉就是"暖机白跑 + 出口侧留着半个 peer"。
 	defer run.closeClientOnce()
@@ -1267,9 +1267,9 @@ func attachTun(fd int) int {
 }
 
 // tunStopWait：通知 tun 循环收工并等待（有界）。扩展重建隧道前必须调用，
-// 否则 Go 核的单飞锁（probeRunning）会拒绝下一次 TailcatTunStart。
+// 否则 Go 核的单飞锁（probeRunning）会拒绝下一次 ClientCoreTunStart。
 // （cgo 的 C 命名空间按文件隔离，故这里只返回 int，由 probe_lib.go 包成 C.int。）
-// 换网/唤醒的就地恢复已整体收编到 recover.go 的恢复阶梯（TailcatTunRecover）。
+// 换网/唤醒的就地恢复已整体收编到 recover.go 的恢复阶梯（ClientCoreTunRecover）。
 
 // errActionTimeout：runBoundedAction 的预算用尽哨兵，区别于被调动作自己返回的本地错误。
 var errActionTimeout = errors.New("本地动作超时")
@@ -1321,7 +1321,7 @@ func tunStopWait() int {
 		return 0
 	case <-time.After(3 * time.Second):
 		// 收工超时（例如阻塞在 fd 读上，close 打不断阻塞读）：
-		// 只要这期间没有新世代启动，就强制放锁——否则重建会永远卡在 TailcatTunStart rc=-1。
+		// 只要这期间没有新世代启动，就强制放锁——否则重建会永远卡在 ClientCoreTunStart rc=-1。
 		if r.isCurrent() {
 			tunUnhealthyWhy.Store("stop") // 收工超时：同世代退出类
 			tunHealthy.Store(false)

@@ -21,7 +21,7 @@ import (
 // 不参与合成，下一拍推送即恢复。取 90s（> 泵节拍 5s × 若干抖动，<< 巡检 60s×2）。
 const activityFreshness = 90 * time.Second
 
-// tunActivity：扩展经 NAPI（TailcatTunSetActivity）下发的「App 前台 / 设备亮屏」。
+// tunActivity：扩展经 NAPI（ClientCoreTunSetActivity）下发的「App 前台 / 设备亮屏」。
 // pushedAt 参与新鲜度判定；初始为零值（两处都按 false + 陈旧处理——prepare 早期
 // 扩展还没来得及推值，保守不算需求，首拍推送后恢复）。
 var tunActivity struct {
