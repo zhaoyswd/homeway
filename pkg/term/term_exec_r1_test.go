@@ -252,7 +252,7 @@ func TestRawStallOverLimitBreaksLeg(t *testing.T) {
 
 // ---- 中4：两种失败模式走 flushSurface 端到端各命中一次计数器 ----
 //
-// queue_overflow（注入 HOMEWAY_TERM_QUEUE_BYTES=64KiB）：pipe 腿无人读 ⇒ 写者阻塞在
+// queue_overflow（注入 HOMEWAY_TERM_QUEUE_BYTES=8192）：pipe 腿无人读 ⇒ 写者阻塞在
 // 首帧写上 ⇒ 后续 flush 的帧持续入队积压到上限 ⇒ flushSurface 的 enqueueGroup 分支
 // 拒绝并 markNeedSnapshot("queue_overflow")。
 func TestQueueOverflowViaRealFlush(t *testing.T) {
@@ -265,7 +265,7 @@ func TestQueueOverflowViaRealFlush(t *testing.T) {
 	defer stuck.Close()
 	_, leg := surfaceLegOf(t, svc, "r1s4")
 
-	// bulkTermShell 持续产出 ⇒ flush 每 16–33ms 构帧入队；写者阻塞 ⇒ 积压超 64KiB。
+	// bulkTermShell 持续产出 ⇒ flush 每 16–33ms 构帧入队；写者阻塞 ⇒ 积压超 8KiB。
 	deadline := time.Now().Add(10 * time.Second)
 	for time.Now().Before(deadline) {
 		if st := leg.leg.statsSnapshot(); st.queueOverflow >= 1 {

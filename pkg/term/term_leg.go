@@ -609,9 +609,9 @@ func (s *termSession) endLegLocked(c *termClient, code int32, reason string, why
 		if c.surface && c.leg != nil {
 			st := c.leg.statsSnapshot()
 			s.svc.logf("term: 会话 %s 腿断开（kind=%s 原因=%s）｜快照=%d 差分=%d 降级=%d 背压=%d "+
-				"队列溢出=%d 分片=%d 下行=%dB FETCH 命中=%d 落空=%d",
+				"队列溢出=%d 编码失败=%d 分片=%d 下行=%dB FETCH 命中=%d 落空=%d",
 				s.name, c.kind, why, st.snapshots, st.diffs, st.degrades, st.backpressure,
-				st.queueOverflow, st.fragments, st.bytesOut, st.fetchHits, st.fetchMiss)
+				st.queueOverflow, st.encodeFailed, st.fragments, st.bytesOut, st.fetchHits, st.fetchMiss)
 		} else {
 			s.svc.logf("term: 会话 %s 腿断开（kind=%s 原因=%s）", s.name, c.kind, why)
 		}

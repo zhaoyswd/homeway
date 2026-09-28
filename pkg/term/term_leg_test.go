@@ -938,7 +938,7 @@ func TestRawStallDoesNotBreakLeg(t *testing.T) {
 
 	// 会话持续输出（ticker）：停滞腿阻塞在写上（pipe 无人读），写超时 → 停滞。
 	// 观察：正常腿持续收数据；停滞腿仍在 legs（未被踢）。
-	time.Sleep(2500 * time.Millisecond) // 覆盖至少一次写超时周期
+	time.Sleep(2500 * time.Millisecond) // 未达默认写超时 10s：验「写阻塞期间其它腿不受影响」；停滞置位/恢复/超限断腿由 exec-r1 整改后的注入用例覆盖（term_exec_r1_test.go）
 	_ = cok.SetReadDeadline(time.Now().Add(5 * time.Second))
 	if got := readDataContains(t, cok, "tick"); !strings.Contains(got, "tick") {
 		t.Fatal("停滞腿在写上卡住时，其它腿不该受影响")
