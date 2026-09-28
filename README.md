@@ -130,6 +130,9 @@ homeway term delete <名字>        # 关闭会话（与 App 的「关闭会话�
 （2026-09-29 双端实测）——出口把 `term.sock`/`files.sock` 显式 chmod **0600**（拦非属主）、
 state 目录收紧 **0700** 作第二层防御（同时护住目录里的身份密钥与 token 台账）——不要把
 state 目录开放给不可信用户/进程。
+（版本边界：`term.sock` 0600 自 v0.9.0 起；`files.sock` 0600 与 `OpenState` 收紧 0700 在
+f610f3f 起、**随下一版出口生效**——v0.9.0 出口重启后 files.sock 会回到 umask 值，但 state
+目录 700 下实际暴露面为零。）
 
 ## 运行细节
 
