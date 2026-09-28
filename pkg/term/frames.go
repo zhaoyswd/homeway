@@ -12,6 +12,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 )
 
 const (
@@ -52,6 +53,17 @@ const (
 	// 放在 0x16 是刻意的：0x0D–0x15 留给 surface 协议（design D2 的 op 分配），
 	// 诊断帧不占那条线，也不会被 surface 客户端误读。
 	opExplain byte = 0x16
+	// opCreate 创建会话但不接入（term-host-cli 任务 6.2，`homeway term new -d`）：
+	// 不动 PTY 尺寸、不产生腿、不触发哨兵/焦点。载荷 [flags:1][nameLen:1][name]，
+	// flags bit0 = only-if-absent；应答沿用一锤子帧（OK / ERROR）。
+	opCreate byte = 0x17
+)
+
+// HELLO flags（bit0 既有；bit1/bit2 是 term-host-cli 的协议增量，design D8）。
+const (
+	helloFlagCreate       = 1 << 0 // 创建语义（既有）
+	helloFlagOnlyIfAbsent = 1 << 1 // 名字已存在则报 already_exists（`new` 不带 -A）
+	helloFlagTakeover     = 1 << 2 // 显式接管：踢掉其它腿（`attach -d`；ENDED reason=replaced）
 )
 
 // GREETING 的 features 位（客户端不认识的位忽略）。
@@ -89,6 +101,17 @@ const (
 	termEndReplaced       = -1 // 同一会话被新的 attach 顶掉
 	termEndKilled         = -2 // App 主动 kill
 	termEndServiceStopped = -3 // 出口服务退出
+)
+
+// termEndNone 是「不发 ENDED」的哨兵值（硬错误/客户端已关）：断腿只关连接，
+// 客户端看到裸 EOF（CLI 按 D7 给可行动文案）。
+const termEndNone = math.MinInt32
+
+// ENDED code=-1 的 reason 受控词表（term-host-cli design D8，r1 P1-4 冻结）：
+// 新增取值 MUST 先扩本表再实现（出口与客户端同批交付）。
+const (
+	termReasonReplaced      = "replaced"       // 被另一客户端显式接管（attach -d）
+	termReasonSelfReconnect = "self_reconnect" // 被同一实例标识的重连替换
 )
 
 // agentName 把枚举渲染成可检索的短名（日志/JSON 用）。
@@ -177,7 +200,8 @@ func decGreeting(p []byte) (ver byte, features uint32, err error) {
 	return p[0], binary.LittleEndian.Uint32(p[1:5]), nil
 }
 
-// encHello / decHello：cols/rows + flags(bit0=create) + nameLen + name。
+// encHello / decHello：cols/rows + flags + nameLen + name。
+// flags 见 helloFlag*（create / only-if-absent / takeover）。
 func encHello(cols, rows uint16, create bool, name string) []byte {
 	var flags byte
 	if create {
@@ -192,23 +216,23 @@ func encHello(cols, rows uint16, create bool, name string) []byte {
 	return p
 }
 
-func decHello(p []byte) (cols, rows uint16, create bool, name string, err error) {
+func decHello(p []byte) (cols, rows uint16, flags byte, name string, err error) {
 	if len(p) < 6 {
-		return 0, 0, false, "", fmt.Errorf("%w: hello len %d", errTermFrame, len(p))
+		return 0, 0, 0, "", fmt.Errorf("%w: hello len %d", errTermFrame, len(p))
 	}
 	cols = binary.LittleEndian.Uint16(p[0:2])
 	rows = binary.LittleEndian.Uint16(p[2:4])
-	create = p[4]&1 != 0
+	flags = p[4]
 	// 布局：cols(2) rows(2) flags(1) nameLen(1) name
 	n := int(p[5])
 	if len(p) < 6+n {
-		return 0, 0, false, "", fmt.Errorf("%w: hello name len %d > %d", errTermFrame, n, len(p)-6)
+		return 0, 0, 0, "", fmt.Errorf("%w: hello name len %d > %d", errTermFrame, n, len(p)-6)
 	}
 	name = string(p[6 : 6+n])
-	return cols, rows, create, name, nil
+	return cols, rows, flags, name, nil
 }
 
-// helloTail 取 HELLO 载荷里 name 之后的**尾随字节**（capability 块所在）。
+// helloTail 取 HELLO 载荷里 name 之后的**尾随字节**（capability / 实例标识块所在）。
 // 旧客户端不发尾随字节 ⇒ 返回空，向后兼容（decHello 本来就只读 name 之前的部分）。
 func helloTail(p []byte, name string) []byte {
 	off := 6 + len(name)
@@ -216,6 +240,89 @@ func helloTail(p []byte, name string) []byte {
 		return nil
 	}
 	return p[off:]
+}
+
+// ---- HELLO 尾随块：capability + 客户端实例标识（term-host-cli 任务 2.3，design D8）----
+//
+// 形状（顺序固定）：[capLen:1][caps:capLen][idLen:1][clientID:idLen]，
+// 两段都是「可省略」但**必须按序**且**后面不能再有字节**。形状不符（如缺 caps 长度前缀的
+// 裸 ID 块）MUST 拒绝——沿用 bad_capability 错误码（任务 2.3 / r1 P2-9）。
+
+// termMaxClientIDLen 是实例标识的字节上限（CLI 侧是主机名+uid+tty 的短哈希，16 字节量级）。
+const termMaxClientIDLen = 64
+
+// encHelloTail 组尾随块（capability 可省略；ID 可省略；顺序固定）。
+func encHelloTail(caps byte, capsPresent bool, id string) []byte {
+	var out []byte
+	if capsPresent {
+		out = append(out, encCapability(caps)...)
+	}
+	if id != "" {
+		out = append(out, byte(len(id)))
+		out = append(out, id...)
+	}
+	return out
+}
+
+// decHelloTail 解 HELLO 尾随：形状校验 + capability + 实例标识。
+// 返回 (caps, 是否携带 caps, clientID, 错误)；畸形形状返回错误（调用方报 bad_capability）。
+func decHelloTail(tail []byte) (caps byte, capsPresent bool, id string, err error) {
+	off := 0
+	if len(tail) > off {
+		n := int(tail[off])
+		if n > 0 {
+			if len(tail) < off+1+n {
+				return 0, false, "", fmt.Errorf("%w: capability 块声明 %d 字节，实际只有 %d",
+					errTermFrame, n, len(tail)-off-1)
+			}
+			for i := 0; i < n; i++ {
+				caps |= tail[off+1+i]
+			}
+			capsPresent = true
+			off += 1 + n
+		}
+		// capLen==0：空 caps 块，按「不携带」处理、前进 1 字节（宽容：等价于没有）。
+	}
+	if len(tail) > off {
+		n := int(tail[off])
+		if len(tail) < off+1+n {
+			return 0, false, "", fmt.Errorf("%w: 实例标识块声明 %d 字节，实际只有 %d",
+				errTermFrame, n, len(tail)-off-1)
+		}
+		if n > termMaxClientIDLen {
+			return 0, false, "", fmt.Errorf("%w: 实例标识 %d 字节超过上限 %d",
+				errTermFrame, n, termMaxClientIDLen)
+		}
+		id = string(tail[off+1 : off+1+n])
+		off += 1 + n
+	}
+	if len(tail) > off {
+		return 0, false, "", fmt.Errorf("%w: 尾随块后还有 %d 字节残留", errTermFrame, len(tail)-off)
+	}
+	return caps, capsPresent, id, nil
+}
+
+// ---- CREATE（任务 6.2）：[flags:1][nameLen:1][name]，flags bit0 = only-if-absent ----
+
+const createFlagOnlyIfAbsent = 1 << 0
+
+func encCreate(flags byte, name string) []byte {
+	p := make([]byte, 2+len(name))
+	p[0] = flags
+	p[1] = byte(len(name))
+	copy(p[2:], name)
+	return p
+}
+
+func decCreate(p []byte) (flags byte, name string, err error) {
+	if len(p) < 2 {
+		return 0, "", fmt.Errorf("%w: create len %d", errTermFrame, len(p))
+	}
+	n := int(p[1])
+	if len(p) < 2+n {
+		return 0, "", fmt.Errorf("%w: create name len %d > %d", errTermFrame, n, len(p)-2)
+	}
+	return p[0], string(p[2 : 2+n]), nil
 }
 
 func encResize(cols, rows uint16) []byte {

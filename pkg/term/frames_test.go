@@ -50,12 +50,12 @@ func TestTermFrameShortAndTruncated(t *testing.T) {
 }
 
 func TestTermHelloRoundTrip(t *testing.T) {
-	cols, rows, create, name, err := decHello(encHello(80, 24, false, "s1"))
+	cols, rows, flags, name, err := decHello(encHello(80, 24, false, "s1"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cols != 80 || rows != 24 || create || name != "s1" {
-		t.Fatalf("hello 往返不一致：%d %d %v %q", cols, rows, create, name)
+	if cols != 80 || rows != 24 || flags != 0 || name != "s1" {
+		t.Fatalf("hello 往返不一致：%d %d 0x%x %q", cols, rows, flags, name)
 	}
 	if _, _, _, _, err := decHello([]byte{1, 2, 3}); err == nil {
 		t.Error("过短的 HELLO 应当报错")
