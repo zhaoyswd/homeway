@@ -3,7 +3,7 @@
 //	homeway                    # 出口（默认角色），零参数即可
 //	homeway exit [flags]       # 出口（显式）
 //	homeway relay [flags]      # 中继
-//	homeway term explain …     # 终端检测诊断
+//	homeway term <子命令> …    # 终端命令面：list / new / attach / delete / explain
 //	homeway --version
 //
 // 一台机器上可以同时跑多个进程（例如一个出口 + 一个中继）：各进程用 --state 区分身份、
@@ -120,7 +120,8 @@ func usage(w *os.File) {
   homeway [flags]              启动出口（默认角色，零参数即可）
   homeway exit [flags]         同上（显式角色）
   homeway relay [flags]        启动中继
-  homeway term explain …       终端检测诊断（离线调规则 / 在线取实时判定）
+  homeway term <子命令> …      终端命令面（list / new / attach / delete / explain；
+                               与 App 同一份会话注册表，经 <state>/term.sock 本地直连）
   homeway --version            打印版本
 
 一台机器上可以同时运行多个进程（如一个出口 + 一个中继）：用 --state 区分身份、

@@ -1,28 +1,38 @@
 //go:build !windows
 
-// term_cli.go — `homeway term explain`（任务 4.8）：把规则判定的**完整依据链**打出来。
+// term_cli.go — `homeway term` 主机命令面（term-host-cli 任务 7.1）+ `homeway term explain`
+// （任务 4.8，规则判定的**完整依据链**）。
 //
-// 两种用法（规格「explain 调试命令」）：
+// 命令面（与 App 同一份会话注册表，经 `<state>/term.sock` 本地直连、不经隧道）：
 //
-//	homeway term explain --file <屏幕文本> --agent <label> [--json]   # 离线：调规则
-//	homeway term explain <会话名> [--state <dir>] [--json]            # 在线：取运行中会话的实时快照
+//	homeway term list [--json] [--state <dir>]
+//	homeway term new [name] [-d] [-A] [--state <dir>]      # 默认创建并接入；-d 只创建不接入
+//	homeway term attach [name] [-d] [--detach-key K] …      # raw 终端客户端（term_cli_attach.go）
+//	homeway term delete <name> [--state <dir>]
+//	homeway term explain --file <屏幕文本> --agent <label>   # 离线：调规则
+//	homeway term explain <会话名>                            # 在线：取运行中会话的实时快照
 //
-// 离线模式是规则迭代的主路径：把误判的屏幕存成文件 → explain 看命中规则与评估轨迹 → 改 TOML →
+// explain 离线模式是规则迭代的主路径：把误判的屏幕存成文件 → explain 看命中规则与评估轨迹 → 改 TOML →
 // 复验（改的是**本地覆盖** `<state>/agent-detection/<id>.toml`，不动移植文件）。
+// 在线模式经 EXPLAIN 帧（诊断用 op 0x16——避开 surface 占用的 0x0D–0x15；出口不在跑时报可行动的错）。
 //
-// 在线模式经 `<state>/term.sock` 问出口进程要一份实时判定（EXPLAIN 帧，诊断用 op 0x16——
-// 避开 surface 占用的 0x0D–0x15；出口不在跑时报可行动的错，不静默失败）。
+// 错误面（design D1/D7）：连接层两态合并提示（ENOENT = 出口未运行或 HOMEWAY_TERM=off；
+// ECONNREFUSED = 残留 socket）；协议层错误码翻可行动中文。**面向同代出口**（破坏性授权
+// 2026-09-27），不做旧出口检测/告警/降级。
 package term
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"net"
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 
 	"github.com/zhaoyswd/homeway/pkg/term/manifest"
 )
@@ -41,10 +51,440 @@ func CLI(args []string) error {
 		termUsage(os.Stdout)
 		return nil
 	}
-	if args[0] != "explain" {
-		return fmt.Errorf("不认识的子命令 %q（可用：explain）", args[0])
+	// `--flag=value` 归一成 `--flag value`（手写解析器统一支持两种形态）。
+	args = expandFlagEq(args)
+	sub, rest := args[0], args[1:]
+	var err error
+	switch sub {
+	case "explain":
+		err = cliExplain(rest)
+	case "list":
+		err = cliList(rest)
+	case "new":
+		err = cliNew(rest)
+	case "attach":
+		var o attachOpts
+		if o, err = parseAttachArgs(rest); err == nil {
+			err = cliAttachCmd(o)
+		}
+	case "delete":
+		err = cliDelete(rest)
+	default:
+		return fmt.Errorf("不认识的子命令 %q（可用：list、new、attach、delete、explain）", sub)
 	}
-	opt, err := parseExplainArgs(args[1:])
+	return err
+}
+
+// expandFlagEq 把 `--flag=value` 拆成 `--flag value`。
+func expandFlagEq(args []string) []string {
+	out := make([]string, 0, len(args))
+	for _, a := range args {
+		if strings.HasPrefix(a, "--") {
+			if i := strings.IndexByte(a, '='); i > 2 {
+				out = append(out, a[:i], a[i+1:])
+				continue
+			}
+		}
+		out = append(out, a)
+	}
+	return out
+}
+
+// ---- 通用参数与连接层（任务 7.1）----
+
+// termCommon 是各子命令的公共参数（--state）。
+type termCommon struct {
+	stateDir string
+}
+
+// nextArg 取第 i+1 个参数（flag 的值）；缺失报可行动错误。
+func nextArg(args []string, i *int, flag string) (string, error) {
+	if *i+1 >= len(args) {
+		return "", fmt.Errorf("%s 后面缺参数", flag)
+	}
+	*i++
+	return args[*i], nil
+}
+
+// applyCommon 解析 `--state <dir>`（写回 *stateDir）。
+func applyCommon(stateDir *string, args []string, i *int) error {
+	v, err := nextArg(args, i, "--state")
+	if err != nil {
+		return err
+	}
+	*stateDir = v
+	return nil
+}
+
+// protoError 是服务端 ERROR 帧的 CLI 侧载体（错误码可被调用方按 code 分支，
+// 如自动命名的 already_exists 重试；文案 = 服务端消息 + 可行动提示）。
+type protoError struct{ code, msg string }
+
+func (e *protoError) Error() string {
+	switch e.code {
+	case "no_session":
+		// 场景含「命令期间会话恰好结束」的竞态（spec：报「会话已结束」并提示刷新）。
+		return e.msg + "；用 homeway term list 查看当前会话"
+	default:
+		if e.msg != "" {
+			return e.msg
+		}
+		return e.code
+	}
+}
+
+func isProtoCode(err error, code string) bool {
+	var pe *protoError
+	return errors.As(err, &pe) && pe.code == code
+}
+
+// dialErrText 把连接层错误翻成可行动文案（D1：两态 + 合并提示）。
+func dialErrText(sock string, err error) error {
+	switch {
+	case errors.Is(err, fs.ErrNotExist):
+		return fmt.Errorf("出口未在运行、或终端服务被关闭（HOMEWAY_TERM=off），或 --state 指错目录"+
+			"（%s 不存在）；检查 --state 与出口状态", sock)
+	case errors.Is(err, syscall.ECONNREFUSED):
+		return fmt.Errorf("连接被拒：%s 像是残留 socket（出口进程已退出）；确认出口在跑，或删除该文件后重试", sock)
+	case errors.Is(err, syscall.EACCES), errors.Is(err, syscall.EPERM):
+		return fmt.Errorf("无权连接 %s（term.sock 仅属主可用；命令面须与出口同一用户运行）", sock)
+	}
+	return fmt.Errorf("连不上 term 服务（%s）：%w", sock, err)
+}
+
+// cliDialTerm 连 <state>/term.sock 并读 GREETING（list/new/delete/attach 共用）。
+func cliDialTerm(stateDir string) (net.Conn, error) {
+	if stateDir == "" {
+		return nil, errors.New("拿不到 state 目录（用 --state 指定）")
+	}
+	sock := filepath.Join(stateDir, "term.sock")
+	conn, err := net.Dial("unix", sock)
+	if err != nil {
+		return nil, dialErrText(sock, err)
+	}
+	f, err := readTermFrame(conn)
+	if err != nil {
+		conn.Close()
+		return nil, fmt.Errorf("读 GREETING：%w", err)
+	}
+	if f.op != opGreeting {
+		conn.Close()
+		return nil, fmt.Errorf("首帧应为 GREETING，收到 op 0x%02x", f.op)
+	}
+	return conn, nil
+}
+
+// cliRoundTrip 一锤子命令：发一帧、读应答；ERROR 帧翻成 protoError。
+func cliRoundTrip(conn net.Conn, op byte, payload []byte) (termFrame, error) {
+	if _, err := conn.Write(encodeTermFrame(op, payload)); err != nil {
+		return termFrame{}, fmt.Errorf("发 op 0x%02x 帧：%w", op, err)
+	}
+	f, err := readTermFrame(conn)
+	if err != nil {
+		return termFrame{}, fmt.Errorf("读应答：%w", err)
+	}
+	if f.op == opError {
+		code, msg, _ := decError(f.payload)
+		return f, &protoError{code: code, msg: msg}
+	}
+	return f, nil
+}
+
+// validateName 本地校验会话名（spec：就地报错、MUST NOT 发起连接）。
+func validateName(name string) error {
+	if !termNameRx.MatchString(name) {
+		return fmt.Errorf("会话名 %q 不合法：只能是 [A-Za-z0-9._-]{1,64}", name)
+	}
+	return nil
+}
+
+// ---- list ----
+
+// cliClientInfo / cliSessionInfo：LIST JSON 的 CLI 侧镜像（字段与出口同构、只增不改，D8）。
+type cliClientInfo struct {
+	Kind    string `json:"kind"` // app / host / legacy
+	Cols    uint16 `json:"cols"`
+	Rows    uint16 `json:"rows"`
+	SinceMs int64  `json:"sinceMs"`
+	Active  bool   `json:"active"`
+}
+
+type cliSessionInfo struct {
+	Name         string          `json:"name"`
+	CreatedMs    int64           `json:"createdMs"`
+	LastActiveMs int64           `json:"lastActiveMs"`
+	Attached     bool            `json:"attached"`
+	Agent        string          `json:"agent"`
+	State        string          `json:"state"`
+	StateV2      string          `json:"stateV2"`
+	Title        string          `json:"title"`
+	Cwd          string          `json:"cwd,omitempty"`
+	Cols         uint16          `json:"cols"`
+	Rows         uint16          `json:"rows"`
+	Pid          int             `json:"pid"`
+	Clients      []cliClientInfo `json:"clients"`
+}
+
+func cliList(args []string) error {
+	var c termCommon
+	jsonOut := false
+	for i := 0; i < len(args); i++ {
+		a := args[i]
+		switch {
+		case a == "--json":
+			jsonOut = true
+		case a == "--state":
+			if err := applyCommon(&c.stateDir, args, &i); err != nil {
+				return err
+			}
+		case strings.HasPrefix(a, "-"):
+			return fmt.Errorf("不认识的参数 %q（可用：--json、--state <dir>）", a)
+		default:
+			return fmt.Errorf("list 不接受会话名（%q）；省略名字接入最近活跃会话请用 attach", a)
+		}
+	}
+	entries, raw, err := cliListFetch(c.stateDir)
+	if err != nil {
+		return err
+	}
+	return cliListPrint(os.Stdout, entries, raw, jsonOut)
+}
+
+// cliListFetch 经 UDS 取 LIST（表格与「attach 省略名字」的最近活跃解析共用）。
+func cliListFetch(stateDir string) ([]cliSessionInfo, []byte, error) {
+	conn, err := cliDialTerm(stateDir)
+	if err != nil {
+		return nil, nil, err
+	}
+	defer conn.Close()
+	f, err := cliRoundTrip(conn, opList, nil)
+	if err != nil {
+		return nil, nil, err
+	}
+	if f.op != opList {
+		return nil, nil, fmt.Errorf("期望 LIST-REPLY，收到 op 0x%02x", f.op)
+	}
+	var out struct {
+		Sessions []cliSessionInfo `json:"sessions"`
+	}
+	if err := json.Unmarshal(f.payload, &out); err != nil {
+		return nil, nil, fmt.Errorf("LIST-REPLY 不是合法 JSON：%w", err)
+	}
+	return out.Sessions, f.payload, nil
+}
+
+// cliListPrint 表格 / JSON 输出（--json 与出口 LIST JSON 同构：原样缩进重排、不改字段）。
+func cliListPrint(w io.Writer, entries []cliSessionInfo, rawJSON []byte, asJSON bool) error {
+	if asJSON {
+		var buf bytes.Buffer
+		if err := json.Indent(&buf, rawJSON, "", "  "); err != nil {
+			return fmt.Errorf("LIST JSON 缩进失败：%w", err)
+		}
+		_, _ = buf.WriteTo(w)
+		return nil
+	}
+	if len(entries) == 0 {
+		fmt.Fprintln(w, "（当前没有会话；homeway term new 可创建）")
+		return nil
+	}
+	// 最近活跃在前（与 attach 省略名字的选取一致）。
+	sorted := append([]cliSessionInfo{}, entries...)
+	for i := 1; i < len(sorted); i++ {
+		for j := i; j > 0 && sorted[j].LastActiveMs > sorted[j-1].LastActiveMs; j-- {
+			sorted[j], sorted[j-1] = sorted[j-1], sorted[j]
+		}
+	}
+	fmt.Fprintf(w, "%-20s %-9s %-9s %-10s %-24s %s\n", "NAME", "SIZE", "STATE", "AGENT", "TITLE", "CLIENTS")
+	for _, s := range sorted {
+		title := s.Title
+		if title == "" {
+			title = "-"
+		}
+		r := []rune(title)
+		if len(r) > 22 {
+			title = string(r[:21]) + "…"
+		}
+		clients := "-"
+		if len(s.Clients) > 0 {
+			kinds := make([]string, 0, len(s.Clients))
+			for _, cl := range s.Clients {
+				k := cl.Kind
+				if cl.Active {
+					k += "*"
+				}
+				kinds = append(kinds, k)
+			}
+			clients = strings.Join(kinds, ",")
+		}
+		fmt.Fprintf(w, "%-20s %dx%-5d %-9s %-10s %-24s %s\n",
+			s.Name, s.Cols, s.Rows, firstNonEmpty(s.StateV2, s.State), s.Agent, title, clients)
+	}
+	return nil
+}
+
+// ---- new / delete ----
+
+// newOpts：`new [name] [-d] [-A]`。
+type newOpts struct {
+	name      string
+	detached  bool // -d：只创建不接入（CREATE op，不动 PTY 尺寸、不产生腿）
+	reuse     bool // -A：已存在则复用（不报 already_exists）
+	stateDir  string
+	autoNamed bool // 省略名字：host-<4hex> + 重名重试
+}
+
+func parseNewArgs(args []string) (newOpts, error) {
+	o := newOpts{stateDir: DefaultStateDir()}
+	for i := 0; i < len(args); i++ {
+		a := args[i]
+		switch {
+		case a == "-d":
+			o.detached = true
+		case a == "-A":
+			o.reuse = true
+		case a == "--state":
+			if err := applyCommon(&o.stateDir, args, &i); err != nil {
+				return o, err
+			}
+		case strings.HasPrefix(a, "-"):
+			return o, fmt.Errorf("不认识的参数 %q（可用：-d、-A、--state <dir>）", a)
+		default:
+			if o.name != "" {
+				return o, fmt.Errorf("只能给一个会话名（已有 %q）", o.name)
+			}
+			o.name = a
+		}
+	}
+	if o.name == "" {
+		o.autoNamed = true
+	} else if err := validateName(o.name); err != nil {
+		return o, err
+	}
+	return o, nil
+}
+
+func cliNew(args []string) error {
+	o, err := parseNewArgs(args)
+	if err != nil {
+		return err
+	}
+	if o.detached {
+		return cliNewDetached(o)
+	}
+	// 默认：创建并接入（tmux 式 new-session）。
+	return cliAttachCmd(attachOpts{
+		name: o.name, stateDir: o.stateDir,
+		create: true, reuse: o.reuse, autoNamed: o.autoNamed,
+	})
+}
+
+// cliNewDetached：`new -d`（CREATE op 创建不接入；任务 6.2 的客户端半边）。
+func cliNewDetached(o newOpts) error {
+	flags := byte(0)
+	if o.reuse {
+		flags |= createFlagOnlyIfAbsent
+	}
+	if o.autoNamed {
+		// 自动命名不带 only-if-absent（带了会静默复用既有会话）：靠 already_exists 重试。
+		for i := 0; i < 8; i++ {
+			name := genAutoName()
+			if err := cliCreateOnce(o.stateDir, name, flags); err != nil {
+				if isProtoCode(err, "already_exists") {
+					continue
+				}
+				return err
+			}
+			fmt.Printf("已创建会话 %s（不接入）\n", name)
+			return nil
+		}
+		return errors.New("自动命名连续重名 8 次（运气太差）；请显式给名字：homeway term new <名字> -d")
+	}
+	if err := cliCreateOnce(o.stateDir, o.name, flags); err != nil {
+		return err
+	}
+	fmt.Printf("已创建会话 %s（不接入）\n", o.name)
+	return nil
+}
+
+func cliCreateOnce(stateDir, name string, flags byte) error {
+	conn, err := cliDialTerm(stateDir)
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+	f, err := cliRoundTrip(conn, opCreate, encCreate(flags, name))
+	if err != nil {
+		return err
+	}
+	if f.op != opOK {
+		return fmt.Errorf("期望 OK，收到 op 0x%02x", f.op)
+	}
+	return nil
+}
+
+// cliDelete：复用既有 KILL 帧（与 App 关闭会话同一路径；wire op 名不改，D1）。
+func cliDelete(args []string) error {
+	var c termCommon
+	name := ""
+	for i := 0; i < len(args); i++ {
+		a := args[i]
+		switch {
+		case a == "--state":
+			if err := applyCommon(&c.stateDir, args, &i); err != nil {
+				return err
+			}
+		case strings.HasPrefix(a, "-"):
+			return fmt.Errorf("不认识的参数 %q（可用：--state <dir>）", a)
+		default:
+			if name != "" {
+				return fmt.Errorf("只能给一个会话名（已有 %q）", name)
+			}
+			name = a
+		}
+	}
+	if name == "" {
+		return errors.New("delete 需要会话名：homeway term delete <name>")
+	}
+	if err := validateName(name); err != nil {
+		return err
+	}
+	conn, err := cliDialTerm(c.stateDir)
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+	f, err := cliRoundTrip(conn, opKill, encName(name))
+	if err != nil {
+		return err
+	}
+	if f.op != opOK {
+		return fmt.Errorf("期望 OK，收到 op 0x%02x", f.op)
+	}
+	fmt.Printf("会话 %s 已结束\n", name)
+	return nil
+}
+
+// cliPickRecentSession 取最近活跃的会话名（attach 省略名字的语义，D7）。
+func cliPickRecentSession(stateDir string) (string, error) {
+	entries, _, err := cliListFetch(stateDir)
+	if err != nil {
+		return "", err
+	}
+	if len(entries) == 0 {
+		return "", errors.New("当前没有会话；homeway term new 可创建一个，或 homeway term list 查看")
+	}
+	best := entries[0]
+	for _, s := range entries[1:] {
+		if s.LastActiveMs > best.LastActiveMs {
+			best = s
+		}
+	}
+	return best.Name, nil
+}
+
+// cliExplain 是原 explain 子命令入口（parseExplainArgs 及以下不变）。
+func cliExplain(args []string) error {
+	opt, err := parseExplainArgs(args)
 	if err != nil {
 		return err
 	}
@@ -293,16 +733,36 @@ func firstNonEmpty(a, b string) string {
 }
 
 func termUsage(w io.Writer) {
-	fmt.Fprint(w, `homeway term —— 终端服务的诊断工具
+	fmt.Fprint(w, `homeway term —— 终端服务的主机命令面（与 App 同一份会话注册表）
 
 用法：
+  homeway term list [--json] [--state <dir>]
+        列会话（--json 输出与出口 LIST JSON 同构，可作脚本契约）
+  homeway term new [name] [-d] [-A] [--state <dir>]
+        新建并接入；-d 只创建不接入（默认尺寸、不占终端）；-A 已存在则复用接入；
+        省略名字自动命名 host-<4hex>（与 App 的命名可区分，重名自动重试）
+  homeway term attach [name] [-d] [--detach-key <K>] [--state <dir>]
+        接入会话（raw 字节模式，本地终端自己渲染）；省略名字 = 最近活跃的会话；
+        -d 显式接管（踢掉该会话的其它客户端）
+  homeway term delete <name> [--state <dir>]
+        结束会话（与 App 关闭会话同一路径）
   homeway term explain --file <屏幕文本> --agent <label> [--state <dir>] [--json]
         离线对一段保存的屏幕跑规则判定（调规则的主路径）
   homeway term explain <会话名> [--state <dir>] [--json]
-        对运行中的会话取实时快照判定（经 <state>/term.sock）
+        对运行中的会话取实时快照判定
+
+attach 中的分离与重对齐（前缀键默认 Ctrl-b，tmux 同款）：
+  Ctrl-b d          分离（会话继续在出口运行）
+  Ctrl-b r          重新对齐：会话尺寸被其它客户端改走后，重新上报本终端尺寸
+  Ctrl-b Ctrl-b     输入字面量 Ctrl-b
+  --detach-key '^x' 换前缀键（如 ^]）；--detach-key none 关闭（全部字节透传）
+  ⚠ 默认前缀与 tmux 的前缀相同；会话里要跑 tmux 时请换键或关闭（示例：--detach-key=^]）
 
 说明：
-  --state 默认 `+DefaultStateDir()+`（与出口一致）；本地规则覆盖目录是
-  <state>/agent-detection/<agent>.toml（本地永远优先，改完重启出口或触发重载即生效）。
+  --state 默认 `+DefaultStateDir()+`（与出口一致）；连接 <state>/term.sock（本地 UDS、不经隧道）。
+  持有该 socket 访问权 = 拿到该主机的 shell（state 目录 0700 是权限边界）。
+  attach 需要交互终端（stdin/stdout 都是 TTY）；管道/脚本里请用 list / new -d / delete。
+  会话内经 TERM_SESSION_ID 检测接入自身会被拒绝（输出回环）。
+  本地规则覆盖目录是 <state>/agent-detection/<agent>.toml（explain 离线模式；改完触发重载即生效）。
 `)
 }
