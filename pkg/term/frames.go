@@ -55,7 +55,7 @@ const (
 	opExplain byte = 0x16
 	// opCreate 创建会话但不接入（term-host-cli 任务 6.2，`homeway term new -d`）：
 	// 不动 PTY 尺寸、不产生腿、不触发哨兵/焦点。载荷 [flags:1][nameLen:1][name]，
-	// flags bit0 = only-if-absent；应答沿用一锤子帧（OK / ERROR）。
+	// flags bit0 = reuse-if-exists（见 createFlagReuseIfExists 的极性说明）；应答沿用一锤子帧（OK / ERROR）。
 	opCreate byte = 0x17
 )
 
@@ -205,8 +205,14 @@ func decGreeting(p []byte) (ver byte, features uint32, err error) {
 func encHello(cols, rows uint16, create bool, name string) []byte {
 	var flags byte
 	if create {
-		flags = 1
+		flags = helloFlagCreate
 	}
+	return encHelloFlags(cols, rows, flags, name)
+}
+
+// encHelloFlags 是 encHello 的全 flags 形态（exec-r3 低8）：bit1/bit2 无法经 encHello 的
+// create bool 表达，需要它们的编码方（CLI）用它，不再手改字节偏移。
+func encHelloFlags(cols, rows uint16, flags byte, name string) []byte {
 	p := make([]byte, 6+len(name))
 	binary.LittleEndian.PutUint16(p[0:2], cols)
 	binary.LittleEndian.PutUint16(p[2:4], rows)
@@ -312,9 +318,16 @@ func decHelloTail(tail []byte) (caps byte, capsPresent bool, id string, err erro
 	return caps, capsPresent, id, nil
 }
 
-// ---- CREATE（任务 6.2）：[flags:1][nameLen:1][name]，flags bit0 = only-if-absent ----
+// ---- CREATE（任务 6.2）：[flags:1][nameLen:1][name]，flags bit0 = reuse-if-exists ----
 
-const createFlagOnlyIfAbsent = 1 << 0
+// createFlagReuseIfExists 是 CREATE 的 bit0：**置位 = 名字已存在则静默复用成功**
+// （`new -d -A`）；不置位 = 已存在则报 already_exists（`new -d` 不静默接管别人的会话）。
+//
+// ⚠️ 极性注意（exec-r3 中2 改述）：同名「存在时怎么办」，CREATE 与 HELLO 的位**相反**——
+// HELLO bit1（helloFlagOnlyIfAbsent）置位 = 存在则**报错** already_exists；CREATE bit0
+// 置位 = 存在则**复用**。wire 值与两者行为均按 tasks 6.2 实测口径不动，只在此把差异写死：
+// 照 HELLO 的字面语义实现 CREATE 会让 `new -d` 静默复用既有会话，恰是要避免的。
+const createFlagReuseIfExists = 1 << 0
 
 func encCreate(flags byte, name string) []byte {
 	p := make([]byte, 2+len(name))
@@ -359,6 +372,18 @@ func encAttached(cols, rows uint16, modes uint32, agent, state byte, name string
 	p[9] = state
 	copy(p[10:], name)
 	return p
+}
+
+// decAttachedHead 解 ATTACHED 载荷头部（encAttached 的逆；exec-r3 低8——客户端不再
+// 裸下标 p[8]/p[9]）。载荷过短时 ok=false。
+func decAttachedHead(p []byte) (cols, rows uint16, modes uint32, agent, state byte, name string, ok bool) {
+	if len(p) < 10 {
+		return 0, 0, 0, 0, 0, "", false
+	}
+	cols = binary.LittleEndian.Uint16(p[0:2])
+	rows = binary.LittleEndian.Uint16(p[2:4])
+	modes = binary.LittleEndian.Uint32(p[4:8])
+	return cols, rows, modes, p[8], p[9], string(p[10:]), true
 }
 
 // replayDoneFlags：bit0 = 头部被截断；bit1 = 回放窗口跨过尺寸变化。

@@ -16,6 +16,7 @@
 package term
 
 import (
+	"bytes"
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/binary"
@@ -44,7 +45,7 @@ type attachOpts struct {
 	name      string // 目标会话（"" = attach 取最近活跃 / new 自动命名）
 	stateDir  string
 	create    bool   // new：创建并接入（HELLO bit0）
-	reuse     bool   // -A：已存在则复用（不带 only-if-absent）
+	reuse     bool   // -A：已存在则复用（HELLO 不置 bit1 / CREATE 置 bit0 reuse-if-exists）
 	takeover  bool   // -d：显式接管（HELLO bit2；其它腿收 ENDED(replaced)）
 	autoNamed bool   // new 省略名字：host-<4hex> + already_exists 重试
 	detachKey string // --detach-key 原始参数（^x / 单字符 / none）
@@ -156,8 +157,7 @@ func cliAttachDial(o attachOpts, tty *cliTTY, name string) (net.Conn, []byte, er
 	if o.takeover {
 		flags |= helloFlagTakeover // `attach -d` 显式接管（D8）
 	}
-	hello := encHello(cols, rows, false, name)
-	hello[4] = flags
+	hello := encHelloFlags(cols, rows, flags, name)
 	hello = append(hello, encHelloTail(capsRawTerminal, true, cliClientID())...)
 	if _, err := conn.Write(encodeTermFrame(opHello, hello)); err != nil {
 		conn.Close()
@@ -194,10 +194,12 @@ func cliAttachRun(conn net.Conn, tty *cliTTY, in, out *os.File, attached []byte,
 		return fmt.Errorf("切换 raw 模式失败：%w", err)
 	}
 	// 标题（7.6）：接入时设为「会话 · agent · 状态」，退出恢复原值（查询不到就不动）。
+	// queryLeftover = 查询窗口内的非应答字节（首键），下面按正常输入回投（exec-r3 高1）。
 	titleOn := !strings.EqualFold(os.Getenv("HOMEWAY_TERM_TITLE"), "off")
 	var oldTitle string
+	var queryLeftover []byte
 	if titleOn {
-		oldTitle = ttyQueryTitle(in, out)
+		oldTitle, queryLeftover = ttyQueryTitle(in, out)
 	}
 	defer func() {
 		if titleOn && oldTitle != "" {
@@ -227,10 +229,11 @@ func cliAttachRun(conn net.Conn, tty *cliTTY, in, out *os.File, attached []byte,
 		})
 	}
 
-	// 信号（SIGTERM/SIGHUP/SIGINT）：还原 tty 后干净退出（spec「异常退出还原终端」）。
-	// raw 模式下 ISIG 已关，Ctrl-C 是普通字节直达会话；这里的信号来自 kill / 终端关闭。
+	// 信号（SIGTERM/SIGHUP/SIGINT/SIGQUIT——SIGQUIT 是 exec-r3 低4 补的：kill -QUIT 也走
+	// 干净退出，不留 raw 终端）：还原 tty 后退出（spec「异常退出还原终端」）。
+	// raw 模式下 ISIG 已关，Ctrl-C/Ctrl-\ 是普通字节直达会话；这里的信号来自 kill / 终端关闭。
 	sigCh := make(chan os.Signal, 1)
-	signal.Notify(sigCh, syscall.SIGTERM, syscall.SIGHUP, syscall.SIGINT)
+	signal.Notify(sigCh, syscall.SIGTERM, syscall.SIGHUP, syscall.SIGINT, syscall.SIGQUIT)
 	defer signal.Stop(sigCh)
 	go func() {
 		select {
@@ -273,6 +276,23 @@ func cliAttachRun(conn net.Conn, tty *cliTTY, in, out *os.File, attached []byte,
 
 	// 输入循环（7.4 的状态机在输入路径上）：stdin → 分离键状态机 → DATA / 动作。
 	dm := newDetachMachine(prefix, keyEnabled)
+	// 查询窗口内抢敲的字节按正常输入回投（首键不丢；分离键同样生效）。
+	if len(queryLeftover) > 0 {
+		pass, action := dm.feed(queryLeftover)
+		if len(pass) > 0 {
+			if err := connSendData(conn, pass); err != nil {
+				finish()
+				return fmt.Errorf("发 DATA：%w", err)
+			}
+		}
+		if action == detachRealign {
+			sendResize()
+		}
+		if action == detachDetach {
+			exitCleanly("已分离（会话 " + name + " 继续在出口运行）")
+			return nil
+		}
+	}
 	go func() {
 		buf := make([]byte, 8192)
 		for {
@@ -358,10 +378,10 @@ func connSendData(conn net.Conn, p []byte) error {
 
 // ---- HELLO / ATTACHED / STATE / ENDED 载荷的客户端侧解析 ----
 
-// attachedAgentState 从 ATTACHED 载荷取 agent/state（cols(2) rows(2) modes(4) agent(1) state(1) name）。
+// attachedAgentState 从 ATTACHED 载荷取 agent/state（经 decAttachedHead，防裸下标漂移）。
 func attachedAgentState(p []byte) (byte, byte) {
-	if len(p) >= 10 {
-		return p[8], p[9]
+	if _, _, _, agent, state, _, ok := decAttachedHead(p); ok {
+		return agent, state
 	}
 	return agentUnknown, stateUnknown
 }
@@ -471,35 +491,72 @@ func (t *cliTTY) size() (uint16, uint16) {
 	return uint16(cols), uint16(rows)
 }
 
-// ttyQueryTitle 尽力取当前终端标题（OSC 21 查询，150ms 超时；取不到返回 ""，退出时就不恢复）。
-// 必须在 raw 模式下调用（应答是裸字节，规范模式会卡行缓冲）。
-func ttyQueryTitle(in, out *os.File) string {
+// ttyQueryTitle 尽力取当前终端标题（OSC 21 查询）；总预算 150ms，超时放弃（标题返回空，
+// 退出时就不恢复）。必须在 raw 模式下调用（应答是裸字节，规范模式会卡行缓冲）。
+//
+// 超时实现 = unix.Poll（exec-r3 高1）：tty fd **不支持** Go 的 SetReadDeadline（返回
+// 「file type does not support deadline」），先前把该错误丢掉后跟着的是无超时阻塞读——
+// 在不应答 OSC 21 的终端上 attach 会挂死到用户按键、且首键被当应答吞掉。
+//
+// 返回 (标题, 剩余字节)：剩余字节 = 查询窗口内收到但不属于标题应答的部分（典型 = 用户
+// 抢在窗口里敲的首键），调用方必须当作正常输入回投会话——「首键不丢」由此成立。
+//
+// 固有残留风险（接受，不换方案）：终端**迟答**（超过 150ms 窗口才回）时，应答落在输入
+// 循环里、被当普通输入喂给会话（垃圾输入但不挂死不吞键）；彻底解法（OSC 22/23 标题栈
+// 或放弃恢复原值）不在本期。HOMEWAY_TERM_TITLE=off 可整体关闭本查询（见 usage）。
+func ttyQueryTitle(in, out *os.File) (string, []byte) {
 	if _, err := out.Write([]byte("\x1b]21;?\x07")); err != nil {
-		return ""
+		return "", nil
 	}
+	deadline := time.Now().Add(titleQueryBudget)
+	var acc []byte
 	buf := make([]byte, 512)
-	_ = in.SetReadDeadline(time.Now().Add(150 * time.Millisecond))
-	n, err := in.Read(buf)
-	_ = in.SetReadDeadline(time.Time{})
-	if err != nil || n == 0 {
-		return ""
+	for time.Now().Before(deadline) {
+		ms := int(time.Until(deadline).Milliseconds())
+		if ms < 1 {
+			ms = 1
+		}
+		pfds := []unix.PollFd{{Fd: int32(in.Fd()), Events: unix.POLLIN}}
+		n, err := unix.Poll(pfds, ms)
+		if err != nil || n == 0 {
+			break // 超时/错误：放弃查询，已收字节当输入回投
+		}
+		m, rerr := in.Read(buf)
+		if m > 0 {
+			acc = append(acc, buf[:m]...)
+		}
+		if rerr != nil || len(acc) > 1024 {
+			break
+		}
+		if title, rest, ok := parseTitleReply(acc); ok {
+			return title, rest
+		}
 	}
-	// 应答形态（xterm）：\x1b]L<title>\x1b\\（可能前面还带一条 \x1b]l… 的图标名）。
-	s := string(buf[:n])
-	idx := strings.Index(s, "\x1b]L")
+	return "", acc
+}
+
+// titleQueryBudget 是 OSC 21 查询的总预算（不应答的终端 ≤ 这么久后进入正常透传）。
+const titleQueryBudget = 150 * time.Millisecond
+
+// parseTitleReply 从窗口内收到的字节里解 OSC 21 应答（xterm 形态：\x1b]L<title>\x1b\\，
+// 前面可能带一条 \x1b]l…\x1b\\ 的图标名应答）。ok=false = 还没收齐（继续等）或不是应答；
+// rest = 应答前后的非应答字节（回投给会话）。
+func parseTitleReply(acc []byte) (title string, rest []byte, ok bool) {
+	idx := bytes.Index(acc, []byte("\x1b]L"))
 	if idx < 0 {
-		return ""
+		return "", nil, false
 	}
-	rest := s[idx+3:]
-	end := strings.Index(rest, "\x1b\\")
+	after := acc[idx+3:]
+	end := bytes.Index(after, []byte("\x1b\\"))
 	if end < 0 {
-		return ""
+		return "", nil, false // 收了一半：窗口内继续等后续分片
 	}
-	title := rest[:end]
-	if len(title) > 128 { // 荒谬长度当噪声丢弃
-		return ""
+	t := ""
+	if len(after[:end]) <= 128 { // 荒谬长度当噪声：不当标题（也不回投——那是发给我们的应答，不是用户输入）
+		t = string(after[:end])
 	}
-	return title
+	rest = append(acc[:idx:idx], after[end+2:]...) // 应答之前的字节（首键）+ 之后的字节
+	return t, rest, true
 }
 
 // ---- 客户端实例标识（design D3：CLI 侧是唯一必需项）----
@@ -643,14 +700,16 @@ func (m *detachMachine) feed(in []byte) ([]byte, detachAction) {
 		if m.sawPrefix {
 			m.sawPrefix = false
 			switch {
+			case b == m.prefix:
+				// 前缀前缀=字面量。匹配**前置于** d/r（exec-r3 低3）：--detach-key 恰为字面
+				// d/r 时 dd/rr 发字面量而不是动作——病态选键下动作不可达，字面量可达（优先级拍板）。
+				pass = append(pass, m.prefix)
 			case b == 'd':
 				return pass, detachDetach
 			case b == 'r':
 				if action == detachNone {
 					action = detachRealign // 重对齐：输入不透传；同段后续字节继续处理（会话不收尾）
 				}
-			case b == m.prefix:
-				pass = append(pass, m.prefix) // Ctrl-b Ctrl-b：字面量
 			default:
 				pass = append(pass, m.prefix, b) // 未绑定的组合：全透传
 			}

@@ -1329,8 +1329,8 @@ func TestCreateOp(t *testing.T) {
 	if op, msg := create("ml22", 0); op != opError || !strings.Contains(msg, "already_exists") {
 		t.Fatalf("new -d 重名应报 already_exists，实际 0x%02x（%s）", op, msg)
 	}
-	// new -A -d（only-if-absent）⇒ 重名复用成功。
-	if op, msg := create("ml22", createFlagOnlyIfAbsent); op != opOK {
+	// new -A -d（CREATE bit0 reuse-if-exists 置位）⇒ 重名静默复用成功（极性与 HELLO bit1 相反）。
+	if op, msg := create("ml22", createFlagReuseIfExists); op != opOK {
 		t.Fatalf("new -A -d 重名应复用成功，实际 0x%02x（%s）", op, msg)
 	}
 	// 非法名。

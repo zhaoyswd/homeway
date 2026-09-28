@@ -10,6 +10,7 @@
 package term
 
 import (
+	"bytes"
 	"fmt"
 	"io"
 	"net"
@@ -71,9 +72,13 @@ func spawnAttachHelper(t *testing.T, ttyFile *os.File, ctty bool, env map[string
 	}
 	cmd.Env = append(os.Environ(),
 		"GO_WANT_HELPER_PROCESS=1",
-		"HOMEWAY_TERM_TITLE=off", // 关标题：避免 OSC 查询窗口吃掉测试按键（7.6 的 best-effort 面不在此测）
 		"CLI_TEST_RESULT="+resFile,
 	)
+	if _, ok := env["HOMEWAY_TERM_TITLE"]; !ok {
+		// 默认关标题：OSC 21 查询窗口可能吃掉紧跟着的测试按键；标题开启路径有专门用例
+		//（TestCLIAttachTitleReply / TestCLIAttachTitleNoReply，exec-r3 低5）。
+		cmd.Env = append(cmd.Env, "HOMEWAY_TERM_TITLE=off")
+	}
 	for k, v := range env {
 		cmd.Env = append(cmd.Env, k+"="+v)
 	}
@@ -103,12 +108,20 @@ type masterStream struct {
 }
 
 func readMasterAsync(master *os.File) *masterStream {
+	return readMasterAsyncHook(master, nil)
+}
+
+// readMasterAsyncHook 同 readMasterAsync，每段输出先过 hook（假终端应答 OSC 21 用）。
+func readMasterAsyncHook(master *os.File, hook func(chunk []byte)) *masterStream {
 	ms := &masterStream{}
 	go func() {
 		buf := make([]byte, 4096)
 		for {
 			n, err := master.Read(buf)
 			if n > 0 {
+				if hook != nil {
+					hook(buf[:n])
+				}
 				ms.mu.Lock()
 				ms.acc = append(ms.acc, buf[:n]...)
 				ms.mu.Unlock()
@@ -645,4 +658,68 @@ func TestCLIAttachRefusals(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "交互终端") {
 		t.Fatalf("非 TTY 应拒绝：%v", err)
 	}
+}
+
+// ---- 标题面（exec-r3 高1/低5）：默认开启（不设 HOMEWAY_TERM_TITLE）的真判据 ----
+
+// TestCLIAttachTitleNoReply：不应答 OSC 21 的终端——attach 在 ≤ 查询预算+握手内**自己**进入
+// 透传（无需按键解挂），且抢在查询窗口里敲的首键**到达会话**（回显可见）。
+// 变异自证：把查询改回无超时阻塞读（吞首键）本用例必红——「tick 到达」与「first-key 回显」
+// 两个断言都会被打破（阻塞版要等按键才有 tick，且首键被当应答吃掉、永不回显）。
+func TestCLIAttachTitleNoReply(t *testing.T) {
+	_, ln, dir := startTestTermUDSShell(t, testTermEchoShell)
+	ensureSession(t, ln, "cli-plain")
+
+	master, ttyFile := openTestPTY(t, 100, 30)
+	ms := readMasterAsync(master) // 不应答 OSC 21
+	start := time.Now()
+	cmd, res := spawnAttachHelper(t, ttyFile, true, map[string]string{
+		"CLI_TEST_STATE": dir, "CLI_TEST_NAME": "cli-plain", "CLI_TEST_MODE": "attach",
+		"HOMEWAY_TERM_TITLE": "", // 显式开启（空 ≠ off）
+	})
+	// 立即敲首键：落在查询窗口**之内**或之外都必须到达会话（leftover 回投 / 正常输入路径）。
+	_, _ = master.Write([]byte("first-key\r"))
+	waitMaster(t, ms, "tick", 10*time.Second) // 无按键解挂：不应答终端自己进入透传
+	if d := time.Since(start); d > 5*time.Second {
+		t.Fatalf("进入透传太慢（%v；查询预算 150ms + 握手）", d)
+	}
+	// 首键未被查询吞掉：**会话侧**回显可见（GOT: 前缀只能由会话产生——本地 tty 在 raw 前
+	// 也会回显纯文本，纯文本判据在变异下是假绿）。
+	waitMaster(t, ms, "GOT:first-key", 5*time.Second)
+	_, _ = master.Write([]byte{0x02, 'd'})
+	waitHelper(t, cmd, 10*time.Second)
+	if got := waitResult(t, res, time.Second); !strings.Contains(got, "err=[<nil>]") {
+		t.Fatalf("分离应正常退出：%s", got)
+	}
+}
+
+// TestCLIAttachTitleReply：应答 OSC 21 的终端——attach 设置标题（OSC 2 含会话名），
+// 退出时恢复原值（OSC 2 = 应答里的标题）。
+func TestCLIAttachTitleReply(t *testing.T) {
+	_, ln, dir := startTestTermUDS(t)
+	ensureSession(t, ln, "cli-title")
+
+	master, ttyFile := openTestPTY(t, 100, 30)
+	// 假终端：看到 OSC 21 查询就应答（应答落在查询窗口内）。
+	hook := func(chunk []byte) {
+		if bytes.Contains(chunk, []byte("\x1b]21;?")) {
+			_, _ = master.Write([]byte("\x1b]Lmy-old-title\x1b\\"))
+		}
+	}
+	ms := readMasterAsyncHook(master, hook)
+	cmd, res := spawnAttachHelper(t, ttyFile, true, map[string]string{
+		"CLI_TEST_STATE": dir, "CLI_TEST_NAME": "cli-title", "CLI_TEST_MODE": "attach",
+		"HOMEWAY_TERM_TITLE": "",
+	})
+	// 设置标题：OSC 2 里带会话名（attach 期间唯一会出现会话名的通道）。
+	waitMaster(t, ms, "cli-title", 10*time.Second)
+	waitMaster(t, ms, "tick", 10*time.Second)
+
+	_, _ = master.Write([]byte{0x02, 'd'})
+	waitHelper(t, cmd, 10*time.Second)
+	if got := waitResult(t, res, time.Second); !strings.Contains(got, "err=[<nil>]") {
+		t.Fatalf("分离应正常退出：%s", got)
+	}
+	// 退出恢复原值：OSC 2 = 查询应答里的标题。
+	waitMaster(t, ms, "my-old-title", 3*time.Second)
 }

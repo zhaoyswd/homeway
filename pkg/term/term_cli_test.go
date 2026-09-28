@@ -189,6 +189,18 @@ func TestDetachMachine(t *testing.T) {
 	if string(pass) != "\x02d" || action != detachDetach {
 		t.Fatalf("自定义前缀：pass=%q action=%v", pass, action)
 	}
+	// 病态选键：前缀恰为字面 d/r——「前缀前缀=字面量」前置于动作（exec-r3 低3）：
+	// dd/rr 发字面量而不是分离/重对齐。
+	m3 := newDetachMachine('d', true)
+	pass, action = m3.feed([]byte{'d', 'd', 'x'})
+	if string(pass) != "dx" || action != detachNone {
+		t.Fatalf("prefix='d'：dd 应为字面量：pass=%q action=%v", pass, action)
+	}
+	m4 := newDetachMachine('r', true)
+	pass, action = m4.feed([]byte{'r', 'r'})
+	if string(pass) != "r" || action != detachNone {
+		t.Fatalf("prefix='r'：rr 应为字面量：pass=%q action=%v", pass, action)
+	}
 }
 
 // ---- 错误文案 ----
@@ -331,7 +343,16 @@ func TestTermUsageNoLegacyHints(t *testing.T) {
 // startTestTermUDS 在临时目录起 <state>/term.sock（服务真跑；TCP 监听留给既有 helper 用）。
 func startTestTermUDS(t *testing.T) (*termService, net.Listener, string) {
 	t.Helper()
-	svc, ln := startTestTermService(t)
+	return startTestTermUDSShell(t, testTermShell)
+}
+
+// testTermEchoShell：会话侧把收到的每行加 GOT: 前缀回显——「输入真到达会话」的判据源
+// （本地 tty 在 raw 之前也会回显，纯文本判据分不清来源；GOT: 只能由会话产生）。
+const testTermEchoShell = "while :; do echo tick; sleep 0.2; done & sed s/^/GOT:/"
+
+func startTestTermUDSShell(t *testing.T, shellCmd string) (*termService, net.Listener, string) {
+	t.Helper()
+	svc, ln := startTestTermServiceShell(t, shellCmd)
 	// macOS sun_path 上限 104 字节：t.TempDir() 的 /var/folders 路径太长，换 /tmp 下短目录。
 	dir, err := os.MkdirTemp("/tmp", "termcli-uds-")
 	if err != nil {

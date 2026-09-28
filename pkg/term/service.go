@@ -1125,7 +1125,7 @@ func (s *termService) ServeConn(c net.Conn) {
 			_ = client.frame(opError, encError("invalid_name", "会话名只能是 [A-Za-z0-9._-]{1,64}"))
 			return
 		}
-		if cerr := s.createOnly(name, flags&createFlagOnlyIfAbsent != 0); cerr != nil {
+		if cerr := s.createOnly(name, flags&createFlagReuseIfExists != 0); cerr != nil {
 			_ = client.frame(opError, encError(cerr.code, cerr.msg))
 			return
 		}
@@ -1237,12 +1237,13 @@ func (s *termService) attachOrCreate(name string, cols, rows uint16, create, onl
 }
 
 // createOnly 创建不接入（任务 6.2，`homeway term new -d`）：不动 PTY 尺寸（默认 80x24）、
-// 不产生腿、不触发哨兵/焦点。onlyIfAbsent = `-A -d`（存在则复用成功）。
-func (s *termService) createOnly(name string, onlyIfAbsent bool) *termErr {
+// 不产生腿、不触发哨兵/焦点。reuseIfExists = `-A -d`（CREATE bit0 置位：存在则静默复用成功；
+// 极性与 HELLO bit1 相反，见 frames.go 的 createFlagReuseIfExists）。
+func (s *termService) createOnly(name string, reuseIfExists bool) *termErr {
 	s.mu.Lock()
 	if ss := s.sessions[name]; ss != nil {
 		s.mu.Unlock()
-		if onlyIfAbsent {
+		if reuseIfExists {
 			return nil
 		}
 		return termErrf("already_exists", "会话 %s 已存在；要接入请用 attach，或加 -A 复用", name)

@@ -380,12 +380,14 @@ func cliNew(args []string) error {
 
 // cliNewDetached：`new -d`（CREATE op 创建不接入；任务 6.2 的客户端半边）。
 func cliNewDetached(o newOpts) error {
+	// CREATE bit0 = reuse-if-exists（置位=存在则静默复用；与 HELLO bit1 的「置位=报
+	// already_exists」极性相反，见 frames.go 的 createFlagReuseIfExists——exec-r3 中2）。
 	flags := byte(0)
 	if o.reuse {
-		flags |= createFlagOnlyIfAbsent
+		flags |= createFlagReuseIfExists
 	}
 	if o.autoNamed {
-		// 自动命名不带 only-if-absent（带了会静默复用既有会话）：靠 already_exists 重试。
+		// 自动命名不置 reuse-if-exists（置位会静默复用既有会话）：靠 already_exists 重试。
 		for i := 0; i < 8; i++ {
 			name := genAutoName()
 			if err := cliCreateOnce(o.stateDir, name, flags); err != nil {
@@ -763,6 +765,11 @@ attach 中的分离与重对齐（前缀键默认 Ctrl-b，tmux 同款）：
   持有该 socket 访问权 = 拿到该主机的 shell（state 目录 0700 是权限边界）。
   attach 需要交互终端（stdin/stdout 都是 TTY）；管道/脚本里请用 list / new -d / delete。
   会话内经 TERM_SESSION_ID 检测接入自身会被拒绝（输出回环）。
+  终端标题：attach 默认以 OSC 2 显示「会话 · agent · 状态」并尽力恢复原值（OSC 21 查询，
+  150ms 内无应答则放弃恢复）；HOMEWAY_TERM_TITLE=off 可整体关闭。
+  退出码：分离 / 会话结束（含被接管）/ 信号退出 = 0；连接层或协议层错误、断链 = 1；
+  未知 term 子命令 = 1（顶层未知角色 = 2）。
+  异常退出后画面混乱时执行 reset 修复。
   本地规则覆盖目录是 <state>/agent-detection/<agent>.toml（explain 离线模式；改完触发重载即生效）。
 `)
 }
