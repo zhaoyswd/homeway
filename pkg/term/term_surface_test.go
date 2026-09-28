@@ -758,7 +758,7 @@ func TestSurfaceFragmentsNotInterleaved(t *testing.T) {
 					sawEnd = true
 					continue
 				}
-				if err := cl.writeFrameOnce(it.op, it.payload); err != nil {
+				if err := cl.writeFrameOnce(it.op, it.payload, termWriteTimeout); err != nil {
 					t.Errorf("写帧失败：%v", err)
 					return
 				}

@@ -215,11 +215,12 @@ func (s *termSession) runLegWriter(c *termClient) {
 	s.runRawWriter(c)
 }
 
-// writeFrameOnce 写一帧（带写超时）。只在写者 goroutine 里调用。
-func (c *termClient) writeFrameOnce(op byte, payload []byte) error {
+// writeFrameOnce 写一帧（带写超时——raw 腿传会话级 writeTimeout，surface 腿沿用全局
+// termWriteTimeout，既有语义不动）。只在写者 goroutine 里调用。
+func (c *termClient) writeFrameOnce(op byte, payload []byte, timeout time.Duration) error {
 	c.wmu.Lock()
 	defer c.wmu.Unlock()
-	_ = c.conn.SetWriteDeadline(time.Now().Add(termWriteTimeout))
+	_ = c.conn.SetWriteDeadline(time.Now().Add(timeout))
 	_, err := c.conn.Write(encodeTermFrame(op, payload))
 	return err
 }
@@ -230,13 +231,13 @@ func (s *termSession) runSurfaceWriter(c *termClient) {
 	for {
 		items, ended, quit := c.out.take()
 		for _, it := range items {
-			if err := c.writeFrameOnce(it.op, it.payload); err != nil {
+			if err := c.writeFrameOnce(it.op, it.payload, termWriteTimeout); err != nil {
 				s.legWriteFailed(c, err)
 				return
 			}
 		}
 		if ended != nil {
-			_ = c.writeFrameOnce(ended.op, ended.payload)
+			_ = c.writeFrameOnce(ended.op, ended.payload, termWriteTimeout)
 			_ = c.conn.Close()
 			return
 		}
@@ -304,6 +305,11 @@ func (s *termSession) runRawWriter(c *termClient) {
 	}
 
 	// 实时循环：控制帧（STATE/ERROR/ENDED）优先、字节环随后。
+	//
+	// 停滞语义（exec-r1 高2 修正）：停滞期间**仍取环尝试写**——退避 sleep 放在写尝试
+	// 之前、绝不 continue 跳过环读取；否则一旦写超时而之后没有 STATE 类帧，这条腿就
+	// 永久哑掉（恢复读取也唤不醒），且停滞上限兜底永远不触发。恢复 = 写成功 ⇒ 清停滞位
+	// ⇒ peekRingChunk 的有界追赶接管；连续停滞超 rawStallLimit 才断腿（不发 ENDED）。
 	for {
 		items, ended, quit := c.out.take()
 		for _, it := range items {
@@ -323,12 +329,10 @@ func (s *termSession) runRawWriter(c *termClient) {
 		if len(items) > 0 {
 			continue
 		}
-		if s.stalled(c) {
-			// 停滞退避：不睡死在 wake 上（数据其实一直在堆积，要重试写）。
-			time.Sleep(termRawStallRetry)
-			continue
+		if c.out.isStalled() {
+			time.Sleep(s.stallRetryBackoff()) // 退避放写前：停一拍再试，而不是跳过写
 		}
-		chunk, ok := s.nextRingChunk(c, &c.off, termDataChunk)
+		chunk, ok := s.peekRingChunk(c, termDataChunk)
 		if !ok {
 			// 腿已被会话侧收尾（finish/接管/淘汰）：控制队列里可能还压着 ENDED——
 			// **排空再退出**（ENDED 先于 close，任务 4.1；quit = 无 ENDED 的直接关）。
@@ -348,10 +352,58 @@ func (s *termSession) runRawWriter(c *termClient) {
 			if !s.rawWriteFrame(c, opData, chunk) {
 				return
 			}
+			c.commitRingChunk(s, len(chunk)) // 写成功才推进 off（停滞重试重写同一片）
 			continue
+		}
+		if c.out.isStalled() {
+			continue // 停滞中且暂无数据：回环再退避（不睡死在 wake 上）
 		}
 		<-c.out.wake
 	}
+}
+
+// stallRetryBackoff 停滞退避节拍：默认 1s；停滞上限较短时（测试注入）自适应缩短到
+// 上限的 1/4，保证「连续停滞超限」在每个退避周期都被判定到（exec-r1 高2）。
+func (s *termSession) stallRetryBackoff() time.Duration {
+	if r := s.rawStallLimit / 4; r > 0 && r < termRawStallRetry {
+		return r
+	}
+	return termRawStallRetry
+}
+
+// peekRingChunk 在会话锁内取本腿下一片环数据（**不推进 off**——写出成功才由
+// commitRingChunk 提交；exec-r1 高2：停滞重试要重写同一片，不能在写失败时悄悄跳过）。
+// ok=false = 腿已摘/会话已收工。落后超过一个回放窗口时**有界追赶**（跳到
+// written-replay：停滞恢复不灌整环历史，D5「跳环续投」的落点）。
+func (s *termSession) peekRingChunk(c *termClient, max int) ([]byte, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if c.removed || s.done {
+		return nil, false
+	}
+	if budget := int64(s.svc.cfg.replay); budget > 0 && s.written-c.off > budget {
+		c.off = s.written - budget
+	}
+	if c.off < s.start {
+		c.off = s.start // 落后被环覆盖：跳到可用起点（宁可丢也不阻塞）
+	}
+	if c.off >= s.written {
+		return nil, true
+	}
+	return s.readLocked(c.off, max), true
+}
+
+// commitRingChunk 写出成功后推进本腿 off（D10-2：只由本腿写者调用）。
+func (c *termClient) commitRingChunk(s *termSession, n int) {
+	if n <= 0 {
+		return
+	}
+	s.mu.Lock()
+	c.off += int64(n)
+	if c.off > s.written {
+		c.off = s.written
+	}
+	s.mu.Unlock()
 }
 
 // nextRingChunk 在会话锁内从字节环读 ≤max 字节并推进 *off（D10-2：off 只由本腿写者推进）。
@@ -373,16 +425,17 @@ func (s *termSession) nextRingChunk(c *termClient, off *int64, max int) ([]byte,
 	return chunk, true
 }
 
-// rawWriteFrame 写一帧到 raw 腿（停滞感知）。返回 false = 写者收工。
+// rawWriteFrame 写一帧到 raw 腿（停滞感知；超时/停滞上限用会话级参数，exec-r1 高2）。
+// 返回 false = 写者收工。
 func (s *termSession) rawWriteFrame(c *termClient, op byte, payload []byte) bool {
-	err := c.writeFrameOnce(op, payload)
+	err := c.writeFrameOnce(op, payload, s.writeTimeout)
 	if err == nil {
 		s.recoverFromStall(c)
 		return true
 	}
 	if isWriteTimeout(err) {
 		// 停滞：标记落后、退避重试（D10-7：绝不能在这里 close/发 ENDED）。
-		if c.out.noteStall(true, termRawStallLimit) {
+		if c.out.noteStall(true, s.rawStallLimit) {
 			s.breakLeg(c, "stalled_over_limit")
 			return false
 		}
@@ -395,25 +448,13 @@ func (s *termSession) rawWriteFrame(c *termClient, op byte, payload []byte) bool
 	return false
 }
 
-// recoverFromStall 从停滞中恢复：续投起点做有界追赶（最多回看一个回放窗口，任务 4.2
-// 「恢复后从可用起点续投」——不追整个环，避免停滞几十秒后灌一兆历史）。
+// recoverFromStall 写成功后清停滞位（续投的有界追赶在 peekRingChunk 里统一做——
+// 落后超过一个回放窗口就跳到 written-replay，exec-r1 高2）。
 func (s *termSession) recoverFromStall(c *termClient) {
-	if !c.out.isStalled() {
-		return
+	if c.out.isStalled() {
+		c.out.noteStall(false, s.rawStallLimit)
 	}
-	c.out.noteStall(false, termRawStallLimit)
-	s.mu.Lock()
-	if budget := int64(s.svc.cfg.replay); budget > 0 && s.written-c.off > budget {
-		c.off = s.written - budget
-	}
-	if c.off < s.start {
-		c.off = s.start
-	}
-	s.mu.Unlock()
 }
-
-// stalled 报告 raw 腿当前是否处于停滞退避中。
-func (s *termSession) stalled(c *termClient) bool { return c.out.isStalled() }
 
 // isWriteTimeout 区分写超时（停滞）与硬错误。
 func isWriteTimeout(err error) bool {
@@ -496,7 +537,8 @@ func (s *termSession) registerLegLocked(c *termClient, takeover bool) *termErr {
 		c.handshake = s.buildRawHandshakeLocked(c, first)
 	}
 	// 接入即活动（design D4）：选举 → 尺寸应用 → 全 surface 腿标记全量。
-	s.noteActivityLocked(c)
+	// 哨兵传 false：attach 的尺寸哨兵由 stream 统一注入一次（低7：一次 attach 一次哨兵）。
+	s.noteActivityLocked(c, false)
 	s.surfaceActive.Store(s.anySurfaceLocked())
 	s.updateResponseSinkLocked()
 	if s.svc.logf != nil {
@@ -542,7 +584,10 @@ func (s *termSession) epochOffsetsLocked() []int64 {
 // code=termEndNone 时不发 ENDED（硬错误/客户端已关：裸 EOF）；否则经写者送达 ENDED
 // 后再关 conn（ENDED 先于 close，任务 4.1）。why 只进日志（任务 2.7）。
 func (s *termSession) endLegLocked(c *termClient, code int32, reason string, why string) {
-	if c.removed {
+	// 低10（exec-r1）：除了 removed 幂等位，还要校验腿确实在表内——未来若有调用点误传
+	// 未注册的腿，这里早退，防 rawTermLegs 变负、静默废掉 D6 窄规则判据。
+	if c.removed || !s.legAliveLocked(c) {
+		c.removed = true
 		return
 	}
 	c.removed = true
@@ -552,7 +597,7 @@ func (s *termSession) endLegLocked(c *termClient, code int32, reason string, why
 			break
 		}
 	}
-	if c.rawCapable {
+	if c.rawCapable && s.rawTermLegs > 0 {
 		s.rawTermLegs--
 	}
 	if code != termEndNone {
@@ -638,7 +683,11 @@ func (s *termSession) rawLegsLocked() []*termClient {
 
 // noteActivityLocked 记一次活动（接入 / RESIZE / 输入）：单调序号 + 选举 + 尺寸/主题应用。
 // 必须持 s.mu。
-func (s *termSession) noteActivityLocked(c *termClient) {
+//
+// sentinel：尺寸变化时是否注入尺寸哨兵——**注册路径传 false**（attach 的哨兵由 stream
+// 统一注入一次，exec-r1 低7：一次 attach 一次哨兵）；RESIZE / 重选举路径传 true
+// （逼远端 TUI 按新尺寸重绘；输入类活动不会改尺寸，传什么都无哨兵）。
+func (s *termSession) noteActivityLocked(c *termClient, sentinel bool) {
 	s.activitySeq++
 	c.lastActivitySeq = s.activitySeq
 	c.lastTouch = time.Now()
@@ -648,7 +697,9 @@ func (s *termSession) noteActivityLocked(c *termClient) {
 	}
 	if c.cols != s.cols || c.rows != s.rows {
 		s.applySizeLocked(c.cols, c.rows) // PTY setsize + epoch + vt 重排 + 全腿标记全量
-		s.sentinelRepaintLocked()         // 逼远端 TUI 按新尺寸重绘（surface 腿的快照在哨兵后）
+		if sentinel {
+			s.sentinelRepaintLocked() // 逼远端 TUI 按新尺寸重绘（surface 腿的快照在哨兵后）
+		}
 	}
 }
 

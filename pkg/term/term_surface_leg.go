@@ -52,7 +52,8 @@ type surfaceStats struct {
 	diffs         uint64 // 下发的差分帧数
 	degrades      uint64 // 差分降级为全量的次数
 	backpressure  uint64 // 背压事件（弃差分标记需快照）
-	queueOverflow uint64 // 队列积压超 perLegQueueBytes 的丢弃事件（任务 4.3 失败模式二）
+	queueOverflow uint64 // 队列积压超队列上限的丢弃事件（任务 4.3 失败模式二）
+	encodeFailed  uint64 // gzip 编码失败（exec-r1 低8；丢弃待发 + 需全量）
 	fragments     uint64 // 分片总数
 	bytesOut      uint64 // 下发字节（分片后的净字节）
 	fetchHits     uint64 // FETCH-ROWS 命中（取到行）
@@ -102,6 +103,8 @@ func (l *surfaceLeg) markNeedSnapshot(reason string) {
 		l.stats.backpressure++
 	case "queue_overflow":
 		l.stats.queueOverflow++
+	case "encode_failed":
+		l.stats.encodeFailed++
 	}
 	l.mu.Unlock()
 }

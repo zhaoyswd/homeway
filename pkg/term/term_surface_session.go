@@ -49,7 +49,7 @@ func (s *termSession) surfaceLoop() {
 			legs := s.surfaceLegsLocked()
 			s.mu.Unlock()
 			for _, c := range legs {
-				c.out.enqueue(writeItem{op: opClipboard, payload: encClipboard(clipKindWrite, text)}, perLegQueueBytes)
+				c.out.enqueue(writeItem{op: opClipboard, payload: encClipboard(clipKindWrite, text)}, s.queueBytes)
 			}
 			continue
 		case <-s.surfaceWake:
@@ -108,8 +108,9 @@ func (s *termSession) flushSurface() {
 		}
 	}
 
-	// 每拍取一次脏行（所有 surface 腿共享同一份；2.2b）。
-	enc, count, st, anyChange := sv.SurfaceTick()
+	// 每拍取一次脏行（所有 surface 腿共享同一份；2.2b）。changed 与 count>0 等价，
+	// 不再单列——差分要不要发由「count>0 或腿基线有差异」决定（exec-r1 高1）。
+	enc, count, st, _ := sv.SurfaceTick()
 
 	type pending struct {
 		c    *termClient
@@ -133,9 +134,14 @@ func (s *termSession) flushSurface() {
 		case force:
 			body, st2 := s.buildSnapshotForLegLocked(c, sv, cols, rows, title)
 			outs = append(outs, pending{c: c, op: opSnapshot, body: body, st: st2})
-		case anyChange:
+		default:
+			// 差分（**count 可为 0**）：有脏行必发；无脏行时按**腿基线**判——光标/
+			// 模式位/回滚条变化不产生脏行，但同样是一帧合法更新（「空行 patch」，
+			// surfaceVer 4 语义；exec-r1 高1：只看脏行会让这些变化一帧都不发——
+			// 2026-09-24 评审 P0 的回归，方向键光标不动/TUI 模式位滞后都是这条）。
+			//（anyChange 为假时 count 必为 0，两条子条件等价于评审给的判定式。）
 			if count == 0 && c.leg.stateUnchanged(st) {
-				continue // 无脏行且该腿基线无差异（光标/模式位/回滚条）⇒ 本腿整拍跳过
+				continue // 无脏行且该腿基线无差异 ⇒ 本腿整拍跳过
 			}
 			payload := encDiffBody(diffBody{
 				Geometry: surfaceGeometry{Cols: cols, Rows: rows, Revision: c.leg.currentRevision()},
@@ -154,14 +160,14 @@ func (s *termSession) flushSurface() {
 	s.mu.Unlock()
 
 	for _, p := range outs {
-		if len(p.body) > perLegPendingCap {
+		if len(p.body) > s.pendingCap {
 			// 失败模式一（单帧超上限，任务 4.3）：标记需全量、下一拍重试（既有语义）。
 			p.c.leg.markNeedSnapshot("backpressure")
 			continue
 		}
 		gz, err := gzipBytes(p.body)
 		if err != nil {
-			p.c.leg.markNeedSnapshot("encode_failed")
+			p.c.leg.markNeedSnapshot("encode_failed") // 低8（exec-r1）：计入 encodeFailed
 			continue
 		}
 		items := make([]writeItem, 0, 2)
@@ -173,7 +179,7 @@ func (s *termSession) flushSurface() {
 			items = append(items, writeItem{op: opSnapshotDone,
 				payload: encReplayDone(uint32(len(p.body)), 0)})
 		}
-		if !p.c.out.enqueueGroup(items, perLegQueueBytes) {
+		if !p.c.out.enqueueGroup(items, s.queueBytes) {
 			// 失败模式二（队列积压超 perLegQueueBytes）：丢弃待发 + 标记需全量（新语义）。
 			p.c.leg.markNeedSnapshot("queue_overflow")
 			continue
@@ -250,7 +256,7 @@ func (s *termSession) handleFetchRows(c *termClient, payload []byte) {
 	for _, frag := range fragmentPayload(gz) {
 		items = append(items, writeItem{op: opFetchRows, payload: frag})
 	}
-	if !c.out.enqueueGroup(items, perLegQueueBytes) {
+	if !c.out.enqueueGroup(items, s.queueBytes) {
 		c.leg.markNeedSnapshot("queue_overflow")
 		return
 	}
@@ -274,7 +280,8 @@ func (s *termSession) handleInput(c *termClient, payload []byte) {
 		return
 	}
 	s.mu.Lock()
-	s.noteActivityLocked(c)
+	// 输入 = 活动；输入不改腿尺寸 ⇒ 哨兵位无效果（传 false 表达「输入不注入哨兵」）。
+	s.noteActivityLocked(c, false)
 	vt := s.vt
 	ptmx := s.ptmx
 	done := s.done
@@ -345,7 +352,7 @@ func (s *termSession) notifyFromScan() {
 	s.lastNotified = text
 	s.mu.Unlock()
 	for _, c := range legs {
-		c.out.enqueue(writeItem{op: opNotify, payload: encNotify(text)}, perLegQueueBytes)
+		c.out.enqueue(writeItem{op: opNotify, payload: encNotify(text)}, s.queueBytes)
 	}
 }
 

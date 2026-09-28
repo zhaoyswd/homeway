@@ -49,7 +49,12 @@ const (
 	termSamplePeriod  = time.Second
 	termReplayTrim    = 4096             // 起点对齐时最多前看这么多字节
 	termRawStallLimit = 60 * time.Second // raw 腿连续停滞多久才断腿（任务 4.2）
-	termRawStallRetry = time.Second      // 停滞退避的重试节拍
+	termRawStallRetry = time.Second      // 停滞退避的重试节拍（停滞上限的 1/4 内自适应缩短）
+
+	// 单帧/队列上限的默认值（exec-r1 中4：经 HOMEWAY_TERM_PENDING_CAP_BYTES /
+	// HOMEWAY_TERM_QUEUE_BYTES 可注入，测试用小上限驱动真实失败路径）。
+	termDefaultPendingCap = perLegPendingCap
+	termDefaultQueueBytes = perLegQueueBytes
 )
 
 var termNameRx = regexp.MustCompile(`^[A-Za-z0-9._-]{1,64}$`)
@@ -65,7 +70,15 @@ type termConfig struct {
 	// maxClients 是每会话腿数上限（HOMEWAY_TERM_MAX_CLIENTS，任务 2.4；满则优先淘汰
 	// 失活/最久空闲腿，显式接管 attach -d 始终可用）。
 	maxClients int
-	detect     bool
+	// writeTimeoutMs / rawStallLimitMs / pendingCapBytes / queueBytes 是 raw 写者停滞
+	// 语义与 surface 背压的参数（exec-r1 高2/中4：会话级可注入——HOMEWAY_TERM_
+	// WRITE_TIMEOUT_MS / HOMEWAY_TERM_STALL_LIMIT_MS / HOMEWAY_TERM_PENDING_CAP_BYTES /
+	// HOMEWAY_TERM_QUEUE_BYTES，默认值即上面的常量；普通用户不需要知道它们）。
+	writeTimeoutMs  int
+	rawStallLimitMs int
+	pendingCapBytes int
+	queueBytes      int
+	detect          bool
 	// scrollbackLines 服务端 vt 的回滚行数上限（HOMEWAY_TERM_SCROLLBACK_LINES，默认 10000）。
 	//
 	// **内存预算口径（任务 1.3 定，7.4 验收）**：每会话常驻 ≈ 1MiB 字节环（history）+ vt 峰值
@@ -101,6 +114,10 @@ func termConfigFromEnv() termConfig {
 		replayEpoch:     strings.ToLower(strings.TrimSpace(os.Getenv("HOMEWAY_TERM_REPLAY_EPOCH"))),
 		maxSessions:     termEnvInt("HOMEWAY_TERM_MAX_SESSIONS", termDefaultMaxSessions),
 		maxClients:      termEnvInt("HOMEWAY_TERM_MAX_CLIENTS", termDefaultMaxClients),
+		writeTimeoutMs:  termEnvInt("HOMEWAY_TERM_WRITE_TIMEOUT_MS", int(termWriteTimeout/time.Millisecond)),
+		rawStallLimitMs: termEnvInt("HOMEWAY_TERM_STALL_LIMIT_MS", int(termRawStallLimit/time.Millisecond)),
+		pendingCapBytes: termEnvInt("HOMEWAY_TERM_PENDING_CAP_BYTES", termDefaultPendingCap),
+		queueBytes:      termEnvInt("HOMEWAY_TERM_QUEUE_BYTES", termDefaultQueueBytes),
 		detect:          !strings.EqualFold(strings.TrimSpace(os.Getenv("HOMEWAY_TERM_DETECT")), "off"),
 		scrollbackLines: termEnvInt("HOMEWAY_TERM_SCROLLBACK_LINES", vtDefaultScrollbackLines),
 	}
@@ -110,7 +127,44 @@ func termConfigFromEnv() termConfig {
 	if cfg.replay > cfg.history {
 		cfg.replay = cfg.history
 	}
+	// 低9（exec-r1）：防御性夹取——termEnvInt 对 ≤0 已回默认值，这里再夹一层，
+	// 保证「腿数上限 0 导致完全无法接入」这类误配置在配置层就不可达。
+	if cfg.maxClients < 1 {
+		cfg.maxClients = termDefaultMaxClients
+	}
+	if cfg.pendingCapBytes < 1024 {
+		cfg.pendingCapBytes = termDefaultPendingCap
+	}
+	if cfg.queueBytes < 4096 {
+		cfg.queueBytes = termDefaultQueueBytes
+	}
 	return cfg
+}
+
+// warnInvalidTermEnv 对「设置了但非法」的 HOMEWAY_TERM_* 调参给一行提示（普通用户
+// 不需要知道这些变量，误设时至少能在日志里看到被忽略了）。
+func warnInvalidTermEnv(logf Logf) {
+	if logf == nil {
+		return
+	}
+	for _, c := range []struct {
+		name string
+		min  int
+	}{
+		{"HOMEWAY_TERM_MAX_CLIENTS", 1},
+		{"HOMEWAY_TERM_WRITE_TIMEOUT_MS", 1},
+		{"HOMEWAY_TERM_STALL_LIMIT_MS", 1},
+		{"HOMEWAY_TERM_PENDING_CAP_BYTES", 1024},
+		{"HOMEWAY_TERM_QUEUE_BYTES", 4096},
+	} {
+		v := strings.TrimSpace(os.Getenv(c.name))
+		if v == "" {
+			continue
+		}
+		if n, err := strconv.Atoi(v); err != nil || n < c.min {
+			logf("term: ⚠️ %s=%q 非法（需 ≥%d），已忽略、用默认值", c.name, v, c.min)
+		}
+	}
 }
 
 // ---- 登录 shell 与登录环境：与「用户自己开一个终端」对齐 ----
@@ -308,6 +362,7 @@ func New(logf Logf, stateDir string) *termService {
 		stopCh:   make(chan struct{}),
 		sessions: map[string]*termSession{},
 	}
+	warnInvalidTermEnv(logf)
 	// 剪贴板写回调是**进程级**的（上游只给 userdata id）⇒ 全局装一次，按 id 分派到会话。
 	installClipboardForwarder()
 	if s.cfg.detect {
@@ -446,6 +501,15 @@ type termSession struct {
 	// responseFn 是服务端代答的接收方（spawn 时初始化为写 ptmx；updateResponseSinkLocked
 	// 按腿况在它与 nil 之间切换——拆成字段是为了窄规则可单测：假 sink 计数，任务 5.1）。
 	responseFn func([]byte)
+	// 会话级写者/背压参数（exec-r1 高2/中4：spawn 时从 cfg 注入；cfg 在 New 后不变，
+	// 写者 goroutine 并发只读安全）。
+	writeTimeout  time.Duration // raw 腿写超时（= 停滞判定阈值）
+	rawStallLimit time.Duration // raw 腿连续停滞多久断腿
+	pendingCap    int           // surface 单帧（未压缩体）上限
+	queueBytes    int           // surface 每腿队列上限
+	// sentinelCount 是尺寸哨兵注入次数（低7 判据计数器：一次 attach 应恰 +1；
+	// 只在 sentinelRepaintLocked 里自增，会话锁保护）。
+	sentinelCount int
 
 	contentSeq     uint64
 	lastScanSeq    uint64
@@ -1258,6 +1322,11 @@ func (s *termService) spawnLocked(name string, cols, rows uint16) (*termSession,
 	ss.surfaceWake = make(chan struct{}, 1)
 	ss.clipChan = make(chan string, 8)
 	ss.surfaceStop = make(chan struct{})
+	// 会话级参数注入（exec-r1 高2/中4）。
+	ss.writeTimeout = time.Duration(s.cfg.writeTimeoutMs) * time.Millisecond
+	ss.rawStallLimit = time.Duration(s.cfg.rawStallLimitMs) * time.Millisecond
+	ss.pendingCap = s.cfg.pendingCapBytes
+	ss.queueBytes = s.cfg.queueBytes
 	// 服务端 vt：失败只让**本会话**退化为 legacy（surface 客户端 attach 会得到明确错误码），
 	// 既有 legacy 会话与其它会话都不受影响（term-surface-protocol 的降级场景）。
 	if sv, verr := newSessionVT(s.cfg, cols, rows); verr == nil {
@@ -1307,6 +1376,7 @@ func (s *termSession) sentinelRepaintLocked() {
 	if s.done || s.ptmx == nil {
 		return
 	}
+	s.sentinelCount++ // 低7 判据计数器：一次 attach 只应 +1
 	cols, rows := s.cols, s.rows
 	sentinel := cols
 	if sentinel > 1 {
@@ -1357,8 +1427,9 @@ func (s *termService) stream(ss *termSession, client *termClient, c net.Conn) {
 		case opData:
 			ss.mu.Lock()
 			ptmx := ss.ptmx
-			// 输入 = 活动（design D4：活动 = 接入 / RESIZE / 输入）。
-			ss.noteActivityLocked(client)
+			// 输入 = 活动（design D4：活动 = 接入 / RESIZE / 输入；输入不改腿尺寸，
+			// 不会触发哨兵——哨兵只在尺寸变化的 RESIZE/选举路径）。
+			ss.noteActivityLocked(client, true)
 			ss.mu.Unlock()
 			if ptmx != nil && len(f.payload) > 0 {
 				if _, werr := ptmx.Write(f.payload); werr != nil {
@@ -1373,7 +1444,8 @@ func (s *termService) stream(ss *termSession, client *termClient, c net.Conn) {
 			}
 			ss.mu.Lock()
 			client.cols, client.rows = cols, rows
-			ss.noteActivityLocked(client) // RESIZE = 活动：选举决定是否真的改会话尺寸
+			// RESIZE = 活动：选举决定是否真的改会话尺寸；尺寸真变 ⇒ 哨兵逼重绘。
+			ss.noteActivityLocked(client, true)
 			ss.mu.Unlock()
 			if client.surface {
 				// surface 的全量快照由 applySizeLocked 的「全腿标记」+ 唤醒负责
