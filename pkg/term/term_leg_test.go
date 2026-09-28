@@ -322,9 +322,29 @@ func TestHelloTailShape(t *testing.T) {
 	if err != nil || !present || caps != capsSurface|capsRawTerminal || id != "host-1234" {
 		t.Fatalf("caps+ID 形状应解析：%v %v %#x %q", err, present, caps, id)
 	}
-	// 裸 ID 块（缺 caps 长度前缀）MUST 拒绝：idLen 被当成 capLen，长度对不上。
+	// 声明长度越界的裸字节串（idLen 被当成 capLen）仍拒绝。
 	if _, _, _, err := decHelloTail([]byte{5, 'h', 'o', 's', 't'}); err == nil {
-		t.Fatal("裸 ID 块（形状不符）必须被拒")
+		t.Fatal("声明长度越界的尾随必须被拒")
+	}
+	// 长度自洽的裸 ID 块（exec-r1 中3，口径 (a)）：两段同形不可判别 ⇒ 按形状**合法**，
+	// 被当作 caps 块解析（OR 出的位可能同时命中 surface/raw）——这是格式固有属性，
+	// 约束在编码侧（encHelloTail 不产出无 caps 的 ID；客户端必须先 caps 后 ID）。
+	caps2, present2, id2, err := decHelloTail([]byte{4, 'h', 'o', 's', 't'})
+	if err != nil || !present2 || id2 != "" {
+		t.Fatalf("长度自洽裸 ID 块应按 caps 解析（口径 a）：%v %v %#x %q", err, present2, caps2, id2)
+	}
+	if !wantsSurface(caps2) || caps2&capsRawTerminal == 0 {
+		t.Fatalf("裸 ID 块被当 caps 的后果应被钉住（会双命中能力位）：caps=%#x", caps2)
+	}
+	// 编码约束：未声明能力（capsPresent=false）时**不产出 ID 块**（静默丢弃）。
+	tail := encHelloTail(0, false, "id-x")
+	if len(tail) != 0 {
+		t.Fatalf("无 caps 块时不应产出 ID（口径 a 编码约束）：% x", tail)
+	}
+	// 空 caps 块（capLen=0）消费 1 字节：[0][idLen][id] 是合法形状（未声明能力 + ID）。
+	caps3, present3, id3, err := decHelloTail([]byte{0, 4, 'a', 'b', 'c', 'd'})
+	if err != nil || present3 || caps3 != 0 || id3 != "abcd" {
+		t.Fatalf("空 caps 块 + ID 应解析：%v %v %#x %q", err, present3, caps3, id3)
 	}
 	// caps 块声明长度越界（既有负例，r1 P2-9 同步）。
 	if _, _, _, err := decHelloTail([]byte{9, capsSurface}); err == nil {
@@ -343,9 +363,9 @@ func TestHelloTailShape(t *testing.T) {
 	for i := range long {
 		long[i] = 'x'
 	}
-	tail := append([]byte{1, capsSurface}, byte(len(long)))
-	tail = append(tail, long...)
-	if _, _, _, err := decHelloTail(tail); err == nil {
+	over := append([]byte{1, capsSurface}, byte(len(long)))
+	over = append(over, long...)
+	if _, _, _, err := decHelloTail(over); err == nil {
 		t.Fatal("ID 超上限必须被拒")
 	}
 }

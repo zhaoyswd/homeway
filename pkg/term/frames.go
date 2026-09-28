@@ -244,22 +244,31 @@ func helloTail(p []byte, name string) []byte {
 
 // ---- HELLO 尾随块：capability + 客户端实例标识（term-host-cli 任务 2.3，design D8）----
 //
-// 形状（顺序固定）：[capLen:1][caps:capLen][idLen:1][clientID:idLen]，
-// 两段都是「可省略」但**必须按序**且**后面不能再有字节**。形状不符（如缺 caps 长度前缀的
-// 裸 ID 块）MUST 拒绝——沿用 bad_capability 错误码（任务 2.3 / r1 P2-9）。
+// 形状（顺序固定）：[capLen:1][caps:capLen][idLen:1][clientID:idLen]，两段都可省略，
+// 解析**必须恰好耗尽**尾随字节（畸形声明长度/残留字节一律拒绝，沿用 bad_capability
+// 错误码，r1 P2-9）。
+//
+// ⚠️ 同形不可判别（exec-r1 中3，口径 (a)）：两段都是 [len][bytes]，解码器无法从形状上
+// 区分「裸 ID 块」与「caps 块」——长度自洽的裸 ID 块（如 [4]"host"）会被当作 caps 解析
+//（OR 出的能力位可能同时命中 capsSurface/capsRawTerminal）。这不是缺陷而是格式的固有
+// 属性；**约束落在编码侧**：带 ID 必带 caps 块（encHelloTail 保证不产出「无 caps 的 ID」），
+// 客户端实现（任务 7 CLI / 可选 8.2）必须遵守。
 
 // termMaxClientIDLen 是实例标识的字节上限（CLI 侧是主机名+uid+tty 的短哈希，16 字节量级）。
 const termMaxClientIDLen = 64
 
 // encHelloTail 组尾随块（capability 可省略；ID 可省略；顺序固定）。
+//
+// 编码约束（exec-r1 中3）：**带 ID 必带 caps 块**——没声明能力就不产出 ID 块（静默丢弃，
+// 与解码侧的「同形不可判别」配套：ID 块只允许跟在 caps 块之后出现）。
 func encHelloTail(caps byte, capsPresent bool, id string) []byte {
 	var out []byte
 	if capsPresent {
 		out = append(out, encCapability(caps)...)
-	}
-	if id != "" {
-		out = append(out, byte(len(id)))
-		out = append(out, id...)
+		if id != "" {
+			out = append(out, byte(len(id)))
+			out = append(out, id...)
+		}
 	}
 	return out
 }
@@ -279,9 +288,10 @@ func decHelloTail(tail []byte) (caps byte, capsPresent bool, id string, err erro
 				caps |= tail[off+1+i]
 			}
 			capsPresent = true
-			off += 1 + n
 		}
-		// capLen==0：空 caps 块，按「不携带」处理、前进 1 字节（宽容：等价于没有）。
+		// 空 caps 块（capLen=0）同样消费 1 字节（exec-r1 中3：注释与实现对齐）：
+		// [0][idLen][id] 是合法形状（= 未声明能力 + 携带 ID——编码侧不会产出，但形状合法）。
+		off += 1 + n
 	}
 	if len(tail) > off {
 		n := int(tail[off])
