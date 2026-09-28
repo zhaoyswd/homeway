@@ -387,6 +387,13 @@ func Start(cfg ServeConfig) (*Server, error) {
 			tsrv.Close()
 		} else {
 			s.termLn, s.termSock, s.termOwn, s.termSrv = tln, tsock, town, tsrv
+			// 权限纵深（term-host-cli 任务 2.6）：listen 后显式 chmod 0600（不依赖 umask 的
+			// 偶然值）。⚠️ 这**不是**边界本体——darwin 上 socket 权限位不参与 connect 判定，
+			// 真正拦住非属主的是 state 目录 0700 的遍历权限（linux 另查 socket 写权限）；
+			// peer 校验（SO_PEERCRED/getpeereid）留待多用户场景（design D1）。
+			if cerr := os.Chmod(tsock, 0o600); cerr != nil {
+				logf("⚠️ term.sock chmod 0600 失败（%v）—— 纵深加固未生效，state 目录权限仍是边界", cerr)
+			}
 			go func() {
 				for {
 					conn, aerr := tln.Accept()

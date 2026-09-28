@@ -156,3 +156,32 @@ func TestRemoveSockOwnNotOthers(t *testing.T) {
 	}
 }
 
+// term.sock 的权限纵深（term-host-cli 任务 2.6）：listen 后显式 chmod 0600——不依赖
+// umask 的偶然值。注意这**不是**边界本体（darwin 上 socket 权限位不参与 connect 判定，
+// 真正拦住非属主的是 state 目录 0700）；非属主拒绝需第二用户（容器/CI），本机记手测。
+func TestTermSocketChmod0600(t *testing.T) {
+	dir := shortDir(t)
+	// 与 serve.go 的 term 段同序列：listenLocalService + chmod 0600。
+	sock, ln, own, err := listenLocalService(dir, "term.sock")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer ln.Close()
+	defer removeSockOwn(sock, own)
+	if err := os.Chmod(sock, 0o600); err != nil {
+		t.Fatalf("chmod: %v", err)
+	}
+	st, err := os.Stat(sock)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st.Mode().Perm() != 0o600 {
+		t.Fatalf("term.sock 权限应为 0600（不依赖 umask），实际 %o", st.Mode().Perm())
+	}
+	// 加固不影响既有连接：监听仍在收连接。
+	c, derr := net.DialTimeout("unix", sock, time.Second)
+	if derr != nil {
+		t.Fatalf("chmod 后属主连接应照常成功: %v", derr)
+	}
+	_ = c.Close()
+}
