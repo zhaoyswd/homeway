@@ -193,24 +193,9 @@ func cliAttachRun(conn net.Conn, tty *cliTTY, in, out *os.File, attached []byte,
 		_ = conn.Close()
 		return fmt.Errorf("切换 raw 模式失败：%w", err)
 	}
-	// 标题（7.6）：接入时设为「会话 · agent · 状态」，退出恢复原值（查询不到就不动）。
-	// queryLeftover = 查询窗口内的非应答字节（首键），下面按正常输入回投（exec-r3 高1）。
-	titleOn := !strings.EqualFold(os.Getenv("HOMEWAY_TERM_TITLE"), "off")
-	var oldTitle string
-	var queryLeftover []byte
-	if titleOn {
-		oldTitle, queryLeftover = ttyQueryTitle(in, out)
-	}
-	defer func() {
-		if titleOn && oldTitle != "" {
-			_, _ = out.Write([]byte("\x1b]2;" + oldTitle + "\x07"))
-		}
-		if rerr := tty.restore(); rerr != nil {
-			fmt.Fprintf(os.Stderr, "\r\nhomeway term: 终端还原失败（%v）；画面混乱时执行 reset 修复\r\n", rerr)
-		}
-		_ = conn.Close()
-	}()
 
+	// 收尾骨架先立（N3：signal.Notify 提到标题查询**之前**——原顺序里查询窗（150ms）
+	// 没有信号保护，SIGTERM 落在窗内会被 Poll 吞掉、退出拖到窗后才发生）。
 	stop := make(chan struct{})     // 收尾信号（各 goroutine 退出）
 	detachCh := make(chan struct{}) // 「干净退出」（分离 / 信号）：决定主循环返回 nil
 	var exitNote atomic.Value       // string：干净退出时打的一行
@@ -241,6 +226,24 @@ func cliAttachRun(conn net.Conn, tty *cliTTY, in, out *os.File, attached []byte,
 			exitCleanly("收到信号退出（会话仍在运行）")
 		case <-stop:
 		}
+	}()
+
+	// 标题（7.6）：接入时设为「会话 · agent · 状态」，退出恢复原值（查询不到就不动）。
+	// queryLeftover = 查询窗口内的非应答字节（首键），下面按正常输入回投（exec-r3 高1）。
+	titleOn := !strings.EqualFold(os.Getenv("HOMEWAY_TERM_TITLE"), "off")
+	var oldTitle string
+	var queryLeftover []byte
+	if titleOn {
+		oldTitle, queryLeftover = ttyQueryTitle(in, out)
+	}
+	defer func() {
+		if titleOn && oldTitle != "" {
+			_, _ = out.Write([]byte("\x1b]2;" + oldTitle + "\x07"))
+		}
+		if rerr := tty.restore(); rerr != nil {
+			fmt.Fprintf(os.Stderr, "\r\nhomeway term: 终端还原失败（%v）；画面混乱时执行 reset 修复\r\n", rerr)
+		}
+		_ = conn.Close()
 	}()
 
 	sendResize := func() {
@@ -532,31 +535,76 @@ func ttyQueryTitle(in, out *os.File) (string, []byte) {
 			return title, rest
 		}
 	}
-	return "", acc
+	// 超时：回投**已剥掉可识别应答**的余量（N1）——不应答/半应答的终端此前会把窗口内
+	// 的完整应答字节当输入灌进会话；rest 恒为「当前非应答字节」（见 parseTitleReply）。
+	_, rest, _ := parseTitleReply(acc)
+	return "", rest
 }
 
 // titleQueryBudget 是 OSC 21 查询的总预算（不应答的终端 ≤ 这么久后进入正常透传）。
 const titleQueryBudget = 150 * time.Millisecond
 
-// parseTitleReply 从窗口内收到的字节里解 OSC 21 应答（xterm 形态：\x1b]L<title>\x1b\\，
-// 前面可能带一条 \x1b]l…\x1b\\ 的图标名应答）。ok=false = 还没收齐（继续等）或不是应答；
-// rest = 应答前后的非应答字节（回投给会话）。
+// parseTitleReply 从窗口内收到的字节里解 OSC 21 应答并**剥掉所有可识别的应答序列**
+// （N1）：应答形态 = \x1b]L<title> 与 \x1b]l<icon>（图标名应答，xterm 先答 l 再答 L），
+// 结束符 ST（"\x1b\\"）与 BEL（"\x07"）**都认**——只认 ST 时，BEL 结尾的终端（评审假终端
+// 实证）整条应答会被当「非应答字节」回投给会话，每次 attach 灌 20–40B 转义垃圾。
+//
+// ok=false = 完整的标题应答还没到（继续等）；rest 恒为「当前非应答字节」——超时路径
+// 也用它回投（ttyQueryTitle 尾部）。荒谬长度（>128）的标题当噪声：不当标题、但仍是
+// 应答（剥掉，不回投——那是发给我们的应答，不是用户输入）。没收齐的 OSC 尾巴
+// （无结束符）同样不回投：那是迟到的应答前缀，喂给会话只会变垃圾。
 func parseTitleReply(acc []byte) (title string, rest []byte, ok bool) {
-	idx := bytes.Index(acc, []byte("\x1b]L"))
-	if idx < 0 {
-		return "", nil, false
+	const oscStart = "\x1b]"
+	var keep []byte
+	buf := acc
+	sawTitle := false
+	for len(buf) > 0 {
+		i := bytes.Index(buf, []byte(oscStart))
+		if i < 0 {
+			keep = append(keep, buf...)
+			break
+		}
+		keep = append(keep, buf[:i]...)
+		body := buf[i+2:]
+		if len(body) == 0 {
+			break // OSC 起始恰在末尾：没收齐
+		}
+		kind := body[0]
+		if kind != 'L' && kind != 'l' {
+			// 其它 OSC 序列不是标题/图标应答：不再扫，剩余当输入回投。
+			keep = append(keep, buf[i:]...)
+			break
+		}
+		payloadEnd, next := oscReplyEnd(body[1:])
+		if next < 0 {
+			break // 无结束符：没收齐（窗口内继续等后续分片）
+		}
+		if kind == 'L' {
+			sawTitle = true
+			if payloadEnd <= 128 {
+				title = string(body[1 : 1+payloadEnd])
+			}
+		}
+		// kind == 'l'：图标名应答，剥掉不回投（不是用户输入）。
+		buf = body[1+next:]
 	}
-	after := acc[idx+3:]
-	end := bytes.Index(after, []byte("\x1b\\"))
-	if end < 0 {
-		return "", nil, false // 收了一半：窗口内继续等后续分片
+	return title, keep, sawTitle
+}
+
+// oscReplyEnd 返回 OSC 应答载荷的结束位置：结束符取先到者 ST（"\x1b\\"，2 字节）或
+// BEL（"\x07"，1 字节）。payloadEnd = 载荷长度（不含结束符）；next = 整个结束符之后的
+// 偏移；没有结束符返回 (-1, -1)（没收齐）。
+func oscReplyEnd(b []byte) (payloadEnd, next int) {
+	bel := bytes.IndexByte(b, '\x07')
+	st := bytes.Index(b, []byte("\x1b\\"))
+	switch {
+	case bel < 0 && st < 0:
+		return -1, -1
+	case st < 0 || (bel >= 0 && bel < st):
+		return bel, bel + 1
+	default:
+		return st, st + 2
 	}
-	t := ""
-	if len(after[:end]) <= 128 { // 荒谬长度当噪声：不当标题（也不回投——那是发给我们的应答，不是用户输入）
-		t = string(after[:end])
-	}
-	rest = append(acc[:idx:idx], after[end+2:]...) // 应答之前的字节（首键）+ 之后的字节
-	return t, rest, true
 }
 
 // ---- 客户端实例标识（design D3：CLI 侧是唯一必需项）----

@@ -723,3 +723,93 @@ func TestCLIAttachTitleReply(t *testing.T) {
 	// 退出恢复原值：OSC 2 = 查询应答里的标题。
 	waitMaster(t, ms, "my-old-title", 3*time.Second)
 }
+
+// ---- N1/N2（exec-r4 非阻塞建议，§9 收尾落地）----
+
+// TestParseTitleReplyStripsRecognizableReplies：N1 的纯函数判据——可识别应答序列
+// （图标名 l / 标题 L；ST 与 BEL 两种结束符）必须被剥掉，只有真正的用户字节进 rest。
+func TestParseTitleReplyStripsRecognizableReplies(t *testing.T) {
+	cases := []struct {
+		name  string
+		in    string
+		title string
+		rest  string
+		ok    bool
+	}{
+		{"ST 结尾标题", "\x1b]Lmy-title\x1b\\", "my-title", "", true},
+		{"BEL 结尾标题", "\x1b]Lmy-title\x07", "my-title", "", true},
+		{"图标名(BEL)+标题(ST)", "\x1b]licon\x07\x1b]Lreal\x1b\\", "real", "", true},
+		{"应答前有首键", "a\x1b]Lreal\x07", "real", "a", true},
+		{"应答后有首键", "\x1b]Lreal\x07z", "real", "z", true},
+		{"纯键入无应答", "abc", "", "abc", false},
+		{"收了一半（无结束符）", "\x1b]Lre", "", "", false},
+		{"荒谬长度不当标题但剥掉", "\x1b]L" + strings.Repeat("x", 200) + "\x07", "", "", true},
+		{"其它 OSC 不剥", "\x1b[?62;22c", "", "\x1b[?62;22c", false}, // CSI 不是 OSC（Index 不命中）
+	}
+	for _, c := range cases {
+		title, rest, ok := parseTitleReply([]byte(c.in))
+		if title != c.title || string(rest) != c.rest || ok != c.ok {
+			t.Fatalf("%s：got (title=%q rest=%q ok=%v), want (%q %q %v)",
+				c.name, title, rest, ok, c.title, c.rest, c.ok)
+		}
+	}
+}
+
+// TestCLIAttachTitleReplyBELForm：应答用 **BEL 结尾 + 先图标名后标题** 的终端（评审假终端
+// 形态，N1 的端到端判据）——标题恢复仍生效，且应答字节**不进会话**（master 输出里没有
+// ESC ] l/L：误判路径下会话会把它当输入回显回来）。
+func TestCLIAttachTitleBELFormNoLeak(t *testing.T) {
+	_, ln, dir := startTestTermUDSShell(t, testTermEchoShell)
+	ensureSession(t, ln, "cli-bel")
+
+	master, ttyFile := openTestPTY(t, 100, 30)
+	hook := func(chunk []byte) {
+		if bytes.Contains(chunk, []byte("\x1b]21;?")) {
+			// 图标名（BEL）+ 标题（BEL）：只认 ST 的旧解析整条当输入回投。
+			_, _ = master.Write([]byte("\x1b]licon\x07\x1b]Lbel-title\x07"))
+		}
+	}
+	ms := readMasterAsyncHook(master, hook)
+	cmd, res := spawnAttachHelper(t, ttyFile, true, map[string]string{
+		"CLI_TEST_STATE": dir, "CLI_TEST_NAME": "cli-bel", "CLI_TEST_MODE": "attach",
+		"HOMEWAY_TERM_TITLE": "",
+	})
+	waitMaster(t, ms, "tick", 10*time.Second)
+	_, _ = master.Write([]byte{0x02, 'd'})
+	waitHelper(t, cmd, 10*time.Second)
+	if got := waitResult(t, res, time.Second); !strings.Contains(got, "err=[<nil>]") {
+		t.Fatalf("分离应正常退出：%s", got)
+	}
+	// BEL 形态的标题也应被解出并恢复。
+	waitMaster(t, ms, "bel-title", 3*time.Second)
+	// N1 判据：应答序列不得经会话回显回来（master 输出不应再出现 ESC ] l/L）。
+	if ms.contains("\x1b]l") || ms.contains("\x1b]L") {
+		t.Fatalf("应答序列泄漏进会话回显（N1 未生效）：%q", ms.dump())
+	}
+}
+
+// TestCLIAttachTitleNoReplyNoKey：N2——**不写任何键**，不应答 OSC 21 的终端上
+// attach 在查询预算（150ms）+ 握手内自己进入透传（tick ≤1s 到达）。现有 NoReply 用例
+// spawn 后立即写键，守不住这条（评审临时用例已证可稳定红/绿）。
+func TestCLIAttachTitleNoReplyNoKey(t *testing.T) {
+	_, ln, dir := startTestTermUDSShell(t, testTermEchoShell)
+	ensureSession(t, ln, "cli-nokey")
+
+	master, ttyFile := openTestPTY(t, 100, 30)
+	ms := readMasterAsync(master) // 不应答 OSC 21；测试全程不写任何键
+	start := time.Now()
+	cmd, res := spawnAttachHelper(t, ttyFile, true, map[string]string{
+		"CLI_TEST_STATE": dir, "CLI_TEST_NAME": "cli-nokey", "CLI_TEST_MODE": "attach",
+		"HOMEWAY_TERM_TITLE": "",
+	})
+	waitMaster(t, ms, "tick", 3*time.Second)
+	if d := time.Since(start); d > time.Second {
+		t.Fatalf("无按键也应 ≤1s 进入透传（tick 自达），实际 %v", d)
+	}
+	// 从 master 侧发分离（这是唯一的「写」——发生在透传建立之后，不破坏用例语义）。
+	_, _ = master.Write([]byte{0x02, 'd'})
+	waitHelper(t, cmd, 10*time.Second)
+	if got := waitResult(t, res, time.Second); !strings.Contains(got, "err=[<nil>]") {
+		t.Fatalf("分离应正常退出：%s", got)
+	}
+}
