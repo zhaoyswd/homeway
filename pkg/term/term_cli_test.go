@@ -7,6 +7,7 @@ package term
 import (
 	"bytes"
 	"errors"
+	"io"
 	"io/fs"
 	"net"
 	"os"
@@ -15,6 +16,7 @@ import (
 	"strings"
 	"syscall"
 	"testing"
+	"time"
 )
 
 // ---- 参数解析 ----
@@ -478,5 +480,76 @@ func TestCLIDialErrAgainstEmptyDir(t *testing.T) {
 	err := cliList([]string{"--state", dir})
 	if err == nil || !strings.Contains(err.Error(), "出口未在运行") {
 		t.Fatalf("空目录应报 ENOENT 合并文案：%v", err)
+	}
+}
+
+// TestCLIListDeleteDefaultState：不带 --state 的 list/delete 也必须落到默认 state
+// （~/.config/homeway，D1「--state 沿用默认」）——发版后实测裸 `homeway term list` 报
+// 「拿不到 state 目录」（cliList/cliDelete 漏了缺省补默认，new/attach/explain 都有），
+// 本用例锁回归：HOME 指到带 .config/homeway/term.sock（symlink 到真实 socket）的假家目录。
+func TestCLIListDeleteDefaultState(t *testing.T) {
+	_, ln, dir := startTestTermUDS(t)
+	_, _, _, _ = attachTerm(t, ln, "cli-dflt", true, 100, 30)
+
+	// macOS sun_path 上限 104 字节：t.TempDir() 的 /var/folders 路径太长（连 symlink 都
+	// 过不了 connect），与 startTestTermUDS 同款换 /tmp 下短目录。
+	home, err := os.MkdirTemp("/tmp", "termcli-home-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.RemoveAll(home) })
+	if err := os.MkdirAll(filepath.Join(home, ".config", "homeway"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(filepath.Join(dir, "term.sock"),
+		filepath.Join(home, ".config", "homeway", "term.sock")); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("HOME", home)
+
+	// 裸 list（无 --state）：走默认 state，能列出会话。
+	var buf bytes.Buffer
+	old := os.Stdout
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	os.Stdout = w
+	listErr := cliList(nil)
+	w.Close()
+	os.Stdout = old
+	_, _ = io.Copy(&buf, r)
+	if listErr != nil {
+		t.Fatalf("裸 list 应走默认 state：%v", listErr)
+	}
+	if !strings.Contains(buf.String(), "cli-dflt") {
+		t.Fatalf("默认 state 的 list 应列出会话：%s", buf.String())
+	}
+
+	// 裸 delete（无 --state）：同样走默认 state（用第二会话验证真删）。注册表摘除与
+	// KILL 的 OK 回复存在毫秒级竞态（TestCLIDeleteAgainstService 偶发顺序差），短轮询等它。
+	_, _, _, _ = attachTerm(t, ln, "cli-dflt2", true, 100, 30)
+	if err := cliDelete([]string{"cli-dflt2"}); err != nil {
+		t.Fatalf("裸 delete 应走默认 state：%v", err)
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		entries, _, err := cliListFetch(dir)
+		if err != nil {
+			t.Fatal(err)
+		}
+		gone := true
+		for _, e := range entries {
+			if e.Name == "cli-dflt2" {
+				gone = false
+			}
+		}
+		if gone {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("cli-dflt2 应已被默认 state 的 delete 删除：%+v", entries)
+		}
+		time.Sleep(50 * time.Millisecond)
 	}
 }

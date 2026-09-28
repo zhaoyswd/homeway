@@ -243,6 +243,10 @@ func cliList(args []string) error {
 			return fmt.Errorf("list 不接受会话名（%q）；省略名字接入最近活跃会话请用 attach", a)
 		}
 	}
+	// 缺省补默认（与 new/attach/explain 同一约定：--state 沿用 ~/.config/homeway）。
+	if c.stateDir == "" {
+		c.stateDir = DefaultStateDir()
+	}
 	entries, raw, err := cliListFetch(c.stateDir)
 	if err != nil {
 		return err
@@ -443,6 +447,10 @@ func cliDelete(args []string) error {
 			}
 			name = a
 		}
+	}
+	// 缺省补默认（同 list：--state 沿用 ~/.config/homeway）。
+	if c.stateDir == "" {
+		c.stateDir = DefaultStateDir()
 	}
 	if name == "" {
 		return errors.New("delete 需要会话名：homeway term delete <name>")
