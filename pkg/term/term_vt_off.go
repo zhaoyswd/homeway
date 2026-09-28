@@ -76,10 +76,8 @@ func (s *sessionVT) SurfaceCursor() surfaceCursor                   { return sur
 func (s *sessionVT) SurfaceModes() (uint32, uint8, uint8)           { return 0, 0, 0 }
 func (s *sessionVT) SurfaceAltScreen() bool                         { return false }
 func (s *sessionVT) SurfaceStateNow() SurfaceState                  { return SurfaceState{} }
-func (s *sessionVT) CommitSurfaceBaseline(st SurfaceState)          { _ = st }
-func (s *sessionVT) ResetSurfaceBaseline()                          {}
-func (s *sessionVT) SurfaceUpdate() ([]byte, uint16, SurfaceState, bool, bool) {
-	return nil, 0, SurfaceState{}, true, true
+func (s *sessionVT) SurfaceTick() ([]byte, uint16, SurfaceState, bool) {
+	return nil, 0, SurfaceState{}, true
 }
 func (s *sessionVT) SurfaceScrollbar() vt.Scrollbar              { return vt.Scrollbar{} }
 func (s *sessionVT) SurfaceClean()                               {}

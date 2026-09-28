@@ -1,21 +1,24 @@
 //go:build !windows
 
-// term_surface_leg.go — surface 腿的投递（任务 2.3/2.4/2.5）。
+// term_surface_leg.go — surface 腿的投递（任务 2.3/2.4/2.5；多腿化 = term-host-cli 2.2a）。
 //
-// 一条会话只有**一条腿**（单腿顶替语义：新 attach 顶掉旧腿，旧腿收 ENDED(replaced)），
-// 所以这里的状态就挂在 termClient 上。
+// 一条会话可以有多条 surface 腿同时在场（每腿一份本结构）：**基线（base/hasBase）、
+// needSnapshot、revision、背压都在腿上**——掉队腿全量重建、健康腿继续差分、互不影响。
 //
 // # 锁纪律（design D2）
 //
-// **锁内只取快照、锁外压缩与发送**：取脏行/网格/光标/模式要持会话锁（与 PTY pump 串行），
-// 但 gzip、分片、socket 写全在锁外——那才是耗时大头，占着会话锁会把子进程一起拖住。
-// （cell 行编码本身在锁内做：实测 100×32 全网格 ~100µs，与取快照同一把锁更简单也更安全。）
+// **锁内只取快照、锁外压缩与入队**：取脏行/网格/光标/模式要持会话锁（与 PTY pump 串行），
+// 但 gzip、分片、socket 写全在锁外（socket 写由每腿唯一的写者 goroutine 执行，design D5/B'，
+// 见 term_leg.go——sendMu 的帧组原子性职责由「单队列 + 单写者」继承）。
 //
-// # 背压（2.5）
+// # 背压（2.5 + 任务 4.3 的两种失败模式）
 //
-// 合并窗（16–33ms）把窗内的多次脏标记并成一帧；单帧体积超过 perLegPendingCap（4MiB）或
-// 上一次写超时/耗时过长（链路慢）⇒ **丢弃待发差分、标记该腿需要全量快照**——
-// 状态宁可全量重建，不可让客户端停在半新半旧。socket 写超时 ⇒ 断该腿（会话存续，
+// 合并窗（16–33ms）把窗内的多次脏标记并成一帧。两种失败模式**分开**：
+//   - 单帧体积超 perLegPendingCap（4MiB）⇒ 标记该腿需要全量、下一拍重试（既有语义）；
+//   - 队列积压超 perLegQueueBytes（8MiB/腿，**队列**上限——perLegPendingCap 是单帧上限、
+//     不是队列长度）⇒ 丢弃待发 + 标记需全量。
+//
+// 状态宁可全量重建，不可让客户端停在半新半旧。socket 写失败（含超时）⇒ 断该腿（会话存续，
 // 客户端按断线重连路径恢复）。
 package term
 
@@ -30,9 +33,14 @@ const (
 	surfaceMergeWindowMin = 16 * time.Millisecond
 	surfaceMergeWindowMax = 33 * time.Millisecond
 
-	// perLegPendingCap 是单腿单帧的体积上限（design D2 的 4MiB）。
+	// perLegPendingCap 是单腿**单帧**的体积上限（design D2 的 4MiB）。
 	// 超过它就不发差分/快照，而是标记「需要全量」并等下一拍（那时体积会小下来）。
 	perLegPendingCap = 4 << 20
+
+	// perLegQueueBytes 是单腿**队列**的体积上限（任务 4.3，默认 8MiB/腿）。
+	// 与 perLegPendingCap 是两个维度：前者拦病态单帧，后者拦持续积压（慢腿吃满队列 ⇒
+	// 丢弃待发 + 标记需全量，写者继续排空已有帧）。
+	perLegQueueBytes = 8 << 20
 
 	// surfaceFetchRowsMax 是单次 FETCH-ROWS 的行数上限（防对端一次要几万行把内存打满）。
 	surfaceFetchRowsMax = 512
@@ -40,36 +48,38 @@ const (
 
 // surfaceStats 是服务端观测计数器（任务 2.9；对称客户端 3.8，7.4 两端对照的数据源）。
 type surfaceStats struct {
-	snapshots    uint64 // 下发的全量快照数
-	diffs        uint64 // 下发的差分帧数
-	degrades     uint64 // 差分降级为全量的次数
-	backpressure uint64 // 背压事件（弃差分标记需快照）
-	fragments    uint64 // 分片总数
-	bytesOut     uint64 // 下发字节（分片后的净字节）
-	fetchHits    uint64 // FETCH-ROWS 命中（取到行）
-	fetchMiss    uint64 // FETCH-ROWS 落空（越界/备用屏）
-	writeTimeout uint64 // 写超时断腿次数
-	sentDiffs    uint64 // 差分成功下发（用于 7.4 的差分 vs 原始 ANSI 对照）
-	trims        uint64 // 回滚裁剪触发的强制全量重建（任务 3.3；观测用）
+	snapshots     uint64 // 下发的全量快照数
+	diffs         uint64 // 下发的差分帧数
+	degrades      uint64 // 差分降级为全量的次数
+	backpressure  uint64 // 背压事件（弃差分标记需快照）
+	queueOverflow uint64 // 队列积压超 perLegQueueBytes 的丢弃事件（任务 4.3 失败模式二）
+	fragments     uint64 // 分片总数
+	bytesOut      uint64 // 下发字节（分片后的净字节）
+	fetchHits     uint64 // FETCH-ROWS 命中（取到行）
+	fetchMiss     uint64 // FETCH-ROWS 落空（越界/备用屏）
+	writeTimeout  uint64 // 写失败/超时断腿次数
+	sentDiffs     uint64 // 差分成功下发（用于 7.4 的差分 vs 原始 ANSI 对照）
+	trims         uint64 // 回滚裁剪触发的强制全量重建（任务 3.3；观测用）
 }
 
 // surfaceLeg 一条 surface 腿的投递状态。
 type surfaceLeg struct {
 	mu sync.Mutex
-	// sendMu 保证**一个帧组（分片序列 + 收尾帧）不被打断**。
-	//
-	// 为什么需要它（2026-09-24 评审整改，P1）：sendFrames 原先不持任何发送锁，而它有三个
-	// 并发来源——投递循环（快照/差分）、stream 读循环（FETCH-ROWS 应答）、`go notifyFromScan()`
-	// （通知）。实测能构造出 `0d 0d 10 0d 0d`（FETCH 帧插进快照两片之间）⇒ 客户端判
-	// 「分片组被其它 op 打断」⇒ 拒收 + 请求全量（用户滚动 + 会话输出时概率最高）。
-	// c.frame 的 wmu 只保证**单帧**不撕裂，管不了跨帧的组原子性。
-	sendMu sync.Mutex
 
 	// revision 是差分对账的世代号：每发一次全量 +1；差分沿用当前值。
 	// 客户端发现断档就 FETCH-SNAPSHOT（服务端不重传旧差分）。
 	revision uint32
 	// needSnapshot 标记该腿需要全量重建（首次 attach / 背压 / 降级 / resize / 回滚裁剪）。
 	needSnapshot bool
+	// base/hasBase 是**该腿**上一次成功下发（快照或差分）的屏态基线（任务 2.2a：
+	// 从 sessionVT 搬到腿上——多腿各自对账）。
+	//
+	// 为什么需要它（2026-09-24 评审整改，P0）：光标移动、鼠标上报模式开关（?1000h）、
+	// DECTCEM 光标显隐、DECCKM、括号粘贴这些**都不产生脏行**——只看「有没有脏行」会
+	// 一个字节都不发。有了基线，本拍与上一拍比光标/模式位/回滚条，任一变化就发帧
+	//（差分体已带这三样）。
+	base    SurfaceState
+	hasBase bool
 	// lastWriteCost 上次写耗时（> 合并窗 ⇒ 链路有压力，下一拍走全量）。
 	lastWriteCost time.Duration
 	// lastSnapTotal / hasSnapTotal：上次全量快照时的回滚条 total（任务 3.3）。
@@ -87,8 +97,11 @@ func newSurfaceLeg() *surfaceLeg { return &surfaceLeg{needSnapshot: true} }
 func (l *surfaceLeg) markNeedSnapshot(reason string) {
 	l.mu.Lock()
 	l.needSnapshot = true
-	if reason == "backpressure" {
+	switch reason {
+	case "backpressure":
 		l.stats.backpressure++
+	case "queue_overflow":
+		l.stats.queueOverflow++
 	}
 	l.mu.Unlock()
 }
@@ -131,6 +144,49 @@ func (l *surfaceLeg) underPressure() bool {
 	return l.lastWriteCost > surfaceMergeWindowMax
 }
 
+// stateUnchanged 报告本拍屏态与该腿基线相比是否完全没动（光标/模式位/回滚条；
+// 脏行由会话级 SurfaceTick 判，这里只补「不产生脏行」的那部分）。
+func (l *surfaceLeg) stateUnchanged(st SurfaceState) bool {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.hasBase && st.Cursor == l.base.Cursor && st.Modes == l.base.Modes &&
+		st.Total == l.base.Total && st.Offset == l.base.Offset && st.Len == l.base.Len
+}
+
+// commitBaseline 在一次快照/差分**成功入队后**记该腿的基线（2.2a：基线在腿上）。
+func (l *surfaceLeg) commitBaseline(st SurfaceState) {
+	l.mu.Lock()
+	l.base, l.hasBase = st, true
+	l.mu.Unlock()
+}
+
+// noteSent 记一次成功入队的载荷（快照/差分）的观测计数。
+func (l *surfaceLeg) noteSent(op byte, items []writeItem) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if op == opSnapshot {
+		l.stats.snapshots++
+	} else {
+		l.stats.diffs++
+		l.stats.sentDiffs++
+	}
+	l.stats.fragments += uint64(len(items))
+	for _, it := range items {
+		l.stats.bytesOut += uint64(len(it.payload))
+	}
+}
+
+// noteFetchRows 记一次 FETCH-ROWS 应答的命中/落空。
+func (l *surfaceLeg) noteFetchRows(hit bool) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if hit {
+		l.stats.fetchHits++
+	} else {
+		l.stats.fetchMiss++
+	}
+}
+
 // noteScrollbar 记下本拍的回滚条 total，并在**检测到裁剪**时要求全量重建（任务 3.3）。
 //
 // 判据：total 比上次快照时小 ⇒ 回滚被裁剪（page 粒度；探针实测：写 4000 行时 total 从 2001
@@ -154,137 +210,9 @@ func (l *surfaceLeg) statsSnapshot() surfaceStats {
 	return l.stats
 }
 
-// sendFrames 把一串帧按顺序写出（调用方保证锁外）。**整组持 sendMu**（见字段注释）。
-//
-// 写失败（含超时）⇒ 返回 false，调用方负责断腿。分片计数与字节数在这里累加。
-func (l *surfaceLeg) sendFrames(c *termClient, op byte, payloads [][]byte) bool {
-	l.sendMu.Lock()
-	defer l.sendMu.Unlock()
-	return l.sendFramesLocked(c, op, payloads)
-}
-
-// sendFramesLocked 是 sendFrames 的实体（调用方已持 sendMu；sendSnapshot 要跨「分片 + DONE」）。
-func (l *surfaceLeg) sendFramesLocked(c *termClient, op byte, payloads [][]byte) bool {
-	start := time.Now()
-	for _, p := range payloads {
-		if len(p) > surfaceMaxFrame {
-			// 服务端**硬保证**单帧 ≤ 64KiB：真出现说明分片逻辑坏了，宁可断腿也不发截断帧
-			// （截断对 surface 是非法化语义，评审 H2）。
-			l.mu.Lock()
-			l.stats.writeTimeout++
-			l.mu.Unlock()
-			return false
-		}
-		if err := c.frame(op, p); err != nil {
-			l.mu.Lock()
-			l.stats.writeTimeout++
-			l.mu.Unlock()
-			return false
-		}
-	}
-	cost := time.Since(start)
+// noteWriteFailure 记一次写失败（写者断腿路径调用；观测用）。
+func (l *surfaceLeg) noteWriteFailure() {
 	l.mu.Lock()
-	l.stats.fragments += uint64(len(payloads))
-	for _, p := range payloads {
-		l.stats.bytesOut += uint64(len(p))
-	}
+	l.stats.writeTimeout++
 	l.mu.Unlock()
-	l.noteWriteCost(cost)
-	return true
-}
-
-// sendSnapshot 下发一次全量快照（锁外调用）：压缩 → 分片 → 逐帧写 → SNAPSHOT-DONE。
-//
-// body 是**未压缩**的 SNAPSHOT 体；体积超上限时返回 false（调用方断腿/重试）。
-// 整组（含 DONE）持 sendMu：DONE 与分片之间被别的帧插进来，客户端虽能容忍，但语义上
-// 「这一代快照」应当是一段连续字节。
-func (l *surfaceLeg) sendSnapshot(c *termClient, body []byte) bool {
-	if len(body) > perLegPendingCap {
-		// 单帧超上限：标记需要全量并在下一拍重试。
-		// ⚠️ 这不是「内容会自己变小」的乐观假设——内容不会自己变小；真正的兜底是
-		// 下一拍 `takeSnapshotFlag` 消费它之前若有差分成功下发，则快照被取消；
-		// 若持续超限，客户端侧 60KiB 分片契约仍能承载（这里只拦 4MiB 级病态体）。
-		l.markNeedSnapshot("backpressure")
-		return true
-	}
-	gz, err := gzipBytes(body)
-	if err != nil {
-		return false
-	}
-	frags := fragmentPayload(gz)
-	l.sendMu.Lock()
-	defer l.sendMu.Unlock()
-	if !l.sendFramesLocked(c, opSnapshot, frags) {
-		return false
-	}
-	// 完成标志：客户端据此解除渲染抑制（surface 版 REPLAY-DONE）。
-	if err := c.frame(opSnapshotDone, encReplayDone(uint32(len(body)), 0)); err != nil {
-		l.mu.Lock()
-		l.stats.writeTimeout++
-		l.mu.Unlock()
-		return false
-	}
-	l.mu.Lock()
-	l.stats.snapshots++
-	l.mu.Unlock()
-	return true
-}
-
-// sendDiff 下发一次差分（锁外调用）。
-func (l *surfaceLeg) sendDiff(c *termClient, body []byte) bool {
-	if len(body) > perLegPendingCap {
-		l.markNeedSnapshot("backpressure")
-		return true
-	}
-	gz, err := gzipBytes(body)
-	if err != nil {
-		return false
-	}
-	if !l.sendFrames(c, opSurfaceDiff, fragmentPayload(gz)) {
-		return false
-	}
-	l.mu.Lock()
-	l.stats.diffs++
-	l.stats.sentDiffs++
-	l.mu.Unlock()
-	return true
-}
-
-// sendFetchRows 下发 FETCH-ROWS 应答（锁外调用）。
-func (l *surfaceLeg) sendFetchRows(c *termClient, reply fetchRowsReply, hit bool) bool {
-	body := encFetchRowsReply(reply)
-	gz, err := gzipBytes(body)
-	if err != nil {
-		return false
-	}
-	if !l.sendFrames(c, opFetchRows, fragmentPayload(gz)) {
-		return false
-	}
-	l.mu.Lock()
-	if hit {
-		l.stats.fetchHits++
-	} else {
-		l.stats.fetchMiss++
-	}
-	l.mu.Unlock()
-	return true
-}
-
-// sendClipboard 下发 OSC 52 写请求（S→C）。
-func (l *surfaceLeg) sendClipboard(c *termClient, payload []byte) bool {
-	return l.sendFrames(c, opClipboard, [][]byte{payload})
-}
-
-// sendNotify 下发裸 OSC 9 通知（S→C）。
-func (l *surfaceLeg) sendNotify(c *termClient, payload []byte) bool {
-	return l.sendFrames(c, opNotify, [][]byte{payload})
-}
-
-// sendState 下发 STATE 帧（S→C）。
-//
-// 走 sendFrames 的意义有二：① 拿到 sendMu（不会插进别人的分片组）；② 写超时/失败的
-// 断腿语义与其它帧一致。**这也是把 STATE 移出会话锁的落点**（2026-09-24 评审整改，P2）：
-// 旧实现 `pushStateLocked` 在会话锁内直接 c.frame ⇒ 慢链路下最多把 PTY pump 堵 5s（写超时）。
-func (l *surfaceLeg) sendState(c *termClient, payload []byte) bool {
-	return l.sendFrames(c, opState, [][]byte{payload})
 }

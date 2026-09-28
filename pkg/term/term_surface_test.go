@@ -583,58 +583,70 @@ func TestSurfaceUpdateSendsCursorAndModeChanges(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer sv.Close()
+	// 多腿化（2.2a）后基线在**腿**上：这里用一条真腿对账（flushSurface 的同款判定）。
+	leg := newSurfaceLeg()
 	sv.Write([]byte("hello"))
 
-	// 建立基线（等价于一次全量快照成功下发）：先把脏状态消费掉再记屏态。
-	sv.SurfaceUpdate()
+	// 建立基线（等价于一次全量成功入队）：消费脏状态再把屏态 commit 到腿上。
+	sv.SurfaceTick()
 	sv.SurfaceClean()
-	base := sv.SurfaceStateNow()
-	sv.CommitSurfaceBaseline(base)
+	leg.commitBaseline(sv.SurfaceStateNow())
 
-	// ① 无变化 ⇒ 整拍跳过（不能空转刷帧）。
-	if _, _, _, needFull, changed := sv.SurfaceUpdate(); needFull || changed {
-		t.Fatalf("无变化应整拍跳过（needFull=%v changed=%v）", needFull, changed)
+	// ① 无变化 ⇒ 整拍跳过（不能空转刷帧）：会话级无脏行 + 腿基线无差异。
+	enc, count, st, changed := sv.SurfaceTick()
+	if changed {
+		t.Fatalf("无变化不应有脏行（changed=%v）", changed)
+	}
+	if count != 0 || len(enc) != 0 {
+		t.Fatalf("无变化不应有载荷（count=%d）", count)
+	}
+	if !leg.stateUnchanged(st) {
+		t.Fatal("无变化时腿基线比对应判定整拍跳过")
 	}
 
-	// ② 只移动光标 ⇒ changed、不降级、**空行集**（count=0）。
+	// ② 只移动光标 ⇒ 无脏行但腿基线感知差异 ⇒ 发「空行集」差分（count=0 是合法更新）。
 	sv.Write([]byte("\x1b[2D"))
-	enc, count, st2, needFull, changed := sv.SurfaceUpdate()
-	if !changed || needFull {
-		t.Fatalf("只移光标应发帧且不降级（changed=%v needFull=%v）", changed, needFull)
+	enc, count, st2, changed := sv.SurfaceTick()
+	if changed {
+		t.Fatal("只移光标不产生脏行（脏行由滚动/内容变化产生）")
 	}
 	if count != 0 || len(enc) != 0 {
 		t.Fatalf("只移光标应是空行集（count=%d enc=%d）", count, len(enc))
 	}
-	if st2.Cursor == base.Cursor {
-		t.Error("本拍光标应与基线不同（否则判据没生效）")
+	if leg.stateUnchanged(st2) {
+		t.Error("腿基线应感知光标变化（否则判据没生效）")
 	}
-	sv.CommitSurfaceBaseline(st2)
+	if st2.Cursor == st.Cursor {
+		t.Error("本拍光标应与基线不同")
+	}
+	leg.commitBaseline(st2)
 
-	// ③ 只开鼠标上报 ⇒ changed 且模式位带 mouse1000（触摸路由靠它）。
+	// ③ 只开鼠标上报 ⇒ 模式位带 mouse1000（触摸路由靠它；同样不产生脏行）。
 	sv.Write([]byte("\x1b[?1000h"))
-	_, _, st3, needFull3, changed3 := sv.SurfaceUpdate()
-	if !changed3 || needFull3 {
-		t.Fatalf("模式位变化应发帧且不降级（changed=%v needFull=%v）", changed3, needFull3)
-	}
+	_, _, st3, _ := sv.SurfaceTick()
 	if st3.Modes&termModeMouse1000 == 0 {
 		t.Errorf("模式位应带 mouse1000，实际 %#x", st3.Modes)
 	}
-	sv.CommitSurfaceBaseline(st3)
+	if leg.stateUnchanged(st3) {
+		t.Error("腿基线应感知模式位变化")
+	}
+	leg.commitBaseline(st3)
 
 	// ④ 滚动输出（DirtyFull）⇒ 走差分（不降级），且带脏行。
 	sv.Write([]byte("a\r\nb\r\nc\r\n"))
-	enc4, count4, _, needFull4, changed4 := sv.SurfaceUpdate()
-	if !changed4 || needFull4 {
-		t.Fatalf("滚动输出应走差分（changed=%v needFull=%v）——P0 整改的核心判据", changed4, needFull4)
+	enc4, count4, _, changed4 := sv.SurfaceTick()
+	if !changed4 {
+		t.Fatal("滚动输出应产生脏行——P0 整改的核心判据（DirtyFull 也走行差分）")
 	}
 	if count4 == 0 || len(enc4) == 0 {
 		t.Fatal("滚动输出应有脏行（全视口行差分）")
 	}
 
-	// ⑤ 备用屏进出 ⇒ 必须全量（离开时要重建主屏镜像）。
+	// ⑤ 备用屏进出 ⇒ 腿判 Alt 与基线不符 ⇒ 该腿全量（离开时要重建主屏镜像）。
 	sv.Write([]byte("\x1b[?1049h"))
-	if _, _, _, needFull5, _ := sv.SurfaceUpdate(); !needFull5 {
-		t.Error("进备用屏应要求全量")
+	_, _, st5, _ := sv.SurfaceTick()
+	if st5.Alt == leg.base.Alt {
+		t.Error("进备用屏后腿的 Alt 基线判定应要求全量")
 	}
 }
 
@@ -710,25 +722,58 @@ func TestSurfaceIdleSendsNoEmptyDiff(t *testing.T) {
 	}
 }
 
-// 分片组不被打断（P1-5）：并发 sendFrames 时，一个帧组必须连续到达。
+// 分片组不被打断（P1-5 的多腿版，任务 4.3）：并发生产者入队时，一个帧组必须连续到达——
+// 帧组原子性由「每腿唯一写者 + FIFO 队列」继承（旧 sendMu 的职责，design D5/B'）。
 func TestSurfaceFragmentsNotInterleaved(t *testing.T) {
 	conn := newSlowFirstWriteConn()
-	cl := &termClient{conn: conn}
-	leg := newSurfaceLeg()
+	cl := &termClient{conn: conn, out: newLegOut()}
 
 	var wg sync.WaitGroup
 	wg.Add(2)
 	// A：一个「多片」快照组（第一片写出时让出，模拟慢链路）。
 	go func() {
 		defer wg.Done()
-		leg.sendFrames(cl, opSnapshot, [][]byte{{1, 'a'}, {1, 'b'}, {0, 'c'}})
+		cl.out.enqueueGroup([]writeItem{
+			{op: opSnapshot, payload: []byte{1, 'a'}},
+			{op: opSnapshot, payload: []byte{1, 'b'}},
+			{op: opSnapshot, payload: []byte{0, 'c'}},
+		}, perLegQueueBytes)
 	}()
-	// B：另一条腿的帧（FETCH 应答/通知/状态都走这条路）。
+	// B：另一路的帧（FETCH 应答/通知/状态都走同一条队列）。
 	go func() {
 		defer wg.Done()
-		leg.sendFrames(cl, opFetchRows, [][]byte{{0, 'f'}})
+		cl.out.enqueueGroup([]writeItem{{op: opFetchRows, payload: []byte{0, 'f'}}}, perLegQueueBytes)
 	}()
 	wg.Wait()
+	// 终止标记：写者见到它就收工（排在两组之后 ⇒ 同时验证 FIFO 不丢帧）。
+	cl.out.enqueue(writeItem{op: opOK}, 0)
+
+	done := make(chan struct{})
+	go func() {
+		for {
+			items, _, _ := cl.out.take()
+			sawEnd := false
+			for _, it := range items {
+				if it.op == opOK {
+					sawEnd = true
+					continue
+				}
+				if err := cl.writeFrameOnce(it.op, it.payload); err != nil {
+					t.Errorf("写帧失败：%v", err)
+					return
+				}
+			}
+			if sawEnd {
+				_ = cl.conn.Close()
+				close(done)
+				return
+			}
+			if len(items) == 0 {
+				<-cl.out.wake
+			}
+		}
+	}()
+	<-done
 
 	ops := conn.ops(t)
 	// A 的三片必须连续（0d 0d 0d），B 只有一片 ⇒ 合法形态只有两种：0d0d0d10 或 100d0d0d。
@@ -833,10 +878,9 @@ func TestSurfaceLoopExitsOnSessionFinish(t *testing.T) {
 	sessionStop := make(chan struct{})
 	ended := make(chan struct{})
 	s := &termSession{
-		svc:         &termService{stopCh: stop},
+		svc:         &termService{stopCh: stop, cfg: termConfigFromEnv()},
 		surfaceWake: make(chan struct{}, 1),
 		clipChan:    make(chan string, 8),
-		stateChan:   make(chan []byte, 1),
 		surfaceStop: sessionStop,
 	}
 	go func() { s.surfaceLoop(); close(ended) }()
@@ -1039,35 +1083,149 @@ func TestSurfaceProgressNotForwardedAsNotify(t *testing.T) {
 	}
 }
 
-// ---- 2.10 单腿顶替语义 ----
+// ---- 多腿语义（term-host-cli 任务 2.1a/2.3；单腿顶替已退役）----
 
-func TestSurfaceSingleLegReplacement(t *testing.T) {
+// 正常接入**不**顶掉旧腿：两条 surface 腿同时在场、各自收快照，旧腿不收 ENDED。
+func TestSurfaceMultiLegCoexist(t *testing.T) {
 	svc, ln := startTestTermService(t)
 	defer svc.Close()
 	defer ln.Close()
 	c1, _ := attachSurface(t, ln, "sf16", 80, 24)
 	defer c1.Close()
 
-	// 第二条 surface 腿 attach 同一会话 ⇒ 旧腿收 ENDED(replaced)。
-	c2, _ := attachSurface(t, ln, "sf16", 80, 24)
+	c2, snap2 := attachSurface(t, ln, "sf16", 80, 24)
 	defer c2.Close()
+	if snap2.Geometry.Cols != 80 {
+		t.Errorf("第二条腿应正常拿到快照（%dx%d）", snap2.Geometry.Cols, snap2.Geometry.Rows)
+	}
 
-	deadline := time.Now().Add(3 * time.Second)
+	// 旧腿在窗口期内**不该**收到 ENDED（正常接入不顶腿）；也不该断流。
+	deadline := time.Now().Add(1500 * time.Millisecond)
 	for time.Now().Before(deadline) {
-		_ = c1.SetReadDeadline(time.Now().Add(2 * time.Second))
+		_ = c1.SetReadDeadline(time.Now().Add(800 * time.Millisecond))
 		f, err := readTermFrame(c1)
+		if err != nil {
+			break // 窗口内无帧（会话安静）：合法——重点是没收到 ENDED
+		}
+		if f.op == opEnded {
+			t.Fatal("正常接入不该顶掉旧腿（收到 ENDED）")
+		}
+	}
+
+	// LIST：attached 为真 + clients 记两条腿（kind=app）。
+	list := listTerm(t, ln)
+	sess, ok := listSession(list, "sf16")
+	if !ok {
+		t.Fatal("会话不在列表里")
+	}
+	clients, _ := sess["clients"].([]any)
+	if len(clients) != 2 {
+		t.Fatalf("clients 应记 2 条腿，实际 %d（%v）", len(clients), sess["clients"])
+	}
+	for _, it := range clients {
+		m, _ := it.(map[string]any)
+		if m["kind"] != "app" {
+			t.Errorf("surface 腿 kind 应为 app，实际 %v", m["kind"])
+		}
+		if _, ok := m["sinceMs"]; !ok {
+			t.Error("clients 条目应有 sinceMs 字段")
+		}
+	}
+}
+
+// 显式接管（HELLO flags bit2 = `attach -d`）：其它腿收 ENDED(code=-1, reason=replaced)。
+func TestSurfaceTakeoverReplaces(t *testing.T) {
+	svc, ln := startTestTermService(t)
+	defer svc.Close()
+	defer ln.Close()
+	c1, _ := attachSurface(t, ln, "sf17", 80, 24)
+	defer c1.Close()
+
+	c2 := dialTerm(t, ln)
+	defer c2.Close()
+	if f := readTermFrameT(t, c2); f.op != opGreeting {
+		t.Fatal("首帧应为 GREETING")
+	}
+	// HELLO flags = create|takeover（bit0|bit2）+ capability（surface）。
+	hello := encHello(80, 24, true, "sf17")
+	hello[4] = helloFlagCreate | helloFlagTakeover
+	hello = append(hello, encCapability(capsSurface)...)
+	writeTermFrame(t, c2, opHello, hello)
+	if f := readTermFrameT(t, c2); f.op != opAttached {
+		t.Fatalf("接管腿应收到 ATTACHED，收到 0x%02x", f.op)
+	}
+
+	f := readTermFrameT(t, c1)
+	for f.op == opSnapshot || f.op == opSurfaceDiff || f.op == opState || f.op == opNotify {
+		f = readTermFrameT(t, c1) // 跳过在飞帧
+	}
+	if f.op != opEnded {
+		t.Fatalf("被接管的腿应收 ENDED，收到 0x%02x", f.op)
+	}
+	code := int32(binary.LittleEndian.Uint32(f.payload[0:4]))
+	if code != termEndReplaced {
+		t.Errorf("ENDED code = %d，期望 %d", code, termEndReplaced)
+	}
+	if reason := string(f.payload[5:]); reason != "replaced" {
+		t.Errorf("ENDED reason = %q，期望 replaced（D8 词表）", reason)
+	}
+}
+
+// 同实例标识重连替换自身旧腿（任务 2.3）：旧腿收 ENDED(self_reconnect)，其它腿不受影响。
+func TestSurfaceSelfReconnectReplaces(t *testing.T) {
+	svc, ln := startTestTermService(t)
+	defer svc.Close()
+	defer ln.Close()
+	// 腿 A：带标识 id-1。
+	c1 := dialTerm(t, ln)
+	defer c1.Close()
+	readTermFrameT(t, c1)
+	hello := append(encHello(80, 24, true, "sf18"), encHelloTail(capsSurface, true, "id-1")...)
+	writeTermFrame(t, c1, opHello, hello)
+	if f := readTermFrameT(t, c1); f.op != opAttached {
+		t.Fatalf("腿 A 应收到 ATTACHED，收到 0x%02x", f.op)
+	}
+	// 腿 B：无标识（别的客户端），应不受影响。
+	c2 := dialTerm(t, ln)
+	defer c2.Close()
+	readTermFrameT(t, c2)
+	writeTermFrame(t, c2, opHello, append(encHello(80, 24, true, "sf18"), encCapability(capsSurface)...))
+	if f := readTermFrameT(t, c2); f.op != opAttached {
+		t.Fatalf("腿 B 应收到 ATTACHED，收到 0x%02x", f.op)
+	}
+
+	// 腿 A'：同标识 id-1 重连 ⇒ 旧腿 A 收 ENDED(self_reconnect)、腿 B 不收。
+	c3 := dialTerm(t, ln)
+	defer c3.Close()
+	readTermFrameT(t, c3)
+	writeTermFrame(t, c3, opHello, append(encHello(80, 24, true, "sf18"), encHelloTail(capsSurface, true, "id-1")...))
+	if f := readTermFrameT(t, c3); f.op != opAttached {
+		t.Fatalf("重连腿应收到 ATTACHED，收到 0x%02x", f.op)
+	}
+
+	f := readTermFrameT(t, c1)
+	for f.op == opSnapshot || f.op == opSurfaceDiff || f.op == opState || f.op == opNotify {
+		f = readTermFrameT(t, c1)
+	}
+	if f.op != opEnded {
+		t.Fatalf("被替换的旧腿应收 ENDED，收到 0x%02x", f.op)
+	}
+	code := int32(binary.LittleEndian.Uint32(f.payload[0:4]))
+	reason := string(f.payload[5:])
+	if code != termEndReplaced || reason != "self_reconnect" {
+		t.Errorf("ENDED = (%d, %q)，期望 (%d, self_reconnect)", code, reason, termEndReplaced)
+	}
+	// 腿 B 不受影响：窗口期内不收 ENDED。
+	_ = c2.SetReadDeadline(time.Now().Add(1200 * time.Millisecond))
+	for {
+		f, err := readTermFrame(c2)
 		if err != nil {
 			break
 		}
 		if f.op == opEnded {
-			code := int32(binary.LittleEndian.Uint32(f.payload[0:4]))
-			if code != termEndReplaced {
-				t.Errorf("旧腿应收到 ENDED(replaced)=%d，实际 %d", termEndReplaced, code)
-			}
-			return
+			t.Fatal("其它腿不该受同实例替换影响（收到 ENDED）")
 		}
 	}
-	t.Fatal("旧腿没收到 ENDED(replaced)")
 }
 
 // ---- 2.5 背压的单元判据 ----
@@ -1171,12 +1329,12 @@ func TestSurfacePayloadRoundTrip(t *testing.T) {
 	}
 
 	for _, caps := range []byte{0, capsSurface, 0xff} {
-		c, present, err := decCapability(encCapability(caps))
+		c, present, _, err := decHelloTail(encCapability(caps))
 		if err != nil || !present || c != caps {
 			t.Errorf("capability 往返不一致：%d %v %v", c, present, err)
 		}
 	}
-	if _, present, err := decCapability(nil); err != nil || present {
+	if _, present, _, err := decHelloTail(nil); err != nil || present {
 		t.Errorf("无尾随字节应是「不携带」而不是错误：%v %v", present, err)
 	}
 }

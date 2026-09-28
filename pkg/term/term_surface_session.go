@@ -1,6 +1,6 @@
 //go:build !windows
 
-// term_surface_session.go — surface 的会话侧编排（任务 2.3–2.7）。
+// term_surface_session.go — surface 的会话侧编排（任务 2.3–2.7；多腿化 = term-host-cli 2.2b）。
 //
 // 分工：线格式在 term_surface.go，腿的投递与背压在 term_surface_leg.go，
 // 这里负责「什么时候发什么」与「收到上行帧怎么处理」。
@@ -8,6 +8,11 @@
 // 节奏（2.5）：PTY 有输出 ⇒ pump 在锁内喂完 vt 后 `wakeSurface()`；投递循环被唤醒后
 // 先睡一个**合并窗**（窗内再来唤醒就顺延到上限），再把这一窗的脏行并成一帧发出去。
 // 这样高频小输出不会变成高频小帧，而子进程也永远不会等投递（投递在独立 goroutine）。
+//
+// 多腿（2.2b）：flushSurface 同一拍遍历**所有** surface 腿——脏行集每拍取一次（共享一个
+// vt render reader），快照/差分按腿各自构建（基线在腿上，2.2a）；掉队腿（上一拍发送失败/
+// 超时）由自己的 needSnapshot 走全量。生产者只**入队**（每腿有界队列 + 写者，design D5/B'），
+// 绝不直接写 socket ⇒ 慢腿不影响其它腿与子进程。
 package term
 
 import (
@@ -37,31 +42,14 @@ func (s *termSession) surfaceLoop() {
 			// 漏一个常驻 goroutine（7.4 的「20 会话建删无泄漏」会抓到）。
 			return
 		case text := <-s.clipChan:
-			// 剪贴板写（OSC 52）：立即下发，不参与脏行合并窗。
+			// 剪贴板写（OSC 52）：立即下发（不参与脏行合并窗）；**只发 surface 腿**
+			// （任务 2.1b：raw 腿的字节流里本来就带这条序列，重复投递 = 双份 + 撞 CLI 的
+			// 未知帧分支）。
 			s.mu.Lock()
-			c := s.attached
-			ok := c != nil && c.surface && c.leg != nil
+			legs := s.surfaceLegsLocked()
 			s.mu.Unlock()
-			if ok && !c.leg.sendClipboard(c, encClipboard(clipKindWrite, text)) {
-				s.mu.Lock()
-				if s.attached == c {
-					s.detachLocked(c)
-				}
-				s.mu.Unlock()
-			}
-			continue
-		case payload := <-s.stateChan:
-			// 状态帧（S→C）：在**锁外**写 socket（见 pushStateLocked 的锁纪律注释）。
-			s.mu.Lock()
-			c := s.attached
-			ok := c != nil && c.surface && c.leg != nil
-			s.mu.Unlock()
-			if ok && !c.leg.sendState(c, payload) {
-				s.mu.Lock()
-				if s.attached == c {
-					s.detachLocked(c)
-				}
-				s.mu.Unlock()
+			for _, c := range legs {
+				c.out.enqueue(writeItem{op: opClipboard, payload: encClipboard(clipKindWrite, text)}, perLegQueueBytes)
 			}
 			continue
 		case <-s.surfaceWake:
@@ -85,11 +73,15 @@ func (s *termSession) surfaceLoop() {
 	}
 }
 
-// flushSurface 取一帧要发的东西（锁内）并下发（锁外）。
+// flushSurface 取一帧要发的东西（锁内）并入队（锁外压缩；任务 2.2a/2.2b 的多腿版）。
+//
+// 锁纪律（design D2）：锁内只取快照与建体（cell 编码 ~100µs 量级），gzip/分片/入队全在锁外。
+// 基线（base/hasBase）在**腿**上（2.2a）：掉队腿全量重建、健康腿继续差分、revision 各自对账。
+// 脏标记的消费时机：本拍构建了任何载荷即 SurfaceClean（乐观消费）——入队失败/写失败都由
+// needSnapshot 兜底全量重建，「宁可全量，不能半新半旧」的语义不变。
 func (s *termSession) flushSurface() {
 	s.mu.Lock()
-	c := s.attached
-	if c == nil || !c.surface || c.leg == nil || s.done {
+	if s.done {
 		s.mu.Unlock()
 		return
 	}
@@ -98,45 +90,54 @@ func (s *termSession) flushSurface() {
 		s.mu.Unlock()
 		return
 	}
+	legs := s.surfaceLegsLocked()
+	if len(legs) == 0 {
+		s.mu.Unlock()
+		return
+	}
 	cols, rows := s.cols, s.rows
 	title := s.scan.title
 
-	// 回滚裁剪检测（任务 3.3）：total 变小 ⇒ 绝对行号滑动 ⇒ 本拍强制全量重建镜像与基线。
+	// 回滚裁剪检测（任务 3.3）：total 变小 ⇒ 绝对行号滑动 ⇒ 该腿强制全量重建。
 	// 放在 takeSnapshotFlag 之前，这样它置的 needSnapshot 会被本拍消费。
-	if c.leg.noteScrollbar(sv.SurfaceScrollbar().Total) {
-		// 判据行：回滚裁剪（page 粒度）导致行号滑动 ⇒ 重建基线（客户端缓存随之作废）。
-		if s.svc.logf != nil {
-			s.svc.logf("term: 会话 %s 回滚裁剪 ⇒ 强制全量重建（绝对行号已滑动）", s.name)
+	for _, c := range legs {
+		if c.leg.noteScrollbar(sv.SurfaceScrollbar().Total) {
+			if s.svc.logf != nil {
+				s.svc.logf("term: 会话 %s 回滚裁剪 ⇒ 强制全量重建（绝对行号已滑动）", s.name)
+			}
 		}
 	}
 
-	// 全量还是差分：首次/背压/降级/备用屏切换/回滚裁剪都走全量。
-	forceSnap := c.leg.takeSnapshotFlag() || c.leg.underPressure()
-	var (
-		op      byte
-		payload []byte
-		state   SurfaceState
-		skip    bool
-	)
-	if forceSnap {
-		op = opSnapshot
-		payload, state = s.buildSnapshotLocked(sv, cols, rows, title)
-	} else {
-		enc, count, st, needFull, changed := sv.SurfaceUpdate()
+	// 每拍取一次脏行（所有 surface 腿共享同一份；2.2b）。
+	enc, count, st, anyChange := sv.SurfaceTick()
+
+	type pending struct {
+		c    *termClient
+		op   byte
+		body []byte
+		st   SurfaceState
+	}
+	var outs []pending
+	for _, c := range legs {
+		force := c.leg.takeSnapshotFlag() || c.leg.underPressure()
+		if !force {
+			if !c.leg.hasBase || st.Alt != c.leg.base.Alt {
+				// 首次基线缺失 / 备用屏进出（离开备用屏要重建主屏镜像）⇒ 该腿全量（2.2a）。
+				c.leg.mu.Lock()
+				c.leg.stats.degrades++
+				c.leg.mu.Unlock()
+				force = true
+			}
+		}
 		switch {
-		case !changed:
-			// 整拍无变化（无脏行、光标/模式位/回滚条都没动）：跳过。
-			skip = true
-		case needFull:
-			c.leg.mu.Lock()
-			c.leg.stats.degrades++
-			c.leg.mu.Unlock()
-			op = opSnapshot
-			payload, state = s.buildSnapshotLocked(sv, cols, rows, title)
-		default:
-			// count 可以为 0：只有光标/模式位/回滚条变了——差分体带这三样，是一帧合法更新。
-			op = opSurfaceDiff
-			payload = encDiffBody(diffBody{
+		case force:
+			body, st2 := s.buildSnapshotForLegLocked(c, sv, cols, rows, title)
+			outs = append(outs, pending{c: c, op: opSnapshot, body: body, st: st2})
+		case anyChange:
+			if count == 0 && c.leg.stateUnchanged(st) {
+				continue // 无脏行且该腿基线无差异（光标/模式位/回滚条）⇒ 本腿整拍跳过
+			}
+			payload := encDiffBody(diffBody{
 				Geometry: surfaceGeometry{Cols: cols, Rows: rows, Revision: c.leg.currentRevision()},
 				Cursor:   surfaceCursorOf(st.Cursor),
 				Modes:    st.Modes,
@@ -144,45 +145,50 @@ func (s *termSession) flushSurface() {
 				Rows:     enc,
 				RowCount: count,
 			})
-			state = st
+			outs = append(outs, pending{c: c, op: opSurfaceDiff, body: payload, st: st})
 		}
+	}
+	if len(outs) > 0 {
+		sv.SurfaceClean() // 乐观消费：入队/写失败由 needSnapshot 全量兜底
 	}
 	s.mu.Unlock()
 
-	if skip {
-		return
-	}
-	// 锁外：gzip + 分片 + 写（耗时大头，绝不能占着会话锁）。
-	var ok bool
-	if op == opSnapshot {
-		ok = c.leg.sendSnapshot(c, payload)
-	} else {
-		ok = c.leg.sendDiff(c, payload)
-	}
-	if !ok {
-		// 写失败/超时 ⇒ 断该腿（会话存续，客户端走断线重连路径）。
-		s.mu.Lock()
-		if s.attached == c {
-			s.detachLocked(c)
+	for _, p := range outs {
+		if len(p.body) > perLegPendingCap {
+			// 失败模式一（单帧超上限，任务 4.3）：标记需全量、下一拍重试（既有语义）。
+			p.c.leg.markNeedSnapshot("backpressure")
+			continue
 		}
-		s.mu.Unlock()
-		return
+		gz, err := gzipBytes(p.body)
+		if err != nil {
+			p.c.leg.markNeedSnapshot("encode_failed")
+			continue
+		}
+		items := make([]writeItem, 0, 2)
+		for _, frag := range fragmentPayload(gz) {
+			items = append(items, writeItem{op: p.op, payload: frag})
+		}
+		if p.op == opSnapshot {
+			// 完成标志与分片同组入队（快照语义上是一段连续字节）。
+			items = append(items, writeItem{op: opSnapshotDone,
+				payload: encReplayDone(uint32(len(p.body)), 0)})
+		}
+		if !p.c.out.enqueueGroup(items, perLegQueueBytes) {
+			// 失败模式二（队列积压超 perLegQueueBytes）：丢弃待发 + 标记需全量（新语义）。
+			p.c.leg.markNeedSnapshot("queue_overflow")
+			continue
+		}
+		p.c.leg.noteSent(p.op, items)
+		p.c.leg.commitBaseline(p.st)
 	}
-	// 成功下发后才消费脏标记并推进屏态基线：中途失败则下一拍重来（宁可重复，不能半新半旧）。
-	// 基线用**本拍取快照时的 state**（不是现在重读——那之间可能又来了输出，会把没发过的
-	// 变化记成已发）。
-	s.mu.Lock()
-	sv.SurfaceClean()
-	sv.CommitSurfaceBaseline(state)
-	s.mu.Unlock()
 }
 
-// buildSnapshotLocked 组一次全量快照的体（**必须持会话锁**）。
+// buildSnapshotForLegLocked 组一条腿的全量快照体（**必须持会话锁**；2.2a：按腿参数化）。
 //
-// 推进 revision：客户端据此判定「快照之后收到的差分是新一代」（SNAPSHOT 隐含重置 revision 基线）。
-// 同时返回本拍屏态（发送成功后由调用方 CommitSurfaceBaseline）。
-func (s *termSession) buildSnapshotLocked(sv *sessionVT, cols, rows uint16, title string) ([]byte, SurfaceState) {
-	rev := s.attached.leg.nextRevision()
+// 推进**该腿**的 revision：客户端据此判定「快照之后收到的差分是新一代」。
+// 同时返回本拍屏态（入队成功后由调用方 commitBaseline 到腿上）。
+func (s *termSession) buildSnapshotForLegLocked(c *termClient, sv *sessionVT, cols, rows uint16, title string) ([]byte, SurfaceState) {
+	rev := c.leg.nextRevision()
 	st := sv.SurfaceStateNow()
 	modes, kitty, misc := sv.SurfaceModes()
 	body := snapshotBody{
@@ -197,23 +203,21 @@ func (s *termSession) buildSnapshotLocked(sv *sessionVT, cols, rows uint16, titl
 		// 镜像窗口：主屏才有意义（备用屏返回空，design D3 要求抑制）。
 		Mirror: sv.SurfaceMirror(cols, rows, mirrorViewports),
 	}
-	// 记下这一代的 total：回滚裁剪（page 粒度，探针实测 4000 行时 total 从 2001 掉到 1719）
-	// 会让**绝对行号滑动** ⇒ 客户端缓存的镜像/拉取行全部失锚。判据用「total 变小」——
-	// total 只在裁剪时减少（写入时只增或持平），比盯页边界可靠。
-	if s.attached != nil && s.attached.leg != nil {
-		s.attached.leg.mu.Lock()
-		s.attached.leg.lastSnapTotal = st.Total
-		s.attached.leg.hasSnapTotal = true
-		s.attached.leg.mu.Unlock()
-	}
+	// 记下这一代的 total：回滚裁剪（page 粒度）会让**绝对行号滑动** ⇒ 该腿缓存的镜像/
+	// 拉取行全部失锚。判据用「total 变小」——total 只在裁剪时减少（写入时只增或持平）。
+	c.leg.mu.Lock()
+	c.leg.lastSnapTotal = st.Total
+	c.leg.hasSnapTotal = true
+	c.leg.mu.Unlock()
 	return encSnapshotBody(body), st
 }
 
-// handleFetchRows 处理 FETCH-ROWS 请求（任务 2.6）：锁内取行、锁外下发。
+// handleFetchRows 处理 FETCH-ROWS 请求（任务 2.6）：锁内取行、锁外建帧入队
+// （**应答走同一队列**——每腿唯一写者保证帧组原子性，任务 4.3）。
 func (s *termSession) handleFetchRows(c *termClient, payload []byte) {
 	req, err := decFetchRowsReq(payload)
 	if err != nil {
-		_ = c.frame(opError, encError("bad_fetch", err.Error()))
+		c.out.enqueue(writeItem{op: opError, payload: encError("bad_fetch", err.Error())}, 0)
 		return
 	}
 	if req.Count > surfaceFetchRowsMax {
@@ -223,7 +227,8 @@ func (s *termSession) handleFetchRows(c *termClient, payload []byte) {
 	vt := s.vt
 	if vt == nil || !vt.Available() || s.done {
 		s.mu.Unlock()
-		_ = c.frame(opError, encError("surface_unavailable", "本会话没有服务端 vt"))
+		c.out.enqueue(writeItem{op: opError,
+			payload: encError("surface_unavailable", "本会话没有服务端 vt")}, 0)
 		return
 	}
 	cols, rows := s.cols, s.rows
@@ -237,13 +242,19 @@ func (s *termSession) handleFetchRows(c *termClient, payload []byte) {
 		Count:    req.Count,
 		Rows:     enc,
 	}
-	if !c.leg.sendFetchRows(c, reply, len(enc) > 0) {
-		s.mu.Lock()
-		if s.attached == c {
-			s.detachLocked(c)
-		}
-		s.mu.Unlock()
+	gz, gerr := gzipBytes(encFetchRowsReply(reply))
+	if gerr != nil {
+		return
 	}
+	items := make([]writeItem, 0, 2)
+	for _, frag := range fragmentPayload(gz) {
+		items = append(items, writeItem{op: opFetchRows, payload: frag})
+	}
+	if !c.out.enqueueGroup(items, perLegQueueBytes) {
+		c.leg.markNeedSnapshot("queue_overflow")
+		return
+	}
+	c.leg.noteFetchRows(len(enc) > 0)
 }
 
 // handleFetchSnapshot 处理 FETCH-SNAPSHOT（revision 断档/病态补丁被拒后客户端要全量）。
@@ -255,14 +266,15 @@ func (s *termSession) handleFetchSnapshot(c *termClient) {
 // handleInput 处理抽象输入（任务 2.7）：服务端按 vt 真实模式编码成转义序列写进 PTY。
 //
 // 这是 vt 后端化的核心收益：kitty 协议/modifyOtherKeys/鼠标格式/括号粘贴全都只存在于出口
-// 这一份 vt 里，客户端只上行「我按了哪个键」。
+// 这一份 vt 里，客户端只上行「我按了哪个键」。输入 = 活动（design D4）。
 func (s *termSession) handleInput(c *termClient, payload []byte) {
 	ev, err := decInputEvent(payload)
 	if err != nil {
-		_ = c.frame(opError, encError("bad_input", err.Error()))
+		c.out.enqueue(writeItem{op: opError, payload: encError("bad_input", err.Error())}, 0)
 		return
 	}
 	s.mu.Lock()
+	s.noteActivityLocked(c)
 	vt := s.vt
 	ptmx := s.ptmx
 	done := s.done
@@ -276,73 +288,64 @@ func (s *termSession) handleInput(c *termClient, payload []byte) {
 	}
 	if _, werr := ptmx.Write(out); werr != nil {
 		s.mu.Lock()
-		if s.attached == c {
-			s.detachLocked(c)
-		}
+		s.endLegLocked(c, termEndNone, "", "ptmx_write_failed")
 		s.mu.Unlock()
 	}
 }
 
-// handleTheme 处理客户端主题上报（任务 2.7）：默认前景/背景交给 vt，OSC 10/11 查询按它应答。
-func (s *termSession) handleTheme(payload []byte) {
-	fg, bg, dark, err := decTheme(payload)
+// handleTheme 处理客户端主题上报（任务 2.7 + 3.3）：**记到腿上**，active 腿的主题才落
+// 到会话 vt（OSC 10/11 查询按它应答）——多腿以最近活动腿为准。
+func (s *termSession) handleTheme(c *termClient, payload []byte) {
+	fg, bg, _, err := decTheme(payload)
 	if err != nil {
 		return // 主题是尽力而为的通道：坏帧不报错、不影响会话
 	}
 	s.mu.Lock()
-	vt := s.vt
-	if vt != nil && vt.Available() {
-		vt.SetTheme(fg, bg)
+	c.themeKnown = true
+	c.themeFg, c.themeBg = fg, bg
+	if s.active == c {
+		if s.vt != nil && s.vt.Available() {
+			s.vt.SetTheme(fg, bg)
+		}
 	}
-	s.darkTheme = dark
 	s.mu.Unlock()
 }
 
-// handleClipboardAnswer 处理客户端对剪贴板读请求的应答（任务 2.7 的读方向）。
+// handleClipboardAnswer 处理客户端对剪贴板读请求的应答（任务 2.7 的读方向 + 3.3 归属）。
 //
 // 上游的读请求回调是**同步**的（请求句柄只在回调期间有效），所以服务端无法在里面等一次
-// 客户端往返；这里把客户端最近一次上报的内容缓存下来，读请求命中缓存即答。
-func (s *termSession) handleClipboardAnswer(payload []byte) {
+// 客户端往返；这里把**上报腿**的内容缓存下来，active 腿的缓存即读请求的应答源。
+func (s *termSession) handleClipboardAnswer(c *termClient, payload []byte) {
 	text, err := decClipboardAnswer(payload)
 	if err != nil {
 		return
 	}
 	s.mu.Lock()
-	s.clipCache = text
-	copied := text
-	s.clipCachePub.Store(&copied) // 原子发布：读回调（锁外）用它
+	c.clipCache = text
+	if s.active == c {
+		copied := text
+		s.clipCachePub.Store(&copied) // 原子发布：读回调（锁外）用它
+	}
 	s.mu.Unlock()
 }
 
-// handleSurfaceResize 处理 surface 腿的尺寸变化（任务 2.6）：
-// vt 重排 → 尺寸哨兵（逼远端 TUI 按新尺寸重绘）→ 下一帧全量快照（隐含重建镜像 + 重置 revision）。
-func (s *termSession) handleSurfaceResize(c *termClient, cols, rows uint16) {
-	s.resize(cols, rows)
-	s.sentinelRepaint()
-	c.leg.markNeedSnapshot("resize")
-	s.wakeSurface()
-}
-
-// notifyFromScan 把 termScan 抓到的裸 OSC 9 通知转发给 surface 腿（任务 2.7）。
+// notifyFromScan 把 termScan 抓到的裸 OSC 9 通知转发给**所有 surface 腿**（任务 2.1b/2.7）。
 //
 // 从扫描器取而不是从 vt 回调取：OSC 9 的双语义判别（9;4 = progress）已经在 termScan 里做完了，
-// 而且这条腿不需要装 vt 回调（少一个 cgo 回调面）。
+// 而且这条腿不需要装 vt 回调（少一个 cgo 回调面）。raw 腿**不发**（字节流自带该序列）。
+// lastNotified 是会话级去重（surface 腿集合派生的状态，2.1b）。
 func (s *termSession) notifyFromScan() {
 	s.mu.Lock()
-	c := s.attached
 	text := s.scan.Notify()
-	if c == nil || !c.surface || c.leg == nil || text == "" || text == s.lastNotified {
+	legs := s.surfaceLegsLocked()
+	if text == "" || text == s.lastNotified || len(legs) == 0 {
 		s.mu.Unlock()
 		return
 	}
 	s.lastNotified = text
 	s.mu.Unlock()
-	if !c.leg.sendNotify(c, encNotify(text)) {
-		s.mu.Lock()
-		if s.attached == c {
-			s.detachLocked(c)
-		}
-		s.mu.Unlock()
+	for _, c := range legs {
+		c.out.enqueue(writeItem{op: opNotify, payload: encNotify(text)}, perLegQueueBytes)
 	}
 }
 
@@ -411,7 +414,7 @@ func clipboardRouter(id uintptr, text string) bool {
 	// ⚠️ **绝不能在这里持会话锁**：回调是在 vt.Write 内部同步触发的，而 pump 调 vt.Write 时
 	// 正持着会话锁 ⇒ 再锁一次就是自死锁（实测：整条会话卡死、连收尾的 cmd.Wait 都不返回）。
 	// 所以这里只做「非阻塞投递到通道」，实际发帧由投递循环（另一个 goroutine）完成。
-	// surfaceActive 是原子标志，专为这种「锁外快速判断」准备。
+	// surfaceActive 是原子标志（腿集合派生，2.1b），专为这种「锁外快速判断」准备。
 	if !s.surfaceActive.Load() {
 		return false // 没有 surface 腿：拒绝这次写（客户端拿不到内容，不能假装成功）
 	}

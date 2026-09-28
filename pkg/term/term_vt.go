@@ -24,15 +24,6 @@ var errVTUnavailable = errors.New("term: 服务端 vt 不可用")
 // sessionVT 一个会话的服务端 vt（薄包装：让 service.go 不依赖构建标签）。
 type sessionVT struct {
 	t *vt.Terminal
-	// base/hasBase 是**上一次成功下发**（快照或差分）的屏态基线。
-	//
-	// 为什么需要它（2026-09-24 评审整改，P0）：光标移动、鼠标上报模式开关（?1000h）、
-	// DECTCEM 光标显隐、DECCKM、括号粘贴这些**都不产生脏行**——只看「有没有脏行」会
-	// 一个字节都不发（真机后果：方向键/行内编辑光标不动；触摸路由按旧模式位判，
-	// TUI 开鼠标上报后手势一直错到下一次行变化）。有了基线，本拍与上一拍比光标/模式位/
-	// 回滚条，任一变化就发帧（差分体已带这三样）。
-	base    SurfaceState
-	hasBase bool
 }
 
 // vtGloballyDisabled 报告 `HOMEWAY_TERM_VT=off`（全局逃生口：整服务退化为 legacy）。
@@ -271,27 +262,16 @@ func (s *sessionVT) SurfaceStateNow() SurfaceState {
 	}
 }
 
-// CommitSurfaceBaseline 在一次快照/差分**成功下发后**记基线（调用方锁内调用）。
-func (s *sessionVT) CommitSurfaceBaseline(st SurfaceState) {
-	s.base, s.hasBase = st, true
-}
-
-// ResetSurfaceBaseline 清基线（换腿/新 attach 时用：新腿从全量快照开始）。
-func (s *sessionVT) ResetSurfaceBaseline() {
-	s.base, s.hasBase = SurfaceState{}, false
-}
-
-// SurfaceUpdate 取本拍要发的差分（锁内调用）。
+// SurfaceTick 取本拍的差分输入（锁内调用；term-host-cli 2.2a：基线判定搬到腿上）。
 //
 // 返回：
-//   - enc/count：脏行 patch（**count 可以为 0**：只有光标/模式位/回滚条变了——差分体里
-//     这三样都带，所以「空行 patch」是一帧合法且有意义的更新）；
-//   - st：本拍屏态（发送成功后调 CommitSurfaceBaseline(st)）；
-//   - needFull：必须走全量（首次基线缺失 / 备用屏进出——离开备用屏要重建主屏镜像）；
-//   - changed：本拍有没有要发的东西（false = 整拍跳过）。
+//   - enc/count：脏行 patch（**count 可以为 0**：只有光标/模式位/回滚条变了——那部分由
+//     腿上的 base 判定，差分体里这三样都带，「空行 patch」是一帧合法且有意义的更新）；
+//   - st：本拍屏态（每条腿入队成功后 commitBaseline(st) 到自己身上）；
+//   - changed：本拍有没有脏行（false = 会话级无输出；腿侧还要比基线才算「整拍无变化」）。
 //
-// **不消费脏状态**：调用方在帧成功下发后才调 SurfaceClean（锁内取快照、锁外编码发送，
-// 中途失败则下一拍重来——宁可重复下发，不能半新半旧，design D2 的背压规则同理）。
+// **不消费脏状态**：调用方在构建载荷后调 SurfaceClean（锁内取快照、锁外压缩入队，
+// 入队失败由 needSnapshot 全量兜底——宁可重复下发，不能半新半旧，design D2 同理）。
 //
 // ⚠️ 2026-09-24 整改（评审 P0）：旧实现把 `Update()==DirtyFull` 直接判为「发全量」，而
 // **滚动（最常见的输出形态）正是 DirtyFull**（整屏行都移动了）⇒ 每行输出都发带 10 视口
@@ -299,27 +279,17 @@ func (s *sessionVT) ResetSurfaceBaseline() {
 // 不带镜像）——全量只留给「语义上真的需要重建」的场合（首次/备用屏进出/裁剪/背压/客户端请求）。
 // 同理删掉了「差分体积 ≥ 整屏编码 ⇒ 降级」的旧自限：那条判据拿**不含镜像的视口编码**当基准，
 // 而实际全量还要加镜像 ⇒ 视口稀疏时把几乎所有更新都误判成「差分更贵」。
-func (s *sessionVT) SurfaceUpdate() (encoded []byte, count uint16, st SurfaceState, needFull, changed bool) {
+func (s *sessionVT) SurfaceTick() (encoded []byte, count uint16, st SurfaceState, changed bool) {
 	if !s.Available() {
-		return nil, 0, SurfaceState{}, true, true
+		return nil, 0, SurfaceState{}, true
 	}
 	s.t.Update() // 把 render state 拉到最新；DirtyFull 时 DirtyRows 会给出全部视口行
 	dirty := s.t.DirtyRows()
 	st = s.SurfaceStateNow()
-	if !s.hasBase {
-		return nil, 0, st, true, true
+	if len(dirty) == 0 {
+		return nil, 0, st, false
 	}
-	if st.Alt != s.base.Alt {
-		// 备用屏进出：整屏语义变了（且「离开备用屏」要求重建主屏镜像）⇒ 全量。
-		return nil, 0, st, true, true
-	}
-	cursorChanged := st.Cursor != s.base.Cursor
-	modesChanged := st.Modes != s.base.Modes
-	scrollChanged := st.Total != s.base.Total || st.Offset != s.base.Offset || st.Len != s.base.Len
-	if len(dirty) == 0 && !cursorChanged && !modesChanged && !scrollChanged {
-		return nil, 0, st, false, false
-	}
-	return vt.EncodeRows(dirty), uint16(len(dirty)), st, false, true
+	return vt.EncodeRows(dirty), uint16(len(dirty)), st, true
 }
 
 // SurfaceClean 在差分/快照**成功下发后**消费脏标记。

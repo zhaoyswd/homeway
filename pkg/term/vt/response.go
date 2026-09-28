@@ -72,7 +72,9 @@ func (t *Terminal) RegistryID() uintptr {
 
 // SetResponseSink 装「写回 PTY」的接收方（nil = 丢弃应答）。
 //
-// 必须在**任何写入之前**调用一次；装配时机见 pkg/term 的会话创建路径。
+// **可在运行时切换**（term-host-cli 任务 5.1）：多腿会话里，声明了 capsRawTerminal 的腿
+// 在场时 pkg/term 会置 nil（服务端 vt 让位——真实终端自己答 DA1/DSR/OSC 10-11），该腿
+// 离开后重新装回；切换发生在会话锁内，与 vt.Write（同锁串行）不并发。
 func (t *Terminal) SetResponseSink(fn func([]byte)) {
 	t.mu.Lock()
 	t.responseSink = fn

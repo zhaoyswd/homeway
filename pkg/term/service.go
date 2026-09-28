@@ -40,13 +40,16 @@ const (
 	termDefaultHistory     = 1 << 20   // 每会话保留的输出字节
 	termDefaultReplay      = 256 << 10 // attach 时回放窗口上限
 	termDefaultMaxSessions = 16
+	termDefaultMaxClients  = 8 // 每会话腿数上限（term-host-cli 任务 2.4，HOMEWAY_TERM_MAX_CLIENTS）
 
-	termReplayBudget = 2 * time.Second
-	termWriteTimeout = 10 * time.Second
-	termHelloTimeout = 15 * time.Second
-	termKillGrace    = 500 * time.Millisecond
-	termSamplePeriod = time.Second
-	termReplayTrim   = 4096 // 起点对齐时最多前看这么多字节
+	termReplayBudget  = 2 * time.Second
+	termWriteTimeout  = 10 * time.Second
+	termHelloTimeout  = 15 * time.Second
+	termKillGrace     = 500 * time.Millisecond
+	termSamplePeriod  = time.Second
+	termReplayTrim    = 4096             // 起点对齐时最多前看这么多字节
+	termRawStallLimit = 60 * time.Second // raw 腿连续停滞多久才断腿（任务 4.2）
+	termRawStallRetry = time.Second      // 停滞退避的重试节拍
 )
 
 var termNameRx = regexp.MustCompile(`^[A-Za-z0-9._-]{1,64}$`)
@@ -59,7 +62,10 @@ type termConfig struct {
 	replay      int
 	replayEpoch string // all | last
 	maxSessions int
-	detect      bool
+	// maxClients 是每会话腿数上限（HOMEWAY_TERM_MAX_CLIENTS，任务 2.4；满则优先淘汰
+	// 失活/最久空闲腿，显式接管 attach -d 始终可用）。
+	maxClients int
+	detect     bool
 	// scrollbackLines 服务端 vt 的回滚行数上限（HOMEWAY_TERM_SCROLLBACK_LINES，默认 10000）。
 	//
 	// **内存预算口径（任务 1.3 定，7.4 验收）**：每会话常驻 ≈ 1MiB 字节环（history）+ vt 峰值
@@ -94,6 +100,7 @@ func termConfigFromEnv() termConfig {
 		replay:          termEnvInt("HOMEWAY_TERM_REPLAY", termDefaultReplay),
 		replayEpoch:     strings.ToLower(strings.TrimSpace(os.Getenv("HOMEWAY_TERM_REPLAY_EPOCH"))),
 		maxSessions:     termEnvInt("HOMEWAY_TERM_MAX_SESSIONS", termDefaultMaxSessions),
+		maxClients:      termEnvInt("HOMEWAY_TERM_MAX_CLIENTS", termDefaultMaxClients),
 		detect:          !strings.EqualFold(strings.TrimSpace(os.Getenv("HOMEWAY_TERM_DETECT")), "off"),
 		scrollbackLines: termEnvInt("HOMEWAY_TERM_SCROLLBACK_LINES", vtDefaultScrollbackLines),
 	}
@@ -411,25 +418,34 @@ type termSession struct {
 	vt *sessionVT
 	// contentSeq 每批 PTY 输出自增：状态机卫生用它做「空闲会话零开销」的短路判据（任务 4.7）。
 	surfaceWake chan struct{}
-	// darkTheme / clipCache / lastNotified：surface 通道的会话侧缓存（任务 2.7）。
-	darkTheme bool
-	clipCache string
-	// clipCachePub 是 clipCache 的原子发布副本：剪贴板读回调在 vt.Write 内部同步触发
-	// （此时会话锁被 pump 持有），**不能取会话锁**去读 clipCache。
+	// clipCachePub 是剪贴板读缓存的原子发布副本（= active 腿最近上报，任务 3.3）：剪贴板读
+	// 回调在 vt.Write 内部同步触发（此时会话锁被 pump 持有），**不能取会话锁**。
 	clipCachePub atomic.Pointer[string]
 	lastNotified string
 	// vtID 是服务端 vt 在回调注册表里的 id（剪贴板回调按它分派）。
 	vtID uintptr
-	// surfaceActive 是「当前有 surface 腿」的无锁标志（剪贴板回调在锁内触发，只能读原子量）。
+	// surfaceActive 是「当前有 surface 腿」的无锁标志（剪贴板回调在锁内触发，只能读原子量；
+	// 由腿集合派生，任务 2.1b）。
 	surfaceActive atomic.Bool
-	// clipChan 承接程序写剪贴板的内容（锁外投递，见 clipboardRouter）。
+	// clipChan 承接程序写剪贴板的内容（锁外投递，见 clipboardRouter；只发 surface 腿）。
 	clipChan chan string
-	// stateChan 承接 STATE 帧的载荷（**锁外写 socket**，2026-09-24 评审整改）：
-	// 旧实现 pushStateLocked 在会话锁内直接 c.frame ⇒ 慢链路下最多把 PTY pump 堵 5s。
-	// 缓冲 1 + latest-wins：状态帧本来就只有「最新值」有意义。
-	stateChan chan []byte
 	// surfaceStop 是会话级收工信号（finish 时 close）：surfaceLoop 据此退出。
 	surfaceStop chan struct{}
+
+	// ---- 多腿会话模型（term-host-cli 任务组 2；见 term_leg.go）----
+	// legs 是在场腿集合（raw 与 surface 混合）；变更只发生在会话锁内的 attach/detach 路径。
+	legs []*termClient
+	// active 是最近活动的腿（尺寸/主题/剪贴板读缓存的归属，design D4）。
+	active *termClient
+	// activitySeq 是活动到达序号（单调递增，不用墙钟——NTP 步进会翻转排序）。
+	activitySeq uint64
+	// attachSeq 是接入序号（tie-break「更晚接入者优先」用，design D4）。
+	attachSeq uint64
+	// rawTermLegs 是声明了 capsRawTerminal 的腿数（查询应答让位的判据，任务 5.1）。
+	rawTermLegs int
+	// responseFn 是服务端代答的接收方（spawn 时初始化为写 ptmx；updateResponseSinkLocked
+	// 按腿况在它与 nil 之间切换——拆成字段是为了窄规则可单测：假 sink 计数，任务 5.1）。
+	responseFn func([]byte)
 
 	contentSeq     uint64
 	lastScanSeq    uint64
@@ -448,7 +464,6 @@ type termSession struct {
 	lastOut    time.Time
 	lastActive time.Time
 	cols, rows uint16
-	attached   *termClient
 	done       bool
 	killed     bool // App 主动 KILL（ENDED 的 code 用 termEndKilled 而不是信号退出码）
 	exitCode   int32
@@ -492,18 +507,46 @@ func (s *termSession) outBytesLocked(now time.Time) int64 {
 	return sum
 }
 
-// termClient 一条已 attach 的连接。off/live 由 session.mu 保护；wmu 串行化写。
+// termClient 一条已 attach 的腿（term-host-cli 起多腿：raw 与 surface 混合）。
+//
+// 字段归属：conn/out/off 归本腿写者（term_leg.go，D10-2/3）；cols/rows/lastActivitySeq/
+// clientID/removed 归会话锁；kind 是接入时定死的只读值。
 type termClient struct {
 	conn net.Conn
-	wmu  sync.Mutex
-	off  int64
-	live bool
+	wmu  sync.Mutex // 单帧不撕裂（写者唯一后基本只剩防御意义；一锤子连接 LIST/KILL 仍直用）
+	off  int64      // raw 腿的字节环偏移（**只由本腿写者推进**，D10-2）
+	// out 是本腿的出站队列与写者唤醒（见 term_leg.go）。
+	out legOut
+	// handshake 是 raw 腿的握手计划（写者执行；surface 腿为 nil）。
+	handshake *rawHandshake
 	// leg 是 surface 投递状态（仅 surface 腿非 nil）。
 	leg *surfaceLeg
 	// surface 表示这条腿声明了 surface 能力（任务 2.1 的能力协商置位）。
 	// 任务 4.8 的枚举兼容靠它分流：**新枚举只发给声明了 surface 能力的腿**，
-	// legacy 腿收到折价后的兼容值（旧 App 显示零回退）。M1 阶段恒 false。
+	// legacy 腿收到折价后的兼容值（旧 App 显示零回退）。
 	surface bool
+	// rawCapable：capability 块声明了 capsRawTerminal（真实终端客户端；应答让位与
+	// kind=host 的判据，任务 5.1 / 2.5）。
+	rawCapable bool
+	// kind 是腿的呈现分类：app（surface）/ host（声明 raw 终端）/ legacy（旧 App raw 腿）。
+	kind string
+	// clientID 是客户端实例标识（HELLO 尾随 ID 块；空 = 未携带）。语义边界 = 「同一实例
+	// 连续重连」替换自身旧腿（design D3）；跨实例的旧腿靠连接关闭 + 上限策略回收。
+	clientID string
+	// takeover：HELLO flags bit2（attach -d 显式接管：其它腿收 ENDED(replaced)）。
+	takeover bool
+
+	// ---- 会话锁保护的字段 ----
+	cols, rows      uint16
+	lastActivitySeq uint64 // 最近活动的到达序号（选举输入）
+	attachSeq       uint64 // 接入序号（tie-break 用）
+	since           time.Time
+	lastTouch       time.Time // 最近活动墙钟（上限淘汰的「最久空闲」排序用）
+	removed         bool
+	// 每腿主题/剪贴板缓存（active 腿的值落到会话 vt / 读缓存，任务 3.3）。
+	themeKnown       bool
+	themeFg, themeBg [3]uint8
+	clipCache        string
 }
 
 // stateForLeg 按腿的能力选状态枚举值（任务 4.8 的兼容契约）。
@@ -607,16 +650,6 @@ func indexByte(p []byte, b byte) int {
 	return -1
 }
 
-// epochsInRange 判断回放窗口内是否跨过尺寸变化（REPLAY-DONE flags bit1）。
-func (s *termSession) epochsInRange(start, end int64) bool {
-	for _, e := range s.epochs {
-		if e.off > start && e.off < end {
-			return true
-		}
-	}
-	return false
-}
-
 // noteSizeLocked 记录一次尺寸变化（同时更新当前尺寸）。
 func (s *termSession) noteSizeLocked(cols, rows uint16) {
 	s.cols, s.rows = cols, rows
@@ -626,86 +659,12 @@ func (s *termSession) noteSizeLocked(cols, rows uint16) {
 	}
 }
 
-// ---- 客户端投递 ----
+// ---- 客户端投递（多腿；注册/摘除/写者见 term_leg.go，surface 编排见 term_surface_session.go）----
 
-func (s *termSession) deliverLocked() {
-	c := s.attached
-	if c == nil || !c.live {
-		return
-	}
-	if c.surface {
-		// surface 腿的画面由投递循环（快照/差分）负责；这里**绝不**发原始字节 DATA
-		// ——那正是 surface 要消灭的路径，混着发会让客户端收到两套语义的内容。
-		return
-	}
-	for {
-		if c.off < s.start {
-			c.off = s.start // 客户端太慢、历史被覆盖：跳到可用起点（宁可丢也不阻塞）
-		}
-		if c.off >= s.written {
-			return
-		}
-		chunk := s.readLocked(c.off, termDataChunk)
-		if len(chunk) == 0 {
-			return
-		}
-		if err := c.frame(opData, chunk); err != nil {
-			s.detachLocked(c)
-			return
-		}
-		c.off += int64(len(chunk))
-	}
-}
-
-func (s *termSession) detachLocked(c *termClient) {
-	if s.attached == c {
-		s.attached = nil
-		s.surfaceActive.Store(false)
-		// 焦点交还：TUI 停动画（空闲闪烁不再进字节环）。
-		s.focusNudgeLocked(false)
-	}
-	if c.surface && c.leg != nil && s.svc.logf != nil {
-		// surface 腿的计数器摘要（任务 2.9）：7.4 的真机流量对照要读这些数。
-		st := c.leg.statsSnapshot()
-		s.svc.logf("term: 会话 %s surface 腿断开｜快照=%d 差分=%d 降级=%d 背压=%d 分片=%d 下行=%dB "+
-			"FETCH 命中=%d 落空=%d 写超时=%d",
-			s.name, st.snapshots, st.diffs, st.degrades, st.backpressure, st.fragments,
-			st.bytesOut, st.fetchHits, st.fetchMiss, st.writeTimeout)
-	}
-	c.close()
-	if s.svc.logf != nil {
-		s.svc.logf("term: 会话 %s 客户端断开（会话继续运行）", s.name)
-	}
-}
-
+// pushStateLocked 发布一次状态到所有腿（每腿投递、按腿编码——raw 腿读它设标题/状态，
+// 任务 2.1b；surface 区段外的 STATE 对两类腿都合法）。
 func (s *termSession) pushStateLocked() {
-	c := s.attached
-	if c == nil {
-		return
-	}
-	st := stateForLeg(c.surface, s.stateV2, s.state)
-	payload := encState(s.agent, st, s.scan.title)
-	if c.surface {
-		// surface 腿：交给投递循环在**锁外**写 socket（sendMu 同时保证不插进别人的分片组）。
-		// latest-wins：缓冲满时丢掉最旧的一帧（状态帧只有最新值有意义）。
-		select {
-		case s.stateChan <- payload:
-		default:
-			select {
-			case <-s.stateChan:
-			default:
-			}
-			select {
-			case s.stateChan <- payload:
-			default:
-			}
-		}
-		return
-	}
-	// legacy 腿：沿用原路径（回放/实时写都在会话锁内，是既有语义，不在本次整改范围）。
-	if err := c.frame(opState, payload); err != nil {
-		s.detachLocked(c)
-	}
+	s.pushStateToLegsLocked()
 }
 
 // focusNudgeLocked 向 PTY 写一个终端焦点事件（仅当 TUI 开了 ?1004 焦点上报时才写，
@@ -731,94 +690,9 @@ func (s *termSession) focusNudgeLocked(focusIn bool) {
 	}
 }
 
-// attachLocked 把 c 接到会话上：顶掉旧客户端 → ATTACHED → 换屏前序 → 回放 → REPLAY-DONE → 实时。
-func (s *termSession) attachLocked(c *termClient) error {
-	if old := s.attached; old != nil && old != c {
-		_ = old.frame(opEnded, encEnded(termEndReplaced, "replaced"))
-		s.detachLocked(old)
-	}
-	s.attached = c
-	c.live = false
-	if c.surface {
-		// surface 腿：ATTACHED（带几何/模式/名称）之后**不发回放**，由投递循环发全量快照。
-		// 回放（原始字节重放）正是 surface 要消灭的那类正确性问题——快照是精确屏态。
-		if err := c.frame(opAttached, encAttached(s.cols, s.rows, s.scan.modes, s.agent,
-			stateForLeg(true, s.stateV2, s.state), s.name)); err != nil {
-			s.detachLocked(c)
-			return err
-		}
-		c.live = true
-		c.off = s.written
-		if c.leg != nil {
-			c.leg.markNeedSnapshot("attach")
-		}
-		s.surfaceActive.Store(true)
-		if s.svc.logf != nil {
-			// 判据行：协商结果（surface 腿接管）+ 几何，供运维核对双轨。
-			s.svc.logf("term: 会话 %s surface 腿接管（%dx%d 全量快照待发）", s.name, s.cols, s.rows)
-		}
-		return nil
-	}
-	start, truncated := s.replayStartLocked()
-	c.off = start
-
-	if err := c.frame(opAttached, encAttached(s.cols, s.rows, s.scan.modes, s.agent,
-		stateForLeg(c.surface, s.stateV2, s.state), s.name)); err != nil {
-		s.detachLocked(c)
-		return err
-	}
-	// 换屏前序：客户端 vt 是新建的，这一步保证回放内容的起点是确定的。
-	if err := c.frame(opData, []byte("\x1b[3J\x1b[2J\x1b[H")); err != nil {
-		s.detachLocked(c)
-		return err
-	}
-	deadline := time.Now().Add(termReplayBudget)
-	end := s.written
-	replayed := 0
-	for c.off < end {
-		chunk := s.readLocked(c.off, termDataChunk)
-		if len(chunk) == 0 {
-			break
-		}
-		if err := c.frame(opData, chunk); err != nil {
-			s.detachLocked(c)
-			return err
-		}
-		c.off += int64(len(chunk))
-		replayed += len(chunk)
-		if time.Now().After(deadline) && c.off < end {
-			truncated = true // 时间预算用尽：丢头部保尾部（本循环本来就是从起点顺序发的）
-			break
-		}
-	}
-	sent := c.off
-	flags := byte(0)
-	if truncated {
-		flags |= replayFlagTruncated
-	}
-	if s.epochsInRange(start, sent) {
-		flags |= replayFlagSizeChange
-	}
-	if err := c.frame(opReplayDone, encReplayDone(uint32(replayed), flags)); err != nil {
-		s.detachLocked(c)
-		return err
-	}
-	if c.off < end {
-		// 预算用尽（上面 break 的那一支）：剩余历史直接跳过，从「现在」接实时流。
-		c.off = s.written
-	}
-	c.live = true
-	// 回放期间新产生的字节 [c.off, s.written) 由这次 flush 补齐，然后交给 pump 持续投递。
-	s.deliverLocked()
-	// 回放完成后注入 focus-in：逼 TUI 立即全屏重绘（见 focusNudgeLocked 注释——
-	// 回放尾部往往没有全屏帧，SIGWINCH sentinel 又会被 TUI 的 pending-resize 优化吞掉）。
-	s.focusNudgeLocked(true)
-	return nil
-}
-
 // ---- 生命周期 ----
 
-// finish 结束会话：回 ENDED → 关 master → 等子进程 → 从注册表删除。
+// finish 结束会话：所有腿经各自写者回 ENDED → 关 master → 等子进程 → 从注册表删除。
 // reason < 0 表示服务侧原因（killed/replaced/service_stopped）；0 表示子进程自己退出。
 func (s *termSession) finish(reason int32, text string) {
 	s.mu.Lock()
@@ -834,9 +708,10 @@ func (s *termSession) finish(reason int32, text string) {
 	if reason < 0 {
 		code = reason
 	}
-	if c := s.attached; c != nil {
-		_ = c.frame(opEnded, encEnded(code, text))
-		s.detachLocked(c)
+	// ENDED 经每腿写者送达后再关 conn（任务 4.1：ENDED 先于 close；客户端可区分
+	// 「被接管 / 会话结束 / 断链」——被接管与会话结束带 ENDED，断链是裸 EOF）。
+	for _, c := range append([]*termClient{}, s.legs...) {
+		s.endLegLocked(c, code, text, "finish")
 	}
 	ptmx := s.ptmx
 	s.mu.Unlock()
@@ -891,7 +766,8 @@ func (s *termService) remove(name string, who *termSession) {
 	s.mu.Unlock()
 }
 
-// pump 常驻读 PTY：写历史、喂扫描器、投递给已 attach 的客户端（永远读，子进程才不会阻塞）。
+// pump 常驻读 PTY：写历史、喂扫描器、唤醒各腿写者（永远读，子进程才不会阻塞）。
+// B'（design D5）：pump 在锁内**只做入队/唤醒**，绝不碰任何 socket——慢腿由各腿写者消化。
 func (s *termSession) pump() {
 	buf := make([]byte, 32<<10)
 	for {
@@ -901,12 +777,11 @@ func (s *termSession) pump() {
 			now := time.Now()
 			s.appendLocked(buf[:n])
 			s.scan.write(buf[:n])
-			// 屏态 vt 与 ring 同锁喂入：ring 仍是 legacy 回放源与诊断，vt 是 surface/检测真源。
-			// （surface 投递的「锁内取脏行快照、锁外编码发送」在 2.x 的投递路径上做。）
+			// 屏态 vt 与 ring 同锁喂入：ring 仍是 raw 回放源与诊断，vt 是 surface/检测真源。
 			s.vt.Write(buf[:n])
 			s.contentSeq++ // 内容序号：检测侧的空闲短路判据（任务 4.7）
-			// surface 投递：只做唤醒（实际取快照/压缩/发送在投递循环里，绝不占着 pump 的锁）。
-			if c := s.attached; c != nil && c.surface {
+			// surface 投递：只做唤醒（取快照/压缩/入队在投递循环里，绝不占着 pump 的锁）。
+			if s.anySurfaceLocked() {
 				s.wakeSurface()
 			}
 			s.countOutLocked(n, now)
@@ -916,11 +791,11 @@ func (s *termSession) pump() {
 				s.scan.changed = false
 				s.pushStateLocked()
 				// 裸 OSC 9 通知转发（surface 腿）：双语义判别已在 termScan 里做完（9;4 是 progress）。
-				if c := s.attached; c != nil && c.surface {
+				if s.anySurfaceLocked() {
 					go s.notifyFromScan()
 				}
 			}
-			s.deliverLocked()
+			s.wakeRawLegsLocked()
 			s.mu.Unlock()
 		}
 		if err != nil {
@@ -1140,7 +1015,7 @@ func stateV2FromManifest(st manifest.State) byte {
 // ServeConn 处理一条客户端连接（由 serve 的 OnTCP 在 term 端口上调用）。
 func (s *termService) ServeConn(c net.Conn) {
 	defer c.Close()
-	client := &termClient{conn: c}
+	client := &termClient{conn: c, out: newLegOut()}
 	if err := client.frame(opGreeting, encGreeting()); err != nil {
 		return
 	}
@@ -1175,20 +1050,36 @@ func (s *termService) ServeConn(c net.Conn) {
 			return
 		}
 		_ = client.frame(opOK, nil)
+	case opCreate:
+		// 创建不接入（任务 6.2）：不动 PTY 尺寸、不产生腿、不触发哨兵/焦点。
+		flags, name, derr := decCreate(f.payload)
+		if derr != nil {
+			_ = client.frame(opError, encError("bad_create", derr.Error()))
+			return
+		}
+		if !termNameRx.MatchString(name) {
+			_ = client.frame(opError, encError("invalid_name", "会话名只能是 [A-Za-z0-9._-]{1,64}"))
+			return
+		}
+		if cerr := s.createOnly(name, flags&createFlagOnlyIfAbsent != 0); cerr != nil {
+			_ = client.frame(opError, encError(cerr.code, cerr.msg))
+			return
+		}
+		_ = client.frame(opOK, nil)
 	case opHello:
-		cols, rows, create, name, derr := decHello(f.payload)
+		cols, rows, flags, name, derr := decHello(f.payload)
 		if derr != nil {
 			_ = client.frame(opError, encError("bad_hello", derr.Error()))
 			return
 		}
-		// 能力协商（任务 2.1）：HELLO 尾随 capability 块 → 这条腿走 surface 还是 legacy。
-		// 畸形块用**独立错误码**（不得复用「协议版本不匹配」路径，规格要求二者可区分）。
-		caps, present, caperr := decCapability(helloTail(f.payload, name))
+		// 能力协商 + 实例标识（任务 2.1/2.3）：HELLO 尾随 [capLen][caps][idLen][clientID]，
+		// 形状不符（如缺 caps 长度前缀的裸 ID 块）必须拒绝——沿用 bad_capability 错误码。
+		caps, capsPresent, clientID, caperr := decHelloTail(helloTail(f.payload, name))
 		if caperr != nil {
 			_ = client.frame(opError, encError("bad_capability", caperr.Error()))
 			return
 		}
-		if present && wantsSurface(caps) {
+		if capsPresent && wantsSurface(caps) {
 			if !surfaceCapable() {
 				// 本会话/本构建没有服务端 vt ⇒ 明确报错，让客户端回落 legacy（不是静默降级）。
 				_ = client.frame(opError, encError("surface_unavailable",
@@ -1198,18 +1089,40 @@ func (s *termService) ServeConn(c net.Conn) {
 			client.surface = true
 			client.leg = newSurfaceLeg()
 		}
+		if capsPresent && caps&capsRawTerminal != 0 {
+			client.rawCapable = true // 真实终端客户端：应答让位判据（任务 5.1）+ LIST kind=host
+		}
+		client.clientID = clientID
+		client.takeover = flags&helloFlagTakeover != 0
+		client.kind = legKindOf(client.surface, client.rawCapable)
+		client.cols, client.rows = cols, rows
 		if !termNameRx.MatchString(name) {
 			_ = client.frame(opError, encError("invalid_name", "会话名只能是 [A-Za-z0-9._-]{1,64}"))
 			return
 		}
-		ss, cerr := s.attachOrCreate(name, cols, rows, create)
+		ss, cerr := s.attachOrCreate(name, cols, rows, flags&helloFlagCreate != 0,
+			flags&helloFlagOnlyIfAbsent != 0)
 		if cerr != nil {
 			_ = client.frame(opError, encError(cerr.code, cerr.msg))
 			return
 		}
 		s.stream(ss, client, c)
 	default:
-		_ = client.frame(opError, encError("bad_op", fmt.Sprintf("首帧必须是 HELLO/LIST/KILL（收到 0x%02x）", f.op)))
+		_ = client.frame(opError, encError("bad_op", fmt.Sprintf("首帧必须是 HELLO/LIST/KILL/CREATE（收到 0x%02x）", f.op)))
+	}
+}
+
+// legKindOf 腿的呈现分类（LIST clients 的 kind，任务 2.5）：
+// app = surface 腿（新 App）；host = 声明 capsRawTerminal 的 raw 腿（CLI）；
+// legacy = 未声明的 raw 腿（旧 App）。
+func legKindOf(surface, rawCapable bool) string {
+	switch {
+	case surface:
+		return "app"
+	case rawCapable:
+		return "host"
+	default:
+		return "legacy"
 	}
 }
 
@@ -1224,7 +1137,13 @@ func termErrf(code, format string, args ...any) *termErr {
 	return &termErr{code: code, msg: fmt.Sprintf(format, args...)}
 }
 
-func (s *termService) attachOrCreate(name string, cols, rows uint16, create bool) (*termSession, *termErr) {
+// attachOrCreate 解析 HELLO 的接入语义（任务 6.1 的 only-if-absent 在这里收口）：
+//   - 不存在：create=false 报 no_session；create=true 起会话；
+//   - 已存在：create+onlyIfAbsent 报 already_exists（`new` 不带 -A 的重名错误）；
+//     其余（create 不带该位 = `-A` 复用；create=false = attach）照旧复用。
+//
+// 尺寸**不在这里动**：多腿模型下尺寸归活动选举（design D4，registerLeg 的 noteActivity）。
+func (s *termService) attachOrCreate(name string, cols, rows uint16, create, onlyIfAbsent bool) (*termSession, *termErr) {
 	s.mu.Lock()
 	ss := s.sessions[name]
 	if ss == nil {
@@ -1243,12 +1162,42 @@ func (s *termService) attachOrCreate(name string, cols, rows uint16, create bool
 			return nil, termErrf("spawn_failed", "%v", err)
 		}
 		s.sessions[name] = ss
+		s.mu.Unlock()
+		return ss, nil
 	}
 	s.mu.Unlock()
-
-	// 先定尺寸（SIGWINCH 触发的重绘落在回放快照之后），再做历史。
-	ss.resize(cols, rows)
+	if create && onlyIfAbsent {
+		return nil, termErrf("already_exists", "会话 %s 已存在；要接入请用 attach，或加 -A 复用", name)
+	}
 	return ss, nil
+}
+
+// createOnly 创建不接入（任务 6.2，`homeway term new -d`）：不动 PTY 尺寸（默认 80x24）、
+// 不产生腿、不触发哨兵/焦点。onlyIfAbsent = `-A -d`（存在则复用成功）。
+func (s *termService) createOnly(name string, onlyIfAbsent bool) *termErr {
+	s.mu.Lock()
+	if ss := s.sessions[name]; ss != nil {
+		s.mu.Unlock()
+		if onlyIfAbsent {
+			return nil
+		}
+		return termErrf("already_exists", "会话 %s 已存在；要接入请用 attach，或加 -A 复用", name)
+	}
+	if len(s.sessions) >= s.cfg.maxSessions {
+		s.mu.Unlock()
+		return termErrf("too_many", "会话数已达上限 %d，请先关闭一些会话", s.cfg.maxSessions)
+	}
+	ss, err := s.spawnLocked(name, 0, 0)
+	if err != nil {
+		s.mu.Unlock()
+		return termErrf("spawn_failed", "%v", err)
+	}
+	s.sessions[name] = ss
+	s.mu.Unlock()
+	if s.logf != nil {
+		s.logf("term: 创建会话 %s（不接入，默认尺寸）", name)
+	}
+	return nil
 }
 
 // spawnLocked 起一个 PTY 会话（调用方持 s.mu）。
@@ -1303,28 +1252,28 @@ func (s *termService) spawnLocked(name string, cols, rows uint16) (*termSession,
 		rows:       rows,
 	}
 	ss.epochs = append(ss.epochs, termEpoch{off: 0, cols: cols, rows: rows})
-	// surface 通道（收工信号 + 唤醒/剪贴板/状态投递）：**总是建**——nil channel 的 select
+	// surface 通道（收工信号 + 唤醒/剪贴板投递）：**总是建**——nil channel 的 select
 	// 会永久阻塞，而这些通道只在 surface 腿存在时被使用；建出来让收尾路径不必到处判 nil。
 	// surfaceLoop 只在有服务端 vt 的构建里启动（没有 vt 就没有 surface 腿）。
 	ss.surfaceWake = make(chan struct{}, 1)
 	ss.clipChan = make(chan string, 8)
-	ss.stateChan = make(chan []byte, 1)
 	ss.surfaceStop = make(chan struct{})
 	// 服务端 vt：失败只让**本会话**退化为 legacy（surface 客户端 attach 会得到明确错误码），
 	// 既有 legacy 会话与其它会话都不受影响（term-surface-protocol 的降级场景）。
 	if sv, verr := newSessionVT(s.cfg, cols, rows); verr == nil {
-		// 查询应答写回 PTY：程序问终端（DA1/DSR/DECRQM/OSC 10-11），由服务端 vt 按真实模式答。
-		// 不装这条腿，vim/htop/tmux 这类启动探测终端的程序会卡住（legacy 模式下是客户端 vt 在做）。
-		ptmxForSink := ptmx
-		sv.SetResponseSink(func(p []byte) { _, _ = ptmxForSink.Write(p) })
 		// 剪贴板双向（OSC 52）：写 → CLIPBOARD 帧转给客户端；读 → 命中客户端最近上报的缓存。
+		// 查询应答（DA1/DSR/OSC 10-11）的归属随腿况动态切换（任务 5.1 窄规则：
+		// capsRawTerminal 腿在场时让位）——初始无腿 = 服务端代答，见 updateResponseSinkLocked。
+		ptmxForSink := ptmx
+		ss.responseFn = func(p []byte) { _, _ = ptmxForSink.Write(p) }
+		ss.vt = sv
 		sv.EnableClipboardWrite()
 		sv.EnableClipboardRead()
 		if id := sv.RegistryID(); id != 0 {
 			ss.vtID = id
 			registerVTSession(id, ss)
 		}
-		ss.vt = sv
+		ss.updateResponseSinkLocked()
 	} else if s.logf != nil {
 		s.logf("term: 会话 %s 无服务端 vt（%v）→ 该会话仅 legacy 原始字节模式", name, verr)
 	}
@@ -1338,25 +1287,23 @@ func (s *termService) spawnLocked(name string, cols, rows uint16) (*termSession,
 	return ss, nil
 }
 
-// resize 应用新尺寸（幂等）：PTY setsize + 记录 epoch。
+// resize 应用新尺寸（幂等；外部入口）。多腿模型下的真正归属是活动选举
+// （applySizeLocked，design D4）——这里保留给无腿时的诊断/维护路径。
 func (s *termSession) resize(cols, rows uint16) {
-	if cols == 0 || rows == 0 {
-		return
-	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.done || s.ptmx == nil || (s.cols == cols && s.rows == rows) {
-		return
-	}
-	_ = pty.Setsize(s.ptmx, &pty.Winsize{Cols: cols, Rows: rows})
-	s.noteSizeLocked(cols, rows)
-	s.vt.Resize(cols, rows) // vt 回滚重排（surface 的 Replace 语义依赖它）
+	s.applySizeLocked(cols, rows)
 }
 
 // sentinelRepaint 尺寸哨兵：sentinel → 真实尺寸，两次 SIGWINCH 逼 TUI 重绘当前屏。
 func (s *termSession) sentinelRepaint() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.sentinelRepaintLocked()
+}
+
+// sentinelRepaintLocked 同 sentinelRepaint（调用方已持 s.mu）。
+func (s *termSession) sentinelRepaintLocked() {
 	if s.done || s.ptmx == nil {
 		return
 	}
@@ -1371,26 +1318,32 @@ func (s *termSession) sentinelRepaint() {
 	_ = pty.Setsize(s.ptmx, &pty.Winsize{Cols: cols, Rows: rows})
 }
 
-// stream：回放 + 实时循环（连接存续期间一直跑）。
+// stream：注册腿 + 读循环（连接存续期间一直跑）。
+//
+// 多腿模型（term-host-cli）：正常接入不顶掉任何腿（旧的单腿顶替语义已退役）；
+// ENDED(replaced) 只剩显式接管（HELLO bit2，`attach -d`）与同实例重连（clientID）两条触发。
+// 正常断开的 defer 走 endLegLocked（修掉旧实现「只置 attached=nil、不发 focus-out 不打日志」
+// 的缺口，任务 2.1a）。
 func (s *termService) stream(ss *termSession, client *termClient, c net.Conn) {
 	ss.mu.Lock()
-	err := ss.attachLocked(client)
-	ss.mu.Unlock()
-	if err != nil {
+	if rerr := ss.registerLegLocked(client, client.takeover); rerr != nil {
+		ss.mu.Unlock()
+		_ = client.frame(opError, encError(rerr.code, rerr.msg))
 		return
 	}
+	ss.mu.Unlock()
+	go ss.runLegWriter(client)
+	// 尺寸哨兵：raw 腿要在**回放之后**（写者按握手计划执行，哨兵的重绘输出落在实时流）；
+	// surface 腿要在**快照下发前**（design D3：哨兵刚发完，投递循环还在合并窗里，
+	// 取到的快照已经是远端按最终尺寸重绘过的屏）。
 	ss.sentinelRepaint()
 	if client.surface {
-		// 尺寸哨兵要在**快照下发前**完成（design D3）：哨兵刚发完，投递循环还在合并窗里，
-		// 所以这里唤醒后取到的快照已经是远端按最终尺寸重绘过的屏。
 		ss.wakeSurface()
 	}
 
 	defer func() {
 		ss.mu.Lock()
-		if ss.attached == client {
-			ss.attached = nil
-		}
+		ss.endLegLocked(client, termEndNone, "", "client_closed")
 		ss.mu.Unlock()
 	}()
 
@@ -1404,6 +1357,8 @@ func (s *termService) stream(ss *termSession, client *termClient, c net.Conn) {
 		case opData:
 			ss.mu.Lock()
 			ptmx := ss.ptmx
+			// 输入 = 活动（design D4：活动 = 接入 / RESIZE / 输入）。
+			ss.noteActivityLocked(client)
 			ss.mu.Unlock()
 			if ptmx != nil && len(f.payload) > 0 {
 				if _, werr := ptmx.Write(f.payload); werr != nil {
@@ -1413,26 +1368,29 @@ func (s *termService) stream(ss *termSession, client *termClient, c net.Conn) {
 		case opResize:
 			cols, rows, derr := decResize(f.payload)
 			if derr != nil {
-				_ = client.frame(opError, encError("bad_resize", derr.Error()))
+				client.out.enqueue(writeItem{op: opError, payload: encError("bad_resize", derr.Error())}, 0)
 				continue
 			}
+			ss.mu.Lock()
+			client.cols, client.rows = cols, rows
+			ss.noteActivityLocked(client) // RESIZE = 活动：选举决定是否真的改会话尺寸
+			ss.mu.Unlock()
 			if client.surface {
-				// surface：vt 重排 + 哨兵 + 下一帧全量（隐含重建镜像 + 重置 revision）。
-				ss.handleSurfaceResize(client, cols, rows)
-				continue
+				// surface 的全量快照由 applySizeLocked 的「全腿标记」+ 唤醒负责
+				//（旧 handleSurfaceResize 的等价路径）。
+				ss.wakeSurface()
 			}
-			ss.resize(cols, rows)
 		case opInput:
 			if client.surface {
 				ss.handleInput(client, f.payload)
 			}
 		case opTheme:
 			if client.surface {
-				ss.handleTheme(f.payload)
+				ss.handleTheme(client, f.payload)
 			}
 		case opClipboard:
 			if client.surface {
-				ss.handleClipboardAnswer(f.payload)
+				ss.handleClipboardAnswer(client, f.payload)
 			}
 		case opFetchRows:
 			if client.surface {
@@ -1445,30 +1403,33 @@ func (s *termService) stream(ss *termSession, client *termClient, c net.Conn) {
 		case opKill:
 			name, derr := decName(f.payload)
 			if derr != nil {
-				_ = client.frame(opError, encError("bad_name", derr.Error()))
+				client.out.enqueue(writeItem{op: opError, payload: encError("bad_name", derr.Error())}, 0)
 				continue
 			}
 			if kerr := s.kill(name); kerr != nil {
-				_ = client.frame(opError, encError(kerr.code, kerr.msg))
+				client.out.enqueue(writeItem{op: opError, payload: encError(kerr.code, kerr.msg)}, 0)
 			} else {
-				_ = client.frame(opOK, nil)
+				client.out.enqueue(writeItem{op: opOK}, 0)
 			}
 		case opList:
-			_ = client.frame(opList, []byte(s.listJSON()))
+			client.out.enqueue(writeItem{op: opList, payload: []byte(s.listJSON())}, 0)
 		case opExplain:
 			name, derr := decName(f.payload)
 			if derr != nil {
-				_ = client.frame(opError, encError("bad_name", derr.Error()))
+				client.out.enqueue(writeItem{op: opError, payload: encError("bad_name", derr.Error())}, 0)
 				continue
 			}
 			out, eerr := s.explainJSON(name)
 			if eerr != nil {
-				_ = client.frame(opError, encError(eerr.code, eerr.msg))
+				client.out.enqueue(writeItem{op: opError, payload: encError(eerr.code, eerr.msg)}, 0)
 				continue
 			}
-			_ = client.frame(opExplain, []byte(out))
+			client.out.enqueue(writeItem{op: opExplain, payload: []byte(out)}, 0)
 		default:
-			_ = client.frame(opError, encError("bad_op", fmt.Sprintf("未知帧 0x%02x", f.op)))
+			// 错误回执也走腿队列（每腿唯一写者 = 帧组原子性；修掉旧实现读循环直发 ERROR
+			// 可能插进分片组的既有洞）。
+			client.out.enqueue(writeItem{op: opError,
+				payload: encError("bad_op", fmt.Sprintf("未知帧 0x%02x", f.op))}, 0)
 		}
 	}
 }
@@ -1568,6 +1529,15 @@ func (s *termService) kill(name string) *termErr {
 
 // listJSON 回 LIST-REPLY 的 JSON（Go/ArkTS 消费；C++ 侧从不发 LIST）。
 func (s *termService) listJSON() string {
+	// clientEntry 是在场腿信息（term-host-cli 任务 2.5，design D8：字段只增不改——
+	// kind/cols/rows/sinceMs/active；attached 保留为「至少一条腿」）。
+	type clientEntry struct {
+		Kind    string `json:"kind"` // app / host / legacy
+		Cols    uint16 `json:"cols"`
+		Rows    uint16 `json:"rows"`
+		SinceMs int64  `json:"sinceMs"`
+		Active  bool   `json:"active"`
+	}
 	type entry struct {
 		Name         string `json:"name"`
 		CreatedMs    int64  `json:"createdMs"`
@@ -1582,10 +1552,11 @@ func (s *termService) listJSON() string {
 		StateV2 string `json:"stateV2"`
 		Title   string `json:"title"`
 		// Cwd 是会话内 shell 经 OSC 7 上报的工作目录（缺省不显示）。
-		Cwd  string `json:"cwd,omitempty"`
-		Cols uint16 `json:"cols"`
-		Rows uint16 `json:"rows"`
-		Pid  int    `json:"pid"`
+		Cwd     string        `json:"cwd,omitempty"`
+		Cols    uint16        `json:"cols"`
+		Rows    uint16        `json:"rows"`
+		Pid     int           `json:"pid"`
+		Clients []clientEntry `json:"clients"`
 	}
 	s.mu.Lock()
 	out := make([]entry, 0, len(s.sessions))
@@ -1593,11 +1564,21 @@ func (s *termService) listJSON() string {
 		ss.mu.Lock()
 		done := ss.done
 		if !done {
+			clients := make([]clientEntry, 0, len(ss.legs))
+			for _, l := range ss.legs {
+				clients = append(clients, clientEntry{
+					Kind:    l.kind,
+					Cols:    l.cols,
+					Rows:    l.rows,
+					SinceMs: l.since.UnixMilli(),
+					Active:  l == ss.active,
+				})
+			}
 			out = append(out, entry{
 				Name:         ss.name,
 				CreatedMs:    ss.created.UnixMilli(),
 				LastActiveMs: ss.lastActive.UnixMilli(),
-				Attached:     ss.attached != nil,
+				Attached:     len(ss.legs) > 0,
 				Agent:        agentName(ss.agent),
 				State:        stateName(ss.state),
 				StateV2:      stateNameV2(ss.stateV2),
@@ -1606,6 +1587,7 @@ func (s *termService) listJSON() string {
 				Cols:         ss.cols,
 				Rows:         ss.rows,
 				Pid:          ss.pid,
+				Clients:      clients,
 			})
 		}
 		ss.mu.Unlock()

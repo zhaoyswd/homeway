@@ -602,34 +602,17 @@ func (r *byteReader) rest() []byte {
 // capsSurface 是客户端 capability 块里的 surface 标志位。
 const capsSurface = 1 << 0
 
+// capsRawTerminal 是 capability 块里的 raw 终端位（term-host-cli 任务 2.3，design D8）：
+// 声明它 = 客户端自己是完整终端（应答 DA1/DSR/OSC 查询）⇒ 服务端 vt 让位（任务 5.1 窄规则）、
+// 腿在 LIST 里记 kind=host。位号 1 已被 capsSurface 之前的提案预留检查过，无冲突。
+const capsRawTerminal = 1 << 1
+
 // encCapability 组 HELLO 尾随的 capability 块：[capLen:1][flags:capLen]。
 //
 // 用「长度 + 位图」而不是单个字节：将来加能力只加位，不必改布局；capLen 让旧出口能安全忽略
 // （旧出口的 decHello 本来就读不完尾随字节）。
 func encCapability(caps byte) []byte {
 	return []byte{1, caps}
-}
-
-// decCapability 解 HELLO 尾随的 capability 块。返回 (caps, 是否携带, 错误)。
-//
-// 畸形块（长度越界）返回**独立错误**，调用方要给出与「协议版本不匹配」不同的错误码
-// （规格「协商失败可区分」）。
-func decCapability(tail []byte) (caps byte, present bool, err error) {
-	if len(tail) == 0 {
-		return 0, false, nil
-	}
-	n := int(tail[0])
-	if n == 0 {
-		return 0, false, nil
-	}
-	if len(tail) < 1+n {
-		return 0, false, fmt.Errorf("%w: capability 块声明 %d 字节，实际只有 %d", errTermFrame, n, len(tail)-1)
-	}
-	var c byte
-	for i := 0; i < n; i++ {
-		c |= tail[1+i]
-	}
-	return c, true, nil
 }
 
 // wantsSurface 报告客户端能力块是否声明了 surface。
