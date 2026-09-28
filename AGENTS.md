@@ -1,0 +1,33 @@
+# AGENTS.md（homeway）
+
+单二进制 `homeway`（`cmd/homeway`）：零参数/`exit` = 出口（WG 端点 + 拦截层 + files/term/端口转发）、
+`relay` = 中继；`clientcore/` = 手机核（tier App 经其仓库的 submodule 钉定检出消费，产物
+`libclientcore.so`）。本文件只放跨会话都要知道的硬规则；工程细节看本仓 `README.md` 与
+tier 仓（`github.com/zhaoyswd/tier`）的 `AGENTS.md` + `docs/agents/` 分册。
+
+## 必须遵守（硬规则）
+
+- **动核源码（`clientcore/`，或本仓任何会被 App 链进 `libclientcore.so` 的面）默认需要用户点头**：
+  先说明「改哪个文件、为什么、影响面」并等明确同意。**例外（2026-09-27 起口径）**：tier 仓
+  `docs/agents/roadmap.md` 通用节点 roadmap 范围内的载体 change（含核迁移/改名/发版/双出口部署）
+  已由用户**预授权全自动推进**，不再逐项点头；范围外的新方向仍需点头。口径出处：tier 仓
+  `AGENTS.md` 硬规则「动核源码…」条与其 roadmap 续接协议。
+- **连接/重试/定时探测行为是跨仓契约**：改任何连接档位、节拍、阈值、门控、恢复阶梯（R1–R3）、
+  判据行，**必须在同一次提交可核对的范围内同步 tier 仓 `docs/agents/connection-lifecycle.md`**
+  （那是单一真源；数字与代码对不上就是文档腐化，下次真机排查会照着错的数字推）。
+- **go directive ≤ 1.24（OHOS 绑定，勿升）**：`clientcore/` 编译面钉 OHOS Go 1.24.5
+  （`GOTOOLCHAIN=local`），上游 x/* 依赖一旦 directive ≥1.25 就编不过——升版本只能取
+  **directive ≤1.24 的最高版**（core-homeway-merge §2.1 实证：x/crypto v0.48 / x/net v0.50 /
+  x/sys v0.41 是上限，0.49/0.51/0.42 起 = go 1.25.0）。CI 有 directive 守卫步兜底。
+- **改 `clientcore/` 后**：tier 侧要 `tools/tailcat/build-core.sh` → 重新 `assembleHsp` 才进装机产物
+  （tier 仓的活，这里只提醒别以为改完就生效）。NAPI 导出面（`//export ClientCore*`）四处同步的
+  机器门在 tier 仓 `tools/docs/check-napi-sync.sh`。
+
+## 两个构建面（测试/构建都要分面跑）
+
+- **无 tag 面**（`go build/vet/test ./...` 排除 `clientcore`，CI 五门）：出口/中继/`pkg/` 全部——
+  默认 modcache，官方 toolchain 即可。
+- **cshared 面**（`go build/vet/test -tags cshared ./clientcore/...`，CI clientcore job）：手机核。
+  cgo 文件靠 `//go:build cshared` 进面，**不带 tag 是 build constraints 排除、不是少跑用例**。
+- ⚠️ **OHOS 定制 go（`~/ohos_golang_go`）只做交叉编译，别在 darwin host 上跑重测试**——
+  运行时会 GC 崩溃（core-homeway-merge exec-report 环节 2 硬事实）；重测试一律官方 toolchain。
