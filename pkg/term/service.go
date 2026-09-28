@@ -490,6 +490,9 @@ type termSession struct {
 	// ---- 多腿会话模型（term-host-cli 任务组 2；见 term_leg.go）----
 	// legs 是在场腿集合（raw 与 surface 混合）；变更只发生在会话锁内的 attach/detach 路径。
 	legs []*termClient
+	// writers = 在跑的腿写者数（r5 M1：历史环的生命周期延长到最后一个写者退出——
+	// endLegLocked 只把腿摘出 legs 表，写者还要把 ENDED/尾部字节送完才退）。
+	writers int
 	// active 是最近活动的腿（尺寸/主题/剪贴板读缓存的归属，design D4）。
 	active *termClient
 	// activitySeq 是活动到达序号（单调递增，不用墙钟——NTP 步进会翻转排序）。
@@ -809,7 +812,11 @@ func (s *termSession) finish(reason int32, text string) {
 	if s.cmd != nil && s.cmd.ProcessState != nil {
 		s.exitCode = int32(s.cmd.ProcessState.ExitCode())
 	}
-	s.ring = nil // 释放历史缓冲
+	if s.writers == 0 {
+		// 释放历史缓冲。还有写者在跑时**不在这里释放**（r5 M1）：腿上可能还有未排干的
+		// 尾部字节要赶在 ENDED 前送出——环改由最后退出的写者释放（writerExited）。
+		s.ring = nil
+	}
 	s.mu.Unlock()
 	if s.vtID != 0 {
 		unregisterVTSession(s.vtID)

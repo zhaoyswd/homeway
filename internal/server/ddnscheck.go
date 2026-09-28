@@ -31,10 +31,10 @@ const ddnsLagThreshold = 3
 
 // ddnsCheckState：自检的滚动状态。只在公网端点探测的 goroutine 里读写（单线程，无需锁）。
 type ddnsCheckState struct {
-	mismatchStreak  int  // 连续「解析与观测不一致」的拍数
-	warnedLag       bool // 滞后告警已发（恢复时打一行静默）
-	warnedNoAAAA    bool // 缺 AAAA 告警已发（恢复时打一行）
-	resolveErrStreak int // 连续解析失败（只打第一拍，防刷屏）
+	mismatchStreak   int  // 连续「解析与观测不一致」的拍数
+	warnedLag        bool // 滞后告警已发（恢复时打一行静默）
+	warnedNoAAAA     bool // 缺 AAAA 告警已发（恢复时打一行）
+	resolveErrStreak int  // 连续解析失败（只打第一拍，防刷屏）
 }
 
 // runDDNSSelfCheck：一拍自检。published 为空（探测被关/本轮未公布）时跳过——没有观测就没有对比。

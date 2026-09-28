@@ -359,6 +359,12 @@ func Start(cfg ServeConfig) (*Server, error) {
 			fsrv.Close()
 			logf("⚠️ files 监听 %s 失败（%v）—— 文件管理会报错（state 目录异常/被其它实例占用），其余功能不受影响", fsock, lerr)
 		} else {
+			// 权限与 term.sock 同款（term-host-cli exec-r5 F2）：listen 后显式 chmod 0600
+			// ——files.sock 承载的是「整个 $HOME 的读写」，没有理由比 term.sock 宽。
+			// 此前实测阿里云 files.sock=755（umask 偶然值）。
+			if cerr := os.Chmod(fsock, 0o600); cerr != nil {
+				logf("⚠️ files.sock chmod 0600 失败（%v）—— 纵深加固未生效，state 目录权限仍是边界", cerr)
+			}
 			s.filesLn, s.filesSock, s.filesOwn, s.files = fln, fsock, fown, fsrv
 			go func() {
 				serr := fsrv.Serve(fln)
@@ -387,10 +393,13 @@ func Start(cfg ServeConfig) (*Server, error) {
 			tsrv.Close()
 		} else {
 			s.termLn, s.termSock, s.termOwn, s.termSrv = tln, tsock, town, tsrv
-			// 权限纵深（term-host-cli 任务 2.6）：listen 后显式 chmod 0600（不依赖 umask 的
-			// 偶然值）。⚠️ 这**不是**边界本体——darwin 上 socket 权限位不参与 connect 判定，
-			// 真正拦住非属主的是 state 目录 0700 的遍历权限（linux 另查 socket 写权限）；
-			// peer 校验（SO_PEERCRED/getpeereid）留待多用户场景（design D1）。
+			// 权限加固（term-host-cli 任务 2.6；exec-r5 F3 实测纠错）：listen 后显式
+			// chmod 0600（不依赖 umask 的偶然值）。socket 权限位在 linux 与 darwin
+			// **都参与 connect 判定**（2026-09-29 双端最小实验：bind 后 chmod 0000，
+			// 同机非属主 connect 得 EACCES）——0600 即拦非属主；state 目录 0700 是
+			// 第二层防御（同时护住目录里的 key.bin / tokens 台账等非 socket 文件，
+			// 见 OpenState 的收紧逻辑）；peer 校验（SO_PEERCRED/getpeereid）留待
+			// 多用户场景（design D1）。
 			if cerr := os.Chmod(tsock, 0o600); cerr != nil {
 				logf("⚠️ term.sock chmod 0600 失败（%v）—— 纵深加固未生效，state 目录权限仍是边界", cerr)
 			}

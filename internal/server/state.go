@@ -28,6 +28,13 @@ func OpenState(dir string) (*State, error) {
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return nil, err
 	}
+	// 既有目录收紧到 0700（term-host-cli exec-r5 F2）：MkdirAll 的 mode 只对**新建**
+	// 目录生效——历史部署可能已是 0755（阿里云实测 /opt/homeway/data=755，与文档
+	// 「state 目录 0700 是边界」的口径不符）。chmod 失败只告警不阻断：边界还有
+	// socket 0600 那一层兜着（见 serve.go），这里尽力而为。
+	if err := os.Chmod(dir, 0o700); err != nil {
+		fmt.Fprintf(os.Stderr, "homewayd: ⚠️ state 目录 %s 收紧 0700 失败（%v）——与文档权限边界口径不一致，建议手工 chmod\n", dir, err)
+	}
 	return &State{dir: dir}, nil
 }
 

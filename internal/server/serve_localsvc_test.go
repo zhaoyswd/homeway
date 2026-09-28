@@ -156,9 +156,9 @@ func TestRemoveSockOwnNotOthers(t *testing.T) {
 	}
 }
 
-// term.sock 的权限纵深（term-host-cli 任务 2.6）：listen 后显式 chmod 0600——不依赖
-// umask 的偶然值。注意这**不是**边界本体（darwin 上 socket 权限位不参与 connect 判定，
-// 真正拦住非属主的是 state 目录 0700）；非属主拒绝需第二用户（容器/CI），本机记手测。
+// term.sock 的权限加固（term-host-cli 任务 2.6；exec-r5 F3 实测纠错）：listen 后显式
+// chmod 0600——不依赖 umask 的偶然值。socket 权限位在 linux 与 darwin 都参与 connect
+// 判定（2026-09-29 双端最小实验），0600 即拦非属主；state 目录 0700 是第二层防御。
 func TestTermSocketChmod0600(t *testing.T) {
 	dir := shortDir(t)
 	// 与 serve.go 的 term 段同序列：listenLocalService + chmod 0600。
@@ -184,4 +184,63 @@ func TestTermSocketChmod0600(t *testing.T) {
 		t.Fatalf("chmod 后属主连接应照常成功: %v", derr)
 	}
 	_ = c.Close()
+}
+
+// state 目录的既有目录收紧（exec-r5 F2）：OpenState 不能只对**新建**目录给 0700——
+// 历史部署已是 0755 的目录必须被收紧（阿里云实测 /opt/homeway/data=755）。红绿路：
+// 没有显式 Chmod 时本用例红（0755 保持不变），加 Chmod 后绿。
+func TestOpenStateTightensExistingDir(t *testing.T) {
+	dir := shortDir(t)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// MkdirAll 对已存在目录（shortDir 建的是 0700）不改 mode——显式放宽到 0755
+	// 模拟历史部署（阿里云实测形态），再让 OpenState 收紧。
+	if err := os.Chmod(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := OpenState(dir); err != nil {
+		t.Fatal(err)
+	}
+	st, err := os.Stat(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st.Mode().Perm() != 0o700 {
+		t.Fatalf("OpenState 应把既有目录收紧到 0700（r5 F2），实际 %o", st.Mode().Perm())
+	}
+	// 新建路径（MkdirAll 0700）不受影响。
+	sub := filepath.Join(shortDir(t), "fresh", "state")
+	if _, err := OpenState(sub); err != nil {
+		t.Fatal(err)
+	}
+	st2, err := os.Stat(sub)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st2.Mode().Perm() != 0o700 {
+		t.Fatalf("新建 state 目录应为 0700，实际 %o", st2.Mode().Perm())
+	}
+}
+
+// files.sock 与 term.sock 同款 0600（exec-r5 F2）：serve.go 的 files 段在 listen 后显式
+// chmod——本用例按同序列断言（承载的是整个 $HOME 读写，没有理由比 term.sock 宽）。
+func TestFilesSocketChmod0600(t *testing.T) {
+	dir := shortDir(t)
+	sock, ln, own, err := listenLocalService(dir, "files.sock")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer ln.Close()
+	defer removeSockOwn(sock, own)
+	if err := os.Chmod(sock, 0o600); err != nil {
+		t.Fatalf("chmod: %v", err)
+	}
+	st, err := os.Stat(sock)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st.Mode().Perm() != 0o600 {
+		t.Fatalf("files.sock 权限应为 0600（与 term.sock 同款），实际 %o", st.Mode().Perm())
+	}
 }

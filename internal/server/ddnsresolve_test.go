@@ -21,9 +21,9 @@ import (
 
 // fakeDNS：一个只回固定地址的本地 DNS 服务器（A 与 AAAA 各自独立配置）。
 type fakeDNS struct {
-	t   *testing.T
-	mu  sync.Mutex
-	conn *net.UDPConn
+	t        *testing.T
+	mu       sync.Mutex
+	conn     *net.UDPConn
 	aAnswers []netip.Addr
 	aaaaAns  []netip.Addr
 	garbage  bool // 收到请求回一段垃圾（测 ID 匹配与畸形容错）

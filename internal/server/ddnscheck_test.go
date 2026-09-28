@@ -83,7 +83,7 @@ func TestTokenEndpointsNoDDNSUnchanged(t *testing.T) {
 // ---------- task 1.4：自检告警 ----------
 
 type ddnsLogCapture struct {
-	mu   sync.Mutex
+	mu    sync.Mutex
 	lines []string
 }
 
@@ -115,8 +115,8 @@ func newSelfCheckServer(t *testing.T, published []string) *Server {
 }
 
 func TestDDNSSelfCheckLagThreshold(t *testing.T) {
-	pub := []string{"203.0.113.7:41641"}         // 本机观测
-	stale := []netip.Addr{netip.MustParseAddr("198.51.100.9")}      // 域名还指着旧值
+	pub := []string{"203.0.113.7:41641"}                       // 本机观测
+	stale := []netip.Addr{netip.MustParseAddr("198.51.100.9")} // 域名还指着旧值
 	fresh := []netip.Addr{netip.MustParseAddr("203.0.113.7")}
 	f := startFakeDNS(t, stale, nil, false)
 	// 动态换答案：先 3 拍旧值 → 告警；再 1 拍新值 → 恢复。
@@ -211,10 +211,10 @@ func TestProbeProbeEndpoints(t *testing.T) {
 	s := &Server{}
 	s.tokMu.Lock()
 	s.lastPublished = []string{
-		"203.0.113.7:41641",            // 公网 v4
-		"[2001:db8::1]:41641",          // 公网 v6
-		"192.168.3.12:41641",           // 私网（不该出现，防御性过滤）
-		"garbage-line",                 // 解析失败：跳过
+		"203.0.113.7:41641",   // 公网 v4
+		"[2001:db8::1]:41641", // 公网 v6
+		"192.168.3.12:41641",  // 私网（不该出现，防御性过滤）
+		"garbage-line",        // 解析失败：跳过
 	}
 	s.tokMu.Unlock()
 	got := s.probeProbeEndpoints()

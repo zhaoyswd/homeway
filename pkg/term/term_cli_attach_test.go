@@ -744,7 +744,11 @@ func TestParseTitleReplyStripsRecognizableReplies(t *testing.T) {
 		{"纯键入无应答", "abc", "", "abc", false},
 		{"收了一半（无结束符）", "\x1b]Lre", "", "", false},
 		{"荒谬长度不当标题但剥掉", "\x1b]L" + strings.Repeat("x", 200) + "\x07", "", "", true},
-		{"其它 OSC 不剥", "\x1b[?62;22c", "", "\x1b[?62;22c", false}, // CSI 不是 OSC（Index 不命中）
+		// CSI 不是 OSC（Index 不命中）——整段原样回投
+		{"CSI 应答不命中", "\x1b[?62;22c", "", "\x1b[?62;22c", false},
+		// 真 OSC 但不是 l/L（窗口标题/颜色查询应答）：kind 分支不误剥，原样回投（M5）
+		{"真 OSC（0;title）不误剥", "\x1b]0;win\x07", "", "\x1b]0;win\x07", false},
+		{"真 OSC（11;rgb）不误剥", "\x1b]11;rgb:0000/0000/0000\x07", "", "\x1b]11;rgb:0000/0000/0000\x07", false},
 	}
 	for _, c := range cases {
 		title, rest, ok := parseTitleReply([]byte(c.in))
@@ -811,5 +815,37 @@ func TestCLIAttachTitleNoReplyNoKey(t *testing.T) {
 	waitHelper(t, cmd, 10*time.Second)
 	if got := waitResult(t, res, time.Second); !strings.Contains(got, "err=[<nil>]") {
 		t.Fatalf("分离应正常退出：%s", got)
+	}
+}
+
+// TestCLIAttachTitleIconOnlyNoLeak（exec-r5 F6 补射程）：终端**只答图标名**（OSC l，BEL
+// 结尾）不答标题（OSC L）——parseTitleReply 识别并剥掉 l 应答但 ok=false，走**超时路径**
+// 的余量回投。判据：可识别应答字节不得经「非应答余量」灌进会话（master 输出无 ESC ] l/L）。
+// 变异自证：把超时路径改回 `return "", acc`（裸回投）本用例必红——TestCLIAttachTitleBELForm
+// 的泄漏断言走不到这条路径（它的应答能解析成功、从 ok 分支返回）。
+func TestCLIAttachTitleIconOnlyNoLeak(t *testing.T) {
+	_, ln, dir := startTestTermUDSShell(t, testTermEchoShell)
+	ensureSession(t, ln, "cli-icon")
+
+	master, ttyFile := openTestPTY(t, 100, 30)
+	hook := func(chunk []byte) {
+		if bytes.Contains(chunk, []byte("\x1b]21;?")) {
+			// 尾部 \n 让回显可见（会话侧 sed 按行缓冲）；它属非应答字节，固定路径也会回投。
+			_, _ = master.Write([]byte("\x1b]licon-only\x07\n"))
+		}
+	}
+	ms := readMasterAsyncHook(master, hook)
+	cmd, res := spawnAttachHelper(t, ttyFile, true, map[string]string{
+		"CLI_TEST_STATE": dir, "CLI_TEST_NAME": "cli-icon", "CLI_TEST_MODE": "attach",
+		"HOMEWAY_TERM_TITLE": "",
+	})
+	waitMaster(t, ms, "tick", 10*time.Second)
+	_, _ = master.Write([]byte{0x02, 'd'})
+	waitHelper(t, cmd, 10*time.Second)
+	if got := waitResult(t, res, time.Second); !strings.Contains(got, "err=[<nil>]") {
+		t.Fatalf("分离应正常退出：%s", got)
+	}
+	if ms.contains("\x1b]l") || ms.contains("\x1b]L") {
+		t.Fatalf("图标名应答泄漏进会话回显（超时路径未剥）：%q", ms.dump())
 	}
 }

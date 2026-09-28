@@ -208,6 +208,13 @@ type rawHandshake struct {
 
 // runLegWriter 每条腿一个写者 goroutine（stream 在注册成功后启动）。
 func (s *termSession) runLegWriter(c *termClient) {
+	// r5 M1：历史环的生命周期延长到**最后一个写者退出**（endLegLocked 只摘 legs 表，
+	// 写者还要把 ENDED 前的尾部字节送完）——finish 不再无条件立刻 nil 环（那会把
+	// 排干窗口里没送出去的尾部直接蒸发掉）。writers 计数在锁内增减。
+	s.mu.Lock()
+	s.writers++
+	s.mu.Unlock()
+	defer s.writerExited()
 	if c.surface {
 		s.runSurfaceWriter(c)
 		return
@@ -318,6 +325,13 @@ func (s *termSession) runRawWriter(c *termClient) {
 			}
 		}
 		if ended != nil {
+			// r5 M1 根因修复：ENDED 前必须把环里**未读**的字节排干——finish（进程退出/
+			// 接管）把 ENDED 压进队列的那一刻，写者的 off 往往落后于 written，直接发
+			// ENDED 会把会话最后一段输出丢掉（真机形态 = TestTermSessionSpawnEnvAligned
+			// 偶发「env 输出截断」，评审 M1 定性为测试竞态、根因在这里）。
+			if !s.drainRingBeforeEnd(c) {
+				return
+			}
 			_ = s.rawWriteFrame(c, ended.op, ended.payload)
 			_ = c.conn.Close()
 			return
@@ -343,6 +357,10 @@ func (s *termSession) runRawWriter(c *termClient) {
 				}
 			}
 			if ended != nil {
+				// 同上（r5 M1）：先排干环、再发 ENDED。
+				if !s.drainRingBeforeEnd(c) {
+					return
+				}
 				_ = s.rawWriteFrame(c, ended.op, ended.payload)
 			}
 			_ = c.conn.Close()
@@ -391,6 +409,66 @@ func (s *termSession) peekRingChunk(c *termClient, max int) ([]byte, bool) {
 		return nil, true
 	}
 	return s.readLocked(c.off, max), true
+}
+
+// peekRingChunkFinal 终局读取（r5 M1）：与 peekRingChunk 同一套有界追赶/推进语义，
+// 但**不因 removed/done 拒绝**——那两位只表达「不会再有新字节进环」，不表达「腿上未读
+// 的字节不作数」。收尾路径（发 ENDED 前）用它把环排干。ok=false = 已读到 written（排干）。
+func (s *termSession) peekRingChunkFinal(c *termClient, max int) ([]byte, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if len(s.ring) == 0 {
+		return nil, false // 环已释放（防御位：正常路径环由本写者退出时才释放）
+	}
+	if budget := int64(s.svc.cfg.replay); budget > 0 && s.written-c.off > budget {
+		c.off = s.written - budget // 与实时路径同一有界追赶（落后超回放预算跳头部保尾部）
+	}
+	if c.off < s.start {
+		c.off = s.start
+	}
+	if c.off >= s.written {
+		return nil, false
+	}
+	return s.readLocked(c.off, max), true
+}
+
+// drainRingBeforeEnd 把本腿在环里未读的字节全部写出（r5 M1）。停滞语义与实时循环一致
+// （D10-7）：写超时 = 退避后**重写同一片**（peek 不推进 off、commit 只在写出成功后），
+// 连续停滞超 rawStallLimit 才放弃（对端已读不到 ENDED，直接断腿）。硬错误同样放弃。
+func (s *termSession) drainRingBeforeEnd(c *termClient) bool {
+	for {
+		chunk, ok := s.peekRingChunkFinal(c, termDataChunk)
+		if !ok {
+			return true // 排干
+		}
+		err := c.writeFrameOnce(opData, chunk, s.writeTimeout)
+		if err == nil {
+			c.commitRingChunk(s, len(chunk))
+			continue
+		}
+		if isWriteTimeout(err) {
+			if c.out.noteStall(true, s.rawStallLimit) {
+				s.breakLeg(c, "stalled_over_limit")
+				return false
+			}
+			time.Sleep(s.stallRetryBackoff())
+			continue
+		}
+		return false // 硬错误：对端已不可达，强发 ENDED 无意义
+	}
+}
+
+// writerExited 写者退出计数；会话已收尾且这是最后一个写者 ⇒ 释放历史环（r5 M1：
+// 保证「ENDED 前排干」窗口里环还在）。
+func (s *termSession) writerExited() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.writers > 0 {
+		s.writers--
+	}
+	if s.done && s.writers == 0 {
+		s.ring = nil
+	}
 }
 
 // commitRingChunk 写出成功后推进本腿 off（D10-2：只由本腿写者调用）。

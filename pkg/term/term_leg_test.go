@@ -1379,3 +1379,50 @@ func TestListClientsJSONContract(t *testing.T) {
 		}
 	}
 }
+
+// TestRawEndedAfterRingDrain（exec-r5 M1 根因回归）：进程退出（finish 把 ENDED 压进队列）
+// 时，raw 写者的 off 往往还落后 written——ENDED 必须**先等环里未读字节排干**再发，否则
+// 会话最后一段输出被丢（真机形态 = TestTermSessionSpawnEnvAligned 偶发「env 输出截断」；
+// 评审 M1 定性为测试读竞态，根因在写者次序）。确定性构造：注入 300ms 写超时 + 大输出
+// （2MB > 环 1MiB，触发回卷）+ 客户端先**不读**（socket 塞满 ⇒ 写者停滞在环中途中）⇒
+// 进程退出时 ENDED 必然在写者追赶途中入队；随后客户端开读——写者恢复后必须先排干环
+// 再发 ENDED。断言：尾部标记与末行先于 ENDED 到达。
+func TestRawEndedAfterRingDrain(t *testing.T) {
+	t.Setenv("HOMEWAY_TERM_WRITE_TIMEOUT_MS", "300")
+	// seq|sed 走 C 工具（~1s 出 1.2MB）；别用 shell while——zsh 逐条解释，200k 次要几分钟。
+	script := `seq 200000 | sed 's/^/line-/' ; echo TAIL-END-MARKER`
+	_, ln, _ := startTestTermUDSShell(t, script)
+	c, _, _, _ := attachTerm(t, ln, "tail-drain", true, 80, 24)
+	defer c.Close()
+
+	// 停滞窗：不读 2.5s——内核 socket 缓冲塞满（200KB 量级）后写者按 300ms 超时进入
+	// 停滞重试（环回卷、off 落后），进程在这窗内跑完退出 ⇒ ENDED 入队。
+	time.Sleep(2500 * time.Millisecond)
+	_ = c.SetDeadline(time.Now().Add(30 * time.Second))
+
+	var acc []byte
+	for {
+		f, err := readTermFrame(c)
+		if err != nil {
+			t.Fatalf("读帧失败（%v）：已收 %d 字节——ENDED 未送达或连接被提前关闭", err, len(acc))
+		}
+		if f.op == opData {
+			acc = append(acc, f.payload...)
+			continue
+		}
+		if f.op == opEnded {
+			out := string(acc)
+			if !strings.Contains(out, "TAIL-END-MARKER") {
+				t.Fatalf("ENDED 先于环排干：TAIL-END-MARKER 未在 ENDED 前到达（已收 %d 字节，尾部丢失）", len(acc))
+			}
+			if !strings.Contains(out, "line-200000") {
+				t.Fatalf("ENDED 前输出不完整：line-199999 缺失（已收 %d 字节）", len(acc))
+			}
+			return
+		}
+		if f.op == opState {
+			continue
+		}
+		t.Fatalf("意外帧 op 0x%02x", f.op)
+	}
+}

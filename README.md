@@ -126,8 +126,10 @@ homeway term delete <名字>        # 关闭会话（与 App 的「关闭会话�
   未知 term 子命令 = 1、顶层未知角色 = 2。
 
 **权限边界**：命令面经出口 state 目录下的 `term.sock`（Unix socket）直连，**持有该 socket
-的访问权 = 拥有该主机的 shell**。真正的边界是 **state 目录 0700**（socket 文件本身也显式
-chmod 0600 作纵深）——不要把 state 目录开放给不可信用户/进程。
+的访问权 = 拥有该主机的 shell**。socket 权限位在 linux 与 darwin 都参与 connect 判定
+（2026-09-29 双端实测）——出口把 `term.sock`/`files.sock` 显式 chmod **0600**（拦非属主）、
+state 目录收紧 **0700** 作第二层防御（同时护住目录里的身份密钥与 token 台账）——不要把
+state 目录开放给不可信用户/进程。
 
 ## 运行细节
 
