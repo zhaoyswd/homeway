@@ -362,9 +362,7 @@ func Start(cfg ServeConfig) (*Server, error) {
 			// 权限与 term.sock 同款（term-host-cli exec-r5 F2）：listen 后显式 chmod 0600
 			// ——files.sock 承载的是「整个 $HOME 的读写」，没有理由比 term.sock 宽。
 			// 此前实测阿里云 files.sock=755（umask 偶然值）。
-			if cerr := os.Chmod(fsock, 0o600); cerr != nil {
-				logf("⚠️ files.sock chmod 0600 失败（%v）—— 纵深加固未生效，state 目录权限仍是边界", cerr)
-			}
+			chmodTighten(fsock, "files.sock")
 			s.filesLn, s.filesSock, s.filesOwn, s.files = fln, fsock, fown, fsrv
 			go func() {
 				serr := fsrv.Serve(fln)
@@ -400,9 +398,7 @@ func Start(cfg ServeConfig) (*Server, error) {
 			// 第二层防御（同时护住目录里的 key.bin / tokens 台账等非 socket 文件，
 			// 见 OpenState 的收紧逻辑）；peer 校验（SO_PEERCRED/getpeereid）留待
 			// 多用户场景（design D1）。
-			if cerr := os.Chmod(tsock, 0o600); cerr != nil {
-				logf("⚠️ term.sock chmod 0600 失败（%v）—— 纵深加固未生效，state 目录权限仍是边界", cerr)
-			}
+			chmodTighten(tsock, "term.sock")
 			go func() {
 				for {
 					conn, aerr := tln.Accept()
@@ -476,6 +472,16 @@ func Start(cfg ServeConfig) (*Server, error) {
 // 注：Go 的 UnixListener.Close 默认会按路径 unlink（unlinkOnClose=true）——本函数
 // 在 listen 成功后关掉这个默认，删除统一走身份比对路径（见 removeSockOwn）。
 // 路径超过 sockaddr_un 上限时直接报错（重试无意义）。
+// chmodTighten 收紧本地服务 socket 权限到 0600（term/files 共用；r5 F2 + r6 F 抽出——
+// serve 启动路径与测试共用同一实现，测试对「删掉生产 chmod」有真变异敏感度）。
+func chmodTighten(path, label string) bool {
+	if err := os.Chmod(path, 0o600); err != nil {
+		logf("⚠️ %s chmod 0600 失败（%v）—— 纵深加固未生效，state 目录权限仍是边界", label, err)
+		return false
+	}
+	return true
+}
+
 func listenLocalService(stateDir, name string) (string, net.Listener, os.FileInfo, error) {
 	sock := filepath.Join(stateDir, name)
 	if len(sock) >= 100 { // sockaddr_un.sun_path 保守上限（darwin 104 / linux 108）

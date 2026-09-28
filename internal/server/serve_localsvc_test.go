@@ -161,15 +161,19 @@ func TestRemoveSockOwnNotOthers(t *testing.T) {
 // 判定（2026-09-29 双端最小实验），0600 即拦非属主；state 目录 0700 是第二层防御。
 func TestTermSocketChmod0600(t *testing.T) {
 	dir := shortDir(t)
-	// 与 serve.go 的 term 段同序列：listenLocalService + chmod 0600。
 	sock, ln, own, err := listenLocalService(dir, "term.sock")
 	if err != nil {
 		t.Fatalf("listen: %v", err)
 	}
 	defer ln.Close()
 	defer removeSockOwn(sock, own)
-	if err := os.Chmod(sock, 0o600); err != nil {
-		t.Fatalf("chmod: %v", err)
+	// 走**生产实现** chmodTighten（r6 F：用例此前自己 chmod 再断言，对 serve.go 无
+	// 变异敏感度——删掉生产 chmod 它照样绿）；先人为放宽到 umask 偶然值形态再收紧。
+	if err := os.Chmod(sock, 0o755); err != nil {
+		t.Fatalf("预放宽: %v", err)
+	}
+	if !chmodTighten(sock, "term.sock") {
+		t.Fatal("chmodTighten 应成功")
 	}
 	st, err := os.Stat(sock)
 	if err != nil {
@@ -233,8 +237,12 @@ func TestFilesSocketChmod0600(t *testing.T) {
 	}
 	defer ln.Close()
 	defer removeSockOwn(sock, own)
-	if err := os.Chmod(sock, 0o600); err != nil {
-		t.Fatalf("chmod: %v", err)
+	// 同 term 版（r6 F）：走生产 chmodTighten，先放宽再收紧——删掉生产 chmod 即红。
+	if err := os.Chmod(sock, 0o755); err != nil {
+		t.Fatalf("预放宽: %v", err)
+	}
+	if !chmodTighten(sock, "files.sock") {
+		t.Fatal("chmodTighten 应成功")
 	}
 	st, err := os.Stat(sock)
 	if err != nil {

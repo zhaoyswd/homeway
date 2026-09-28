@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"net"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -1425,4 +1426,130 @@ func TestRawEndedAfterRingDrain(t *testing.T) {
 		}
 		t.Fatalf("意外帧 op 0x%02x", f.op)
 	}
+}
+
+// TestRawReplayCutByDoneNoGap（exec-r6 A 回归）：raw 腿**回放途中**会话被收尾（KILL）⇒
+// 接收端拿到的行号必须无缺口。确定性构造：① 先拨号读 GREETING 后**不读不 attach**，让
+// emitter 把 ~3MB 灌进环（attach 快照 hs.end 捕获全量）；② 发 HELLO 起 writer——回放
+// 字节灌进内核缓冲（~1MB）后阻塞在写上（写超时默认 10s，**不产生跳片**）；③ 0.5s 时经
+// 管理连接 KILL 会话（finish → done）；④ 0.7s 客户端开读——阻塞写完成 ⇒ 回放循环下一轮
+// nextRingChunk 返回 !ok（cutByDone，且未触 2s 回放预算）⇒ REPLAY-DONE 后由
+// drainRingBeforeEnd 排干 [off, written)。断言：line-N 连续无缺口且含末行、ENDED 收尾。
+// 变异自证（r6 修法反向）：把 cutByDone 分支改回无条件 c.off=hs.end ⇒ [sent, hs.end)
+// 蒸发 ⇒ 缺口断言红。
+func TestRawReplayCutByDoneNoGap(t *testing.T) {
+	t.Setenv("HOMEWAY_TERM_SHELL", `seq 300000 | sed 's/^/line-/'; sleep 10`) // 尾部 sleep：灌完 ~3MB 后会话保持存活等 KILL
+	t.Setenv("HOMEWAY_TERM_HISTORY", "8388608")                               // 8MiB 环：不回卷
+	t.Setenv("HOMEWAY_TERM_REPLAY", "8388608")                                // 回放/排干预算 = 环大小：不跳头部
+	t.Setenv("HOMEWAY_TERM_DETECT", "off")
+	svc := New(nil, "")
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	go func() {
+		for {
+			cc, aerr := ln.Accept()
+			if aerr != nil {
+				return
+			}
+			go svc.ServeConn(cc)
+		}
+	}()
+	defer ln.Close()
+	defer svc.Close()
+
+	// 先建会话并让 emitter 把 ~3MB 灌进环（attach 的 hs 快照要捕获大回放窗口，
+	// 回放才能在 KILL 时刻仍在途——这是 r6 A 的命中条件）。
+	ensureSession(t, ln, "cut-by-done")
+	time.Sleep(1500 * time.Millisecond)
+
+	c := dialTerm(t, ln)
+	defer c.Close()
+	if f := readTermFrameT(t, c); f.op != opGreeting {
+		t.Fatalf("首帧应为 GREETING，收到 0x%02x", f.op)
+	}
+	writeTermFrame(t, c, opHello, encHello(80, 24, false, "cut-by-done"))
+	// 0.5s：回放正在灌内核缓冲/阻塞在写上（未到 2s 回放预算）——此刻 KILL 会话。
+	time.Sleep(500 * time.Millisecond)
+	kc := dialTerm(t, ln)
+	if f := readTermFrameT(t, kc); f.op != opGreeting {
+		t.Fatalf("管理连接 GREETING 失败")
+	}
+	writeTermFrame(t, kc, opKill, append([]byte{byte(len("cut-by-done"))}, []byte("cut-by-done")...))
+	_ = kc.Close()
+	// 0.7s 起开读：阻塞写完成 → cutByDone → drain 排干 → ENDED。
+	time.Sleep(200 * time.Millisecond)
+	_ = c.SetDeadline(time.Now().Add(30 * time.Second))
+
+	var acc []byte
+	sawReplayDone := false
+	for {
+		f, rerr := readTermFrame(c)
+		if rerr != nil {
+			t.Fatalf("读帧失败（%v）：已收 %d 字节", rerr, len(acc))
+		}
+		switch f.op {
+		case opData:
+			acc = append(acc, f.payload...)
+		case opReplayDone:
+			sawReplayDone = true
+		case opAttached, opState:
+			// 握手与状态帧，跳过
+		case opEnded:
+			if !sawReplayDone {
+				t.Fatalf("ENDED 前应见过 REPLAY-DONE")
+			}
+			checkLineContiguity(t, acc, 300000)
+			return
+		default:
+			t.Fatalf("意外帧 op 0x%02x", f.op)
+		}
+	}
+}
+
+// checkLineContiguity 断言累计字节里的 line-N 连续且覆盖到 last（r6 A 判据）。
+func checkLineContiguity(t *testing.T, acc []byte, last int) {
+	t.Helper()
+	fields := strings.Fields(string(acc))
+	nums := make([]int, 0, last)
+	for _, f := range fields {
+		if !strings.HasPrefix(f, "line-") {
+			continue
+		}
+		n, perr := strconvAtoi(f[len("line-"):])
+		if perr != nil {
+			continue // 帧边界切开的残段（首块前的头半行）不算
+		}
+		nums = append(nums, n)
+	}
+	if len(nums) == 0 {
+		t.Fatalf("没解析到任何 line-N（已收 %d 字节）", len(acc))
+	}
+	seen := make(map[int]bool, len(nums))
+	for _, n := range nums {
+		seen[n] = true
+	}
+	miss := 0
+	firstMiss := 0
+	for n := nums[0]; n <= last; n++ {
+		if !seen[n] {
+			miss++
+			if firstMiss == 0 {
+				firstMiss = n
+			}
+		}
+	}
+	if miss > 0 {
+		t.Fatalf("line 号有缺口：首个缺失 line-%d，共缺 %d 个（收到 %d..%d 中 %d 个）",
+			firstMiss, miss, nums[0], last, len(nums))
+	}
+	if !seen[last] {
+		t.Fatalf("末行 line-%d 缺失", last)
+	}
+	t.Logf("连续 line-%d..%d（%d 个，%d 字节）无缺口", nums[0], last, len(nums), len(acc))
+}
+
+func strconvAtoi(s string) (int, error) {
+	return strconv.Atoi(s)
 }

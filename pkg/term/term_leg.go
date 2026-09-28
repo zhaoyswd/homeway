@@ -272,11 +272,21 @@ func (s *termSession) runRawWriter(c *termClient) {
 		return // 换屏前序：客户端 vt 是新建的，回放起点要确定
 	}
 	// 回放：锁内读环、锁外写；时间预算用尽就跳到实时（丢头部保尾部）。
+	// cutByDone（r6 A）：回放途中会话收尾（done/removed）时，实时起点必须留在**断点**——
+	// 无条件跳 hs.end 会把「已计划回放但还没送出去」的 [sent, hs.end) 窗口永久蒸发
+	// （评审探针：12.9MB 窗口只送出 0.8MB）；断点之后的字节交给收尾路径的
+	// drainRingBeforeEnd 排干 [off, written)。预算用尽那条**保持** hs.end（丢头部保尾部的
+	// 既有语义不动）。
 	sent, replayed := hs.start, 0
+	cutByDone := false
 	deadline := time.Now().Add(hs.budget)
 	for sent < hs.end {
 		chunk, ok := s.nextRingChunk(c, &sent, termDataChunk)
-		if !ok || len(chunk) == 0 {
+		if !ok {
+			cutByDone = true // 收尾打断（nextRingChunk 的 ok=false 只剩 done/removed）
+			break
+		}
+		if len(chunk) == 0 {
 			break
 		}
 		if !s.rawWriteFrame(c, opData, chunk) {
@@ -302,8 +312,12 @@ func (s *termSession) runRawWriter(c *termClient) {
 		return
 	}
 	// 实时起点：预算用尽 ⇒ 剩余回放窗口直接跳过（丢头部保尾部）；否则 sent == hs.end。
-	// 回放期间新产生的字节 [hs.end, s.written) 由实时循环从环里接上。
+	// 回放期间新产生的字节 [hs.end, s.written) 由实时循环从环里接上。收尾打断（cutByDone）
+	// 则留在断点 sent（r6 A，见上）——不跳过任何还没送出的回放字节。
 	c.off = hs.end
+	if cutByDone {
+		c.off = sent
+	}
 	if hs.nudgeFocus {
 		// 首腿：回放完成后注入 focus-in，逼 TUI 立即全屏重绘（见 focusNudgeLocked 注释）。
 		s.mu.Lock()
@@ -325,10 +339,11 @@ func (s *termSession) runRawWriter(c *termClient) {
 			}
 		}
 		if ended != nil {
-			// r5 M1 根因修复：ENDED 前必须把环里**未读**的字节排干——finish（进程退出/
-			// 接管）把 ENDED 压进队列的那一刻，写者的 off 往往落后于 written，直接发
-			// ENDED 会把会话最后一段输出丢掉（真机形态 = TestTermSessionSpawnEnvAligned
-			// 偶发「env 输出截断」，评审 M1 定性为测试竞态、根因在这里）。
+			// r5 M1 根因修复（r6 措辞收窄）：ENDED 前必须把 **[off, written)** 排干——
+			// finish（进程退出/接管）把 ENDED 压进队列的那一刻，写者的 off 往往落后于
+			// written，直接发 ENDED 会把这段丢掉（真机形态 = TestTermSessionSpawnEnvAligned
+			// 偶发「env 输出截断」，评审 M1 定性为测试竞态、根因在这里）。off 的来源：
+			// 实时路径 = 本循环推进；回放被收尾打断 = 断点 sent（r6 A）。
 			if !s.drainRingBeforeEnd(c) {
 				return
 			}
@@ -432,9 +447,13 @@ func (s *termSession) peekRingChunkFinal(c *termClient, max int) ([]byte, bool) 
 	return s.readLocked(c.off, max), true
 }
 
-// drainRingBeforeEnd 把本腿在环里未读的字节全部写出（r5 M1）。停滞语义与实时循环一致
-// （D10-7）：写超时 = 退避后**重写同一片**（peek 不推进 off、commit 只在写出成功后），
-// 连续停滞超 rawStallLimit 才放弃（对端已读不到 ENDED，直接断腿）。硬错误同样放弃。
+// drainRingBeforeEnd 把本腿的 **[off, written)** 窗口全部写出（r5 M1；r6 措辞收窄——
+// 「环里未读」按窗口说：off 之前的字节已交付或按既有语义跳过，不在本函数职责内）。
+// 停滞语义与实时循环**基本**一致（D10-7）：写超时 = 退避后**重写同一片**（peek 不推进
+// off、commit 只在写出成功后）、硬错误放弃；**已知差异（r6 B 登记）**：成功写不调
+// recoverFromStall，停滞位不在此清除——间歇超时但持续推进的腿在 drain 内累计到
+// rawStallLimit 会被 breakLeg("stalled_over_limit") 砍掉（drain 本就发生在收尾、实害
+// 有限；补 recoverFromStall 归下版）。
 func (s *termSession) drainRingBeforeEnd(c *termClient) bool {
 	for {
 		chunk, ok := s.peekRingChunkFinal(c, termDataChunk)

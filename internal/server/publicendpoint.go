@@ -257,7 +257,7 @@ func (s *Server) tokenEndpoints(published []string, listenPort uint16) (eps []pr
 }
 
 // ddnsEntryPort：--ddns 域名条目的端口 = 已公布公网 v4 端点的外部端口；
-// 无公网端点观测（--upnp=false --stun=”）时回退实际监听口（让位退让后的真实口）。
+// 无公网端点观测（--upnp=false --stun="")时回退实际监听口（让位退让后的真实口）。
 func ddnsEntryPort(published []string, listenPort uint16) uint16 {
 	for _, line := range published {
 		if ap, err := netip.ParseAddrPort(line); err == nil && ap.Addr().Is4() && ap.Port() != 0 {
