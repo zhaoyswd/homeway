@@ -1,6 +1,7 @@
-//go:build cshared
+package hostsession
 
-// session_endpoints.go — token 端点 → 建连候选（IP 字面量 / 域名两种形态）。
+// session_endpoints.go — token 端点 → 建连候选（IP 字面量 / 域名两种形态；
+// 随迁自 cshared session_endpoints.go，逐字不动，host-registry-daemon D1）。
 //
 // 为什么需要：token 的端点在协议里允许写域名（`pkg/proto` 的注释与 `EncodeToken` 的校验
 // 都按 `net.SplitHostPort` 放行），但建连候选必须是 `IP:port`（Bind 直接用它做 UDP 目标）。
@@ -10,7 +11,6 @@
 // 语义：域名在**每次建会话时**解析一次（A + AAAA：隧道内层只承载 IPv4，但**承载**（外层 WG socket）
 // 可以是 IPv4 或 IPv6 —— 出口若公布域名或 v6 地址，客户端要能把 AAAA 也当候选）；解析出的每个地址
 // 都作为独立候选参与赛跑。解析失败只记一行、跳过该端点（其它端点照常）；全部失败才算「没有可用端点」。
-package main
 
 import (
 	"context"

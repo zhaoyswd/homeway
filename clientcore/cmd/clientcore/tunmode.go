@@ -30,37 +30,8 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-type tunConfig struct {
-	MTU uint32 `json:"mtu"`
-	Out string `json:"out"`
-	// 诊断/实验开关（ArkTS 侧不传即取默认值）
-	DialMs    int `json:"dialMs"`    // 上游拨号预算（默认 15000）
-	StatsSecs int `json:"statsSecs"` // 周期统计间隔（默认 60）
-	// EndpointCacheDir 是端点学习缓存的目录（openspec direct-handshake-connect）：
-	// 巡检观察到直连端点时按 <serverPubHex>.json 落盘，下次建连排全部候选之前。
-	// 空串 = 不读不写（CLI/测试）。文件按 server 公钥命名：删主机时残留无害。
-	EndpointCacheDir string `json:"endpointCacheDir"`
-	// IdentityDir 是设备身份目录（openspec/changes/device-identity-persist）：
-	// <dir>/master.key 存本设备主密钥，按后端派生稳定 WG 身份与设备标签（devTag）。
-	// 空串 = 每次进程临时身份（CLI/测试；重连会在出口多占记录）。
-	IdentityDir string `json:"identityDir"`
-
-	// DiagFdSecs > 0 时每这么多秒打一行 fd 快照（读 /proc/self/fd + 逐 fd getsockopt）。
-	// 默认 0 = 不打（省 CPU 与日志量）；排查 fd 泄漏时由 App 侧常量打开。
-	// 无论开关如何，每世代建立后都会打**一行基线**，便于对比。
-	DiagFdSecs int `json:"diagFdSecs"`
-	// TzOffsetMinutes 设备时区相对 UTC 的偏移（分钟，东八区 = 480）。Go 的 log 包用 time.Local
-	// 打时间戳，而 OHOS 上这个进程的 Local 是 UTC —— 不设的话隧道日志比 App 日志差 8 小时，
-	// 日志页把两份日志按时间合并时顺序就全乱了（实测）。
-	TzOffsetMinutes int `json:"tzOffsetMinutes"`
-	// Token：homeway token（唯一入口形态）—— 自带后端公钥、凭证种子与端点列表。
-	Token string `json:"token"`
-
-	// PortForwards：端口映射（见 app_portfwd.go）——attached 后在本进程监听
-	// 127.0.0.1:<listen>，把连接经隧道转发到 targetIp:targetPort（空 IP = 出口自己）。
-	// 空列表 = 无映射，零开销。
-	PortForwards []tunPortForward `json:"portForwards"`
-}
+// tunConfig 已随迁 hostsession.Config（host-registry-daemon D1：本文件经
+// hostsession_shell.go 的类型别名 + normalizeTunConfig 薄壳引用，下方引用点零改动）。
 
 // tunStats 逐项计数：与设备 /proc/net/dev 的 vpn-tun 行对表，用来确认
 // 「fd 读=应用上行 / fd 写=回程」的方向约定，并暴露静默丢弃。
@@ -703,25 +674,7 @@ const (
 	attachDeadline = 60 * time.Second
 )
 
-// normalizeTunConfig 填默认值。必须在暖机之前做：attach 与日志都要用这些值。
-// 所有"时长/尺寸"类字段都按 **<=0 就回落默认**处理：负数不仅无意义，还会直接炸掉
-// （`time.NewTicker` 参数 <=0 会 panic，而 panic 发生在子 goroutine 里，会把扩展进程带走；
-//
-//	DialMs 为负则所有拨号立即超时=静默变砖）。App 侧只传固定正值，但这里不该赌调用方。
-func normalizeTunConfig(cfg *tunConfig) {
-	if cfg.MTU <= 0 {
-		// 与 App 侧 TUN_MTU(1280) 对齐：超过 Tailscale/WireGuard 隧道自身的承载上限会出现
-		// 「能连、DNS/TLS 都通、大包被丢」的白屏（AGENTS 坑 23）。任何新调用点忘传 MTU
-		// 也不该静默踩回 1360 那个坑。
-		cfg.MTU = 1280
-	}
-	if cfg.DialMs <= 0 {
-		cfg.DialMs = 15000
-	}
-	if cfg.StatsSecs <= 0 {
-		cfg.StatsSecs = 60
-	}
-}
+// normalizeTunConfig 已随迁 hostsession.Normalize（薄壳在 hostsession_shell.go）。
 
 // runTun2Tailcat 一个世代的完整生命周期：暖机（prepare）→ 等 attach → 数据面 → 收工。
 // 阶段状态只允许当前世代修改：收工时若已置 failed 则保留（调用方要读原因），否则回 idle。
@@ -1271,26 +1224,8 @@ func attachTun(fd int) int {
 // （cgo 的 C 命名空间按文件隔离，故这里只返回 int，由 probe_lib.go 包成 C.int。）
 // 换网/唤醒的就地恢复已整体收编到 recover.go 的恢复阶梯（ClientCoreTunRecover）。
 
-// errActionTimeout：runBoundedAction 的预算用尽哨兵，区别于被调动作自己返回的本地错误。
-var errActionTimeout = errors.New("本地动作超时")
-
-// runBoundedAction 在预算内跑一个同步动作，把"卡住"变成可判定的失败。
-//
-// 超时后动作的 goroutine 仍会跑完（不泄漏锁、不重复加锁）；调用方只当它失败。这条路径上
-// 真正危险的是**无界等待**：换网重绑会一直占着扩展那次调用，巡检里的自重绑则会
-// 让整个巡检 goroutine 永久停摆（连"3 连败"都不再上报）。Rebind 是幂等的换 socket，重复调用无害。
-func runBoundedAction(budget time.Duration, f func() error) error {
-	done := make(chan error, 1)
-	go func() { done <- f() }()
-	timer := time.NewTimer(budget)
-	defer timer.Stop()
-	select {
-	case err := <-done:
-		return err
-	case <-timer.C:
-		return errActionTimeout
-	}
-}
+// errActionTimeout/runBoundedAction 已随迁 hostsession（r4 订正：随迁、包内未导出——
+// 796c0fb 实测调用点全在随迁的共享阶梯 recover.go 内，本包无调用点残留，故无壳）。
 
 // tunLogf 取本世代 tunRunner 的 logger（带 `tier-core: ` 前缀，与其它核日志同一格式）。
 func tunLogf(r *tunRun) Logf {

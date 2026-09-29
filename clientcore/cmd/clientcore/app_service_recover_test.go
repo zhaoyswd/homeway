@@ -28,6 +28,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/zhaoyswd/homeway/clientcore/hostsession"
 	"github.com/zhaoyswd/homeway/pkg/intercept"
 	"github.com/zhaoyswd/homeway/pkg/proto"
 	"github.com/zhaoyswd/homeway/pkg/servercore"
@@ -79,12 +80,14 @@ func TestServiceSessionRecoverLadder(t *testing.T) {
 	//	①健康路径用生产值（3s/10s/2s）——测试预算不该比生产更苛刻，语义才诚实；
 	//	②③的死路径（起查探测必超时、③验证必超时）只等超时本身，维持毫秒级省墙钟；
 	//	②的验证探测与①同宽（恢复真发生时远快于预算，预算只是兜底慢机）。
-	oldPre, oldVerify, oldAct := recoverPreProbeTimeout, recoverVerifyTimeout, recoverActionTimeout
+	// 【1.2 过渡】预算 var 已随迁 hostsession（未导出）；经 1.2 暂设的导出指针改写，
+	// 1.3 本用例随迁同包后改回直接赋值。
+	oldPre, oldVerify, oldAct := *hostsession.RecoverPreProbeTimeout, *hostsession.RecoverVerifyTimeout, *hostsession.RecoverActionTimeout
 	setBudgets := func(b svcTestBudgets) {
-		recoverPreProbeTimeout, recoverVerifyTimeout, recoverActionTimeout = b.pre, b.verify, b.action
+		*hostsession.RecoverPreProbeTimeout, *hostsession.RecoverVerifyTimeout, *hostsession.RecoverActionTimeout = b.pre, b.verify, b.action
 	}
 	t.Cleanup(func() {
-		recoverPreProbeTimeout, recoverVerifyTimeout, recoverActionTimeout = oldPre, oldVerify, oldAct
+		*hostsession.RecoverPreProbeTimeout, *hostsession.RecoverVerifyTimeout, *hostsession.RecoverActionTimeout = oldPre, oldVerify, oldAct
 	})
 
 	// ---------- 服务端：生产同一份 ServerBind + DeviceTable（同 wgcore recover_test 形态） ----------
@@ -346,7 +349,7 @@ func TestRecoverGateRunsOncePerRound(t *testing.T) {
 	release := make(chan struct{})
 	firstDone := make(chan int, 1)
 	go func() {
-		firstDone <- g.merge(recoverR2, "first", func(from recoverLevel) int {
+		firstDone <- g.Merge(recoverR2, "first", func(from recoverLevel) int {
 			runs.Add(1)
 			close(started)
 			<-release
@@ -356,7 +359,7 @@ func TestRecoverGateRunsOncePerRound(t *testing.T) {
 	<-started
 	lateDone := make(chan int, 1)
 	go func() {
-		lateDone <- g.merge(recoverR2, "late", func(from recoverLevel) int {
+		lateDone <- g.Merge(recoverR2, "late", func(from recoverLevel) int {
 			runs.Add(1)
 			return 99 // 不该被执行：等待者不另起 run
 		})

@@ -39,6 +39,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/zhaoyswd/homeway/clientcore/hostsession"
 	"github.com/zhaoyswd/homeway/clientcore/internal/wtransport"
 )
 
@@ -133,7 +134,7 @@ var (
 type serviceBuilder func(cfg tunConfig, logf Logf) (exitSession, *wtransport.EndpointCache, error)
 
 var serviceBuild serviceBuilder = func(cfg tunConfig, logf Logf) (exitSession, *wtransport.EndpointCache, error) {
-	return buildExitSession(cfg, logf)
+	return hostsession.BuildExitSession(cfg, logf) // 构造本体已随迁 hostsession（D1）
 }
 
 // setState 状态迁移（带时间戳）。
@@ -448,11 +449,11 @@ func (s *serviceSession) recoverStaleSession(sess exitSession, why string) int {
 	if tr == nil {
 		return 0
 	}
-	rc := s.recGate.merge(recoverR2, why, func(from recoverLevel) int {
-		rc := runRecoverLadder(recoverDeps{
-			probe: func(ctx context.Context) error { return sess.PathProbe(ctx) },
-			tr:    tr,
-			logf:  s.logf,
+	rc := s.recGate.Merge(recoverR2, why, func(from recoverLevel) int {
+		rc := runRecoverLadder(hostsession.RecoverDeps{
+			Probe: func(ctx context.Context) error { return sess.PathProbe(ctx) },
+			Tr:    tr,
+			Logf:  s.logf,
 		}, from, why)
 		s.noteLadderResult(rc) // 每轮恰好执行一次（merge 只让一个入口跑 run）
 		return rc

@@ -1,12 +1,16 @@
-//go:build cshared
+package hostsession
 
-// session.go — 「出口会话」的传输面（wg-native-stack tasks 4.1 起的唯一实现）。
+// session.go — 「出口会话」的传输面（wg-native-stack tasks 4.1 起的唯一实现；
+// 随迁自 cshared session.go，host-registry-daemon D1）。
 //
 // 核里对外只有三件事：拨出口主机本机端口、拨任意目标、存活探测；外加关闭。
 // 实现 = *wgcore.Transport（WG + 隧道侧 netstack）。**换传输 = 换这里的构造**，
-// tunmode 的调用点一行不动。接缝保留为接口（exitSession）是给测试假会话
-// （fakeExitSession）用的——生产构造（buildExitSession）只会产出 newSession。
-package main
+// 留守 cshared 的调用点一行不动。接缝保留为接口（ExitSession）是给测试假会话
+// （fakeExitSession）用的——生产构造（BuildExitSession）只会产出 newSession。
+//
+// 差异随迁说明：原文件的 startSession（隧道世代装配，引用留守的 tunRun）**留守
+// cshared**，经 BuildExitSession 走本构造；隧道域与本包的差异只在生命周期管理
+// （run/世代 vs 独立状态机）。
 
 import (
 	"context"
@@ -22,11 +26,11 @@ import (
 	"github.com/zhaoyswd/homeway/pkg/proto"
 )
 
-// exitSession：本世代出口会话（传输面）。
+// ExitSession：本世代出口会话（传输面）。
 //
 // 只有 TCP 面：L3 直通后应用 UDP 由 TUN 直通出口过境拦截，手机核不再承载 UDP 会话
 // （review 复审 #1 收尾：DialUDP/exitUDP 整条死管线已删）。
-type exitSession interface {
+type ExitSession interface {
 	DialTCPPort(ctx context.Context, port uint16) (net.Conn, error)
 	DialTCP(ctx context.Context, dst netip.AddrPort) (net.Conn, error)
 	// PathProbe 存活判据（巡检/换网重绑/自重绑共用）：返回 nil = 对端可达。
@@ -80,7 +84,8 @@ func isRefusedLike(err error) bool {
 	return wgcore.IsRefusedLike(err)
 }
 
-// ---------- tunAttachSurface（l3-exit-intercept：L3 attach 能力透出） ----------
+// ---------- tunAttachSurface（l3-exit-intercept：L3 attach 能力透出，留守 cshared 经
+// ExitSession 接口断言到本类型） ----------
 
 func (n newSession) AttachFD(fd, mtu int) error      { return n.core.AttachFD(fd, mtu) }
 func (n newSession) SetOnTunError(f func(err error)) { n.core.SetOnTunError(f) }
@@ -98,12 +103,12 @@ func (n newSession) Close() error {
 }
 
 // 编译期保证：两个实现都满足接缝。
-var _ exitSession = newSession{}
+var _ ExitSession = newSession{}
 
-// newTransport 取传输门面：新栈特有的能力（Rebind/Rearm/Probe/学习缓存接线/状态快照）
+// NewTransport 取传输门面：新栈特有的能力（Rebind/Rearm/Probe/学习缓存接线/状态快照）
 // 都从这里走。返回 nil 仅发生在测试假会话（fakeExitSession 不实现传输面）——生产
-// 构造（buildExitSession）只会产出 newSession。
-func newTransport(s exitSession) *wgcore.Transport {
+// 构造（BuildExitSession）只会产出 newSession。
+func NewTransport(s ExitSession) *wgcore.Transport {
 	if n, ok := s.(newSession); ok {
 		return n.tr
 	}
@@ -111,20 +116,35 @@ func newTransport(s exitSession) *wgcore.Transport {
 }
 
 // newCore 取核：服务会话的流量计数（WG 传输层字节数，Bind.RxTx）从这里走；
-// 隧道域不经过它（流量面在 hub fd 层）。nil 语义同 newTransport（仅测试假会话）。
-func newCore(s exitSession) *wgcore.Core {
+// 隧道域不经过它（流量面在 hub fd 层）。nil 语义同 NewTransport（仅测试假会话）。
+// 未导出：消费面（状态快照）在本包内。
+func newCore(s ExitSession) *wgcore.Core {
 	if n, ok := s.(newSession); ok {
 		return n.core
 	}
 	return nil
 }
 
-// buildExitSession 出口会话的**共用构造**（openspec app-service-session 任务 2.1）：
-// token 解码 → 候选解析 → 设备身份（同目录落盘复用）→ wgcore.Prepare → Transport →
-// 候选清单落日志 → 参照点探测（出口能力位）。隧道世代（startSession）与服务会话
-// （app_service.go）都从这里起会话；差异只在生命周期管理（run/世代 vs 独立状态机）。
+// errIdentityEphemeral：StrictIdentity 下身份不可持久化的哨兵（Options.StrictIdentity
+// 的降级口径，r1 N2）——Session 侧据此把 reason 记为 identity_ephemeral。
+var errIdentityEphemeral = errors.New("身份不可持久化（identity_ephemeral）")
+
+// BuildExitSession 出口会话的**共用构造**（openspec app-service-session 任务 2.1；
+// 手机语义：非严格身份——身份不可持久化时降级临时身份继续连）。
+// 严格身份（daemon：SourceEphemeral 视为失败）走包内 buildExitSession + Options。
+func BuildExitSession(cfg Config, logf Logf) (ExitSession, *wtransport.EndpointCache, error) {
+	return buildExitSession(cfg, Options{}, logf)
+}
+
+// buildExitSession 出口会话构造本体：token 解码 → 候选解析 → 设备身份（同目录落盘
+// 复用）→ wgcore.Prepare → Transport → 候选清单落日志 → 参照点探测（出口能力位）。
+// 隧道世代（留守 startSession）与服务会话（本包状态机）都从这里起会话；差异只在
+// 生命周期管理（run/世代 vs 独立状态机）。
 // 返回的 EndpointCache 由调用方持有并在收工时显式 Save（Observe/NoteFailure 只改内存）。
-func buildExitSession(cfg tunConfig, logf Logf) (exitSession, *wtransport.EndpointCache, error) {
+// opts.StrictIdentity = true 时：身份不可持久化（SourceEphemeral）返回
+// errIdentityEphemeral（调用方按该主机会话 failed reason=identity_ephemeral 收工，
+// 可重试）——杜绝「每次重启换临时钥匙在出口多占一条设备记录」。
+func buildExitSession(cfg Config, opts Options, logf Logf) (ExitSession, *wtransport.EndpointCache, error) {
 	if strings.TrimSpace(cfg.Token) == "" {
 		return nil, nil, errors.New("新栈需要 homeway token（cfg.token 为空）")
 	}
@@ -154,6 +174,9 @@ func buildExitSession(cfg tunConfig, logf Logf) (exitSession, *wtransport.Endpoi
 	id, idSrc, idErr := wtransport.LoadOrCreateIdentity(cfg.IdentityDir, tok.PeerID)
 	if idErr != nil {
 		if idSrc == wtransport.SourceEphemeral {
+			if opts.StrictIdentity {
+				return nil, nil, fmt.Errorf("%w：%v", errIdentityEphemeral, idErr)
+			}
 			logf("身份：不可持久化（%v）—— 本次用临时身份建连；重连会换钥匙（出口会多占一条记录）", idErr)
 		} else {
 			return nil, nil, fmt.Errorf("身份加载失败：%w", idErr)
@@ -248,18 +271,6 @@ func buildExitSession(cfg tunConfig, logf Logf) (exitSession, *wtransport.Endpoi
 			build, dns, gen, saw, rtt.Round(time.Millisecond))
 	}(cands[0].Addr)
 	return sess, cache, nil
-}
-
-// startSession 起出口会话（wg-native-stack tasks 4.1）：homeway token 驱动 ——
-// token 自带后端公钥/凭证种子/端点列表，因此不需要（也拿不到）tailcat 地址那套
-// 出口信息/DERP 地图；身份按设计每进程临时生成（后端靠 cap/LRU 兜住累积）。
-func startSession(cfg tunConfig, run *tunRun, logf Logf) (exitSession, error) {
-	sess, _, err := buildExitSession(cfg, logf)
-	if err != nil {
-		return nil, err
-	}
-	run.setClient(sess) // 供 stop 打断暖机、以及 ClientCoreTunRecover 下推恢复阶梯
-	return sess, nil
 }
 
 // 出口能力位（与 homeway internal/server/udpcap.go 的同名常量同源）：

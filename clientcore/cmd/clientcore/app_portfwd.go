@@ -31,13 +31,8 @@ import (
 	"C"
 )
 
-// tunPortForward 是 tunConfig.PortForwards 的一条。
-// 字段名与扩展侧拼 JSON 的键一致（listen / targetIp / targetPort）。
-type tunPortForward struct {
-	Listen     uint16 `json:"listen"`
-	TargetIp   string `json:"targetIp"` // 空 = 出口主机自己
-	TargetPort uint16 `json:"targetPort"`
-}
+// tunPortForward 已随迁 hostsession.PortForward（host-registry-daemon D1：tunConfig
+// 整体随迁，其字段元素类型一并走；本包经 hostsession_shell.go 类型别名引用）。
 
 // pfTargetText 展示用目标文本（与 ArkTS 侧 forwardTargetText 同语义）。
 func pfTargetText(f tunPortForward) string {

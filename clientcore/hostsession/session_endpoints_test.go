@@ -1,6 +1,8 @@
-//go:build cshared
+//go:build !cshared
 
-package main
+// （随迁自 cshared package main，host-registry-daemon D8 账本·纯迁 12 之一；
+// diff = 构建约束翻面（账本口径：用例迁出 cshared 计数面）+ 包名。）
+package hostsession
 
 import (
 	"context"
