@@ -19,6 +19,8 @@ func TestResolveRole(t *testing.T) {
 		{"未知子命令", []string{"foo"}, "foo", []string{}},
 		{"exit 裸调", []string{"exit"}, "exit", []string{}},
 		{"relay 裸调", []string{"relay"}, "relay", []string{}},
+		{"host 角色（host-cli 3b）", []string{"host", "add", "--name", "mbp", "hmw1x"}, "host", []string{"add", "--name", "mbp", "hmw1x"}},
+		{"host 裸调（usage 面）", []string{"host"}, "host", []string{}},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {

@@ -6,6 +6,7 @@
 //	homeway term <子命令> …    # 终端命令面：list / new / attach / delete / explain
 //	homeway daemon [--state D] # 桌面守护进程（多主机会话注册表；host-registry-daemon）
 //	homeway daemon status …    # 守护进程状态（控制面读面；--json 机器可读快照）
+//	homeway host <子命令> …    # 主机表管理命令面：add / list / status / delete
 //	homeway --version
 //
 // 一台机器上可以同时跑多个进程（例如一个出口 + 一个中继）：各进程用 --state 区分身份、
@@ -57,8 +58,10 @@ func run(args []string) int {
 		err = term.CLI(rest)
 	case "daemon":
 		err = daemon.CLI(rest, version)
+	case "host":
+		err = daemon.CLI(append([]string{"host"}, rest...), version)
 	default:
-		fmt.Fprintf(os.Stderr, "homeway: 不认识的子命令 %q（可用：exit、relay、term、daemon）\n", role)
+		fmt.Fprintf(os.Stderr, "homeway: 不认识的子命令 %q（可用：exit、relay、term、daemon、host）\n", role)
 		usage(os.Stderr)
 		return 2
 	}
@@ -112,6 +115,8 @@ func resolveRole(args []string) (role string, rest []string) {
 		return "term", args[1:]
 	case "daemon":
 		return "daemon", args[1:]
+	case "host":
+		return "host", args[1:]
 	}
 	// `homeway --relay 'rl1…'` 这类省略子命令的写法：首参是 flag 时按默认角色（出口）走。
 	if strings.HasPrefix(args[0], "-") {
@@ -134,6 +139,13 @@ func usage(w *os.File) {
   homeway daemon status [--json] [--state DIR]
                                守护进程状态（控制面读面：版本/代际/角色/主机+链路态；
                                --json = 机器可读全量快照）
+  homeway host add [--name N] [--force] <token>
+                               添加主机（服务端有界连通性验证，三档结论；token 恒掩码）
+  homeway host list [--json]   主机列表（会话态/链路态/流量/添加时间）
+  homeway host status [name] [--json]
+                               单台主机详面（省略 name = 全部）
+  homeway host delete <name|id> [--yes]
+                               删除主机（交互确认默认 N；非终端 stdin 需 --yes）
   homeway --version            打印版本
 
 一台机器上可以同时运行多个进程（如一个出口 + 一个中继）：用 --state 区分身份、

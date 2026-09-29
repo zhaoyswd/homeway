@@ -11,6 +11,7 @@ package daemon
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"os"
@@ -25,15 +26,30 @@ import (
 // CLI daemon 子命令入口（cmd/homeway 转发；version 随构建注入——welcome/
 // daemon.status 的 serverVersion）。
 //
-// 子命令：status（4.1，控制面读面的 CLI 消费）；其余参数 = 守护进程本体。
+// 子命令：status（4.1，控制面读面）、host（host-cli 3b：主机表管理命令面）；
+// 其余参数 = 守护进程本体。
 func CLI(args []string, version string) error {
 	if len(args) > 0 && args[0] == "status" {
 		return statusCLI(args[1:], version, os.Stdout)
 	}
+	if len(args) > 0 && args[0] == "host" {
+		return hostCLI(args[1:], version, os.Stdout)
+	}
 	fs := flag.NewFlagSet("homeway daemon", flag.ContinueOnError)
+	fs.SetOutput(os.Stdout)
 	stateDir := fs.String("state", DefaultStateDir(), "state 目录（单实例锁/主机表/身份/日志）")
 	if err := fs.Parse(args); err != nil {
+		// B15（host-cli 3b）：--help 正常化（此前 flag: help requested + exit 1）
+		// ——与 status_cli.go 同款 ErrHelp→nil 姿势，usage 已由 flag 集打印。
+		if errors.Is(err, flag.ErrHelp) {
+			return nil
+		}
 		return err
+	}
+	// B15：flag 解析后的意外位置参数报错（此前 `homeway daemon --state X status`
+	// 静默吞掉 status 起守护进程）。
+	if fs.NArg() > 0 {
+		return fmt.Errorf("daemon 不接受位置参数 %q（子命令：status / host；启动守护进程 = 无子命令）", fs.Args())
 	}
 
 	// ⓪ 与出口/中继禁止同 state 目录（硬拦，见 checkNotExitState）。

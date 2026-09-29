@@ -153,9 +153,36 @@ homeway daemon status [--json] # 状态面（版本/代际/角色/主机+链路�
   契约真源 = 手机仓 openspec `daemon-control-plane` 能力域的 spec + 语言无关 fixtures
   （`internal/control/testdata/fixtures/v1/`，含独立解码对拍脚本 `decode_check.py`——
   非 Go 消费者可仅凭 spec + fixtures 实现对拍）。
-- **桌面消费形态**：CLI/未来 Mac APP 是控制面的薄前端——`daemon status --json` 是协议级
-  机器可读消费路径的实证；主机增删命令面（`host add/list` 等）与远程终端命令
-  （`term --host`）归后续版本。
+- **桌面消费形态**：CLI/未来 Mac APP 是控制面的薄前端——`daemon status --json` 与
+  `host list --json`（见下）是协议级机器可读消费路径的实证。
+
+### 主机表管理（`homeway host`，守护托管命令面）
+
+管理守护进程注册表里的多台主机——全部经控制面 UDS 操作守护进程（不直读/直写
+hosts.json；守护进程未运行时报可行动错误，无降级直读模式）：
+
+```bash
+homeway host add [--name N] [--force] <token>
+    # 添加主机。服务端做有界连通性验证（≤3.5s，与手机 App 同一份探测实现），三档结论：
+    #   直连可达   → 成功行（实测端点 + RTT）
+    #   仅中继可达 → 成功行 + 提示「直连不可达，连接将走中继；检查出口公网端口/UPnP」
+    #   全不可达   → 非零退出 + 排查建议 + --force（仍然添加）提示；不入表
+    # --force = 跳过验证直接入表（端点未实测，首次连接时补全）。token 在输出与错误
+    # 信息中恒为掩码（hmw1…xxxx）；经命令行参数传入（与凭证类命令同威胁模型）。
+homeway host list [--json]
+    # 主机列表：名称/短 ID/会话态/链路（via/端点/rtt）/收发字节/添加时间。
+    # --json = 控制面快照的 hosts 数组原样（stdout 一行 JSON，无包裹对象）。
+homeway host status [name] [--json]
+    # 单台详面（省略 name = 全部）；--json 同 list 形状，status <name> = 单元素数组。
+homeway host delete <name|id> [--yes]
+    # 删除：停会话、出表、落盘。按名称/完整 ID/无歧义短前缀寻址；交互确认默认 N，
+    # 非终端 stdin 未给 --yes 时拒绝（防脚本误删）；目标不存在报错非零（不静默成功）。
+# 全部子命令支持 --state DIR（同 daemon status）与 --timeout；add 默认 10s，其余 5s。
+```
+
+验证实现一份：手机 App（cshared `ClientCoreProbeReach`）与 daemon `host.add` 服务端
+同调 `pkg/probe.Reach`（decode → 端点解析（并行，计入同一预算）/去重 → 并发参照点
+探测）；探测为纯旁路（独立临时 UDP socket、无身份、不碰任何在跑会话）。
 - **launchd 守护化**（macOS）：模板与安装说明见 `tools/launchd/`（RunAtLoad + KeepAlive
   崩溃自动重拉；模板经 `launchctl load` 实测）。
 - **单实例**：state 目录 flock 排他锁，二次启动报「已在运行（pid N）」；进程死亡锁自动
