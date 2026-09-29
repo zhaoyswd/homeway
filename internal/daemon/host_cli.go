@@ -133,7 +133,11 @@ func printHostAdded(w io.Writer, res *control.HostAddResult) {
 		name = "-"
 	}
 	if res.Reach == nil {
-		fmt.Fprintf(w, "已添加主机 %s（%s）——旧版守护进程无验证结论，重启 daemon 后可复核（homeway host status %s）\n", name, shortHostID(res.ID), name)
+		hint := ""
+		if res.Name != "" {
+			hint = fmt.Sprintf("（homeway host status %s）", res.Name)
+		}
+		fmt.Fprintf(w, "已添加主机 %s（%s）——旧版守护进程无验证结论，重启 daemon 后可复核%s\n", name, shortHostID(res.ID), hint)
 		return
 	}
 	switch res.Reach.Tier {
