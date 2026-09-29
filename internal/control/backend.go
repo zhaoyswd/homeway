@@ -1,0 +1,47 @@
+package control
+
+// backend.go — 服务器对宿主（internal/daemon）的窄依赖面。control 不 import
+// daemon（依赖方向单向：daemon 装配 control）；Backend 由 daemon 侧实现。
+
+import (
+	"context"
+	"errors"
+	"net"
+)
+
+// Backend 哨兵错误（server 层映射到错误码表）。
+var (
+	// ErrBackendHostExists 同 token 重复添加（host_exists）。
+	ErrBackendHostExists = errors.New("host 已在表中")
+	// ErrBackendBadToken token 本地解析失败（bad_token）。
+	ErrBackendBadToken = errors.New("token 非法")
+	// ErrBackendNoHost 主机不在表（no_host）。
+	ErrBackendNoHost = errors.New("host 不在表中")
+	// ErrBackendNoSession 主机在表但会话不在（收工/重建窗口/未就绪）——流打开
+	// 被拒（stream_refused）。
+	ErrBackendNoSession = errors.New("会话不在（收工/重建窗口）")
+)
+
+// Backend 控制面服务器的宿主面（daemon 装配时实现；全部方法必须可并发调用）。
+// 锁序（design D5 快照路径②）：HostStates 内部先拷贝会话集合再逐会话无锁快照，
+// **不得**在持 Registry.mu 时回调 control。
+type Backend interface {
+	// ServerVersion 服务端版本（welcome/daemon.status）。
+	ServerVersion() string
+	// RolesStatus 角色状态面（daemon.status）。
+	RolesStatus() []RoleBrief
+	// HostBriefs 主机登记面（host.list / snapshot.get 的静态部分）。
+	HostBriefs() []HostBrief
+	// AddHost 解析入表（3a 语义：token 语法/本地解码校验；连通性验证归 3b）。
+	AddHost(name, token string) (HostBrief, error)
+	// RemoveHost 摘除主机。
+	RemoveHost(id string) error
+	// HostStates 各主机动态面（state/reason/link/stats——各会话无锁快照汇成）。
+	HostStates() []HostState
+	// DialTerm 打开一条到目标主机 term 服务（核内约定端口 7724）的隧道连接。
+	// 控制面对 term 协议纯字节透传（spec「流式通道」）。
+	DialTerm(ctx context.Context, host string) (net.Conn, error)
+	// NotReady 宿主未就绪（如 client 角色未运行/注册表未挂）——host.*/snapshot
+	// 类操作报 not_ready。
+	NotReady() bool
+}
