@@ -5,6 +5,7 @@
 //	homeway relay [flags]      # 中继
 //	homeway term <子命令> …    # 终端命令面：list / new / attach / delete / explain
 //	homeway daemon [--state D] # 桌面守护进程（多主机会话注册表；host-registry-daemon）
+//	homeway daemon status …    # 守护进程状态（控制面读面；--json 机器可读快照）
 //	homeway --version
 //
 // 一台机器上可以同时跑多个进程（例如一个出口 + 一个中继）：各进程用 --state 区分身份、
@@ -130,6 +131,9 @@ func usage(w *os.File) {
                                与 App 同一份会话注册表，经 <state>/term.sock 本地直连）
   homeway daemon [--state DIR] 桌面守护进程（多主机会话注册表；默认 state
                                ~/.config/homeway/daemon——与出口 state 禁止同目录）
+  homeway daemon status [--json] [--state DIR]
+                               守护进程状态（控制面读面：版本/代际/角色/主机+链路态；
+                               --json = 机器可读全量快照）
   homeway --version            打印版本
 
 一台机器上可以同时运行多个进程（如一个出口 + 一个中继）：用 --state 区分身份、

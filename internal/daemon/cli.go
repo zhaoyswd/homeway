@@ -23,7 +23,12 @@ import (
 
 // CLI daemon 子命令入口（cmd/homeway 转发；version 随构建注入——welcome/
 // daemon.status 的 serverVersion）。
+//
+// 子命令：status（4.1，控制面读面的 CLI 消费）；其余参数 = 守护进程本体。
 func CLI(args []string, version string) error {
+	if len(args) > 0 && args[0] == "status" {
+		return statusCLI(args[1:], version, os.Stdout)
+	}
 	fs := flag.NewFlagSet("homeway daemon", flag.ContinueOnError)
 	stateDir := fs.String("state", DefaultStateDir(), "state 目录（单实例锁/主机表/身份/日志）")
 	if err := fs.Parse(args); err != nil {
