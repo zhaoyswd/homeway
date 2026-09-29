@@ -36,16 +36,6 @@ type exitSession = hostsession.ExitSession
 
 func newTransport(s exitSession) *wgcore.Transport { return hostsession.NewTransport(s) }
 
-// newCore（留守期垫片）：原 session.go 的 newCore 未导出随迁；留守 serviceStatusJSON
-// 的流量计数经 NewTransport().Core() 等价取核（nil 语义一致：仅测试假会话）。
-// 1.3 状态面改读 StatusSnapshot 后本垫片随之消亡。
-func newCore(s exitSession) *wgcore.Core {
-	if tp := newTransport(s); tp != nil {
-		return tp.Core()
-	}
-	return nil
-}
-
 // startSession 起出口会话（wg-native-stack tasks 4.1；随 session.go 迁出后留守在壳文件——
 // 它引用留守的 tunRun，属隧道域装配）：homeway token 驱动 —— token 自带后端公钥/凭证种子/
 // 端点列表，因此不需要（也拿不到）tailcat 地址那套出口信息/DERP 地图；身份按设计每进程

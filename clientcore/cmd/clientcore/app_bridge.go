@@ -407,6 +407,13 @@ func (h *bridgeHost) authHex() string {
 	return hex.EncodeToString(blob)
 }
 
+// hostsession.Bridge 接缝的导出方法面（host-registry-daemon D1/A2）：小写方法保留
+// （既有调用点零改动），导出版只做转发、供 hostsession.Session 经接口调用。
+func (h *bridgeHost) Start()                             { h.start() }
+func (h *bridgeHost) Stop()                              { h.stop() }
+func (h *bridgeHost) AuthHex() string                    { return h.authHex() }
+func (h *bridgeHost) SockJSON() (string, string, string) { return h.sockJSON() }
+
 // bridgeWriteAuth 客户端：连上桥后**先**发鉴权首包（authHex 来自状态 JSON 的 bridgeAuth）。
 func bridgeWriteAuth(c net.Conn, authHex string) error {
 	blob, err := hex.DecodeString(authHex)

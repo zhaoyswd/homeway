@@ -1,8 +1,11 @@
-//go:build cshared
+//go:build !cshared
 
 // app_service_recover_test.go — 服务腿恢复阶梯的**进程内集成**（openspec recovery-ladder
-// 评审二轮·四-2）：起一个真 serviceSession（真 WG 会话 + 回环上的真出口），验证
+// 评审二轮·四-2）：起一个真 Session（真 WG 会话 + 回环上的真出口），验证
 // recoverStaleSession 真的接上了统一阶梯——
+// （随迁自 cshared package main，host-registry-daemon D8 账本·重接线 10 之一；
+// 接线变化：单例入口 serviceStartFromJSON/serviceCur → 包内 Default()；
+// 预算 var 改回同包直接赋值（1.2 过渡指针收回）——断言集合/语义逐条不变。）——
 //
 //	① 会话健康：探测先行，零档位动作（不打 R1/R2/R3 行）；
 //	② 出口设备记录被回收（= 出口重启形态）：R2 直入跑齐「补注册+丢会话+换源」，一个
@@ -11,13 +14,11 @@
 //
 // 阶梯预算缩到毫秒级让用例秒级跑完（生产值见 recover.go）；与隧道域互不等待是结构性
 // 保证（两个独立 gate 对象，隧道域闸挂在 tunRun 上），单飞语义另由 TestRecoverMergeSingleFlight 钉住。
-package main
+package hostsession
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
-	"github.com/zhaoyswd/homeway/clientcore/internal/wtransport"
 	"net"
 	"net/netip"
 	"os"
@@ -28,7 +29,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/zhaoyswd/homeway/clientcore/hostsession"
+	"github.com/zhaoyswd/homeway/clientcore/internal/wtransport"
 	"github.com/zhaoyswd/homeway/pkg/intercept"
 	"github.com/zhaoyswd/homeway/pkg/proto"
 	"github.com/zhaoyswd/homeway/pkg/servercore"
@@ -80,14 +81,12 @@ func TestServiceSessionRecoverLadder(t *testing.T) {
 	//	①健康路径用生产值（3s/10s/2s）——测试预算不该比生产更苛刻，语义才诚实；
 	//	②③的死路径（起查探测必超时、③验证必超时）只等超时本身，维持毫秒级省墙钟；
 	//	②的验证探测与①同宽（恢复真发生时远快于预算，预算只是兜底慢机）。
-	// 【1.2 过渡】预算 var 已随迁 hostsession（未导出）；经 1.2 暂设的导出指针改写，
-	// 1.3 本用例随迁同包后改回直接赋值。
-	oldPre, oldVerify, oldAct := *hostsession.RecoverPreProbeTimeout, *hostsession.RecoverVerifyTimeout, *hostsession.RecoverActionTimeout
+	oldPre, oldVerify, oldAct := recoverPreProbeTimeout, recoverVerifyTimeout, recoverActionTimeout
 	setBudgets := func(b svcTestBudgets) {
-		*hostsession.RecoverPreProbeTimeout, *hostsession.RecoverVerifyTimeout, *hostsession.RecoverActionTimeout = b.pre, b.verify, b.action
+		recoverPreProbeTimeout, recoverVerifyTimeout, recoverActionTimeout = b.pre, b.verify, b.action
 	}
 	t.Cleanup(func() {
-		*hostsession.RecoverPreProbeTimeout, *hostsession.RecoverVerifyTimeout, *hostsession.RecoverActionTimeout = oldPre, oldVerify, oldAct
+		recoverPreProbeTimeout, recoverVerifyTimeout, recoverActionTimeout = oldPre, oldVerify, oldAct
 	})
 
 	// ---------- 服务端：生产同一份 ServerBind + DeviceTable（同 wgcore recover_test 形态） ----------
@@ -130,24 +129,21 @@ func TestServiceSessionRecoverLadder(t *testing.T) {
 	}
 	dir := t.TempDir()
 	logPath := filepath.Join(dir, "svc.log")
-	cfgJSON, err := json.Marshal(tunConfig{
+	cfg := Config{
 		Token:            tokStr,
 		IdentityDir:      filepath.Join(dir, "id"),
 		EndpointCacheDir: filepath.Join(dir, "ep"),
 		Out:              logPath,
-	})
-	if err != nil {
-		t.Fatal(err)
 	}
-	if rc := serviceStartFromJSON(string(cfgJSON)); rc != 0 {
-		t.Fatalf("serviceStartFromJSON rc=%d", rc)
+	if rc := Default().Start(cfg, Options{}); rc != 0 {
+		t.Fatalf("Default().Start rc=%d", rc)
 	}
-	t.Cleanup(func() { serviceStopInternal() })
+	t.Cleanup(func() { Default().Stop() })
 
 	// 等 ready（暖机探测通过即 ready）。
 	deadline := time.Now().Add(15 * time.Second)
 	for {
-		st, _, _ := serviceCur.snapshotState()
+		st, _, _ := Default().current().snapshotState()
 		if st == svcStateReady {
 			break
 		}
@@ -160,10 +156,11 @@ func TestServiceSessionRecoverLadder(t *testing.T) {
 		t.Fatalf("就绪后设备表应 1 条：%d", sbind.Table.Len())
 	}
 
-	currentSess := func() exitSession {
-		serviceCur.mu.Lock()
-		defer serviceCur.mu.Unlock()
-		return serviceCur.sess
+	currentSess := func() ExitSession {
+		cur := Default().current()
+		cur.mu.Lock()
+		defer cur.mu.Unlock()
+		return cur.sess
 	}
 	logHas := func(needle string) bool {
 		b, rerr := os.ReadFile(logPath)
@@ -193,7 +190,7 @@ func TestServiceSessionRecoverLadder(t *testing.T) {
 
 	// ① 健康：探测先行，零档位动作。
 	setBudgets(svcTestBudgets{pre: 3 * time.Second, verify: 10 * time.Second, action: 2 * time.Second})
-	serviceCur.recoverStaleSession(currentSess(), "集成①")
+	Default().current().recoverStaleSession(currentSess(), "集成①")
 	if !logHas("RECOVER 已恢复（R2 换源 起查，原因=集成①，零档位动作") {
 		t.Fatal("①健康路径应零档位动作（探测先行命中）")
 	}
@@ -206,7 +203,7 @@ func TestServiceSessionRecoverLadder(t *testing.T) {
 	// 验证探测给生产宽度：RefreshReg 的 REG 与握手 initiation 在出口侧跨 goroutine
 	// 竞争，首发被丢要等 WG 的 5s 重发（recover.go 生产注释同款考量）。
 	setBudgets(svcTestBudgets{pre: 800 * time.Millisecond, verify: 10 * time.Second, action: 2 * time.Second})
-	serviceCur.recoverStaleSession(currentSess(), "集成②")
+	Default().current().recoverStaleSession(currentSess(), "集成②")
 	if !logHas("RECOVER 恢复于 R2 换源（原因=集成②") {
 		t.Fatal("②设备回收后应由 R2 档恢复（补注册+丢会话+换源）")
 	}
@@ -218,7 +215,7 @@ func TestServiceSessionRecoverLadder(t *testing.T) {
 	// 探测只会超时（收不到任何应答），预算短等超时本身即可，省墙钟。
 	closeSrv()
 	setBudgets(svcTestBudgets{pre: 800 * time.Millisecond, verify: 1500 * time.Millisecond, action: 2 * time.Second})
-	serviceCur.recoverStaleSession(currentSess(), "集成③")
+	Default().current().recoverStaleSession(currentSess(), "集成③")
 	if !logHas("RECOVER 走完 R1→R3 仍未恢复（起跑=R2 换源，原因=集成③") {
 		t.Fatal("③出口死透应走完全档并报 -1")
 	}
@@ -229,12 +226,12 @@ func TestServiceSessionRecoverLadder(t *testing.T) {
 // dial 走 curSession 动态取）；③冷却窗口内不重复拆建；④新会话建立失败按 failed 收工
 // （s.sess 清空、状态机可再次 Start，不闩锁）。
 func TestRebuildSessionSwapsCoolsDownAndFailsClosed(t *testing.T) {
-	restore := withFakeServiceBuild(func(cfg tunConfig, logf Logf) (exitSession, *wtransport.EndpointCache, error) {
+	restore := withFakeServiceBuild(func(cfg Config, logf Logf) (ExitSession, *wtransport.EndpointCache, error) {
 		return newFakeExitSession(), nil, nil
 	})
 	defer restore()
 
-	s := &serviceSession{state: svcStateReady, since: time.Now(), logf: Discard, cfg: tunConfig{}}
+	s := &Session{state: svcStateReady, since: time.Now(), logf: Discard, cfg: Config{}}
 	first := newFakeExitSession()
 	s.sess = first
 
@@ -243,7 +240,7 @@ func TestRebuildSessionSwapsCoolsDownAndFailsClosed(t *testing.T) {
 		t.Fatal("旧会话未被 Close（重建必须全弃握手状态/socket）")
 	}
 	second := s.sess
-	if second == nil || second == exitSession(first) {
+	if second == nil || second == ExitSession(first) {
 		t.Fatalf("未换入新会话（%v）", second)
 	}
 	select {
@@ -263,7 +260,7 @@ func TestRebuildSessionSwapsCoolsDownAndFailsClosed(t *testing.T) {
 	s.rebuildAt = time.Time{} // 解除限频
 	s.mu.Unlock()
 	restore()
-	fail := withFakeServiceBuild(func(cfg tunConfig, logf Logf) (exitSession, *wtransport.EndpointCache, error) {
+	fail := withFakeServiceBuild(func(cfg Config, logf Logf) (ExitSession, *wtransport.EndpointCache, error) {
 		return nil, nil, errFakeNotImpl
 	})
 	defer fail()
@@ -280,12 +277,12 @@ func TestRebuildSessionSwapsCoolsDownAndFailsClosed(t *testing.T) {
 // 巡检触发同权计数后）：①一次耗尽+一次健康 → 归零，不重建；②连续两次耗尽（无论
 // 来自哪个入口——计数点在 run 回调、按轮记）→ 触发整会话重建；③健康拍也归零。
 func TestNoteLadderResultCountsAndRebuilds(t *testing.T) {
-	restore := withFakeServiceBuild(func(cfg tunConfig, logf Logf) (exitSession, *wtransport.EndpointCache, error) {
+	restore := withFakeServiceBuild(func(cfg Config, logf Logf) (ExitSession, *wtransport.EndpointCache, error) {
 		return newFakeExitSession(), nil, nil
 	})
 	defer restore()
 
-	s := &serviceSession{state: svcStateReady, since: time.Now(), logf: Discard, cfg: tunConfig{}}
+	s := &Session{state: svcStateReady, since: time.Now(), logf: Discard, cfg: Config{}}
 	first := newFakeExitSession()
 	s.sess = first
 
@@ -295,14 +292,14 @@ func TestNoteLadderResultCountsAndRebuilds(t *testing.T) {
 	s.markLadderHealthy()
 	s.noteLadderResult(-1)
 	s.maybeRebuildIfExhausted()
-	if s.sess != exitSession(first) {
+	if s.sess != ExitSession(first) {
 		t.Fatal("1 次耗尽（中途归零后）不应触发重建")
 	}
 
 	// 再连续一次耗尽 → 重建换新
 	s.noteLadderResult(-1)
 	s.maybeRebuildIfExhausted()
-	if s.sess == nil || s.sess == exitSession(first) {
+	if s.sess == nil || s.sess == ExitSession(first) {
 		t.Fatal("连续 2 次耗尽应触发整会话重建")
 	}
 	if first.closeAt.IsZero() {
@@ -314,7 +311,7 @@ func TestNoteLadderResultCountsAndRebuilds(t *testing.T) {
 	// 断言恒真，什么都没钉住；变异测试证实旧写法在"每次耗尽都重建"的实现下照样过）
 	s.noteLadderResult(1)
 	second := s.sess
-	if second == nil || second == exitSession(first) {
+	if second == nil || second == ExitSession(first) {
 		t.Fatal("前置校验失败：重建后的会话应在位")
 	}
 	s.noteLadderResult(-1)
@@ -349,7 +346,7 @@ func TestRecoverGateRunsOncePerRound(t *testing.T) {
 	release := make(chan struct{})
 	firstDone := make(chan int, 1)
 	go func() {
-		firstDone <- g.Merge(recoverR2, "first", func(from recoverLevel) int {
+		firstDone <- g.merge(recoverR2, "first", func(from recoverLevel) int {
 			runs.Add(1)
 			close(started)
 			<-release
@@ -359,7 +356,7 @@ func TestRecoverGateRunsOncePerRound(t *testing.T) {
 	<-started
 	lateDone := make(chan int, 1)
 	go func() {
-		lateDone <- g.Merge(recoverR2, "late", func(from recoverLevel) int {
+		lateDone <- g.merge(recoverR2, "late", func(from recoverLevel) int {
 			runs.Add(1)
 			return 99 // 不该被执行：等待者不另起 run
 		})

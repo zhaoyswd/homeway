@@ -6,11 +6,12 @@ package hostsession
 //   - BridgeFactory：回环桥构造接缝。实现（bridgeHost）留守 cshared——桥是手机侧能力
 //     （App 沙箱内的 UDS 桥）；daemon 传 nil = 无桥直通（桌面直拨隧道端口，桥 socket
 //     在桌面根本不出现——「回环桥 socket 路径全会话共享」的并发反例由此消解，D2）。
+//   - Observer：状态迁移观察者（daemon 事件面消费；nil = 不通知，手机包装现状：
+//     状态面走轮询 Snapshot）。
 //   - StrictIdentity：身份降级策略（r1 N2）。daemon = true：SourceEphemeral（身份目录
 //     不可持久化）视为该主机会话 failed（reason=identity_ephemeral，可重试）——杜绝
 //     「每次重启换临时钥匙在出口多占一条设备记录」；手机 = false 保持现状（打警告
 //     继续——手机语义「无论如何先连上」）。
-//   - Observer（状态迁移观察者，daemon 事件面消费）：随 1.3 状态机（Session）一道落。
 
 import (
 	"context"
@@ -35,8 +36,16 @@ type Bridge interface {
 // healingDialCurrent 动态取当前会话，cshared 同款）。
 type BridgeFactory func(cfg Config, logf Logf, dial func(ctx context.Context, port uint16) (net.Conn, error), dialTimeout time.Duration) Bridge
 
-// Options 会话构造注入面（见文件头注释；零值 = 无桥、非严格身份）。
+// Observer 会话生命周期观察者（D1 导出面）。StateChanged 在状态迁移落定后**同步**调用
+// （setState 尾部）；实现方不得在其中调用同一 Session 的变更方法（会重入锁）。
+// nil Observer = 不通知（手机包装现状：状态面走轮询 Snapshot）。
+type Observer interface {
+	StateChanged(s *Session, from, to, reason string)
+}
+
+// Options 会话构造注入面（见文件头注释；零值 = 无桥、无观察者、非严格身份）。
 type Options struct {
+	Observer       Observer
 	BridgeFactory  BridgeFactory
 	StrictIdentity bool
 }

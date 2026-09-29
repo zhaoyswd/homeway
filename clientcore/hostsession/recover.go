@@ -69,10 +69,9 @@ func clampRecoverLevel(from int) recoverLevel {
 // Rebind 只做 `net.ListenUDP + 换 fd`，拿不到 socket 才会失败 ⇒ 少了 PathProbe 就等于把
 // 「本地换了个 socket」谎报成「对端可达」，换网 + 出口不可达会被判成已恢复、界面假已连接
 // 直到巡检 3 连败。阶梯每档动作后必带验证探测，正是这条契约的延续。
-// var 而非 const：进程内集成测试（同包 service_recover_test.go）会把它们缩到毫秒级
+// var 而非 const：进程内集成测试（同包 app_service_recover_test.go）会把它们缩到毫秒级
 // 让用例秒级跑完；生产路径无并发改写。【非串扰共享点 #2（D1 登记）：只读共享、仅同包
-// 测试改写。1.2 过渡期暂导出（Recover*Timeout）供留守 cshared 测试改写，1.3 用例随迁
-// 后收回未导出。】
+// 测试改写。】
 var (
 	recoverPreProbeTimeout = 3 * time.Second
 	recoverVerifyTimeout   = 10 * time.Second
@@ -101,12 +100,6 @@ var (
 	// RecoverLevelName / ClampRecoverLevel 的导出版（probe_lib 的 NAPI 入口壳用）。
 	RecoverLevelName  = recoverLevelName
 	ClampRecoverLevel = clampRecoverLevel
-
-	// 【1.2 过渡】留守 cshared 测试（TestServiceSessionRecoverLadder）改写预算用；
-	// 1.3 用例随迁本包后删除，恢复 var 仅同包可写。
-	RecoverPreProbeTimeout = &recoverPreProbeTimeout
-	RecoverVerifyTimeout   = &recoverVerifyTimeout
-	RecoverActionTimeout   = &recoverActionTimeout
 )
 
 // recoverTransport 阶梯要的传输动作面（*wgcore.Transport 满足；单测注入假实现）。

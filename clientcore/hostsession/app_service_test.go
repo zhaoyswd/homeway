@@ -1,21 +1,25 @@
-//go:build cshared
+//go:build !cshared
 
 // app_service_test.go — 服务会话状态机（openspec app-service-session 任务 2.2）：
 // 起停生命周期、starting 中取消（同钥匙不双发的关键路径）、失败终态与幂等。
-package main
+// （随迁自 cshared package main，host-registry-daemon D8 账本·重接线 10 之一；
+// 接线变化（r3 订正口径——断言集合/语义逐条不变）：入口 serviceStartFromJSON/
+// StatusJSON/StopInternal → 包内 Default() API；bridgeAuth/reason/waitServiceState
+// 改读 StatusSnapshot；桥断言改由注入的假桥工厂供给等价值。）
+package hostsession
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"net"
 	"net/netip"
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
 	"github.com/zhaoyswd/homeway/clientcore/internal/wtransport"
-	"path/filepath"
 )
 
 // fakeExitSession 可编排的假会话：probe 行为可注入，Close 被记录。
@@ -70,75 +74,113 @@ func (f *fakeExitSession) Close() error {
 var errFakeNotImpl = errors.New("fake: not implemented")
 
 // withFakeServiceBuild 注入假 builder（并返回恢复函数）。
-func withFakeServiceBuild(b serviceBuilder) func() {
-	old := serviceBuild
-	serviceBuild = b
-	return func() { serviceBuild = old }
+func withFakeServiceBuild(b sessionBuilder) func() {
+	old := sessionBuild
+	sessionBuild = b
+	return func() { sessionBuild = old }
+}
+
+// fakeBridge 假回环桥（重接线：桥断言改由注入的假桥工厂供给等价值——96 hex 的
+// 鉴权 blob 与三座 sock 路径，形状与真桥一致）。
+type fakeBridge struct {
+	started bool
+	stopped bool
+}
+
+func (b *fakeBridge) Start() { b.started = true }
+func (b *fakeBridge) Stop()  { b.stopped = true }
+func (b *fakeBridge) AuthHex() string {
+	// 16B 魔数 + 32B 令牌 = 48B → 96 hex 字符（真桥同长度）。
+	return fmt.Sprintf("%032x%064x", 1, 2)
+}
+func (b *fakeBridge) SockJSON() (string, string, string) {
+	return "files.sock", "term.sock", "speed.sock"
 }
 
 // resetService 测试收尾：停掉全局实例，回到干净状态。
 func resetService(t *testing.T) {
 	t.Helper()
-	if rc := serviceStopInternal(); rc != 0 {
+	if rc := Default().Stop(); rc != 0 {
 		t.Logf("收尾 stop 返回 %d（重试一次）", rc)
-		_ = serviceStopInternal()
+		_ = Default().Stop()
 	}
-	serviceMu.Lock()
-	serviceCur = nil
-	serviceMu.Unlock()
+	Default().reset()
 }
 
-// waitServiceState 轮询等状态（上限 3s）。
+// waitServiceState 轮询等状态（上限 3s）——改读 StatusSnapshot（r3：断言语义不变）。
 func waitServiceState(t *testing.T, want string) {
 	t.Helper()
 	deadline := time.Now().Add(3 * time.Second)
 	for time.Now().Before(deadline) {
-		var st struct {
-			State string `json:"state"`
-		}
-		if err := json.Unmarshal([]byte(serviceStatusJSON()), &st); err == nil && st.State == want {
+		if Default().Snapshot().State == want {
 			return
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
-	t.Fatalf("3s 内未到状态 %q（当前 %s）", want, serviceStatusJSON())
+	t.Fatalf("3s 内未到状态 %q（当前 %s）", want, Default().Snapshot().State)
 }
 
-func serviceTestConfig(t *testing.T) string {
+func serviceTestConfig(t *testing.T) Config {
 	t.Helper()
 	// identityDir：桥目录由其父目录推得（app-bridge-uds）——测试给短目录，
-	// 避免 macOS 临时路径叠测试名顶过 sun_path 上限（见 app_bridge_test.go 注）。
-	return fmt.Sprintf(`{"token":"hmw1-test","out":"","identityDir":%q}`, filepath.Join(shortBridgeDir(t), "identity"))
+	// 避免 macOS 临时路径叠测试名顶过 sun_path 上限（源定义留守 cshared
+	// app_bridge_test.go；本包测试保留同款副本，r4 口径）。
+	return Config{Token: "hmw1-test", IdentityDir: filepath.Join(shortBridgeDir(t), "identity")}
+}
+
+// shortBridgeDir 每用例独立的桥目录：名字刻意短——macOS 的 t.TempDir() 路径带着
+// 长测试名，叠上 /bridge/xxx.sock 后会顶过 sun_path 的 104 字节上限（bind 报
+// invalid argument），2026-09-22 踩过。源定义留守 cshared（桥 11 例仍用），
+// 本包测试保留同款副本（r4：源定义留守 + hostsession 测试包同款副本）。
+func shortBridgeDir(t *testing.T) string {
+	t.Helper()
+	d, err := os.MkdirTemp("", "br")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(d) })
+	return d
 }
 
 // 起停生命周期：start → ready（bridgeAuth 可见）→ stop → idle，会话被关。
 func TestServiceLifecycle(t *testing.T) {
-	restore := withFakeServiceBuild(func(cfg tunConfig, logf Logf) (exitSession, *wtransport.EndpointCache, error) {
+	fb := &fakeBridge{}
+	restore := withFakeServiceBuild(func(cfg Config, logf Logf) (ExitSession, *wtransport.EndpointCache, error) {
 		return newFakeExitSession(), nil, nil
 	})
 	defer restore()
 	defer resetService(t)
 
-	if rc := serviceStartFromJSON(serviceTestConfig(t)); rc != 0 {
+	if rc := Default().Start(serviceTestConfig(t), Options{BridgeFactory: func(cfg Config, logf Logf, dial func(ctx context.Context, port uint16) (net.Conn, error), dialTimeout time.Duration) Bridge {
+		return fb
+	}}); rc != 0 {
 		t.Fatalf("start rc=%d", rc)
 	}
 	waitServiceState(t, svcStateReady)
+	if !fb.started {
+		t.Fatal("假桥未被 Start（工厂注入未生效）")
+	}
 
-	// 状态面：bridgeAuth 存在且 96 hex 字符；identity/link 缺省（假会话不是 newSession）。
-	var st struct {
-		BridgeAuth string `json:"bridgeAuth"`
-	}
-	if err := json.Unmarshal([]byte(serviceStatusJSON()), &st); err != nil {
-		t.Fatalf("status JSON 解析失败：%v", err)
-	}
+	// 状态面（改读 StatusSnapshot，r3）：bridgeAuth 存在且 96 hex 字符；
+	// identity/link 缺省（假会话不是 newSession）。
+	st := Default().Snapshot()
 	if len(st.BridgeAuth) != 96 {
 		t.Fatalf("bridgeAuth 长度 %d ≠ 96", len(st.BridgeAuth))
 	}
+	if st.BridgeFilesSock == "" || st.BridgeTermSock == "" || st.BridgeSpeedSock == "" {
+		t.Fatalf("三座桥 sock 缺省：%+v", st)
+	}
+	if st.Link != nil || st.Identity != nil || st.Stats != nil {
+		t.Fatalf("假会话不应有 link/identity/stats：%+v", st)
+	}
 
-	if rc := serviceStopInternal(); rc != 0 {
+	if rc := Default().Stop(); rc != 0 {
 		t.Fatalf("stop rc=%d", rc)
 	}
 	waitServiceState(t, svcStateIdle)
+	if !fb.stopped {
+		t.Fatal("收工后假桥未被 Stop")
+	}
 }
 
 // starting 中 stop：探测挂起直到取消；stop 快速收工、会话被关（同钥匙不双发的关键路径）。
@@ -148,17 +190,17 @@ func TestServiceStopDuringStarting(t *testing.T) {
 		<-ctx.Done() // 挂起等取消（模拟探测在途收到停止请求）
 		return ctx.Err()
 	}
-	restore := withFakeServiceBuild(func(cfg tunConfig, logf Logf) (exitSession, *wtransport.EndpointCache, error) {
+	restore := withFakeServiceBuild(func(cfg Config, logf Logf) (ExitSession, *wtransport.EndpointCache, error) {
 		return fake, nil, nil
 	})
 	defer restore()
 	defer resetService(t)
 
-	if rc := serviceStartFromJSON(serviceTestConfig(t)); rc != 0 {
+	if rc := Default().Start(serviceTestConfig(t), Options{}); rc != 0 {
 		t.Fatalf("start rc=%d", rc)
 	}
 	begin := time.Now()
-	if rc := serviceStopInternal(); rc != 0 {
+	if rc := Default().Stop(); rc != 0 {
 		t.Fatalf("stop rc=%d", rc)
 	}
 	if d := time.Since(begin); d > serviceStopWait {
@@ -174,24 +216,20 @@ func TestServiceStopDuringStarting(t *testing.T) {
 
 // 构造失败：state=failed、reason 非空、可被 stop 归位。
 func TestServiceBuildFailure(t *testing.T) {
-	restore := withFakeServiceBuild(func(cfg tunConfig, logf Logf) (exitSession, *wtransport.EndpointCache, error) {
+	restore := withFakeServiceBuild(func(cfg Config, logf Logf) (ExitSession, *wtransport.EndpointCache, error) {
 		return nil, nil, errFakeNotImpl
 	})
 	defer restore()
 	defer resetService(t)
 
-	if rc := serviceStartFromJSON(serviceTestConfig(t)); rc != 0 {
+	if rc := Default().Start(serviceTestConfig(t), Options{}); rc != 0 {
 		t.Fatalf("start rc=%d", rc)
 	}
 	waitServiceState(t, svcStateFailed)
-	var st struct {
-		Reason string `json:"reason"`
-	}
-	_ = json.Unmarshal([]byte(serviceStatusJSON()), &st)
-	if st.Reason == "" {
+	if st := Default().Snapshot(); st.Reason == "" {
 		t.Fatal("failed 态缺 reason")
 	}
-	if rc := serviceStopInternal(); rc != 0 {
+	if rc := Default().Stop(); rc != 0 {
 		t.Fatalf("stop rc=%d", rc)
 	}
 	// failed 实例 stop 后仍是 failed（保留归因）；再次 start 可替换重试（见下一测试）。
@@ -200,7 +238,7 @@ func TestServiceBuildFailure(t *testing.T) {
 // failed 后重试成功（Start 可替换失败实例）。
 func TestServiceRetryAfterFailure(t *testing.T) {
 	fail := true
-	restore := withFakeServiceBuild(func(cfg tunConfig, logf Logf) (exitSession, *wtransport.EndpointCache, error) {
+	restore := withFakeServiceBuild(func(cfg Config, logf Logf) (ExitSession, *wtransport.EndpointCache, error) {
 		if fail {
 			fail = false
 			return nil, nil, errFakeNotImpl
@@ -210,13 +248,13 @@ func TestServiceRetryAfterFailure(t *testing.T) {
 	defer restore()
 	defer resetService(t)
 
-	if rc := serviceStartFromJSON(serviceTestConfig(t)); rc != 0 {
+	if rc := Default().Start(serviceTestConfig(t), Options{}); rc != 0 {
 		t.Fatalf("start rc=%d", rc)
 	}
 	waitServiceState(t, svcStateFailed)
-	_ = serviceStopInternal()
+	_ = Default().Stop()
 	time.Sleep(50 * time.Millisecond) // 等 done 关闭（failed 后 goroutine 即将退出）
-	if rc := serviceStartFromJSON(serviceTestConfig(t)); rc != 0 {
+	if rc := Default().Start(serviceTestConfig(t), Options{}); rc != 0 {
 		t.Fatalf("重试 start rc=%d", rc)
 	}
 	waitServiceState(t, svcStateReady)
@@ -224,17 +262,17 @@ func TestServiceRetryAfterFailure(t *testing.T) {
 
 // 幂等：ready 下重复 start 返回 0 且不换实例。
 func TestServiceStartIdempotent(t *testing.T) {
-	restore := withFakeServiceBuild(func(cfg tunConfig, logf Logf) (exitSession, *wtransport.EndpointCache, error) {
+	restore := withFakeServiceBuild(func(cfg Config, logf Logf) (ExitSession, *wtransport.EndpointCache, error) {
 		return newFakeExitSession(), nil, nil
 	})
 	defer restore()
 	defer resetService(t)
 
-	if rc := serviceStartFromJSON(serviceTestConfig(t)); rc != 0 {
+	if rc := Default().Start(serviceTestConfig(t), Options{}); rc != 0 {
 		t.Fatalf("start rc=%d", rc)
 	}
 	waitServiceState(t, svcStateReady)
-	if rc := serviceStartFromJSON(serviceTestConfig(t)); rc != 0 {
+	if rc := Default().Start(serviceTestConfig(t), Options{}); rc != 0 {
 		t.Fatalf("重复 start rc=%d（应幂等 0）", rc)
 	}
 	waitServiceState(t, svcStateReady)
@@ -253,7 +291,7 @@ func TestServiceFinishSavesCache(t *testing.T) {
 	ap := netip.MustParseAddrPort("127.0.0.1:41641")
 	cache.Observe(ap, wtransport.SourceHint, time.Now())
 
-	s := &serviceSession{
+	s := &Session{
 		state:  svcStateReady,
 		since:  time.Now(),
 		stopCh: make(chan struct{}),
