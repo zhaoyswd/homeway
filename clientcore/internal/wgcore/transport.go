@@ -422,7 +422,9 @@ func (t *Transport) Probe(ctx context.Context, target netip.AddrPort) (time.Dura
 }
 
 // probePad：旁路探测的请求填充长度——要拿到端点列表就得 pad 到期望最大应答长度
-// （基础应答 ~47B + 满配列表 1+8×18=145B；200 留裕量）。
+// （基础应答 ~47B + 满配列表 1+8×18=145B；200 留裕量）。与 pkg/probe.ReachPad
+// （reach.go，add-host 连通性探测编排）**登记同源**：同值两处、注释互指、改必同改
+// ——这里是巡检旁路探测的独立调用点，不为合并而合并（host-cli 1.1）。
 const probePad = 200
 
 // ProbeCandidates：**旁路观测**（endpoint-freshness）：对候选全集（仅直连条目——探测中继

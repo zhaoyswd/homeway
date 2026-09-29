@@ -69,9 +69,9 @@ type Response struct {
 	Type      byte
 	Nonce     [8]byte
 	Build     string
-	Flags     byte              // 出口能力位（type=ping；老出口不回这一段 ⇒ 0）
-	Seen      netip.AddrPort    // type=hint：后端看到的客户端源地址
-	Endpoints []netip.AddrPort  // type=ping：出口端点列表段（老出口无此段 ⇒ nil）
+	Flags     byte             // 出口能力位（type=ping；老出口不回这一段 ⇒ 0）
+	Seen      netip.AddrPort   // type=hint：后端看到的客户端源地址
+	Endpoints []netip.AddrPort // type=ping：出口端点列表段（老出口无此段 ⇒ nil）
 }
 
 // EncodeRequest 组请求（pad 为填充长度，建议 16 ⇒ 总长 40B）。

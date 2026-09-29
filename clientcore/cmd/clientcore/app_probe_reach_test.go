@@ -1,13 +1,17 @@
 //go:build cshared
 
-// app_probe_reach_test.go — 连通性探测导出的纯 Go 主体（add-host-connectivity 任务 2.1）：
-// 活/死端点分桶、relay 标记、预算封顶（全死端点在预算内返回空结果）。
+// app_probe_reach_test.go — 连通性探测导出的呈现层判据（add-host-connectivity 任务
+// 2.1 起；host-cli 1.1 提取共享后）：活/死端点分桶、relay 标记、预算封顶（全死端点
+// 在预算内返回空结果）+ 提取前后**规范化解对拍**（键集合/字段顺序/非时序值逐字节；
+// results 按 ep 规范排序、rtt_ms 固定桩、空 results 必须 `[]`——口径 host-cli
+// design D2/r1 M2；编排本体单测在 pkg/probe/reach_test.go 无 tag 面）。
 package main
 
 import (
 	"encoding/json"
+	"fmt"
 	"net"
-	"net/netip"
+	"strings"
 	"testing"
 	"time"
 
@@ -136,8 +140,8 @@ func TestProbeReachAllDeadWithinBudget(t *testing.T) {
 	if !out.OK || len(out.Results) != 0 {
 		t.Fatalf("全死端点应返回空结果：%s", raw)
 	}
-	// 预算封顶：总耗时不显著超过 reachBudget（ICMP 快退只会更早）。
-	if elapsed > reachBudget+500*time.Millisecond {
+	// 预算封顶：总耗时不显著超过探测预算（ICMP 快退只会更早）。
+	if elapsed > probe.ReachProbeBudget+500*time.Millisecond {
 		t.Fatalf("超预算：%v", elapsed)
 	}
 }
@@ -153,23 +157,84 @@ func TestProbeReachBadToken(t *testing.T) {
 	}
 }
 
-// dedupAddrPorts / resolveReachTarget 的纯函数面。
-func TestResolveReachTargetAndDedup(t *testing.T) {
-	if got := resolveReachTarget("1.2.3.4:41641"); len(got) != 1 || got[0] != netip.MustParseAddrPort("1.2.3.4:41641") {
-		t.Fatalf("IP 直解不符：%v", got)
+// canonReachJSON 规范化解（对拍口径 host-cli design D2）：map 键序（encoding/json
+// 字母序）承载键集合与字段顺序；rtt_ms 固定桩 0；results 按 (ep, relay) 排序——
+// 同地址可同时有直连与中继两条结论（relay 决胜；完成序本就随 goroutine 不定）。
+func canonReachJSON(t *testing.T, raw string) string {
+	t.Helper()
+	var m map[string]any
+	if err := json.Unmarshal([]byte(raw), &m); err != nil {
+		t.Fatalf("非合法 JSON：%v（%s）", err, raw)
 	}
-	if got := resolveReachTarget("1.2.3.4:0"); got != nil {
-		t.Fatalf("零端口应拒绝：%v", got)
+	if rs, ok := m["results"].([]any); ok {
+		for _, r := range rs {
+			if rm, ok := r.(map[string]any); ok {
+				rm["rtt_ms"] = float64(0)
+			}
+		}
+		key := func(r any) string {
+			rm, _ := r.(map[string]any)
+			rel := false
+			if v, ok := rm["relay"].(bool); ok {
+				rel = v
+			}
+			return fmt.Sprint(rm["ep"]) + "|" + fmt.Sprint(rel)
+		}
+		for i := 1; i < len(rs); i++ {
+			for j := i; j > 0; j-- {
+				if key(rs[j-1]) > key(rs[j]) {
+					rs[j-1], rs[j] = rs[j], rs[j-1]
+				} else {
+					break
+				}
+			}
+		}
 	}
-	if got := resolveReachTarget("no-host-port"); got != nil {
-		t.Fatalf("坏格式应拒绝：%v", got)
+	out, _ := json.Marshal(m)
+	return string(out)
+}
+
+// TestProbeReachCanonicalGolden 提取前后规范化解对拍（host-cli 1.1 验证列）：
+// 基线 = 提取前实采（在线出口/离线端点/非法 token 三态，2026-09-29 在 3a 收官态
+// homeway 6620815 上以同一 canonicalizer 采得）；端口号是活端点的监听口（每跑不同），
+// 对拍前先回填占位。
+func TestProbeReachCanonicalGolden(t *testing.T) {
+	alive := startFakeProber(t, "cap-exit-v1")
+	dead := deadPort(t)
+
+	aliveEp := alive.pc.LocalAddr().String()
+	deadEp := dead
+
+	tokAlive := makeReachToken(t,
+		proto.Endpoint{Addr: aliveEp},
+		proto.Endpoint{Addr: deadEp},
+		proto.Endpoint{Addr: aliveEp, Relay: true},
+	)
+	tokDead := makeReachToken(t,
+		proto.Endpoint{Addr: deadEp},
+		proto.Endpoint{Addr: "203.0.113.7:41641", Relay: true},
+	)
+
+	cases := []struct {
+		name string
+		raw  string
+		want string
+	}{
+		{"在线出口", canonReachJSON(t, probeReachJSON(tokAlive)),
+			`{"endpoints":["<alive>","<dead>","relay:<alive>"],"ok":true,"peer":"000000000000","results":[{"build":"cap-exit-v1","ep":"<alive>","relay":false,"rtt_ms":0},{"build":"cap-exit-v1","ep":"<alive>","relay":true,"rtt_ms":0}]}`},
+		{"离线端点", canonReachJSON(t, probeReachJSON(tokDead)),
+			`{"endpoints":["<dead>","relay:203.0.113.7:41641"],"ok":true,"peer":"000000000000","results":[]}`},
+		{"非法 token", canonReachJSON(t, probeReachJSON("hmw1-not-a-token")),
+			`{"error":"homeway/token: 校验失败（串被截断或损坏）"}`},
 	}
-	in := []netip.AddrPort{
-		netip.MustParseAddrPort("1.1.1.1:1"),
-		netip.MustParseAddrPort("1.1.1.1:1"),
-		netip.MustParseAddrPort("2.2.2.2:2"),
-	}
-	if got := dedupAddrPorts(in); len(got) != 2 {
-		t.Fatalf("去重不符：%v", got)
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			want := c.want
+			want = strings.ReplaceAll(want, "<alive>", aliveEp)
+			want = strings.ReplaceAll(want, "<dead>", deadEp)
+			if c.raw != want {
+				t.Fatalf("规范化解不符：\n got=%s\nwant=%s", c.raw, want)
+			}
+		})
 	}
 }
