@@ -209,6 +209,12 @@ func (h *fakeTermHost) serve(c net.Conn) {
 			if h.noread {
 				// 不再读上行：socket 缓冲 + 服务端 upC 灌满 → 服务端按背压收流
 				//（finish(gone)）；挂到 conn 被关（defer 收尾）。
+				// 接收缓冲钉小（同 internal/control 的 TestStreamSendErrorsAfterEnd）：
+				// linux TCP loopback 自调发送缓冲可整段吞掉 2MiB 测试预算（CI ubuntu
+				// 两轮实拍：128 帧发完仍无 gone）——接收窗口钉住后背压确定触发。
+				if tc, ok := c.(*net.TCPConn); ok {
+					_ = tc.SetReadBuffer(16 << 10)
+				}
 				block := make(chan struct{})
 				<-block
 			}
@@ -661,12 +667,14 @@ func TestRemoteAttachEarlyExitOnDeadStream(t *testing.T) {
 		t.Fatalf("ATTACHED：op=0x%02x err=%v", op, err)
 	}
 
-	// 灌 1MiB（connSendData 同款分片语义：16KiB/帧）。socket 缓冲会先吸收一段，
-	// 预算内持续连发直到 Write 报错（流已被背压收流）。
+	// 持续连发直到 Write 报错（流已被背压收流）。socket 缓冲会先吸收一段，吸收量是
+	// **内核相关的**（同 internal/control 的 TestStreamSendErrorsAfterEnd）：darwin loopback
+	// ~700KB；linux TCP 发送缓冲自调到 tcp_wmem[2]=4MB 才封顶（CI ubuntu 两轮实拍：2MiB
+	// 预算整段被吞、零背压）。预算 768 帧（12MiB）> 全链吸收上限，保证溢出；节拍 2ms。
 	chunk := make([]byte, 16<<10)
 	sent, failed := 0, 0
 	deadline := time.After(15 * time.Second)
-	for i := 0; i < 128 && failed == 0; i++ { // 2MiB 上限：> upC 8×16KiB + 双侧 socket
+	for i := 0; i < 768 && failed == 0; i++ { // 12MiB 上限：> sndbuf 4MB + upC 8×16KiB + 双侧 socket
 		if _, err := conn.Write(chunk); err != nil {
 			failed = i + 1
 			if !strings.Contains(err.Error(), "流已终结") {
@@ -677,9 +685,9 @@ func TestRemoteAttachEarlyExitOnDeadStream(t *testing.T) {
 		sent += len(chunk)
 		select {
 		case <-deadline:
-			t.Fatalf("流未收尾（128 帧内无 gone）：%d 帧已发", i)
+			t.Fatalf("流未收尾（768 帧内无 gone）：%d 帧已发", i)
 		default:
-			time.Sleep(30 * time.Millisecond) // 给服务端 upC 满 → finish(gone) 的窗口
+			time.Sleep(2 * time.Millisecond) // 给服务端 upC 满 → finish(gone) 的窗口
 		}
 	}
 	if failed == 0 {

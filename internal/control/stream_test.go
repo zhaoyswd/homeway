@@ -688,6 +688,12 @@ func TestStreamSendErrorsAfterEnd(t *testing.T) {
 		if err != nil {
 			return
 		}
+		// 接收缓冲钉小：linux TCP loopback 的自调发送缓冲可把整段测试预算（96 帧 1.5MiB）
+		// 吞进内核（CI ubuntu 两轮实拍：upC 永不満、无 gone、预算发完仍零背压）——接收窗口
+		// 钉住后发送侧几帧内即阻塞，upC 必满，背压确定触发（darwin 缓冲小，不钉也触发）。
+		if tc, ok := bc.(*net.TCPConn); ok {
+			_ = tc.SetReadBuffer(16 << 10)
+		}
 		backendConn <- bc
 	}()
 	c, _ := dialTest(t, ts)
@@ -695,10 +701,14 @@ func TestStreamSendErrorsAfterEnd(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// 背靠背连发直到背压收流：upC（8 槽）之外 socket 缓冲也会先吸收一段（loopback
-	// 实测 ~700KB——host-cli exec-r2 ① 同发现），预算 96 帧（1.5MiB）保证溢出。
+	// 背靠背连发直到背压收流：upC（8 槽）之外 socket 缓冲也会先吸收一段——吸收量是
+	// **内核相关的**：darwin loopback 实测 ~700KB（host-cli exec-r2 ① 同发现）；linux TCP
+	// 发送缓冲自调到 tcp_wmem[2]（CI ubuntu/docker 均 4MB）才封顶（接收侧钉小 rcvbuf 也
+	// 拦不住——unsent 数据照进 sndbuf，CI ubuntu 两轮实拍：1.5MiB 预算整段被吞、零背压）。
+	// 预算 768 帧（12MiB）> 全链吸收上限（sndbuf 4MB + 客户端 UDS ~208KB + upC 128KB +
+	// 接收窗口），保证溢出；节拍 2ms（只给服务端 fill upC → finish(gone) 的窗口）。
 t2:
-	for i := 0; i < 96; i++ {
+	for i := 0; i < 768; i++ {
 		if err := st.Send(make([]byte, streamChunkSize)); err != nil {
 			// 流已终结但 End() 通道尚未被本测试消费——Send 的终结检查（markEnded
 			// 先于 end 投递）即背压收流的**第一可见信号**，正是 2.2 的红面行为。
@@ -714,7 +724,7 @@ t2:
 			}
 			break t2
 		default:
-			time.Sleep(20 * time.Millisecond)
+			time.Sleep(2 * time.Millisecond)
 		}
 	}
 	// end(gone) 必达（若上面经 Send 报错退出，这里非阻塞补收）。
