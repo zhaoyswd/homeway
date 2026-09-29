@@ -23,7 +23,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
-	"net"
+	"io"
 	"os"
 	"os/signal"
 	"os/user"
@@ -43,18 +43,26 @@ type termiosT = unix.Termios
 // attachOpts 是 attach / new（接入形态）的参数。
 type attachOpts struct {
 	name      string // 目标会话（"" = attach 取最近活跃 / new 自动命名）
-	stateDir  string
+	stateDir  string // 空 = 构造目标时按模式补默认
 	create    bool   // new：创建并接入（HELLO bit0）
 	reuse     bool   // -A：已存在则复用（HELLO 不置 bit1 / CREATE 置 bit0 reuse-if-exists）
 	takeover  bool   // -d：显式接管（HELLO bit2；其它腿收 ENDED(replaced)）
 	autoNamed bool   // new 省略名字：host-<4hex> + already_exists 重试
 	detachKey string // --detach-key 原始参数（^x / 单字符 / none）
+	hostRef   string // --host：远程模式（term-remote 1.2）
+	timeout   time.Duration
+	remote    RemoteTerm // CLI 入口注入
+}
+
+// target 构造本命令的拨号目标（newTermTarget 的缺省决策）。
+func (o attachOpts) target() *termTarget {
+	return newTermTarget(o.remote, o.stateDir, o.hostRef, o.timeout)
 }
 
 // parseAttachArgs 解析 attach 参数（--flag value 与 --flag=value 两种形态都支持，
 // CLI() 入口已用 expandFlagEq 归一）。
 func parseAttachArgs(args []string) (attachOpts, error) {
-	o := attachOpts{stateDir: DefaultStateDir()}
+	o := attachOpts{}
 	for i := 0; i < len(args); i++ {
 		a := args[i]
 		switch {
@@ -64,6 +72,14 @@ func parseAttachArgs(args []string) (attachOpts, error) {
 			if err := applyCommon(&o.stateDir, args, &i); err != nil {
 				return o, err
 			}
+		case a == "--host":
+			if err := applyHostRef(&o.hostRef, args, &i); err != nil {
+				return o, err
+			}
+		case a == "--timeout":
+			if err := applyTimeout(&o.timeout, args, &i); err != nil {
+				return o, err
+			}
 		case a == "--detach-key":
 			v, err := nextArg(args, &i, "--detach-key")
 			if err != nil {
@@ -71,7 +87,7 @@ func parseAttachArgs(args []string) (attachOpts, error) {
 			}
 			o.detachKey = v
 		case strings.HasPrefix(a, "-"):
-			return o, fmt.Errorf("不认识的参数 %q（可用：-d、--detach-key <K>、--state <dir>）", a)
+			return o, fmt.Errorf("不认识的参数 %q（可用：-d、--detach-key <K>、--state <dir>、--host <name|id>、--timeout <时长>）", a)
 		default:
 			if o.name != "" {
 				return o, fmt.Errorf("只能给一个会话名（已有 %q）", o.name)
@@ -104,9 +120,11 @@ func cliAttachCmd(o attachOpts) error {
 	if err != nil {
 		return fmt.Errorf("读终端属性失败：%w", err)
 	}
+	// 拨号目标一次构造（远程解析结果在 LIST（省略名字）与接入/自动命名重试间复用）。
+	t := o.target()
 	if name == "" && !o.autoNamed {
-		// attach 省略名字 = 最近活跃（D7）。
-		n, perr := cliPickRecentSession(o.stateDir)
+		// attach 省略名字 = 最近活跃（D7；远程走同一拨号缝的远程 LIST，D4）。
+		n, perr := cliPickRecentSession(t)
 		if perr != nil {
 			return perr
 		}
@@ -120,7 +138,7 @@ func cliAttachCmd(o attachOpts) error {
 	if o.autoNamed {
 		for i := 0; i < 8; i++ {
 			n := genAutoName()
-			conn, attached, aerr := cliAttachDial(o, tty, n)
+			conn, attached, aerr := cliAttachDial(t, o, tty, n)
 			if aerr != nil {
 				if isProtoCode(aerr, "already_exists") {
 					continue
@@ -131,18 +149,19 @@ func cliAttachCmd(o attachOpts) error {
 		}
 		return errors.New("自动命名连续重名 8 次（运气太差）；请显式给名字：homeway term new <名字>")
 	}
-	conn, attached, aerr := cliAttachDial(o, tty, name)
+	conn, attached, aerr := cliAttachDial(t, o, tty, name)
 	if aerr != nil {
 		return aerr
 	}
 	return cliAttachRun(conn, tty, in, out, attached, name, o)
 }
 
-// cliAttachDial：连 term.sock → GREETING → HELLO（capsRawTerminal + 实例标识尾随）→ 首帧。
+// cliAttachDial：经拨号缝接入（本地面 term.sock / 远端注入缝）→ GREETING → HELLO
+// （capsRawTerminal + 实例标识尾随——远程面复用同一编码路径，kind=host）→ 首帧。
 //
 // HELLO 尾随**必须先 caps 后 ID、带 ID 必带 caps**（design D8 编码侧约束，encHelloTail 保证）。
-func cliAttachDial(o attachOpts, tty *cliTTY, name string) (net.Conn, []byte, error) {
-	conn, err := cliDialTerm(o.stateDir)
+func cliAttachDial(t *termTarget, o attachOpts, tty *cliTTY, name string) (io.ReadWriteCloser, []byte, error) {
+	conn, err := cliDialTerm(t)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -181,7 +200,8 @@ func cliAttachDial(o attachOpts, tty *cliTTY, name string) (net.Conn, []byte, er
 }
 
 // cliAttachRun：raw 模式 + 双向透传 + 分离键 + 尺寸同步 + 收尾（任务 7.2–7.6 的主体）。
-func cliAttachRun(conn net.Conn, tty *cliTTY, in, out *os.File, attached []byte, name string, o attachOpts) error {
+// conn = 本地 UDS 或远程适配器（RemoteEndError 三态归因，term-remote 1.3/D5）。
+func cliAttachRun(conn io.ReadWriteCloser, tty *cliTTY, in, out *os.File, attached []byte, name string, o attachOpts) error {
 	prefix, keyEnabled, kerr := detachKeySpec(o.detachKey)
 	if kerr != nil {
 		_ = conn.Close()
@@ -303,8 +323,11 @@ func cliAttachRun(conn net.Conn, tty *cliTTY, in, out *os.File, attached []byte,
 			if n > 0 {
 				pass, action := dm.feed(buf[:n])
 				if len(pass) > 0 {
+					// 流死早退（term-remote 1.3/D3）：远程腿经 L4 上行显式化——流终结
+					//（end 已收/连接断）后 Send 逐帧报错，connSendData 首个失败帧即返回，
+					// 余下分片不再推进死流（粘贴 1MiB 中途流死不静默丢整段）。
 					if werr := connSendData(conn, pass); werr != nil {
-						finish() // 写失败：主循环读端也会失败并给断链文案
+						finish() // 写失败：主循环读端也会失败并给（三态）文案
 						return
 					}
 				}
@@ -323,7 +346,11 @@ func cliAttachRun(conn net.Conn, tty *cliTTY, in, out *os.File, attached []byte,
 		}
 	}()
 
-	// 主读循环：DATA → stdout；STATE → 标题；ENDED → 文案后正常退出；裸 EOF → 断链文案。
+	// 主读循环：DATA → stdout；STATE → 标题；ENDED → 文案后正常退出；裸 EOF → 断链文案
+	//（远程 = RemoteEndError 三态归因：gone/closed/连接级断开，design D5——不复用本地面
+	//「断链」单一文案；term 层 ENDED 与流终结两层叠加时以先到的 term ENDED 解释；
+	// 干净退出（分离/信号）优先于流终结归因——分离键正是靠「先关流」收尾的，读失败
+	// 的第一归因必须是 detachCh）。
 	for {
 		f, rerr := readTermFrame(conn)
 		if rerr != nil {
@@ -334,6 +361,10 @@ func cliAttachRun(conn net.Conn, tty *cliTTY, in, out *os.File, attached []byte,
 				}
 				return nil
 			default:
+			}
+			var re *RemoteEndError
+			if errors.As(rerr, &re) {
+				return errors.New(remoteEndMessage(name, re.Reason))
 			}
 			return fmt.Errorf("与出口的连接被断开（%v）；会话仍在运行，可用 homeway term attach %s 重新接入", rerr, name)
 		}
@@ -364,8 +395,9 @@ func cliAttachRun(conn net.Conn, tty *cliTTY, in, out *os.File, attached []byte,
 	}
 }
 
-// connSendData 把终端输入按 ≤16KiB 分片发 DATA（与 App 侧契约一致）。
-func connSendData(conn net.Conn, p []byte) error {
+// connSendData 把终端输入按 ≤16KiB 分片发 DATA（与 App 侧契约一致）；远程腿的分片
+// 经 ClientStream.Send 逐帧查流终结——死流在首个失败帧返回，余量不推进（1.3 早退）。
+func connSendData(conn io.ReadWriteCloser, p []byte) error {
 	for len(p) > 0 {
 		n := len(p)
 		if n > termDataChunk {

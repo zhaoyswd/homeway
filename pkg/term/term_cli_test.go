@@ -383,7 +383,7 @@ func TestCLIListAgainstService(t *testing.T) {
 	c, _, _, _ := attachTerm(t, ln, "cli-l1", true, 100, 30)
 	defer c.Close()
 
-	entries, raw, err := cliListFetch(dir)
+	entries, raw, err := cliListFetch(&termTarget{stateDir: dir})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -407,13 +407,13 @@ func TestCLIDeleteAgainstService(t *testing.T) {
 	c, _, _, _ := attachTerm(t, ln, "cli-del", true, 80, 24)
 	defer c.Close()
 
-	if err := cliDelete([]string{"cli-del", "--state", dir}); err != nil {
+	if err := cliDelete([]string{"cli-del", "--state", dir}, nil); err != nil {
 		t.Fatalf("delete：%v", err)
 	}
 	if _, ok := listSession(listTerm(t, ln), "cli-del"); ok {
 		t.Fatal("delete 后会话应消失")
 	}
-	err := cliDelete([]string{"cli-del", "--state", dir})
+	err := cliDelete([]string{"cli-del", "--state", dir}, nil)
 	if err == nil || !strings.Contains(err.Error(), "homeway term list") {
 		t.Fatalf("delete 不存在的会话应报可行动错误：%v", err)
 	}
@@ -422,7 +422,7 @@ func TestCLIDeleteAgainstService(t *testing.T) {
 func TestCLINewDetachedAgainstService(t *testing.T) {
 	_, ln, dir := startTestTermUDS(t)
 
-	if err := cliNew([]string{"-d", "ci1", "--state", dir}); err != nil {
+	if err := cliNew([]string{"-d", "ci1", "--state", dir}, nil); err != nil {
 		t.Fatalf("new -d：%v", err)
 	}
 	sess, ok := listSession(listTerm(t, ln), "ci1")
@@ -436,16 +436,16 @@ func TestCLINewDetachedAgainstService(t *testing.T) {
 		t.Error("new -d ⇒ 默认尺寸 80x24")
 	}
 	// 重名（未给 -A）报错。
-	err := cliNew([]string{"-d", "ci1", "--state", dir})
+	err := cliNew([]string{"-d", "ci1", "--state", dir}, nil)
 	if !isProtoCode(err, "already_exists") {
 		t.Fatalf("new -d 重名应报 already_exists：%v", err)
 	}
 	// -A -d 复用成功。
-	if err := cliNew([]string{"-d", "-A", "ci1", "--state", dir}); err != nil {
+	if err := cliNew([]string{"-d", "-A", "ci1", "--state", dir}, nil); err != nil {
 		t.Fatalf("new -A -d：%v", err)
 	}
 	// 自动命名。
-	if err := cliNew([]string{"-d", "--state", dir}); err != nil {
+	if err := cliNew([]string{"-d", "--state", dir}, nil); err != nil {
 		t.Fatalf("new -d 自动命名：%v", err)
 	}
 	rx := regexp.MustCompile(`^host-[0-9a-f]{4}$`)
@@ -465,7 +465,7 @@ func TestCLINewDetachedAgainstService(t *testing.T) {
 
 func TestCLIInvalidNameNoDial(t *testing.T) {
 	// 非法名：就地报错（不发起连接——state 目录根本不存在也不会碰到 socket 层错误）。
-	err := cliDelete([]string{"bad name!", "--state", "/nonexistent-xyz"})
+	err := cliDelete([]string{"bad name!", "--state", "/nonexistent-xyz"}, nil)
 	if err == nil || !strings.Contains(err.Error(), "不合法") {
 		t.Fatalf("非法名应就地报错：%v", err)
 	}
@@ -477,7 +477,7 @@ func TestCLIInvalidNameNoDial(t *testing.T) {
 
 func TestCLIDialErrAgainstEmptyDir(t *testing.T) {
 	dir := t.TempDir() // 没有 term.sock
-	err := cliList([]string{"--state", dir})
+	err := cliList([]string{"--state", dir}, nil)
 	if err == nil || !strings.Contains(err.Error(), "出口未在运行") {
 		t.Fatalf("空目录应报 ENOENT 合并文案：%v", err)
 	}
@@ -515,7 +515,7 @@ func TestCLIListDeleteDefaultState(t *testing.T) {
 		t.Fatal(err)
 	}
 	os.Stdout = w
-	listErr := cliList(nil)
+	listErr := cliList(nil, nil)
 	w.Close()
 	os.Stdout = old
 	_, _ = io.Copy(&buf, r)
@@ -529,12 +529,12 @@ func TestCLIListDeleteDefaultState(t *testing.T) {
 	// 裸 delete（无 --state）：同样走默认 state（用第二会话验证真删）。注册表摘除与
 	// KILL 的 OK 回复存在毫秒级竞态（TestCLIDeleteAgainstService 偶发顺序差），短轮询等它。
 	_, _, _, _ = attachTerm(t, ln, "cli-dflt2", true, 100, 30)
-	if err := cliDelete([]string{"cli-dflt2"}); err != nil {
+	if err := cliDelete([]string{"cli-dflt2"}, nil); err != nil {
 		t.Fatalf("裸 delete 应走默认 state：%v", err)
 	}
 	deadline := time.Now().Add(2 * time.Second)
 	for {
-		entries, _, err := cliListFetch(dir)
+		entries, _, err := cliListFetch(&termTarget{stateDir: dir})
 		if err != nil {
 			t.Fatal(err)
 		}

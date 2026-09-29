@@ -1,28 +1,32 @@
 //go:build !windows
 
 // term_cli.go — `homeway term` 主机命令面（term-host-cli 任务 7.1）+ `homeway term explain`
-// （任务 4.8，规则判定的**完整依据链**）。
+// （任务 4.8，规则判定的**完整依据链**）+ `--host` 远程模式（term-remote §1）。
 //
-// 命令面（与 App 同一份会话注册表，经 `<state>/term.sock` 本地直连、不经隧道）：
+// 命令面（与 App 同一份会话注册表；本地面经 `<state>/term.sock` 本地直连、不经隧道；
+// `--host` 模式经注入缝（RemoteTerm）走 daemon 控制面 → 隧道 → 对端 term 服务）：
 //
-//	homeway term list [--json] [--state <dir>]
-//	homeway term new [name] [-d] [-A] [--state <dir>]      # 默认创建并接入；-d 只创建不接入
-//	homeway term attach [name] [-d] [--detach-key K] …      # raw 终端客户端（term_cli_attach.go）
-//	homeway term delete <name> [--state <dir>]
-//	homeway term explain --file <屏幕文本> --agent <label>   # 离线：调规则
-//	homeway term explain <会话名>                            # 在线：取运行中会话的实时快照
+//	homeway term list [--json] [--host <ref>] [--state <dir>] [--timeout <T>]
+//	homeway term new [name] [-d] [-A] [--host <ref>] …      # 默认创建并接入；-d 只创建不接入
+//	homeway term attach [name] [-d] [--detach-key K] …       # raw 终端客户端（term_cli_attach.go）
+//	homeway term delete <name> [--host <ref>] …
+//	homeway term explain --file <屏幕文本> --agent <label>   # 离线：调规则（本地面，不接受 --host）
+//	homeway term explain <会话名> [--host <ref>] …            # 在线：取运行中会话的实时快照
 //
 // explain 离线模式是规则迭代的主路径：把误判的屏幕存成文件 → explain 看命中规则与评估轨迹 → 改 TOML →
 // 复验（改的是**本地覆盖** `<state>/agent-detection/<id>.toml`，不动移植文件）。
 // 在线模式经 EXPLAIN 帧（诊断用 op 0x16——避开 surface 占用的 0x0D–0x15；出口不在跑时报可行动的错）。
 //
-// 错误面（design D1/D7）：连接层两态合并提示（ENOENT = 出口未运行或 HOMEWAY_TERM=off；
-// ECONNREFUSED = 残留 socket）；协议层错误码翻可行动中文。**面向同代出口**（破坏性授权
+// 错误面（design D1/D7 + term-remote D4/D5 三层）：连接层两态合并提示（ENOENT = 出口未运行或
+// HOMEWAY_TERM=off；ECONNREFUSED = 残留 socket）；协议层错误码翻可行动中文。远程模式另有两层：
+// 控制面连接层与 stream.open 错误码（internal/daemon/term_remote.go 翻文案）、流终结三态归因
+// （RemoteEndError → remoteEndMessage）。**面向同代出口**（破坏性授权
 // 2026-09-27），不做旧出口检测/告警/降级。
 package term
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -33,6 +37,7 @@ import (
 	"path/filepath"
 	"strings"
 	"syscall"
+	"time"
 
 	"github.com/zhaoyswd/homeway/pkg/term/manifest"
 )
@@ -45,8 +50,8 @@ func DefaultStateDir() string {
 	return ""
 }
 
-// CLI 是 `homeway term` 的入口。
-func CLI(args []string) error {
+// CLI 是 `homeway term` 的入口（remote = `--host` 模式的注入缝；nil = 仅本地面）。
+func CLI(args []string, remote RemoteTerm) error {
 	if len(args) == 0 || args[0] == "--help" || args[0] == "-h" || args[0] == "help" {
 		termUsage(os.Stdout)
 		return nil
@@ -57,18 +62,19 @@ func CLI(args []string) error {
 	var err error
 	switch sub {
 	case "explain":
-		err = cliExplain(rest)
+		err = cliExplain(rest, remote)
 	case "list":
-		err = cliList(rest)
+		err = cliList(rest, remote)
 	case "new":
-		err = cliNew(rest)
+		err = cliNew(rest, remote)
 	case "attach":
 		var o attachOpts
 		if o, err = parseAttachArgs(rest); err == nil {
+			o.remote = remote
 			err = cliAttachCmd(o)
 		}
 	case "delete":
-		err = cliDelete(rest)
+		err = cliDelete(rest, remote)
 	default:
 		return fmt.Errorf("不认识的子命令 %q（可用：list、new、attach、delete、explain）", sub)
 	}
@@ -90,12 +96,59 @@ func expandFlagEq(args []string) []string {
 	return out
 }
 
-// ---- 通用参数与连接层（任务 7.1）----
+// ---- 通用参数与连接层（任务 7.1；--host/--timeout = term-remote 1.2）----
 
-// termCommon 是各子命令的公共参数（--state）。
+// termCommon 是各子命令的公共参数（--state/--host/--timeout）。
+//
+// --host 非空 = 远程模式：--state 的指代切换为 daemon state 目录（control.sock
+// 所在；空串 = 实现侧默认 ~/.config/homeway/daemon）——同一 flag 重载、非互斥
+// 报错（r1 P2-5）；--timeout = 「控制面连接 + stream.open」总预算（默认 10s；
+// attach 流本身不设 deadline——两口径分开，r1 P2-9）。
 type termCommon struct {
 	stateDir string
+	hostRef  string
+	timeout  time.Duration
 }
+
+// target 构造拨号目标（见 newTermTarget 的缺省决策）。
+func (c termCommon) target(remote RemoteTerm) *termTarget {
+	return newTermTarget(remote, c.stateDir, c.hostRef, c.timeout)
+}
+
+// defaultRemoteTimeout --host 模式「控制面连接 + stream.open」总预算（--timeout
+// 缺省；参照 host add 的 10s 预算口径——host list/status/delete 为 5s，取宽者
+// 覆盖「连接 + 打开」组合，r2 低④）。
+const defaultRemoteTimeout = 10 * time.Second
+
+// termTarget 拨号目标：本地面（remote == nil 或 hostRef == ""，连
+// <stateDir>/term.sock）或远端（--host，经注入缝走 daemon 控制面 → 隧道 → 对端
+// term 服务）。hostID 缓存首次解析结果——attach 省略名字（LIST）+ 接入（HELLO）
+// 与自动命名重试不重复解析。
+type termTarget struct {
+	stateDir string        // 本地 = 出口 state；远程 = daemon state（空串 = 实现侧默认）
+	remote   RemoteTerm    // nil = 本地面
+	hostRef  string        // --host 原始 ref
+	hostID   string        // 远程已解析 hex（拨号复用）
+	timeout  time.Duration // 远程总预算（连接 + stream.open）
+}
+
+// newTermTarget 按参数构造目标：远程模式 timeout 缺省补 defaultRemoteTimeout、
+// stateDir 留空交给实现侧默认（用户显式给 --state 才透传）；本地面 stateDir 缺省
+// 补 DefaultStateDir()（现状语义）。
+func newTermTarget(remote RemoteTerm, stateDir, hostRef string, timeout time.Duration) *termTarget {
+	t := &termTarget{stateDir: stateDir, remote: remote, hostRef: hostRef, timeout: timeout}
+	if hostRef != "" {
+		if t.timeout <= 0 {
+			t.timeout = defaultRemoteTimeout
+		}
+	} else if t.stateDir == "" {
+		t.stateDir = DefaultStateDir()
+	}
+	return t
+}
+
+// remoteMode 远程模式判定（--host 给了且注入缝在）。
+func (t *termTarget) remoteMode() bool { return t.remote != nil && t.hostRef != "" }
 
 // nextArg 取第 i+1 个参数（flag 的值）；缺失报可行动错误。
 func nextArg(args []string, i *int, flag string) (string, error) {
@@ -113,6 +166,33 @@ func applyCommon(stateDir *string, args []string, i *int) error {
 		return err
 	}
 	*stateDir = v
+	return nil
+}
+
+// applyHostRef 解析 `--host <ref>`（空值就地报错——空串走不到远程解析层）。
+func applyHostRef(dst *string, args []string, i *int) error {
+	v, err := nextArg(args, i, "--host")
+	if err != nil {
+		return err
+	}
+	if strings.TrimSpace(v) == "" {
+		return errors.New("--host 需要主机名或 ID（homeway host list 查看在表主机）")
+	}
+	*dst = v
+	return nil
+}
+
+// applyTimeout 解析 `--timeout <时长>`（如 10s、1500ms；仅远程模式使用）。
+func applyTimeout(dst *time.Duration, args []string, i *int) error {
+	v, err := nextArg(args, i, "--timeout")
+	if err != nil {
+		return err
+	}
+	d, perr := time.ParseDuration(v)
+	if perr != nil || d <= 0 {
+		return fmt.Errorf("--timeout %q 不是合法时长（如 10s、1500ms）", v)
+	}
+	*dst = d
 	return nil
 }
 
@@ -152,15 +232,44 @@ func dialErrText(sock string, err error) error {
 	return fmt.Errorf("连不上 term 服务（%s）：%w", sock, err)
 }
 
-// cliDialTerm 连 <state>/term.sock 并读 GREETING（list/new/delete/attach 共用）。
-func cliDialTerm(stateDir string) (net.Conn, error) {
-	if stateDir == "" {
-		return nil, errors.New("拿不到 state 目录（用 --state 指定）")
-	}
-	sock := filepath.Join(stateDir, "term.sock")
-	conn, err := net.Dial("unix", sock)
-	if err != nil {
-		return nil, dialErrText(sock, err)
+// cliDialTerm 按目标拨号并读 GREETING——list/new/delete/attach/explain 共用的
+// 唯一拨号缝（1.1 收敛面：本地面连 <state>/term.sock；远端经注入缝 Resolve →
+// DialTerm，term 帧协议端到端原样承载）。explainSession 原自带的独立拨号点
+// （net.Dial 直连）已随动并入（r2 低⑥）。
+func cliDialTerm(t *termTarget) (io.ReadWriteCloser, error) {
+	var conn io.ReadWriteCloser
+	if t.remoteMode() {
+		// 远程：解析（幂等缓存）→ 拨号；预算覆盖「控制面连接 + stream.open」。
+		if t.hostID == "" {
+			rctx, rcancel := context.WithTimeout(context.Background(), t.timeout)
+			id, _, rerr := t.remote.ResolveHostRef(rctx, t.stateDir, t.hostRef)
+			rcancel()
+			if rerr != nil {
+				return nil, rerr
+			}
+			t.hostID = id
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), t.timeout)
+		defer cancel()
+		var err error
+		conn, err = t.remote.DialTerm(ctx, t.stateDir, t.hostID)
+		if err != nil {
+			return nil, err
+		}
+	} else {
+		if t.hostRef != "" {
+			// 防御：CLI 入口恒注入（cmd/homeway 接线）；只跑本地面的调用方给了 --host。
+			return nil, errors.New("--host 需要远程接入缝（本构建未注入）；本地面请去掉 --host")
+		}
+		if t.stateDir == "" {
+			return nil, errors.New("拿不到 state 目录（用 --state 指定）")
+		}
+		sock := filepath.Join(t.stateDir, "term.sock")
+		var err error
+		conn, err = net.Dial("unix", sock)
+		if err != nil {
+			return nil, dialErrText(sock, err)
+		}
 	}
 	f, err := readTermFrame(conn)
 	if err != nil {
@@ -175,7 +284,7 @@ func cliDialTerm(stateDir string) (net.Conn, error) {
 }
 
 // cliRoundTrip 一锤子命令：发一帧、读应答；ERROR 帧翻成 protoError。
-func cliRoundTrip(conn net.Conn, op byte, payload []byte) (termFrame, error) {
+func cliRoundTrip(conn io.ReadWriteCloser, op byte, payload []byte) (termFrame, error) {
 	if _, err := conn.Write(encodeTermFrame(op, payload)); err != nil {
 		return termFrame{}, fmt.Errorf("发 op 0x%02x 帧：%w", op, err)
 	}
@@ -225,7 +334,7 @@ type cliSessionInfo struct {
 	Clients      []cliClientInfo `json:"clients"`
 }
 
-func cliList(args []string) error {
+func cliList(args []string, remote RemoteTerm) error {
 	var c termCommon
 	jsonOut := false
 	for i := 0; i < len(args); i++ {
@@ -237,26 +346,32 @@ func cliList(args []string) error {
 			if err := applyCommon(&c.stateDir, args, &i); err != nil {
 				return err
 			}
+		case a == "--host":
+			if err := applyHostRef(&c.hostRef, args, &i); err != nil {
+				return err
+			}
+		case a == "--timeout":
+			if err := applyTimeout(&c.timeout, args, &i); err != nil {
+				return err
+			}
 		case strings.HasPrefix(a, "-"):
-			return fmt.Errorf("不认识的参数 %q（可用：--json、--state <dir>）", a)
+			return fmt.Errorf("不认识的参数 %q（可用：--json、--state <dir>、--host <name|id>、--timeout <时长>）", a)
 		default:
 			return fmt.Errorf("list 不接受会话名（%q）；省略名字接入最近活跃会话请用 attach", a)
 		}
 	}
-	// 缺省补默认（与 new/attach/explain 同一约定：--state 沿用 ~/.config/homeway）。
-	if c.stateDir == "" {
-		c.stateDir = DefaultStateDir()
-	}
-	entries, raw, err := cliListFetch(c.stateDir)
+	// 缺省补默认（newTermTarget 内：本地面 --state 沿用 ~/.config/homeway；远程
+	// --state 留空 = daemon 侧默认 ~/.config/homeway/daemon）。
+	entries, raw, err := cliListFetch(c.target(remote))
 	if err != nil {
 		return err
 	}
 	return cliListPrint(os.Stdout, entries, raw, jsonOut)
 }
 
-// cliListFetch 经 UDS 取 LIST（表格与「attach 省略名字」的最近活跃解析共用）。
-func cliListFetch(stateDir string) ([]cliSessionInfo, []byte, error) {
-	conn, err := cliDialTerm(stateDir)
+// cliListFetch 经拨号缝取 LIST（表格与「attach 省略名字」的最近活跃解析共用）。
+func cliListFetch(t *termTarget) ([]cliSessionInfo, []byte, error) {
+	conn, err := cliDialTerm(t)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -328,17 +443,19 @@ func cliListPrint(w io.Writer, entries []cliSessionInfo, rawJSON []byte, asJSON 
 
 // ---- new / delete ----
 
-// newOpts：`new [name] [-d] [-A]`。
+// newOpts：`new [name] [-d] [-A]`（--host/--timeout 远程模式）。
 type newOpts struct {
 	name      string
-	detached  bool // -d：只创建不接入（CREATE op，不动 PTY 尺寸、不产生腿）
-	reuse     bool // -A：已存在则复用（不报 already_exists）
-	stateDir  string
-	autoNamed bool // 省略名字：host-<4hex> + 重名重试
+	detached  bool          // -d：只创建不接入（CREATE op，不动 PTY 尺寸、不产生腿）
+	reuse     bool          // -A：已存在则复用（不报 already_exists）
+	stateDir  string        // 空 = 构造目标时按模式补默认
+	hostRef   string        // --host
+	timeout   time.Duration // --timeout
+	autoNamed bool          // 省略名字：host-<4hex> + 重名重试
 }
 
 func parseNewArgs(args []string) (newOpts, error) {
-	o := newOpts{stateDir: DefaultStateDir()}
+	o := newOpts{}
 	for i := 0; i < len(args); i++ {
 		a := args[i]
 		switch {
@@ -350,8 +467,16 @@ func parseNewArgs(args []string) (newOpts, error) {
 			if err := applyCommon(&o.stateDir, args, &i); err != nil {
 				return o, err
 			}
+		case a == "--host":
+			if err := applyHostRef(&o.hostRef, args, &i); err != nil {
+				return o, err
+			}
+		case a == "--timeout":
+			if err := applyTimeout(&o.timeout, args, &i); err != nil {
+				return o, err
+			}
 		case strings.HasPrefix(a, "-"):
-			return o, fmt.Errorf("不认识的参数 %q（可用：-d、-A、--state <dir>）", a)
+			return o, fmt.Errorf("不认识的参数 %q（可用：-d、-A、--state <dir>、--host <name|id>、--timeout <时长>）", a)
 		default:
 			if o.name != "" {
 				return o, fmt.Errorf("只能给一个会话名（已有 %q）", o.name)
@@ -367,34 +492,36 @@ func parseNewArgs(args []string) (newOpts, error) {
 	return o, nil
 }
 
-func cliNew(args []string) error {
+func cliNew(args []string, remote RemoteTerm) error {
 	o, err := parseNewArgs(args)
 	if err != nil {
 		return err
 	}
 	if o.detached {
-		return cliNewDetached(o)
+		return cliNewDetached(o, remote)
 	}
 	// 默认：创建并接入（tmux 式 new-session）。
 	return cliAttachCmd(attachOpts{
 		name: o.name, stateDir: o.stateDir,
 		create: true, reuse: o.reuse, autoNamed: o.autoNamed,
+		hostRef: o.hostRef, timeout: o.timeout, remote: remote,
 	})
 }
 
 // cliNewDetached：`new -d`（CREATE op 创建不接入；任务 6.2 的客户端半边）。
-func cliNewDetached(o newOpts) error {
+func cliNewDetached(o newOpts, remote RemoteTerm) error {
 	// CREATE bit0 = reuse-if-exists（置位=存在则静默复用；与 HELLO bit1 的「置位=报
 	// already_exists」极性相反，见 frames.go 的 createFlagReuseIfExists——exec-r3 中2）。
 	flags := byte(0)
 	if o.reuse {
 		flags |= createFlagReuseIfExists
 	}
+	t := newTermTarget(remote, o.stateDir, o.hostRef, o.timeout)
 	if o.autoNamed {
 		// 自动命名不置 reuse-if-exists（置位会静默复用既有会话）：靠 already_exists 重试。
 		for i := 0; i < 8; i++ {
 			name := genAutoName()
-			if err := cliCreateOnce(o.stateDir, name, flags); err != nil {
+			if err := cliCreateOnce(t, name, flags); err != nil {
 				if isProtoCode(err, "already_exists") {
 					continue
 				}
@@ -405,15 +532,15 @@ func cliNewDetached(o newOpts) error {
 		}
 		return errors.New("自动命名连续重名 8 次（运气太差）；请显式给名字：homeway term new <名字> -d")
 	}
-	if err := cliCreateOnce(o.stateDir, o.name, flags); err != nil {
+	if err := cliCreateOnce(t, o.name, flags); err != nil {
 		return err
 	}
 	fmt.Printf("已创建会话 %s（不接入）\n", o.name)
 	return nil
 }
 
-func cliCreateOnce(stateDir, name string, flags byte) error {
-	conn, err := cliDialTerm(stateDir)
+func cliCreateOnce(t *termTarget, name string, flags byte) error {
+	conn, err := cliDialTerm(t)
 	if err != nil {
 		return err
 	}
@@ -429,7 +556,7 @@ func cliCreateOnce(stateDir, name string, flags byte) error {
 }
 
 // cliDelete：复用既有 KILL 帧（与 App 关闭会话同一路径；wire op 名不改，D1）。
-func cliDelete(args []string) error {
+func cliDelete(args []string, remote RemoteTerm) error {
 	var c termCommon
 	name := ""
 	for i := 0; i < len(args); i++ {
@@ -439,8 +566,16 @@ func cliDelete(args []string) error {
 			if err := applyCommon(&c.stateDir, args, &i); err != nil {
 				return err
 			}
+		case a == "--host":
+			if err := applyHostRef(&c.hostRef, args, &i); err != nil {
+				return err
+			}
+		case a == "--timeout":
+			if err := applyTimeout(&c.timeout, args, &i); err != nil {
+				return err
+			}
 		case strings.HasPrefix(a, "-"):
-			return fmt.Errorf("不认识的参数 %q（可用：--state <dir>）", a)
+			return fmt.Errorf("不认识的参数 %q（可用：--state <dir>、--host <name|id>、--timeout <时长>）", a)
 		default:
 			if name != "" {
 				return fmt.Errorf("只能给一个会话名（已有 %q）", name)
@@ -448,17 +583,13 @@ func cliDelete(args []string) error {
 			name = a
 		}
 	}
-	// 缺省补默认（同 list：--state 沿用 ~/.config/homeway）。
-	if c.stateDir == "" {
-		c.stateDir = DefaultStateDir()
-	}
 	if name == "" {
 		return errors.New("delete 需要会话名：homeway term delete <name>")
 	}
 	if err := validateName(name); err != nil {
 		return err
 	}
-	conn, err := cliDialTerm(c.stateDir)
+	conn, err := cliDialTerm(c.target(remote))
 	if err != nil {
 		return err
 	}
@@ -474,9 +605,10 @@ func cliDelete(args []string) error {
 	return nil
 }
 
-// cliPickRecentSession 取最近活跃的会话名（attach 省略名字的语义，D7）。
-func cliPickRecentSession(stateDir string) (string, error) {
-	entries, _, err := cliListFetch(stateDir)
+// cliPickRecentSession 取最近活跃的会话名（attach 省略名字的语义，D7——远程模式
+// 走同一拨号缝的远程 LIST，D4）。
+func cliPickRecentSession(t *termTarget) (string, error) {
+	entries, _, err := cliListFetch(t)
 	if err != nil {
 		return "", err
 	}
@@ -492,17 +624,21 @@ func cliPickRecentSession(stateDir string) (string, error) {
 	return best.Name, nil
 }
 
-// cliExplain 是原 explain 子命令入口（parseExplainArgs 及以下不变）。
-func cliExplain(args []string) error {
+// cliExplain 是 explain 子命令入口（--host = 在线模式远程化，r1 P1-6；--file 是
+// 本地面、不接受 --host——组合就地报可行动错误）。
+func cliExplain(args []string, remote RemoteTerm) error {
 	opt, err := parseExplainArgs(args)
 	if err != nil {
 		return err
+	}
+	if opt.file != "" && opt.hostRef != "" {
+		return errors.New("--file 是本地面（规则判定在本地 manifest），不接受 --host；对远程主机的会话取实时判定：homeway term explain <会话名> --host <name|id>")
 	}
 	var out explainOutput
 	if opt.file != "" {
 		out, err = explainFile(opt)
 	} else if opt.session != "" {
-		out, err = explainSession(opt)
+		out, err = explainSession(opt, remote)
 	} else {
 		return errors.New("需要 --file <屏幕文本> 或 <会话名>（见 homeway term --help）")
 	}
@@ -516,12 +652,14 @@ type explainOpts struct {
 	file     string
 	agent    string
 	session  string
-	stateDir string
+	stateDir string // --file 模式的 manifest 覆盖目录（本地语义恒定；空 = 构造时补默认）
 	json     bool
+	hostRef  string        // 在线模式 --host（远程）
+	timeout  time.Duration // 远程总预算
 }
 
 func parseExplainArgs(args []string) (explainOpts, error) {
-	o := explainOpts{stateDir: DefaultStateDir()}
+	o := explainOpts{}
 	for i := 0; i < len(args); i++ {
 		a := args[i]
 		next := func() (string, error) {
@@ -539,6 +677,14 @@ func parseExplainArgs(args []string) (explainOpts, error) {
 			o.agent, err = next()
 		case a == "--state":
 			o.stateDir, err = next()
+		case a == "--host":
+			if err = applyHostRef(&o.hostRef, args, &i); err != nil {
+				return o, err
+			}
+		case a == "--timeout":
+			if err = applyTimeout(&o.timeout, args, &i); err != nil {
+				return o, err
+			}
 		case a == "--json":
 			o.json = true
 		case strings.HasPrefix(a, "-"):
@@ -594,13 +740,18 @@ type evaluatedRuleOut struct {
 	RegionBytes int    `json:"regionBytes"`
 }
 
-// explainFile 离线模式：对一段保存的屏幕文本跑分类。
+// explainFile 离线模式：对一段保存的屏幕文本跑分类（本地面：--state 恒指出口
+// state 的 manifest 覆盖目录，缺省补默认——与 --host 模式的指代切换无关）。
 func explainFile(o explainOpts) (explainOutput, error) {
 	data, err := os.ReadFile(o.file)
 	if err != nil {
 		return explainOutput{}, fmt.Errorf("读屏幕文件：%w", err)
 	}
-	l := loaderFor(o.stateDir)
+	stateDir := o.stateDir
+	if stateDir == "" {
+		stateDir = DefaultStateDir()
+	}
+	l := loaderFor(stateDir)
 	if _, ok := l.ForProcess(o.agent); !ok {
 		if _, ok := l.ForID(o.agent); !ok {
 			return explainOutput{}, fmt.Errorf("认不出 agent %q（可用：%s）", o.agent, strings.Join(l.IDs(), " "))
@@ -609,21 +760,16 @@ func explainFile(o explainOpts) (explainOutput, error) {
 	return runExplain(l, o.agent, string(data), ""), nil
 }
 
-// explainSession 在线模式：经 term.sock 问出口要一份实时判定。
-func explainSession(o explainOpts) (explainOutput, error) {
-	if o.stateDir == "" {
-		return explainOutput{}, errors.New("拿不到 state 目录（用 --state 指定）")
-	}
-	sock := filepath.Join(o.stateDir, "term.sock")
-	conn, err := net.Dial("unix", sock)
+// explainSession 在线模式：经统一拨号缝问出口（本地）或目标主机（--host）要一份
+// 实时判定——EXPLAIN 一锤子往返零 wire 改动（1.4：原自带 net.Dial 的独立拨号点
+// 已并入 cliDialTerm，r2 低⑥）。
+func explainSession(o explainOpts, remote RemoteTerm) (explainOutput, error) {
+	t := newTermTarget(remote, o.stateDir, o.hostRef, o.timeout)
+	conn, err := cliDialTerm(t)
 	if err != nil {
-		return explainOutput{}, fmt.Errorf("连不上出口的 term 服务（%s）：%w\n"+
-			"出口没在跑、或 HOMEWAY_TERM=off 时会这样；离线调规则用 --file 模式", sock, err)
+		return explainOutput{}, err
 	}
 	defer conn.Close()
-	if _, err := readTermFrame(conn); err != nil { // GREETING
-		return explainOutput{}, fmt.Errorf("读 GREETING：%w", err)
-	}
 	if _, err := conn.Write(encodeTermFrame(opExplain, encName(o.session))); err != nil {
 		return explainOutput{}, fmt.Errorf("发 EXPLAIN：%w", err)
 	}
@@ -746,20 +892,31 @@ func termUsage(w io.Writer) {
 	fmt.Fprint(w, `homeway term —— 终端服务的主机命令面（与 App 同一份会话注册表）
 
 用法：
-  homeway term list [--json] [--state <dir>]
+  homeway term list [--json] [--host <name|id>] [--state <dir>] [--timeout <T>]
         列会话（--json 输出与出口 LIST JSON 同构，可作脚本契约）
-  homeway term new [name] [-d] [-A] [--state <dir>]
+  homeway term new [name] [-d] [-A] [--host <name|id>] [--state <dir>] [--timeout <T>]
         新建并接入；-d 只创建不接入（默认尺寸、不占终端）；-A 已存在则复用接入；
         省略名字自动命名 host-<4hex>（与 App 的命名可区分，重名自动重试）
-  homeway term attach [name] [-d] [--detach-key <K>] [--state <dir>]
+  homeway term attach [name] [-d] [--detach-key <K>] [--host <name|id>] [--state <dir>] [--timeout <T>]
         接入会话（raw 字节模式，本地终端自己渲染）；省略名字 = 最近活跃的会话；
         -d 显式接管（踢掉该会话的其它客户端）
-  homeway term delete <name> [--state <dir>]
+  homeway term delete <name> [--host <name|id>] [--state <dir>] [--timeout <T>]
         结束会话（与 App 关闭会话同一路径）
   homeway term explain --file <屏幕文本> --agent <label> [--state <dir>] [--json]
-        离线对一段保存的屏幕跑规则判定（调规则的主路径）
-  homeway term explain <会话名> [--state <dir>] [--json]
-        对运行中的会话取实时快照判定
+        离线对一段保存的屏幕跑规则判定（调规则的主路径；本地面，不接受 --host）
+  homeway term explain <会话名> [--host <name|id>] [--state <dir>] [--timeout <T>] [--json]
+        对运行中的会话取实时快照判定（--host = 对远程主机会话跑 EXPLAIN 往返）
+
+远程模式（--host，经 daemon 控制面转发；term 帧协议经隧道端到端原样复用）：
+  --host <name|id>   目标主机（与 host delete/status 同规则：名称精确 / peerID 全长
+                     hex / 无歧义短前缀；homeway host list 查看在表主机）
+  ⚠ --host 模式下 --state 指守护进程 state 目录（control.sock 所在，默认
+     ~/.config/homeway/daemon）——与本地面（出口 state，默认 ~/.config/homeway）
+     指代不同；--timeout 为「控制面连接 + 打开」总预算（默认 10s，如 10s/1500ms），
+     attach 流本身不设 deadline（长连接语义）。daemon 未运行时先启动：homeway daemon
+  远程 attach 的流终结归因：gone = 主机不可达或上行过快（会话仍在目标主机运行，可
+     重新 attach）；closed = 对端关闭（也可能是本端长时间停止读取、出口侧慢腿自治
+     收尾）；连接级断开 = 与守护进程的连接断了，重新执行命令即可。
 
 attach 中的分离与重对齐（前缀键默认 Ctrl-b，tmux 同款）：
   Ctrl-b d          分离（会话继续在出口运行）

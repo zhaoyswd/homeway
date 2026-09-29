@@ -6,8 +6,9 @@ package term
 
 import "errors"
 
-// CLI windows 桩。
-func CLI(args []string) error {
+// CLI windows 桩（remote 参数仅为签名对齐——本平台不提供终端子命令）。
+func CLI(args []string, remote RemoteTerm) error {
 	_ = args
+	_ = remote
 	return errors.New("term: windows 不提供终端子命令")
 }

@@ -25,6 +25,15 @@ func (e CodeError) Error() string { return string(e) }
 // ErrConnClosed 客户端连接已断（等待响应期间对端关闭/告别）。
 var ErrConnClosed = errors.New("控制面连接已关闭")
 
+// ErrStreamEnded 流已终结（stream.end 已收 / 连接已断）后 Send 的错误
+// （term-remote 2.2 上行显式化：不再静默成功把数据写进死流；errors.Is 可判，
+// 原因见包装文案——closed/gone/连接断三态）。
+var ErrStreamEnded = errors.New("流已终结")
+
+// endReasonConn 连接级断开的终结原因（区别于 stream.end 的 closed/gone——
+// endReason 值只进本地错误文案，不上 wire）。
+const endReasonConn = "conn"
+
 // Client 控制面客户端（一连接一客户端）。
 type Client struct {
 	nc      net.Conn
@@ -56,6 +65,46 @@ type ClientStream struct {
 	ID   uint32
 	recv chan []byte
 	end  chan string
+
+	// 终结状态（2.2）：收到 stream.end（closed|gone）或连接级断开（conn）置位，
+	// 此后 Send 恒报 ErrStreamEnded。end 通道语义不变（只对流级 end 触发——
+	// 连接级断开与流级 end 三者可区分的既有契约）。
+	mu        sync.RWMutex
+	ended     bool
+	endReason string
+}
+
+// markEnded 流终结状态化（幂等，首个原因生效）。
+func (s *ClientStream) markEnded(reason string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.ended {
+		return
+	}
+	s.ended = true
+	s.endReason = reason
+}
+
+// EndedErr 流已终结时的错误（含原因文案）；nil = 流还活着。Send 的前置检查。
+func (s *ClientStream) EndedErr() error {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if !s.ended {
+		return nil
+	}
+	return fmt.Errorf("%w（%s）", ErrStreamEnded, endReasonText(s.endReason))
+}
+
+func endReasonText(r string) string {
+	switch r {
+	case StreamEndClosed:
+		return "对端已关闭（stream.end=closed）"
+	case StreamEndGone:
+		return "主机不可达或上行过快（stream.end=gone）"
+	case endReasonConn:
+		return "控制面连接已断开"
+	}
+	return r
 }
 
 // Dial 连接 control.sock 并完成握手；返回客户端与 welcome（服务端版本/代际/序号）。
@@ -223,13 +272,18 @@ func mustMarshal(v any) []byte {
 // 服务端下行 backendPump 读块同款常量）自动分片——单帧 body 超 256KiB-4 会被
 // 服务端按帧长上限拒（bad_frame 断连），大块上行必须分片（host-cli 3b，exec-r2 ①）。
 // 流 = 字节流语义，不承诺帧边界（对端按序重组即可）。
-// 注记（exec-r1 第 8/9 条）：分片无流控——真服务器上行队列仅 8 槽、超突发仍会被
-// 背压收流（finish(gone)，design D7 已注记）；流控/按窗口发送归 4a（大块上行消费
-// 者期，届时以真实消费者定型）。空载荷显式不发（旧实现恒发一帧含空载荷——行为
-// 差异如实登记；字节流语义下无实害、当前无 in-repo 消费者）。
+// L4 上行显式化（term-remote 2.2）：Send 先查终结状态——stream.end 已收或连接已断
+// 即报 ErrStreamEnded（含原因），不再静默成功把数据写进死流（现状 = 数据丢失无从
+// 感知）。分片循环逐帧经 EndedErr 复查，流中途死即停发（粘贴突发不推进死流）。
+// 注记：分片无流控（真流控 = 4a 的 credit 设计——无 wire 反馈信号，任何客户端侧
+// 窗口都只是猜测）；超突发仍会被服务端按背压收流（finish(gone)，design D7）。
+// 空载荷显式不发（字节流语义下无实害；历史口径见 host-cli 3b 注记）。
 func (s *ClientStream) Send(b []byte) error {
 	if len(b) == 0 {
 		return nil
+	}
+	if err := s.EndedErr(); err != nil {
+		return err
 	}
 	for off := 0; off < len(b); off += streamChunkSize {
 		end := off + streamChunkSize
@@ -237,6 +291,9 @@ func (s *ClientStream) Send(b []byte) error {
 			end = len(b)
 		}
 		if err := s.c.writeFrame(EncodeFrame(OpStreamData, EncodeStreamBody(s.ID, b[off:end]))); err != nil {
+			return err
+		}
+		if err := s.EndedErr(); err != nil {
 			return err
 		}
 	}
@@ -263,8 +320,10 @@ func (c *Client) Close() {
 	})
 }
 
-// reader 客户端读循环（分发 rsp/evt/流帧/生命周期帧）。
+// reader 客户端读循环（分发 rsp/evt/流帧/生命周期帧）。退出（IO 错误/EOF/goodbye/
+// reload）= 连接级断开：在册流全部终结状态化（见 readerDone）。
 func (c *Client) reader() {
+	defer c.readerDone()
 	for {
 		head, err := ReadHeader(c.nc) // 按 op 选上限（流 DATA 256KiB / 控制类 1MiB）
 		if err != nil {
@@ -352,15 +411,31 @@ func (c *Client) reader() {
 				continue
 			}
 			if st, ok := c.streams.Load(id); ok {
+				// L4 下行背压显式化（term-remote 2.1）：满槽时阻塞投递而非 default 丢弃
+				//——丢帧对 term 是无从感知的静默画面损坏（协议无重传/校验），阻塞是唯一
+				// 不丢的选项。背压沿链传导（本条链路的设计意图）：本端停读 → 这里阻塞 →
+				// 服务端 conn.writer 阻在 dataC（16 条）→ backendPump 停读后端 → 隧道 TCP
+				// 背压 → 出口侧 raw 腿跳环/追赶截断策略收尾（term-host-cli D5「慢腿自治」
+				// 本就是那一层的职责）。
+				// 逃生口 = 连接关闭（<-c.closed）：Close 先关连接即解阻塞（CLI 分离键/
+				// 信号路径，见 daemon streamConn 的 Close 定序——反序在 reader 阻塞时死锁）。
+				// 单流前端语义（r1 P0-1 拍板 = 接受）：reader 阻塞期间同连接的其它帧
+				//（应答/事件/别的流的 end）停摆是既定语义而非待修缺陷——CLI term attach
+				// 一条连接唯一 term 流、host 命令面是一次性独立连接，「另一条连接上的
+				// 请求照常应答」天然成立；同连接多流/混合前端的公平性与收流语义归
+				// 4a 事件总线期。停读窗口内的可保证项：本流已接收数据零丢失、本流
+				// data/end 顺序不乱。
 				select {
 				case st.(*ClientStream).recv <- payload:
-				default:
+				case <-c.closed:
 				}
 			}
 		case OpStreamEnd:
 			var e StreamEndBody
 			if err := json.Unmarshal(body, &e); err == nil {
 				if st, ok := c.streams.Load(e.StreamID); ok {
+					// 先标记终结（Send 立即报错），再投递 end 信号（语义不变）。
+					st.(*ClientStream).markEnded(e.Reason)
 					select {
 					case st.(*ClientStream).end <- e.Reason:
 					default:
@@ -369,4 +444,14 @@ func (c *Client) reader() {
 			}
 		}
 	}
+}
+
+// readerDone 连接级断开的终结状态化：在册流全部标记 ended（reason=conn）——此后
+// Send 报错而非静默成功（连接断了发什么都是丢）；end 通道不触发（连接级断开与
+// 流级 end 三者可区分的既有契约）。
+func (c *Client) readerDone() {
+	c.streams.Range(func(_, v any) bool {
+		v.(*ClientStream).markEnded(endReasonConn)
+		return true
+	})
 }

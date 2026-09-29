@@ -110,8 +110,19 @@ homeway term list                 # 列会话（--json 给机器可读格式）
 homeway term new [名字] [-d] [-A] # 新建会话；-d = 创建不接入；-A = 重名复用；缺名自动 host-<4hex>
 homeway term attach [名字] [-d]   # 接入（缺名 = 最近活跃）；-d = 接管（踢掉其它腿，含手机）
 homeway term delete <名字>        # 关闭会话（与 App 的「关闭会话」同一路径）
+
+# 远程：任何机器上经 daemon 控制面接入指定后端主机（term 帧协议经隧道端到端原样复用）
+homeway term list --host mac      # --host <name|id>：与 host delete/status 同一寻址规则
+homeway term attach --host mac    #（名称精确 / peerID 全长 hex / 无歧义短前缀）
+homeway term explain <会话名> --host mac   # 在线 explain 远程往返（--file 离线模式仍是本地面）
 ```
 
+- **远程模式（`--host`）**：命令经本机 daemon 的控制面（`stream.open{kind:term}` 纯透传）
+  过隧道到达目标主机的 term 服务——与手机 surface 腿同挂一条会话、互不顶替。
+  ⚠️ **`--state` 的指代随 `--host` 切换**：远程模式下指 daemon state 目录
+  （control.sock 所在，默认 `~/.config/homeway/daemon`），不再是出口 state；
+  `--timeout` 为「控制面连接 + 打开」总预算（默认 10s；attach 流本身不设 deadline）。
+  daemon 未运行 = 可行动错误（提示先启动 `homeway daemon`）。
 - **接入形态**：本地终端被置为 raw 双向透传，本地终端自己就是仿真器（raw 字节模式）。
   窗口尺寸变化自动同步（SIGWINCH → RESIZE）；会话级尺寸/主题以**最近活动的腿**为准。
 - **分离键**：默认 `Ctrl-b` 前缀——`d` 分离（会话继续在出口跑）、`Ctrl-b Ctrl-b` 送字面量、
@@ -120,6 +131,10 @@ homeway term delete <名字>        # 关闭会话（与 App 的「关闭会话�
   `--detach-key=^]`（或 `--detach-key=none` 关掉分离键）即可；`HOMEWAY_TERM_SHELL`
   配了 tmux 一类命令模式时同样适用。
 - **断链文案**：连接被断开（如出口重启）时提示「会话仍在运行，可重新 attach」。
+  远程 attach 的流终结按来源归因：`gone` = 主机不可达或上行过快（会话仍在目标主机
+  运行，可重新 attach）；`closed` = 对端关闭（也可能是本端长时间停止读取、出口侧
+  慢腿自治收尾了本腿）；连接级断开 = 与守护进程的连接断了，重新执行命令即可。
+  输入侧流死后逐帧报错早退——粘贴大段文本中途流死，余量不再写进死流。
 - **标题**：接入时终端标题设为「会话 · agent · 状态」，退出恢复原值；
   `HOMEWAY_TERM_TITLE=off` 可关。
 - **退出码**：分离 / 会话结束（含被接管 `-d`）/ 信号退出 = 0；连接或协议错误、断链 = 1；

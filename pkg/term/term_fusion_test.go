@@ -320,15 +320,16 @@ func TestExplainUnknownAgent(t *testing.T) {
 	}
 }
 
-// 在线模式：出口没跑时报可行动的错（并提示离线模式）。
+// 在线模式：出口没跑时报可行动的错（1.4 收敛：explainSession 并入 cliDialTerm 统一
+// 拨号缝后，连接层文案与本地面 list/new/delete 同一 dialErrText——ENOENT 合并提示）。
 func TestExplainOnlineNoExit(t *testing.T) {
 	dir := t.TempDir() // 里面没有 term.sock
-	_, err := explainSession(explainOpts{session: "s1", stateDir: dir})
+	_, err := explainSession(explainOpts{session: "s1", stateDir: dir}, nil)
 	if err == nil {
 		t.Fatal("没有 term.sock 应报错")
 	}
-	if !strings.Contains(err.Error(), "--file") {
-		t.Errorf("错误信息应提示离线模式，实际 %v", err)
+	if !strings.Contains(err.Error(), "出口未在运行") {
+		t.Errorf("错误信息应为连接层合并文案，实际 %v", err)
 	}
 }
 

@@ -14,6 +14,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -342,7 +343,12 @@ func TestStreamNoStreamOnClosedAndData(t *testing.T) {
 		t.Fatalf("已关流 close 应 no_stream：%v", err)
 	}
 	// 对已关流发 data：corr=0 通知回执 no_stream，连接与其它流不受影响。
-	if err := st.Send([]byte("ghost")); err != nil {
+	// 2.2 起流终结后 Send 报 ErrStreamEnded（不再静默成功）——死流上行改用 raw 帧
+	// 直写驱动，服务端 no_stream 回执路径的断言保持。
+	if err := st.Send([]byte("ghost")); !errors.Is(err, ErrStreamEnded) {
+		t.Fatalf("流终结后 Send 应报 ErrStreamEnded：%v", err)
+	}
+	if err := c.writeFrame(EncodeFrame(OpStreamData, EncodeStreamBody(st.ID, []byte("ghost")))); err != nil {
 		t.Fatal(err)
 	}
 	select {
@@ -507,4 +513,278 @@ func mustJSONBytes(t *testing.T, v any) []byte {
 		t.Fatal(err)
 	}
 	return b
+}
+
+// ---------- L4 背压显式化（term-remote 2.1/2.2） ----------
+
+// TestStreamBackpressureNoLoss 下行不静默丢（2.1 红绿主路）：后端灌 >64 帧（recv
+// 队列容量 64）而消费方停读一段（模拟 Ctrl-S 冻结输出）再恢复——断言零丢失（逐
+// 字节重组）、本流 data/end 顺序不乱（end 前收齐全部字节）、另一条连接上的请求
+// 照常应答（单流前端语义：同连接 Request 在停读窗口内不保证，已从判据删除——
+// r1 P0-1）。
+func TestStreamBackpressureNoLoss(t *testing.T) {
+	ts := startTestServer(t, BusConfig{})
+	// 后端：写 N 块（块内字节带序号模式）后主动关——EOF 触发 end(closed)。
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ts.backend.mu.Lock()
+	ts.backend.dialAddr = ln.Addr().String()
+	ts.backend.mu.Unlock()
+	const blocks = 200
+	const blockSize = 4 << 10 // 共 ~800KB > 服务端流队列(16×16KiB)+双侧 socket 缓冲
+	payload := make([]byte, blocks*blockSize)
+	for i := range payload {
+		payload[i] = byte(i * 7 % 251) // 无周期短重复的确定性模式
+	}
+	backendClosed := make(chan struct{})
+	go func() {
+		defer close(backendClosed)
+		bc, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		for off := 0; off < len(payload); off += blockSize {
+			if _, err := bc.Write(payload[off : off+blockSize]); err != nil {
+				return
+			}
+			time.Sleep(2 * time.Millisecond) // 防 TCP 合并：确保 backendPump 逐块成条目
+			//（>64 条才能触发 recv 满槽——变异自证的必要条件）
+		}
+		_ = bc.Close() // 写完全部后关 ⇒ end(closed) 必在全部数据之后
+	}()
+	c, _ := dialTest(t, ts)
+	st, err := c.OpenStream(context.Background(), "aa")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// 停读窗口：不消费 recv，等背压链真积压（服务端 dataC 满 + backendPump 停读
+	// + TCP 写满——后端写循环阻塞在 bc.Write 上）。
+	time.Sleep(1200 * time.Millisecond)
+
+	// 停读窗口内：另一条连接上的请求照常应答（既有判据保留）。
+	c2, _ := dialTest(t, ts)
+	c2ctx, c2cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer c2cancel()
+	if _, err := c2.Request(c2ctx, OpDaemonStatus, nil); err != nil {
+		t.Fatalf("停读窗口内另一条连接的请求应照常应答：%v", err)
+	}
+
+	// 恢复读：零丢失 + 顺序（end 之前收齐全部字节）。注意 select 的双就绪随机性：
+	// end 到达时全部数据已在 recv 队列（reader 按帧序阻塞投递），收到 end 后先排干
+	// recv 再断言顺序——不能让随机选择把 end「插」到未读数据前面造成假红。
+	got := make([]byte, 0, len(payload))
+	sawEnd := false
+	endReason := ""
+	deadline := time.After(20 * time.Second)
+	for len(got) < len(payload) {
+		select {
+		case b := <-st.Recv():
+			if sawEnd {
+				t.Fatalf("end 之后仍收到本流数据（顺序破坏）：%d 字节", len(b))
+			}
+			got = append(got, b...)
+		case r := <-st.End():
+			sawEnd, endReason = true, r
+			for { // end 已收 = reader 已投完全部数据：非阻塞排干 recv
+				select {
+				case b := <-st.Recv():
+					got = append(got, b...)
+					continue
+				default:
+				}
+				break
+			}
+			if len(got) < len(payload) {
+				t.Fatalf("end(closed=%q) 先于数据到齐：%d/%d 字节", r, len(got), len(payload))
+			}
+		case <-deadline:
+			t.Fatalf("恢复读后未收齐：%d/%d（end=%v）", len(got), len(payload), sawEnd)
+		}
+	}
+	for i := range payload {
+		if got[i] != payload[i] {
+			t.Fatalf("零丢失被破坏 @%d：%02x ≠ %02x（丢帧或乱序）", i, got[i], payload[i])
+		}
+	}
+	// end(closed) 到达且在数据之后（主循环可能已顺带收走——那只消费一次）。
+	if !sawEnd {
+		select {
+		case endReason = <-st.End():
+		case <-time.After(3 * time.Second):
+			t.Fatal("end 帧未到达")
+		}
+	}
+	if endReason != StreamEndClosed {
+		t.Fatalf("后端 EOF 应 end(closed)：%q", endReason)
+	}
+}
+
+// TestStreamBackpressureOldDeliveryDropsFrames 变异自证（2.1 判据）：同一灌帧场景
+// 下，旧投递形态（select/default 满则弃——改前 client.go 的 OpStreamData 分支）
+// 确实丢帧。用独立的假投递循环复刻旧语义驱动真实 ClientStream，断言收到的字节
+// 少于发送的字节（若旧形态不丢，本用例红——即 2.1 的红面对照）。
+func TestStreamBackpressureOldDeliveryDropsFrames(t *testing.T) {
+	// 构造与生产同参数的流（recv 64 槽）与一条供投递的通道；投递协程 = 旧形态。
+	st := &ClientStream{recv: make(chan []byte, 64)}
+	src := make(chan []byte)
+	delivered := make(chan struct{})
+	go func() {
+		defer close(delivered)
+		for b := range src {
+			select { // 旧形态：满则弃（改前行为逐字复刻）
+			case st.recv <- b:
+			default:
+			}
+		}
+	}()
+	const blocks = 200
+	sent := 0
+	for i := 0; i < blocks; i++ {
+		b := make([]byte, 4<<10)
+		sent += len(b)
+		src <- b
+	}
+	close(src)
+	<-delivered
+	// 停读后的队列余量 + 全部消费 < 发送总量 ⇒ 丢帧成立（旧形态的红面证据）。
+	// 非阻塞排干（recv 永不 close——range 会挂死）。
+	total := 0
+	draining := true
+	for draining {
+		select {
+		case b := <-st.recv:
+			total += len(b)
+		default:
+			draining = false
+		}
+	}
+	// 通道容量 64 条 × 4KiB = 256KiB < 800KiB ⇒ 必然丢弃；给一点余量防极端调度
+	// 下发送侧还没灌满（src 无界通道不背压，投递侧全速）。
+	if total >= sent {
+		t.Fatalf("旧投递形态应丢帧：收到 %d ≥ 发送 %d（变异不成立，请核对新旧对照）", total, sent)
+	}
+	t.Logf("旧形态丢帧实证：投递 %d/%d 字节（丢 %d 字节）", total, sent, sent-total)
+}
+
+// TestStreamSendErrorsAfterEnd 上行终结报错（2.2 红绿）：后端持续不读，Send >8 帧
+// 背靠背 → 服务端上行队列满按背压收流（finish(gone)）→ 流收尾后后续 Send 报
+// ErrStreamEnded（非 nil、errors.Is 可判、含原因）。
+func TestStreamSendErrorsAfterEnd(t *testing.T) {
+	ts := startTestServer(t, BusConfig{})
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ts.backend.mu.Lock()
+	ts.backend.dialAddr = ln.Addr().String()
+	ts.backend.mu.Unlock()
+	// 后端：接受连接后一个字节都不读（上行队列必满 → gone）。
+	backendConn := make(chan net.Conn, 1)
+	go func() {
+		bc, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		backendConn <- bc
+	}()
+	c, _ := dialTest(t, ts)
+	st, err := c.OpenStream(context.Background(), "aa")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 背靠背连发直到背压收流：upC（8 槽）之外 socket 缓冲也会先吸收一段（loopback
+	// 实测 ~700KB——host-cli exec-r2 ① 同发现），预算 96 帧（1.5MiB）保证溢出。
+t2:
+	for i := 0; i < 96; i++ {
+		if err := st.Send(make([]byte, streamChunkSize)); err != nil {
+			// 流已终结但 End() 通道尚未被本测试消费——Send 的终结检查（markEnded
+			// 先于 end 投递）即背压收流的**第一可见信号**，正是 2.2 的红面行为。
+			if !errors.Is(err, ErrStreamEnded) {
+				t.Fatalf("第 %d 帧 Send 报错应为 ErrStreamEnded：%v", i, err)
+			}
+			break t2
+		}
+		select {
+		case r := <-st.End():
+			if r != StreamEndGone {
+				t.Fatalf("后端不读应收 end(gone)：%q", r)
+			}
+			break t2
+		default:
+			time.Sleep(20 * time.Millisecond)
+		}
+	}
+	// end(gone) 必达（若上面经 Send 报错退出，这里非阻塞补收）。
+	select {
+	case r := <-st.End():
+		if r != StreamEndGone {
+			t.Fatalf("后端不读应收 end(gone)：%q", r)
+		}
+	default:
+	}
+	// 流收尾后：后续 Send 报错非 nil（2.2 主断言——改前为静默成功）。
+	err = st.Send([]byte("after-end"))
+	if err == nil {
+		t.Fatal("流终结后 Send 应报错（改前 = 静默成功、数据丢失）")
+	}
+	if !errors.Is(err, ErrStreamEnded) {
+		t.Fatalf("应 errors.Is ErrStreamEnded：%v", err)
+	}
+	if !strings.Contains(err.Error(), "gone") {
+		t.Fatalf("错误文案应含原因：%v", err)
+	}
+	// 空载荷仍为 no-op（既有口径）。
+	if err := st.Send(nil); err != nil {
+		t.Fatalf("空载荷不该报错：%v", err)
+	}
+	select {
+	case bc := <-backendConn:
+		_ = bc.Close()
+	default:
+	}
+}
+
+// TestStreamSendErrorsAfterConnClose 连接级断开的终结状态化（2.2 另一面）：服务端
+// 收工（连接断，无 end 帧）→ 在册流全部标记 ended（reason=conn）→ Send 报
+// ErrStreamEnded（含「连接已断开」文案）。
+func TestStreamSendErrorsAfterConnClose(t *testing.T) {
+	ts := startTestServer(t, BusConfig{})
+	echo := startEchoBackend(t)
+	ts.backend.mu.Lock()
+	ts.backend.dialAddr = echo.ln.Addr().String()
+	ts.backend.mu.Unlock()
+	c, _ := dialTest(t, ts)
+	st, err := c.OpenStream(context.Background(), "aa")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 正常路径先过（Send/Recv 往返不回归）。
+	if err := st.Send([]byte("ping")); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case b := <-st.Recv():
+		if string(b) != "ping" {
+			t.Fatalf("echo 字节不符：%q", b)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("echo 未回")
+	}
+	// 服务端收工 → 连接级断开（无 end）。
+	ts.srv.Close()
+	select {
+	case <-c.Closed():
+	case <-time.After(3 * time.Second):
+		t.Fatal("连接未断")
+	}
+	err = st.Send([]byte("after-close"))
+	if err == nil || !errors.Is(err, ErrStreamEnded) {
+		t.Fatalf("连接断开后 Send 应报 ErrStreamEnded：%v", err)
+	}
+	if !strings.Contains(err.Error(), "连接") {
+		t.Fatalf("错误文案应含连接断开归因：%v", err)
+	}
 }

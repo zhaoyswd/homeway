@@ -55,7 +55,9 @@ func run(args []string) int {
 	case "relay":
 		err = relay.CLI(rest)
 	case "term":
-		err = term.CLI(rest)
+		// 远程接入缝注入（term-remote D1）：`term … --host <ref>` 经 daemon 控制面
+		// 转发；nil = 仅本地面（此处恒注入）。
+		err = term.CLI(rest, daemon.TermRemote(version))
 	case "daemon":
 		err = daemon.CLI(rest, version)
 	case "host":
