@@ -5,9 +5,9 @@ package daemon
 // client 角色挂注册表（角色子系统，2.4）→ 控制面（§3：internal/control——
 // control.sock 0600、事件总线、流腿）→ 等信号收工。
 //
-// ⚠️ 与出口禁止同 state 目录（D2 组合处置）：锁文件内容与失败文案带角色名可辨；
-// 安装说明（4.2）明示 `homeway exit --state X` 与 `homeway daemon --state X` 并存
-// 未定义（3f 合并前两角色 state 语义不同）。
+// ⚠️ 与出口禁止同 state 目录（D2 组合处置）：daemon 侧硬拦（checkNotExitState——
+// state 下有 tokens.jsonl 即拒启）；exit/relay 侧不检测（锁只约束 daemon），方向上
+// 仍靠安装说明（4.2）提示，角色/state 合并归 3f。
 
 import (
 	"context"
@@ -15,6 +15,7 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"syscall"
 
 	"github.com/zhaoyswd/homeway/clientcore/hostsession"
@@ -32,6 +33,11 @@ func CLI(args []string, version string) error {
 	fs := flag.NewFlagSet("homeway daemon", flag.ContinueOnError)
 	stateDir := fs.String("state", DefaultStateDir(), "state 目录（单实例锁/主机表/身份/日志）")
 	if err := fs.Parse(args); err != nil {
+		return err
+	}
+
+	// ⓪ 与出口/中继禁止同 state 目录（硬拦，见 checkNotExitState）。
+	if err := checkNotExitState(*stateDir); err != nil {
 		return err
 	}
 
@@ -88,6 +94,18 @@ func CLI(args []string, version string) error {
 	return nil
 }
 
+// checkNotExitState 拒绝把 daemon 指到出口/中继的 state 目录（硬拦，exec-r1 B11：
+// 此前只有安装文档的「单实例锁会互相拒绝」提示——而 exit/relay 根本不取 daemon 的
+// 锁，真把 daemon 指到在役出口 state 会正常启动并与其共写 events/debug 日志
+// （各自 rename 轮转互踩）与 identity 目录）。判据 = state 下存在 tokens.jsonl
+// （出口身份特征：签发审计 + 启动加载，D7；daemon 永不写这个文件）。
+func checkNotExitState(stateDir string) error {
+	if _, err := os.Stat(filepath.Join(stateDir, "tokens.jsonl")); err == nil {
+		return fmt.Errorf("state %s 含 tokens.jsonl（出口身份特征）——daemon 禁止与 exit/relay 同 state 目录（共写日志与 identity 目录会互踩；请为 daemon 用独立 --state 目录）", stateDir)
+	}
+	return nil
+}
+
 // clientRole client 角色：多主机会话注册表的宿主（失败由 supervisor 退避重建——
 // 重建时重新 OpenRegistry，按 hosts.json 恢复会话；Registry 事件接进控制面总线）。
 type clientRole struct {
@@ -108,6 +126,7 @@ func (r *clientRole) Run(ctx context.Context) error {
 	reg, err := OpenRegistry(r.stateDir, RegistryOptions{
 		StrictIdentity: true, // daemon = 严格身份（D2/N2）
 		Logf:           hostsession.Logf(r.st.Debugf),
+		Eventf:         r.st.Eventf, // hosts.json 损坏备份等用户应见异常 → events.log
 		Events:         &registryEventsAdaptor{bus: r.holder.bus()},
 	})
 	if err != nil {

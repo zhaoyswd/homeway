@@ -247,10 +247,15 @@ func (c *Client) Close() {
 // reader 客户端读循环（分发 rsp/evt/流帧/生命周期帧）。
 func (c *Client) reader() {
 	for {
-		op, body, err := ReadFrame(c.nc, MaxControlBody)
+		head, err := ReadHeader(c.nc) // 按 op 选上限（流 DATA 256KiB / 控制类 1MiB）
 		if err != nil {
 			return
 		}
+		body, err := ReadBody(c.nc, head)
+		if err != nil {
+			return
+		}
+		op := head.Op
 		switch op {
 		case OpWelcome:
 			var w WelcomeBody

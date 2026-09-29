@@ -66,7 +66,11 @@ func printStatus(w io.Writer, st *control.DaemonStatusResult, stateDir string) {
 		fmt.Fprint(w, "  角色： 无\n")
 	}
 	for _, r := range st.Roles {
-		fmt.Fprintf(w, "  角色： %s=%s（进程内重建 %d 次）\n", r.Name, r.State, r.Restarts)
+		line := fmt.Sprintf("  角色： %s=%s（进程内重建 %d 次）", r.Name, r.State, r.Restarts)
+		if r.Reason != "" {
+			line += " reason=" + r.Reason
+		}
+		fmt.Fprintln(w, line)
 	}
 	if len(st.Hosts) == 0 {
 		fmt.Fprint(w, "  主机： 无\n")

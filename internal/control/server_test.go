@@ -6,6 +6,7 @@ package control
 import (
 	"bufio"
 	"context"
+	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -14,6 +15,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -552,6 +554,113 @@ func TestServerCloseSendsGoodbyeShuttingDown(t *testing.T) {
 	}
 }
 
+// ---------- exec-r1 整改回归 ----------
+
+// TestClientDisconnectReleasesConnAndGoroutines 客户端正常断开（不发 goodbye——
+// CLI 形态）后连接必须收尾：conn 条目与 reader/writer 两 goroutine 全部回落
+// （exec-r1 B1：此前 run() 在 reader 返回后先等 writerDone 再走 defer close，
+// writer 永远等不到 closed ⇒ 每次断开泄漏 1 conn + 2 goroutine + 1 fd，监控脚本
+// 几小时打爆 fd 上限）。
+func TestClientDisconnectReleasesConnAndGoroutines(t *testing.T) {
+	ts := startTestServer(t, BusConfig{})
+	before := runtime.NumGoroutine()
+	for i := 0; i < 10; i++ {
+		c, _ := dialTest(t, ts)
+		if _, err := c.Request(context.Background(), OpDaemonStatus, nil); err != nil {
+			t.Fatalf("第 %d 条连接 status 失败：%v", i, err)
+		}
+		c.Close() // 直接关 socket（CLI 正常断开形态）
+	}
+	deadline := time.Now().Add(1500 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		ts.srv.mu.Lock()
+		n := len(ts.srv.conns)
+		ts.srv.mu.Unlock()
+		if n == 0 {
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	ts.srv.mu.Lock()
+	n := len(ts.srv.conns)
+	ts.srv.mu.Unlock()
+	if n != 0 {
+		t.Fatalf("10 条正常断开的连接应收尾干净（conns=%d）——连接泄漏回归", n)
+	}
+	grace := time.Now().Add(time.Second) // goroutine 回落容差窗（测试运行期后台噪声）
+	for time.Now().Before(grace) && runtime.NumGoroutine() > before+2 {
+		time.Sleep(50 * time.Millisecond)
+	}
+	if got := runtime.NumGoroutine(); got > before+2 {
+		t.Fatalf("连接 goroutine 未回落（before=%d now=%d）——泄漏回归", before, got)
+	}
+}
+
+// TestConnCloseBoundedWhenHighQueueFull highC 满 + 帧级错误下 close 必须有界返回
+// （exec-r1 M1：此前 close(reason) 先走阻塞 sendHigh，唯一逃生口 closed 又在本
+// 函数更后面才关——互等挂死，Server.Close()（daemon 收工路径）收不了尾）。
+func TestConnCloseBoundedWhenHighQueueFull(t *testing.T) {
+	bus := NewBus(NewGeneration(), BusConfig{})
+	srv := NewServer(ServerConfig{Bus: bus, Backend: newFakeBackend()})
+	a, _ := net.Pipe()
+	c := newConn(srv, a)
+	for i := 0; i < highQueue; i++ { // 灌满控制帧队列（前端不读的病态）
+		c.highC <- []byte("x")
+	}
+	done := make(chan struct{})
+	go func() {
+		c.fatal(CodeBadFrame) // 帧级错误路径 = close(bad_frame) 携带告别帧
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("highC 满 + 帧级错误下 close 挂死（互等回归）")
+	}
+	select {
+	case <-c.closed:
+	default:
+		t.Fatal("close 返回后 closed 应已关闭")
+	}
+	_ = a.Close()
+}
+
+// TestServerRejectsOversizedStreamDataOnReadPath 服务器读路径对流 DATA 帧执行
+// 256KiB 上限（exec-r1 B2：此前读循环一律按控制上限 1MiB 读——512KiB 的
+// stream.data 被完整读下、只回 no_stream 不断连，spec「帧长上限」对流帧名存实亡）。
+// 只写 5 字节帧头（body 不发）同时证明「超限在读 body 前拒绝」。
+func TestServerRejectsOversizedStreamDataOnReadPath(t *testing.T) {
+	ts := startTestServer(t, BusConfig{})
+	nc, err := net.Dial("unix", ts.sock)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer nc.Close()
+	if _, err := nc.Write(EncodeFrame(OpHello, []byte(`{"protoVersion":1,"frontend":{"kind":"cli","name":"raw","version":"0"}}`))); err != nil {
+		t.Fatal(err)
+	}
+	r := bufio.NewReader(nc)
+	readFrameRaw(t, r) // welcome
+	var head [5]byte   // 512KiB：超流上限（256KiB+1 即超）、未超控制上限（1MiB）
+	head[0] = OpStreamData
+	binary.BigEndian.PutUint32(head[1:5], uint32(512<<10))
+	// 读超时兜底：按旧实现（一律控制上限）服务器会去等 512KiB 的 body——本测试
+	// 只发帧头，变异/回归形态将以读超时失败，而不是永久挂起。
+	_ = nc.SetDeadline(time.Now().Add(5 * time.Second))
+	if _, err := nc.Write(head[:]); err != nil {
+		t.Fatal(err)
+	}
+	op, body := readFrameRaw(t, r)
+	var g GoodbyeBody
+	_ = json.Unmarshal(body, &g)
+	if op != OpGoodbye || g.Reason != CodeBadFrame {
+		t.Fatalf("超流上限应 goodbye(bad_frame)：op=0x%02x reason=%q", op, g.Reason)
+	}
+	if _, err := r.ReadByte(); err != io.EOF {
+		t.Fatalf("bad_frame 后应断连：%v", err)
+	}
+}
+
 // ---------- §3.6 监听（权限位 + 残留 socket 两分支） ----------
 
 func TestListenControlPermissions(t *testing.T) {
@@ -625,4 +734,39 @@ func TestListenControlResidue(t *testing.T) {
 		t.Fatalf("接管后应可连接：%v", err)
 	}
 	c.Close()
+}
+
+// TestServerConcurrentUnsubscribeVsPublish 生产形态的并发「退订 × 发布」（经真实
+// 连接的 events.subscribe/unsubscribe × 总线 Publish——exec-r1 H1 竞态的真实现场：
+// 此前 opUnsubscribe 在 subMu 下裸 delete(sub.domains)，与 publish 在 b.mu 下经
+// matches 读同一张 map 构成 fatal 级竞态）。`-race` 下旧实现必报
+// concurrent map read and map write；修复 = 域增删收敛进总线锁
+// （Bus.UnsubscribeDomains，server 只调）。
+func TestServerConcurrentUnsubscribeVsPublish(t *testing.T) {
+	ts := startTestServer(t, BusConfig{SubQueue: 1024})
+	c, _ := dialTest(t, ts)
+	ctx := context.Background()
+	if _, err := c.Subscribe(ctx, []string{DomainSession}, nil, "", ""); err != nil {
+		t.Fatal(err)
+	}
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() { // 并发发布（publish 在 b.mu 下读 sub.domains）
+		defer wg.Done()
+		for i := 0; i < 500; i++ {
+			_, _ = ts.bus.Publish(DomainSession, KindSessionStateChanged, SessionStateChangedPayload{Host: "aa", State: "x"})
+		}
+	}()
+	go func() { // 并发退订/再订阅（写 sub.domains——只在 b.mu 内）
+		defer wg.Done()
+		for i := 0; i < 100; i++ {
+			if err := c.Unsubscribe(ctx, []string{DomainSession}); err != nil {
+				return // 连接被断（overrun 等）：停（竞态窗口已开过）
+			}
+			if _, err := c.Subscribe(ctx, []string{DomainSession}, nil, "", ""); err != nil {
+				return
+			}
+		}
+	}()
+	wg.Wait()
 }

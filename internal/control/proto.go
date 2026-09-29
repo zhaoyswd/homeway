@@ -349,11 +349,14 @@ type DaemonStatusResult struct {
 	Hosts         []HostState `json:"hosts"`
 }
 
-// RoleBrief 角色状态摘要。
+// RoleBrief 角色状态摘要。Reason = 最近一次失败原因（running 态为空；spec
+// 「状态面呈现 failed + 原因」——此前只进 events.log、状态面看不到，exec-r1 B10；
+// 字段只增，旧前端忽略）。
 type RoleBrief struct {
 	Name     string `json:"name"`
 	State    string `json:"state"`
 	Restarts int    `json:"restarts"`
+	Reason   string `json:"reason,omitempty"`
 }
 
 // HostState snapshot.get / daemon.status 里一台主机的动态面（各会话无锁快照汇成——

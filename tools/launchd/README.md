@@ -14,9 +14,12 @@ sed -e 's|__HOMEWAY_BIN__|/usr/local/bin/homeway|g' \
 
 # 2. ⚠️ 先做「禁止同目录」检查（模板头注释同款提醒）：
 #    该 state 目录不得与任何在役 `homeway exit --state`/`homeway relay --state`
-#    部署相同（exit 与 daemon 同 state 目录的组合未定义，单实例锁会互相拒绝——
-#    两角色 state 合并归后续能力域）。默认子目录 ~/.config/homeway/daemon 与
-#    在役出口 ~/.config/homeway 不同目录，可并存。
+#    部署相同。daemon 侧已硬拦：state 下存在 tokens.jsonl（出口身份特征）即报错
+#    拒启；但 exit/relay 侧不检测（单实例锁只约束 daemon，exit 不取锁）——把
+#    exit 指到 daemon 的 state 目录不会被任何一边拦住，只能靠人工避免（两进程
+#    会共写 events/debug 日志并各自 rename 轮转互踩、共享 identity 目录）。角色
+#    合并归后续能力域（3f）。默认子目录 ~/.config/homeway/daemon 与在役出口
+#    ~/.config/homeway 不同目录，可并存。
 
 # 3. 手动跑一次确认 state 初始化正常（可选但建议；目录/权限由守护进程自建）
 /usr/local/bin/homeway daemon --state ~/.config/homeway/daemon
@@ -52,8 +55,9 @@ rm ~/Library/LaunchAgents/me.zhaozhe.homeway-daemon.plist
 | 守护进程 | `me.zhaozhe.homeway-daemon` | `~/.config/homeway/daemon` | 仅本机 UDS（control.sock，0600） |
 
 不同 label、不同 state 目录、无端口竞争面，可并存。**禁止**把两者的 `--state`
-指到同一目录（见上）。角色合并（exit/relay 装进 daemon 进程、state 归一）归后续
-能力域（3f），届时本说明随迁移更新。
+指到同一目录：daemon 侧对含 `tokens.jsonl` 的 state 硬拦拒启，exit/relay 侧不检测
+（锁只约束 daemon）——反向指过去只能靠人工避免（见上）。角色合并（exit/relay 装进
+daemon 进程、state 归一）归后续能力域（3f），届时本说明随迁移更新。
 
 ## 教训（为什么模板必须实测）
 

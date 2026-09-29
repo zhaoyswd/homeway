@@ -65,6 +65,7 @@ type Registry struct {
 	hosts    map[[32]byte]*hostEntry
 	strict   bool
 	logf     hostsession.Logf
+	eventf   func(format string, args ...any)
 	events   RegistryEvents
 
 	// newSession 会话构造接缝（默认 hostsession.NewSession；同包测试注入桩）。
@@ -80,23 +81,30 @@ type RegistryOptions struct {
 	Logf hostsession.Logf
 	// Events 事件接缝（nil = 不发；控制面装配时注入总线适配）。
 	Events RegistryEvents
+	// Eventf 事件级告警口（hosts.json 损坏备份等用户应见的异常；nil = 降级 Logf）。
+	Eventf func(format string, args ...any)
 }
 
-// OpenRegistry 打开注册表：读 hosts.json（缺失 = 空表）并按表逐后端拉会话
-// （「重启按表恢复」——会话与端点缓存/身份按既有目录布局复用）。
+// OpenRegistry 打开注册表：读 hosts.json（缺失 = 空表；损坏 = 备份后空表 + 事件级
+// 告警，见 loadHosts）并按表逐后端拉会话（「重启按表恢复」——会话与端点缓存/身份
+// 按既有目录布局复用）。
 func OpenRegistry(stateDir string, opts RegistryOptions) (*Registry, error) {
 	r := &Registry{
 		stateDir:   stateDir,
 		hosts:      make(map[[32]byte]*hostEntry),
 		strict:     opts.StrictIdentity,
 		logf:       opts.Logf,
+		eventf:     opts.Eventf,
 		events:     opts.Events,
 		newSession: hostsession.NewSession,
 	}
 	if r.logf == nil {
 		r.logf = hostsession.Discard
 	}
-	recs, err := loadHosts(filepath.Join(stateDir, hostsFileName))
+	if r.eventf == nil {
+		r.eventf = func(format string, args ...any) { r.logf("hosts: "+format, args...) }
+	}
+	recs, err := loadHosts(filepath.Join(stateDir, hostsFileName), r.eventf)
 	if err != nil {
 		return nil, err
 	}
@@ -269,6 +277,10 @@ func (r *Registry) Close() {
 }
 
 // saveLocked 落盘主机表（0600）。调用方持锁。
+//
+// temp + rename 原子替换：kill -9 落在写窗口也只会留下完整旧表或完整新表，
+// 不产生截断 JSON（此前裸 os.WriteFile 覆写 × 损坏即拒启 = 主机表不可恢复——
+// exec-r1 M2）。
 func (r *Registry) saveLocked() error {
 	path := filepath.Join(r.stateDir, hostsFileName)
 	if err := os.MkdirAll(r.stateDir, 0o700); err != nil {
@@ -282,7 +294,11 @@ func (r *Registry) saveLocked() error {
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(path, append(b, '\n'), 0o600)
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, append(b, '\n'), 0o600); err != nil {
+		return err
+	}
+	return os.Rename(tmp, path)
 }
 
 // stateChangedFunc hostsession.Observer 的函数适配。
@@ -292,9 +308,12 @@ func (f stateChangedFunc) StateChanged(s *hostsession.Session, from, to, reason 
 	f(s, from, to, reason)
 }
 
-// loadHosts 读主机表（缺失 = 空表；损坏 = 报错拒启——主机表是持久化真源，
-// 静默清空等于丢主机）。
-func loadHosts(path string) ([]HostRecord, error) {
+// loadHosts 读主机表。缺失 = 空表；损坏 = 备份 `hosts.json.corrupt-<ts>` 后按空表
+// 启动 + warnf 事件级告警（exec-r1 M2：损坏即拒启会让 client 角色无限退避、daemon
+// 永远 not_ready，且无自愈路径——备份保住「不静默清空」的初衷（原件保留可人工修复，
+// 修复后重启即恢复），空表启动保住 daemon 不被一份坏文件锁死）。备份本身失败（目录
+// 只读等）仍报错拒启：那时空表启动等于下一次落盘就把主机表真清空。
+func loadHosts(path string, warnf func(string, ...any)) ([]HostRecord, error) {
 	b, err := os.ReadFile(path)
 	if errors.Is(err, os.ErrNotExist) {
 		return nil, nil
@@ -304,7 +323,12 @@ func loadHosts(path string) ([]HostRecord, error) {
 	}
 	var recs []HostRecord
 	if err := json.Unmarshal(b, &recs); err != nil {
-		return nil, fmt.Errorf("hosts.json 损坏：%w", err)
+		backup := fmt.Sprintf("%s.corrupt-%d", path, time.Now().Unix())
+		if rerr := os.Rename(path, backup); rerr != nil {
+			return nil, fmt.Errorf("hosts.json 损坏（%v）且备份失败：%w", err, rerr)
+		}
+		warnf("hosts.json 损坏（%v）——已备份 %s，按空表启动（原件保留，可修复后重启恢复）", err, backup)
+		return nil, nil
 	}
 	return recs, nil
 }

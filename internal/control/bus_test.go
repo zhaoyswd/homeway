@@ -8,6 +8,7 @@ package control
 import (
 	"errors"
 	"fmt"
+	"sync"
 	"testing"
 	"time"
 )
@@ -332,5 +333,42 @@ func TestBusRingByteBudgetEvicts(t *testing.T) {
 	b.mu.Unlock()
 	if oldest != 2 || ringLen != 2 || bytes != 40+62 {
 		t.Fatalf("字节量淘汰后环应剩 seq2+seq3（102B）：oldest=%d len=%d bytes=%d", oldest, ringLen, bytes)
+	}
+}
+
+// TestBusConcurrentUnsubscribeDomainsVsPublish 并发「退订域 × 发布」的竞态回归
+// （exec-r1 H1：此前 server 侧在 subMu 下裸 delete(sub.domains)——与 publish 在
+// b.mu 下经 matches 读同一张 map 是运行时 fatal 级竞态，recover 兜不住；修法 =
+// 域增删收敛进总线锁 UnsubscribeDomains）。`-race` 下跑：旧实现必报
+// concurrent map read and map write。
+func TestBusConcurrentUnsubscribeDomainsVsPublish(t *testing.T) {
+	b := NewBus("gen-1", BusConfig{SubQueue: 512})
+	sub := b.NewSubscriber()
+	if _, err := b.Subscribe(sub, []string{DomainSession, DomainLink}, nil, ""); err != nil {
+		t.Fatal(err)
+	}
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() { // 并发发布（publish 在 b.mu 下读 sub.domains）
+		defer wg.Done()
+		for i := 0; i < 200; i++ {
+			_, _ = b.Publish(DomainSession, KindSessionStateChanged, SessionStateChangedPayload{Host: "aa", State: "x"})
+		}
+	}()
+	go func() { // 并发订阅/退订域（写 sub.domains——只在 b.mu 内）
+		defer wg.Done()
+		for i := 0; i < 200; i++ {
+			_, _ = b.Subscribe(sub, []string{DomainSession, DomainLink}, nil, "")
+			b.UnsubscribeDomains(sub, []string{DomainSession})
+		}
+	}()
+	wg.Wait()
+	// 语义面顺带断言：摘空全部域 = 整体从总线摘除（此后发布不再投递）。
+	b.UnsubscribeDomains(sub, []string{DomainLink})
+	b.mu.Lock()
+	_, registered := b.subs[sub]
+	b.mu.Unlock()
+	if registered {
+		t.Fatal("摘空全部域后订阅者应已从总线摘除")
 	}
 }

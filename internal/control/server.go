@@ -179,16 +179,28 @@ func (c *conn) run() {
 	}()
 	defer c.close("")
 	c.reader()
+	// reader 已退（EOF/IO 错误/对端直接关 socket——CLI 形态不发 goodbye）：立即收工
+	// 唤醒 writer（close 关闭 closed + nc.Close），再等 writer 退出。若等到
+	// `<-writerDone` 之后才走 defer 的 close，writer 会永远停在 step() 的 select
+	// 里等 closed——连接 goroutine 与 fd 全部泄漏（exec-r1 B1）。
+	c.close("")
 	<-writerDone
 }
 
 // close 收工连接（幂等）。reason 非空时尽力先发 goodbye（服务端主动收工）：
-// 入 highC 后等 writer 取尽（有界等待——告别帧送达是尽力语义，写停滞看门狗与
-// 对端不读的病态下允许丢弃）。
+// 入 highC 用**非阻塞**发送——队列满（前端不读的病态）时丢弃而非挂等（告别帧
+// 本就是尽力语义，写停滞看门狗是对端不读的最终兜底）。此前这里走阻塞 sendHigh，
+// 唯一逃生口 `<-c.closed` 又在本函数更后面才关：highC 满 + 一次帧级错误会让
+// close 永久互等挂死、`Server.Close()`（daemon 收工路径）收不了尾（exec-r1 M1）。
 func (c *conn) close(reason string) {
 	c.once.Do(func() {
 		if reason != "" {
-			c.sendHigh(encodeJSONFrame(OpGoodbye, GoodbyeBody{Reason: reason}))
+			if f := encodeJSONFrame(OpGoodbye, GoodbyeBody{Reason: reason}); f != nil {
+				select {
+				case c.highC <- f:
+				default: // 队列满：尽力语义，丢弃告别帧不挂等
+				}
+			}
 		}
 		waitHighDrained(c) // reload/goodbye 等在途告别帧的有界等待（空队列零等待）
 		close(c.closed)
@@ -241,13 +253,18 @@ func encodeJSONFrame(op byte, body any) []byte {
 
 func (c *conn) reader() {
 	for {
-		op, body, err := ReadFrame(c.nc, MaxControlBody)
+		head, err := ReadHeader(c.nc) // 按 op 选上限（流 DATA 256KiB / 控制类 1MiB）
 		if err != nil {
 			if errors.Is(err, ErrBadFrame) {
 				c.fatal(CodeBadFrame) // 长度超限（读 body 前拒绝）
 			}
 			return // IO 错误/EOF = 连接结束
 		}
+		body, err := ReadBody(c.nc, head)
+		if err != nil {
+			return // 半帧（声明了 body 却断流）= 连接结束
+		}
+		op := head.Op
 		if !ValidOp(op) {
 			c.fatal(CodeBadFrame) // 非法 op（预留段/未知值）
 			return
@@ -556,12 +573,9 @@ func (c *conn) opUnsubscribe(corr uint64, args json.RawMessage) {
 	c.subMu.Lock()
 	defer c.subMu.Unlock()
 	if c.sub != nil {
-		for _, d := range a.Domains {
-			delete(c.sub.domains, d)
-		}
-		if len(c.sub.domains) == 0 {
-			c.s.cfg.Bus.Unsubscribe(c.sub)
-		}
+		// 域增删收敛在总线锁内（Bus.UnsubscribeDomains）——订阅态的写半边不得
+		// 留在 server 侧裸改（exec-r1 H1 的竞态源）。
+		c.s.cfg.Bus.UnsubscribeDomains(c.sub, a.Domains)
 	}
 	c.reply(corr, UnsubscribeResult{Domains: a.Domains}, nil)
 }

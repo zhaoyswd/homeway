@@ -70,10 +70,16 @@ func serviceStopInternal() int {
 // 形状契约：键集合、缺省条件与随迁前一致（elapsedMs 随 Since、bridge*/link/identity/
 // stats 随快照指针缺省）——包装冒烟 + hostsession 快照用例守。
 func serviceStatusJSON() string {
-	snap := hostsession.Default().Snapshot()
-	// 无实例短路（迁移前形状逐字节）：serviceCur == nil 时原实现直接返回
-	// `{"state":"idle"}`（不带 reason）。实例一经构造 Since 必非零（构造/每次 setState
-	// 都打时间戳），零值 Since 即无实例——冒烟用例逐字节钉住。
+	return serviceSnapshotJSON(hostsession.Default().Snapshot())
+}
+
+// serviceSnapshotJSON Snapshot → 状态 JSON 的组装（纯函数：不触 Default 单例——
+// exec-r1 M6 守卫缺口，「ready + 有桥」的键集合可直接喂构造的 Snapshot 断言，
+// 不必起真桥）。
+// 无实例短路（迁移前形状逐字节）：serviceCur == nil 时原实现直接返回
+// `{"state":"idle"}`（不带 reason）。实例一经构造 Since 必非零（构造/每次 setState
+// 都打时间戳），零值 Since 即无实例——冒烟用例逐字节钉住。
+func serviceSnapshotJSON(snap hostsession.Snapshot) string {
 	if snap.Since.IsZero() && snap.State == "idle" {
 		return `{"state":"idle"}`
 	}

@@ -122,7 +122,10 @@ func TestRegistryIsolationHealthyAndFailing(t *testing.T) {
 	deadline := time.Now().Add(30 * time.Second)
 	for time.Now().Before(deadline) {
 		snap := sessA.StatusSnapshot()
-		if snap.Link != nil && snap.Link.Via == "direct" && snap.Link.Ep != "" && table.Len() >= 1 {
+		// 等待条件必须并入 ready：链路采纳与状态机到 ready 之间有窗口
+		//（exec-r1 整改发现：-race 时序下循环在 starting 期即 break，终断言
+		// 误报——既有批 3 用例缺陷，非本批代码回归）。
+		if snap.State == "ready" && snap.Link != nil && snap.Link.Via == "direct" && snap.Link.Ep != "" && table.Len() >= 1 {
 			break
 		}
 		time.Sleep(200 * time.Millisecond)

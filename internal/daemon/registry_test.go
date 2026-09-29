@@ -7,8 +7,11 @@ package daemon
 
 import (
 	"encoding/hex"
+	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -162,4 +165,112 @@ func TestRegistryStrictIdentityEphemeral(t *testing.T) {
 		time.Sleep(50 * time.Millisecond)
 	}
 	t.Fatalf("10s 内未按 identity_ephemeral 收工（当前 %+v）", sess.StatusSnapshot())
+}
+
+// hosts.json 损坏：备份 `hosts.json.corrupt-<ts>` + 空表启动 + 事件级告警
+// （exec-r1 M2 红路：此前损坏即拒启——client 角色无限退避、daemon 永远
+// not_ready，主机登记（含 token）无自愈路径）。
+func TestRegistryCorruptHostsBacksUpAndStartsEmpty(t *testing.T) {
+	dir := t.TempDir()
+	p := filepath.Join(dir, hostsFileName)
+	if err := os.WriteFile(p, []byte("{这是坏掉的 hosts"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var warns []string
+	r, err := OpenRegistry(dir, RegistryOptions{
+		StrictIdentity: true,
+		Eventf:         func(format string, args ...any) { warns = append(warns, fmt.Sprintf(format, args...)) },
+	})
+	if err != nil {
+		t.Fatalf("损坏 hosts.json 应备份后空表启动，实得拒启：%v", err)
+	}
+	defer r.Close()
+	if got := len(r.Hosts()); got != 0 {
+		t.Fatalf("损坏后应按空表启动（表长 %d）", got)
+	}
+	if len(warns) != 1 || !strings.Contains(warns[0], "hosts.json 损坏") {
+		t.Fatalf("应恰好一条事件级告警：%q", warns)
+	}
+	// 原件保留（备份可人工修复后重启恢复）、主文件已挪走（下次落盘重建）。
+	backups := 0
+	des, _ := os.ReadDir(dir)
+	for _, de := range des {
+		if strings.HasPrefix(de.Name(), hostsFileName+".corrupt-") {
+			backups++
+		}
+	}
+	if backups != 1 {
+		t.Fatalf("应恰有一个 corrupt-<ts> 备份（实得 %d）", backups)
+	}
+	if _, err := os.Stat(p); !os.IsNotExist(err) {
+		t.Fatalf("损坏原件应已挪走（stat err=%v）", err)
+	}
+	// 空表可继续服役：Add 一台 → 新 hosts.json 落盘且可解析。
+	tokA, _ := testToken(t, 7, "127.0.0.1:40007")
+	if _, err := r.Add("甲", tokA); err != nil {
+		t.Fatal(err)
+	}
+	b, err := os.ReadFile(p)
+	if err != nil {
+		t.Fatalf("Add 后 hosts.json 未重建：%v", err)
+	}
+	var recs []HostRecord
+	if err := json.Unmarshal(b, &recs); err != nil || len(recs) != 1 || recs[0].Name != "甲" {
+		t.Fatalf("重建的 hosts.json 应含一条可解析记录：%v（%s）", err, b)
+	}
+}
+
+// 落盘原子性（temp+rename，exec-r1 M2 绿路）：不残留 .tmp；写窗口被中断最坏留
+// 完整旧表或完整新表，不再产生截断 JSON（此前裸 os.WriteFile 覆写）。
+func TestRegistrySaveAtomicRename(t *testing.T) {
+	dir := t.TempDir()
+	r := openTestRegistry(t, dir)
+	// 预置陈旧 .tmp（上次写窗口被杀的残留）：rename 语义下被覆盖后挪走。
+	tmp := filepath.Join(dir, hostsFileName+".tmp")
+	if err := os.WriteFile(tmp, []byte("陈旧残tmp"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	tokA, peerA := testToken(t, 8, "127.0.0.1:40008")
+	if _, err := r.Add("甲", tokA); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(tmp); !os.IsNotExist(err) {
+		t.Fatalf("落盘后不应残留 .tmp（stat err=%v）", err)
+	}
+	p := filepath.Join(dir, hostsFileName)
+	b, err := os.ReadFile(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var recs []HostRecord
+	if err := json.Unmarshal(b, &recs); err != nil || len(recs) != 1 || recs[0].Name != "甲" {
+		t.Fatalf("hosts.json 应为完整可解析新表：%v（%s）", err, b)
+	}
+	// 第二轮写：删除后再确认（任意中断点都只可能是 rename 前后两个完整态）。
+	if err := r.Remove(peerA); err != nil {
+		t.Fatal(err)
+	}
+	b2, err := os.ReadFile(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal(b2, &recs); err != nil || len(recs) != 0 {
+		t.Fatalf("删除后应为完整空表：%v（%s）", err, b2)
+	}
+}
+
+// daemon 拒绝出口 state 目录（exec-r1 B11 硬拦）：tokens.jsonl = 出口身份特征
+// （签发审计 + 启动加载，D7；daemon 永不写它）。
+func TestDaemonRefusesExitStateDir(t *testing.T) {
+	dir := t.TempDir()
+	if err := checkNotExitState(dir); err != nil {
+		t.Fatalf("干净目录不应拦：%v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "tokens.jsonl"), []byte("{}\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	err := checkNotExitState(dir)
+	if err == nil || !strings.Contains(err.Error(), "tokens.jsonl") {
+		t.Fatalf("含 tokens.jsonl 的目录应报错拒启：%v", err)
+	}
 }

@@ -96,6 +96,46 @@ func ReadFrame(r io.Reader, maxBody int) (op byte, body []byte, err error) {
 	return op, body, nil
 }
 
+// FrameHead 已过上限先验的帧头（op + 声明 body 长度）。
+type FrameHead struct {
+	Op byte
+	N  uint32
+}
+
+// maxBodyFor 按 op 选帧长上限（spec「帧封装」冻结：流 DATA 帧 256KiB、其余控制
+// 类 1MiB）。读循环 MUST 走这条路——一律按控制上限读会让流帧的 256KiB 上限
+// 在读路径根本不生效（exec-r1 B2：512KiB 的 stream.data 此前被完整读下）。
+func maxBodyFor(op byte) int {
+	if op == OpStreamData {
+		return MaxStreamBody
+	}
+	return MaxControlBody
+}
+
+// ReadHeader 读 5 字节帧头并按 op 选上限做长度先验（超限**不读 body** 返回
+// ErrBadFrame）。服务器/客户端读循环用（ReadHeader+ReadBody 组合 = 按 op 的
+// 两档上限）；显式传 maxBody 的旧用法见 ReadFrame。
+func ReadHeader(r io.Reader) (FrameHead, error) {
+	var head [5]byte
+	if _, err := io.ReadFull(r, head[:]); err != nil {
+		return FrameHead{}, err
+	}
+	h := FrameHead{Op: head[0], N: binary.BigEndian.Uint32(head[1:5])}
+	if int(h.N) > maxBodyFor(h.Op) {
+		return h, fmt.Errorf("%w: 声明长度 %d 超上限 %d（op=0x%02x）", ErrBadFrame, h.N, maxBodyFor(h.Op), h.Op)
+	}
+	return h, nil
+}
+
+// ReadBody 读 FrameHead 声明的 body（head 已过 ReadHeader 的上限先验）。
+func ReadBody(r io.Reader, head FrameHead) ([]byte, error) {
+	body := make([]byte, head.N)
+	if _, err := io.ReadFull(r, body); err != nil {
+		return body, err
+	}
+	return body, nil
+}
+
 // WriteFrame 向 w 写一帧。len 由 body 长度推导；调用方保证 body 不超所属类的上限
 // （EncodeFrame 系列产物天然满足）。
 func WriteFrame(w io.Writer, op byte, body []byte) error {

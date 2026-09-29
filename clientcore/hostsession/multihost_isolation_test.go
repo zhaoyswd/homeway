@@ -177,15 +177,52 @@ func TestMultiHostSessionsIsolatedUnderRecoveryStorm(t *testing.T) {
 	waitSnap(sB, svcStateReady) // 软失败形态（会话在、链路无）
 
 	// ---- B 的恢复风暴：拨号失败驱动阶梯；连续耗尽 → 整会话重建 → 再耗尽被限频。----
+	// 风暴在**后台 goroutine** 里跑，与 A 的健康轮询窗口重叠（exec-r1 M4：此前
+	// 四次串行 stormDial 跑完才断言 A，风暴期 A 的巡检/探测并发面根本没被覆盖）。
 	stormDial := func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 7*time.Second)
 		defer cancel()
 		_, _ = sB.DialPort(ctx, 7724) // 失败属预期（死端点）；价值在内部恢复路径被驱动
 	}
-	stormDial() // 阶梯轮 1（走完仍失败）
-	stormDial() // 阶梯轮 2 → 连续耗尽 → REBUILD 整会话重建（计数触发即归零）
-	stormDial() // 新会话阶梯轮 3
-	stormDial() // 阶梯轮 4 → 再耗尽 → 限频挡下（「被限频」行）
+	stormDone := make(chan struct{})
+	go func() {
+		defer close(stormDone)
+		stormDial() // 阶梯轮 1（走完仍失败）
+		stormDial() // 阶梯轮 2 → 连续耗尽 → REBUILD 整会话重建（计数触发即归零）
+		stormDial() // 新会话阶梯轮 3
+		stormDial() // 阶梯轮 4 → 再耗尽 → 限频挡下（「被限频」行）
+	}()
+
+	// 风暴窗口内持续采样 A 的健康（与风暴并发——隔离判据的可失败形态：任一采样
+	// 掉出 ready+direct 即串扰实证，而不是风暴结束后才看一眼终态）。
+	healthySamples := 0
+	stormDeadline := time.After(40 * time.Second)
+sampling:
+	for {
+		select {
+		case <-stormDone:
+			break sampling
+		case <-stormDeadline:
+			t.Fatal("风暴 40s 未走完（四轮拨号预算异常）")
+		default:
+		}
+		if sess := sA.curSession(); sess != nil {
+			pctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+			perr := sess.PathProbe(pctx)
+			cancel()
+			snap := sA.StatusSnapshot()
+			if perr == nil && snap.Link != nil && snap.Link.Via == "direct" && snap.Link.Ep != "" {
+				healthySamples++
+			} else if snap.State != svcStateReady || snap.Link == nil || snap.Link.Via != "direct" {
+				t.Fatalf("风暴窗口内 A 掉出 ready+direct（串扰实证）：%+v（probe err=%v）", snap, perr)
+			}
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+	<-stormDone
+	if healthySamples < 3 {
+		t.Fatalf("风暴窗口内 A 的健康采样过少（%d 次）——重叠窗口未形成，用例失效", healthySamples)
+	}
 
 	// ---- 隔离判据（逐条，HD 场景「两主机会话并发互不干扰」） ----
 	// ① A 仍是就绪会话、链路仍在（巡检/链路状态不受 B 风暴影响）。
@@ -200,21 +237,30 @@ func TestMultiHostSessionsIsolatedUnderRecoveryStorm(t *testing.T) {
 	if sB.rebuildAt.IsZero() {
 		t.Fatal("B 应已触发整会话重建（rebuildAt 零值）")
 	}
-	// ③ 恢复闸按会话自持（无共享 gate）。
-	if &sA.recGate == &sB.recGate {
-		t.Fatal("两会话不应共享恢复闸")
+	// ③ 恢复闸按会话各自完成独立轮次（exec-r1 M4：此前比较两会话结构体字段地址
+	// 恒不相等、恒真零证明力——改为可失败断言：B 的闸完成过 ≥2 轮完整阶梯
+	//（每轮耗尽各记一行「RECOVER 走完」），A 的闸恰 0 轮——若闸/计数被共享，
+	// B 的轮次会丢或 A 会冒出恢复行）。
+	logA, _ := os.ReadFile(filepath.Join(dir, "host-a.log"))
+	logB, _ := os.ReadFile(filepath.Join(dir, "host-b.log"))
+	if got := strings.Count(string(logB), "RECOVER 走完"); got < 2 {
+		t.Fatalf("B 的恢复闸应完成 ≥2 轮完整阶梯（实得 %d 轮「RECOVER 走完」行）", got)
+	}
+	if got := strings.Count(string(logA), "RECOVER"); got != 0 {
+		t.Fatalf("A 的恢复闸应为 0 轮（日志出现 %d 处 RECOVER——串扰）", got)
 	}
 	// ④ 身份按后端派生：同 master、不同后端公钥 → 不同 WG 钥匙（devTag 是设备级
 	// 共享——出口按 devTag 归并同一台设备，这是 D2 的派生模型，不比较 Dev）。
+	// exec-r1 M4：去掉 nil 前置守卫——严格身份下两侧指纹是**必然产物**，缺失即
+	// 用例失效（此前 B 缺失会静默跳过断言）。
 	snapB := sB.StatusSnapshot()
-	if snapA2.Identity != nil && snapB.Identity != nil {
-		if snapA2.Identity.Pub == snapB.Identity.Pub {
-			t.Fatal("不同后端派生的 WG 公钥指纹不应相同")
-		}
+	if snapA2.Identity == nil || snapB.Identity == nil {
+		t.Fatalf("两会话都应派生身份指纹（A=%v B=%v）——严格身份下必然非空", snapA2.Identity, snapB.Identity)
+	}
+	if snapA2.Identity.Pub == snapB.Identity.Pub {
+		t.Fatal("不同后端派生的 WG 公钥指纹不应相同")
 	}
 	// ⑤ 恢复动作只发生在 B 的会话上：日志按主机归属对拍（A 的日志零恢复行）。
-	logA, _ := os.ReadFile(filepath.Join(dir, "host-a.log"))
-	logB, _ := os.ReadFile(filepath.Join(dir, "host-b.log"))
 	for _, bad := range []string{"RECOVER", "REBUILD", "拨号失败"} {
 		if strings.Contains(string(logA), bad) {
 			t.Fatalf("A 的日志不应出现恢复动作 %q（串扰）", bad)

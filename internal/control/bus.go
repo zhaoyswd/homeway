@@ -361,6 +361,22 @@ func (b *Bus) Unsubscribe(sub *Subscriber) {
 	delete(b.subs, sub)
 }
 
+// UnsubscribeDomains 从订阅中摘除若干域（幂等；未含域 = 无操作），摘空即整体
+// 从总线摘除。**订阅域的增删只在 b.mu 内发生**（Subscribe 换集合、本函数删条目）
+// ——publish 在同一把锁下经 matches 读 domains，锁外改这张 map 是运行时
+// fatal 级竞态（concurrent map read and map write，recover 兜不住——exec-r1 H1：
+// 此前 server 侧持 subMu 裸删，与 publish 的 b.mu 互不相干）。
+func (b *Bus) UnsubscribeDomains(sub *Subscriber, domains []string) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	for _, d := range domains {
+		delete(sub.domains, d)
+	}
+	if len(sub.domains) == 0 {
+		delete(b.subs, sub)
+	}
+}
+
 // terminateLocked 标记 overrun 并停投（publish 的投递失败路径调用）。
 func (s *Subscriber) terminateOverrun() {
 	s.once.Do(func() {

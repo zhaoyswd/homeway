@@ -61,7 +61,7 @@ func (b *controlBackend) RolesStatus() []control.RoleBrief {
 	stats := b.sup.Statuses()
 	out := make([]control.RoleBrief, 0, len(stats))
 	for _, st := range stats {
-		out = append(out, control.RoleBrief{Name: st.Name, State: st.State, Restarts: st.Restarts})
+		out = append(out, control.RoleBrief{Name: st.Name, State: st.State, Restarts: st.Restarts, Reason: st.LastError})
 	}
 	return out
 }

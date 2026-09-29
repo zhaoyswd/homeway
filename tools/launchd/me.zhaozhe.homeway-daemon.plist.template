@@ -3,8 +3,10 @@
      安装前替换两处占位：
        __HOMEWAY_BIN__  homeway 可执行文件绝对路径（如 /usr/local/bin/homeway）
        __STATE_DIR__    守护进程 state 目录绝对路径（如 /Users/you/.config/homeway/daemon）
-     ⚠️ ⚠️ exit 与 daemon 禁止共用同一 state 目录（该组合未定义——两角色 state 语义不同，
-     单实例锁会互相拒绝；角色合并归后续能力域 3f）。检查：state 目录不得与任何
+     ⚠️ ⚠️ exit 与 daemon 禁止共用同一 state 目录（共写日志轮转互踩、共享
+     identity 目录；角色合并归后续能力域 3f）。daemon 侧硬拦：state 下存在
+     tokens.jsonl（出口身份特征）即拒启；exit/relay 侧不检测（单实例锁只约束
+     daemon），反向指过去只能靠人工避免。检查：state 目录不得与任何
      `homeway exit --state`/`homeway relay --state` 在役部署相同；本模板默认子目录
      ~/.config/homeway/daemon 与在役出口 ~/.config/homeway 天然不同目录，可并存
      （不同 label：me.zhaozhe.homeway-exit / me.zhaozhe.homeway-daemon）。
