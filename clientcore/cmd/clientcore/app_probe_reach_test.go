@@ -238,3 +238,48 @@ func TestProbeReachCanonicalGolden(t *testing.T) {
 		})
 	}
 }
+
+// TestProbeReachRawKeyOrder 键序断言（exec-r1 第 3 条）：design D2 的「字段顺序
+// 逐字节」这半条在 canonicalizer（map 重排）下不可判别——这里对**原始 raw** 直接
+// 断言：顶层键按 endpoints → ok → peer → results 出现（map marshal 字母序），
+// results 元组按结构体声明序 ep → rtt_ms → build → relay。任何一方字段增删/换序
+// （含未来改用结构体 marshal 顶层）本用例即红。
+func TestProbeReachRawKeyOrder(t *testing.T) {
+	alive := startFakeProber(t, "ko-v1")
+	tok := makeReachToken(t,
+		proto.Endpoint{Addr: alive.pc.LocalAddr().String()},
+		proto.Endpoint{Addr: alive.pc.LocalAddr().String(), Relay: true},
+	)
+	raw := probeReachJSON(tok)
+	if !strings.HasPrefix(raw, `{"endpoints":[`) {
+		t.Fatalf("顶层首键应为 endpoints（map 字母序）：%.60s", raw)
+	}
+	last := -1
+	for _, k := range []string{`"endpoints":`, `"ok":`, `"peer":`, `"results":`} {
+		i := strings.Index(raw, k)
+		if i < 0 {
+			t.Fatalf("缺顶层键 %s：%s", k, raw)
+		}
+		if i < last {
+			t.Fatalf("顶层键序不符（%s 出现在前一键之前）：%s", k, raw)
+		}
+		last = i
+	}
+	// results 元组键序 = reachResult 结构体声明序。
+	i := strings.Index(raw, `"results":[{`)
+	if i < 0 {
+		t.Fatalf("results 应含活端点元组：%s", raw)
+	}
+	tup := raw[i:]
+	last = -1
+	for _, k := range []string{`"ep":`, `"rtt_ms":`, `"build":`, `"relay":`} {
+		j := strings.Index(tup, k)
+		if j < 0 {
+			t.Fatalf("results 元组缺键 %s：%s", k, tup)
+		}
+		if j < last {
+			t.Fatalf("元组键序不符（%s 在前一键之前）：%.200s", k, tup)
+		}
+		last = j
+	}
+}

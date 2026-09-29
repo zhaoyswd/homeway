@@ -223,7 +223,14 @@ func mustMarshal(v any) []byte {
 // 服务端下行 backendPump 读块同款常量）自动分片——单帧 body 超 256KiB-4 会被
 // 服务端按帧长上限拒（bad_frame 断连），大块上行必须分片（host-cli 3b，exec-r2 ①）。
 // 流 = 字节流语义，不承诺帧边界（对端按序重组即可）。
+// 注记（exec-r1 第 8/9 条）：分片无流控——真服务器上行队列仅 8 槽、超突发仍会被
+// 背压收流（finish(gone)，design D7 已注记）；流控/按窗口发送归 4a（大块上行消费
+// 者期，届时以真实消费者定型）。空载荷显式不发（旧实现恒发一帧含空载荷——行为
+// 差异如实登记；字节流语义下无实害、当前无 in-repo 消费者）。
 func (s *ClientStream) Send(b []byte) error {
+	if len(b) == 0 {
+		return nil
+	}
 	for off := 0; off < len(b); off += streamChunkSize {
 		end := off + streamChunkSize
 		if end > len(b) {

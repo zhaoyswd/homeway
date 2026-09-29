@@ -80,6 +80,12 @@ func hostAddCLI(args []string, version string, w io.Writer) error {
 	if _, err := proto.DecodeToken(token); err != nil {
 		return fmt.Errorf("token 非法（%s）：%v（token 形如 hmw1…，从出口启动日志现场获取后重新粘贴）", maskToken(token), err)
 	}
+	// exec-r1 第 11 条：--timeout 低于 5s 时告警——服务端探测预算 ≤3.5s，客户端
+	// ctx 先退时服务端（每请求独立 goroutine）继续探测并**已入表**，脚本按退出码
+	// 判失败会误判（--force 重试得 host_exists）。
+	if *timeout < 5*time.Second {
+		fmt.Fprintf(w, "  警告：--timeout=%s 低于 5s——超时先退时主机或已入表（核对：homeway host list）\n", *timeout)
+	}
 
 	// ②守护托管：结论（三档 + 实测端点）以 host.add 响应载荷只增字段返回。
 	sock := filepath.Join(*stateDir, control.ControlSockName)
@@ -115,19 +121,31 @@ func hostAddCLI(args []string, version string, w io.Writer) error {
 }
 
 // printHostAdded 三档映射输出（spec host-cli「host add 的呈现」）。
+//
+// exec-r1 第 1 条：Reach == nil（**版本偏斜**——3a 期常驻 daemon 的 host.add 回
+// HostBrief{id,name,addedAt}，无 reach 字段；daemon 独立常驻、升级 CLI 二进制不重启
+// 它时该形态可达）走降级分支——不得解引用、不得静默；主机确实已入表（旧 daemon 会
+// 先入表），提示重启 daemon 后可复核。未知 tier 值（词表只增，未来新增或漂移）同样
+// 非静默（exec-r1 第 4 条）：打印原始值 +「验证结论未知」，添加本身成功不误报失败。
 func printHostAdded(w io.Writer, res *control.HostAddResult) {
 	name := res.Name
 	if name == "" {
 		name = "-"
 	}
-	switch {
-	case res.Reach == nil || res.Reach.Tier == control.ReachTierDirect:
+	if res.Reach == nil {
+		fmt.Fprintf(w, "已添加主机 %s（%s）——旧版守护进程无验证结论，重启 daemon 后可复核（homeway host status %s）\n", name, shortHostID(res.ID), name)
+		return
+	}
+	switch res.Reach.Tier {
+	case control.ReachTierDirect:
 		fmt.Fprintf(w, "已添加主机 %s（%s）——直连可达 ep=%s rtt=%dms\n", name, shortHostID(res.ID), res.Reach.BestEp, res.Reach.RttMs)
-	case res.Reach.Tier == control.ReachTierRelay:
+	case control.ReachTierRelay:
 		fmt.Fprintf(w, "已添加主机 %s（%s）——仅中继可达 ep=%s rtt=%dms\n", name, shortHostID(res.ID), res.Reach.BestEp, res.Reach.RttMs)
 		fmt.Fprintln(w, "  提示：直连不可达，连接将走中继；若非预期请检查出口公网端口/UPnP")
-	case res.Reach.Tier == control.ReachTierSkipped:
+	case control.ReachTierSkipped:
 		fmt.Fprintf(w, "已添加主机 %s（%s）——跳过验证（--force，端点未实测，首次连接时补全）\n", name, shortHostID(res.ID))
+	default:
+		fmt.Fprintf(w, "已添加主机 %s（%s）——验证结论未知（tier=%q，词表外值；守护进程版本或高于本 CLI）\n", name, shortHostID(res.ID), res.Reach.Tier)
 	}
 }
 
@@ -251,6 +269,9 @@ func hostStatusCLI(args []string, version string, w io.Writer) error {
 	name := ""
 	if fs.NArg() == 1 {
 		name = fs.Arg(0)
+		if strings.TrimSpace(name) == "" {
+			return errors.New("空主机名不可寻址——homeway host status [name] 需要主机名，或省略 name 查看全部（homeway host list 查看在表主机）")
+		}
 		var matched []control.HostState
 		for _, h := range hosts {
 			if h.Name == name {
@@ -261,7 +282,9 @@ func hostStatusCLI(args []string, version string, w io.Writer) error {
 			return fmt.Errorf("主机 %q 不存在（homeway host list 查看在表主机）", name)
 		}
 		if len(matched) > 1 {
-			return fmt.Errorf("多台主机同名 %q（%d 台）——请用完整 ID 寻址：homeway host status 后查 host list --json", name, len(matched))
+			// exec-r1 第 6 条：host status 只按名称匹配（不支持 ID 寻址）——提示
+			// 必须可行动：改名或先删其一。
+			return fmt.Errorf("多台主机同名 %q（%d 台）——请先改名（host delete 其一后重新 host add 命名）再查，或用 host list --json 看全部", name, len(matched))
 		}
 		hosts = matched
 	}
@@ -372,6 +395,11 @@ func hostDeleteCLI(args []string, version string, w io.Writer) error {
 // resolveHostTarget 寻址：名称精确 / peerID hex 全长 / 短前缀无歧义（歧义报错
 // 列候选——可行动）。不存在报错（幂等 ≠ 静默成功）。
 func resolveHostTarget(hosts []control.HostState, target string) (id, name string, err error) {
+	// exec-r1 第 5 条：空 target 显式拒绝——strings.HasPrefix(h.ID, "") 恒真，
+	// 单主机时会命中唯一主机（误删风险）、多主机时报歧义；均不可达。
+	if strings.TrimSpace(target) == "" {
+		return "", "", errors.New("空寻址串不可用——homeway host delete 需要 <name|id>（homeway host list 查看）")
+	}
 	// ① 名称精确匹配。
 	var byName []control.HostState
 	for _, h := range hosts {

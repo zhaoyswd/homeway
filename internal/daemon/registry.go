@@ -196,6 +196,9 @@ func (r *Registry) Add(name, token string) (HostRecord, error) {
 		}
 		// 停旧会话。B7①（用户面）：Stop -1 = 拒绝该操作 + events.log 记行——此时
 		// 磁盘或已含新 token、内存保持旧值，重试或重启按磁盘收敛（如实注记）。
+		// 「拒绝」是名义拒绝（exec-r1 第 7 条措辞对齐）：拒绝的是**更新内存**——
+		// Stop 已被调用过一次（stopOnce 不可回退），旧会话对象虽仍在册但已进入
+		// 收尾/垂死，该主机短暂离线属预期。
 		if e.sess != nil && stopFunc(e.sess) < 0 {
 			r.eventf("hosts: %s（%s）token 刷新被拒——会话停止超时（-1，垂死会话仍在收尾；重试或重启按磁盘收敛）", e.rec.ID, e.rec.Name)
 			return HostRecord{}, errStopTimeout
@@ -248,6 +251,8 @@ func (r *Registry) Remove(id [32]byte) error {
 		r.eventf("hosts: %s（%s）删除被拒——会话停止超时（-1，垂死会话仍在收尾；重试或重启按磁盘收敛）", e.rec.ID, e.rec.Name)
 		return errStopTimeout
 	}
+	// 同上（exec-r1 第 7 条）：-1 时磁盘已无该条目、内存条目仍在——「拒绝」= 拒绝
+	// 摘除内存；会话已进收尾、该主机短暂离线属预期，重试收敛。
 	delete(r.hosts, id)
 	r.logf("hosts: - %s（%s）", e.rec.ID, e.rec.Name)
 	if r.events != nil {

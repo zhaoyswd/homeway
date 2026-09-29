@@ -278,6 +278,11 @@ func TestB7RefreshRejectOnStopTimeout(t *testing.T) {
 	if r.Session(peerA) != oldSess {
 		t.Fatal("拒绝后旧会话对象应未动")
 	}
+	// exec-r1 第 7 条措辞对齐：对象未换 ≠ 会话在跑——stopFunc 已返回 -1（真实
+	// 语义 = Session.Stop 的 stopOnce 已触发、等待收尾超时），旧会话已进入垂死/
+	// 收尾，该主机短暂离线属预期；本用例注入缝直接短路返回，真实 Stop 语义见
+	// hostsession/service.go 的 stopOnce 注释。落盘失败路径（上一用例）才是
+	// 「会话完全未动」。
 	// 磁盘或已含新 token（B5 先落盘语义——拒绝只回滚内存，磁盘收敛如实注记）：
 	// 重试（stopFunc 恢复）后内存与磁盘一致。
 	b, err := os.ReadFile(filepath.Join(dir, hostsFileName))

@@ -5,7 +5,7 @@
 `host add/list/status/delete` = 主机表管理命令面（host-cli 起：守护托管，`host add` 服务端
 做有界连通性验证——探测核 `pkg/probe.Reach` 与手机 App 同调一份）；`clientcore/` = 手机核
 （tier App 经其仓库的 submodule 钉定检出消费，产物 `libclientcore.so`）。本文件只放跨会话
-都要知道的硬规则；工程细节看本仓 `README.md` 与 tier 仓（`github.com/zhaozwd/tier`）的
+都要知道的硬规则；工程细节看本仓 `README.md` 与 tier 仓（`github.com/zhaoyswd/tier`）的
 `AGENTS.md` + `docs/agents/` 分册。
 
 ## 必须遵守（硬规则）

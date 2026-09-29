@@ -10,6 +10,8 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
+	"net"
 	"os"
 	"path/filepath"
 	"strings"
@@ -309,5 +311,87 @@ func cleanHost(t *testing.T, sock string) {
 	}
 	for _, h := range list.Hosts {
 		_, _ = c.Request(ctx, control.OpHostRemove, control.HostRemoveArgs{Host: h.ID})
+	}
+}
+
+// skewBackend exec-r1 第 1 条的「旧 daemon」wire 形态：3a 期 host.add 回
+// HostBrief{id,name,addedAt}（无 reach 字段；旧 parseArgs 朴素 Unmarshal 忽略未知
+// force 后照旧入表并回旧载荷）。Reach=nil 的 HostAddResult 经 omitempty 序列化后
+// 与旧形态逐字节同构——用假 Backend + 真控制面服务器复现「新 CLI + 旧常驻 daemon」。
+type skewBackend struct{}
+
+func (b *skewBackend) ServerVersion() string            { return "0.9.0-old" }
+func (b *skewBackend) RolesStatus() []control.RoleBrief { return nil }
+func (b *skewBackend) HostBriefs() []control.HostBrief  { return nil }
+func (b *skewBackend) RemoveHost(id string) error       { return nil }
+func (b *skewBackend) HostStates() []control.HostState  { return nil }
+func (b *skewBackend) NotReady() bool                   { return false }
+func (b *skewBackend) DialTerm(ctx context.Context, host string) (net.Conn, error) {
+	return nil, control.ErrBackendNoHost
+}
+func (b *skewBackend) AddHost(name, token string, force bool) (control.HostAddResult, error) {
+	// 无 Reach = 旧 wire 形态（reach,omitempty）
+	return control.HostAddResult{ID: fmt.Sprintf("%064x", 7), Name: name, AddedAt: 1760000000000}, nil
+}
+
+// TestHostCLIAddVersionSkewNoReach 版本偏斜（exec-r1 第 1 条，P0）：旧 daemon 的
+// host.add 响应无 reach 字段——新 CLI 不得 panic、不得静默，走降级分支提示重启
+// daemon 后复核，退出码 0（主机确实已被旧 daemon 入表）。
+func TestHostCLIAddVersionSkewNoReach(t *testing.T) {
+	dir := shortTempDirDaemon(t)
+	bus := control.NewBus(control.NewGeneration(), control.BusConfig{})
+	srv := control.NewServer(control.ServerConfig{ServerVersion: "0.9.0-old", Bus: bus, Backend: &skewBackend{}})
+	sock, ln, err := control.ListenControl(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	go func() { _ = srv.Serve(ln) }()
+	t.Cleanup(srv.Close)
+	_ = sock
+
+	tok := hostTok(t, 31, "")
+	var buf bytes.Buffer
+	// 修复前：printHostAdded 在 Reach==nil 分支解引用 BestEp ⇒ nil 指针 panic
+	// （评审者 worktree 复现形态）；修复后走降级分支。
+	if err := hostCLI([]string{"add", "--state", dir, "--name", "旧daemon", tok}, "cli-new", &buf); err != nil {
+		t.Fatalf("版本偏斜下 add 应成功（主机已入表）：%v", err)
+	}
+	out := buf.String()
+	if !strings.Contains(out, "已添加主机 旧daemon") || !strings.Contains(out, "旧版守护进程无验证结论") || !strings.Contains(out, "重启 daemon") {
+		t.Fatalf("降级分支输出不符：%s", out)
+	}
+}
+
+// TestPrintHostAddedUnknownTier 未知 tier 值非静默（exec-r1 第 4 条）：词表只增，
+// 未来新增或漂移时 default 打印原始值 +「验证结论未知」（添加成功不误报失败）。
+func TestPrintHostAddedUnknownTier(t *testing.T) {
+	var buf bytes.Buffer
+	printHostAdded(&buf, &control.HostAddResult{ID: "ab", Name: "n", Reach: &control.HostReach{Tier: "quantum"}})
+	out := buf.String()
+	if !strings.Contains(out, "已添加主机 n") || !strings.Contains(out, "验证结论未知") || !strings.Contains(out, `tier="quantum"`) {
+		t.Fatalf("未知 tier 应非静默打印原始值：%s", out)
+	}
+}
+
+// TestResolveHostTargetEmptyRejected 空 target 显式拒绝（exec-r1 第 5 条）：
+// HasPrefix(h.ID, "") 恒真——单主机时会命中唯一主机（host delete "" --yes 误删）、
+// 多主机时报歧义；status "" 同理会匹配全部未命名主机。两路都必须可行动报错。
+func TestResolveHostTargetEmptyRejected(t *testing.T) {
+	one := []control.HostState{{ID: "0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20", Name: "唯一"}}
+	if id, _, err := resolveHostTarget(one, ""); err == nil {
+		t.Fatalf("空 target 单主机时被命中（id=%s）——须拒绝", id)
+	}
+	// e2e：host delete ""（非 tty 注入 + --yes）与 host status "" 均拒绝。
+	origTTY := stdinIsTerminal
+	stdinIsTerminal = func() bool { return false }
+	t.Cleanup(func() { stdinIsTerminal = origTTY })
+	_, sock := startDaemonForTest(t)
+	dir := strings.TrimSuffix(sock, "/"+control.ControlSockName)
+	var buf bytes.Buffer
+	if err := hostCLI([]string{"delete", "--state", dir, "--yes", ""}, "cli-test", &buf); err == nil || !strings.Contains(err.Error(), "空寻址串") {
+		t.Fatalf("host delete \"\" 应可行动报错：%v", err)
+	}
+	if err := hostCLI([]string{"status", "--state", dir, ""}, "cli-test", &buf); err == nil || !strings.Contains(err.Error(), "空主机名") {
+		t.Fatalf("host status \"\" 应可行动报错：%v", err)
 	}
 }
