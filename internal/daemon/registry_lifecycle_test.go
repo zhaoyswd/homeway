@@ -289,6 +289,8 @@ func TestB7RefreshRejectOnStopTimeout(t *testing.T) {
 	if rec, err := r.Add("甲", tokA2); err != nil || rec.Token != tokA2 {
 		t.Fatalf("重试刷新应收敛到新 token：%v", err)
 	}
+	// 收尾：真收工（重试起的新会话不停会与 TempDir 清理竞争——identity 目录写入）。
+	r.Close()
 }
 
 // TestB7RemoveRejectOnStopTimeout Remove 遇 Stop -1：拒绝 + events.log 恰一行、
@@ -362,10 +364,14 @@ func TestB7CloseContinuesOnStopTimeout(t *testing.T) {
 	stopFunc = func(s *hostsession.Session) int { return -1 }
 	defer func() { stopFunc = origStop }()
 
+	var sesss []*hostsession.Session
 	for _, pb := range []byte{17, 18} {
-		tok, _ := testToken(t, pb, "127.0.0.1:40000")
+		tok, peer := testToken(t, pb, "127.0.0.1:40000")
 		if _, err := r.Add(fmt.Sprintf("机%d", pb), tok); err != nil {
 			t.Fatal(err)
+		}
+		if s := r.Session(peer); s != nil {
+			sesss = append(sesss, s)
 		}
 	}
 
@@ -393,5 +399,12 @@ func TestB7CloseContinuesOnStopTimeout(t *testing.T) {
 	}
 	if len(r.Hosts()) != 0 {
 		t.Fatal("Close 后表应清空")
+	}
+	// 收尾：恢复真停步并逐台真收——注入 -1 时 Close 记行后继续但**不会真停会话**，
+	// 在跑会话的 identity 写入会与 TempDir 清理竞争（CI 实测 unlinkat "directory
+	// not empty"——2026-09-29 v0.10.0 tag 首跑）。
+	stopFunc = origStop
+	for _, s := range sesss {
+		_ = s.Stop()
 	}
 }
