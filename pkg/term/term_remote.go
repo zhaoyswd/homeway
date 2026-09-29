@@ -17,8 +17,9 @@ type RemoteTerm interface {
 	// 空串 = 实现侧默认 ~/.config/homeway/daemon）。
 	ResolveHostRef(ctx context.Context, stateDir, ref string) (hexID, name string, err error)
 	// DialTerm 打开到目标主机 term 服务的字节流（term 帧协议端到端承载、零改写；
-	// 返回的连接已满足「可读 GREETING」的普通流语义）。ctx = 「控制面连接 +
-	// stream.open」总预算（CLI --timeout，默认 10s）。
+	// 返回的连接已满足「可读 GREETING」的普通流语义）。ctx = 本次拨号（控制面连接 +
+	// stream.open）的预算，取 CLI --timeout 的「打开」一份（默认 10s）——解析是另一次
+	// 独立预算，最坏相加 20s。
 	DialTerm(ctx context.Context, stateDir, hexID string) (io.ReadWriteCloser, error)
 }
 

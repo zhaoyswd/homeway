@@ -135,8 +135,9 @@ type fakeTermHost struct {
 	// flood 参数（exec-r1 M1①）：默认 512×8KiB 全速（PTY 全链用例沿用——pty 缓冲
 	// 小，全速也能把链灌满）；要「确定灌满客户端 recv」的用例改 paced 形态（借
 	// internal/control TestStreamBackpressureNoLoss 的 200×4KiB + 2ms 节拍配方：
-	// 节拍防 TCP 合并、逐块成条目，>64 条必灌满 recv 64 槽——全速大块在 darwin 可被
-	// 自调 TCP 缓冲整段吸收，exec-r1 实测一条都进不了满槽投递）。
+	// 节拍防 TCP 合并、逐块成条目，>64 条必灌满 recv 64 槽——与 internal/control
+	// 同款确定化取向。原用例前置不成立的真实根因是从未发 HELLO、flood 根本没开闸
+	// （exec-report 整改段已正名），非「全速进不了满槽」）。
 	floodBlocks int           // ≤0 = 默认 512
 	floodChunk  int           // ≤0 = 默认 8KiB
 	floodEvery  time.Duration // 0 = 全速连发；>0 = 每块间隔节拍
@@ -474,9 +475,10 @@ func TestStreamConnEndThenEOF(t *testing.T) {
 // 全满、消费方停读（不调 Read）→ reader 阻塞在 recv<- → 触发 Close —— 必须在 500ms 内
 // 返回（先 Client.Close()：closed 信号解阻塞 reader；不依赖 reader 前进）。
 // 判别力三件（M1①②③）：flood 用 200×4KiB + 2ms 节拍（借 internal/control
-// TestStreamBackpressureNoLoss 的配方——节拍防 TCP 合并、逐块成条目，>64 条必灌满 recv；
-// 原全速 512×8KiB 在 darwin 被内核自调 TCP 缓冲整段吸收，实测一条都进不了满槽投递，
-// 该前置在本机不成立）；用 control.SlowDeliveryCount() 断言 reader 真进过满槽投递
+// TestStreamBackpressureNoLoss 的配方——节拍防 TCP 合并、逐块成条目，>64 条必灌满 recv，
+// 与 internal/control 同款确定化取向。原用例前置不成立的真实根因是从未发 HELLO、
+// flood 根本没开闸（exec-report 整改段已正名），非「全速进不了满槽」）；用
+// control.SlowDeliveryCount() 断言 reader 真进过满槽投递
 // （否则本用例对逃生口无判别力，前置不成立就地红）；Close 预算 8s→500ms，让「先
 // Client.Close()」定序可判——反序（先 stream.Close 等 rsp）退化为等满 ≤2s 兜底 ctx
 // 才返回（rsp 由被阻塞的 reader 投递；**无界** ctx 才恒挂死），500ms 预算下反序必红。

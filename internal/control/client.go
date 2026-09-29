@@ -320,6 +320,9 @@ func (s *ClientStream) End() <-chan string { return s.end }
 // （markEnded(StreamEndClosed)，exec-r1 L4）：终结状态化原只覆盖「收到 stream.end /
 // 连接级断开」，本端主动关流后 Send 同样不再静默成功写进死流（与 2.2 的 proposal
 // 意图对齐；服务端对已关流的 data 另有 no_stream 回执兜底，此处是本端第一道闸）。
+// 归因复用 closed 的近似（exec-r2 N4 登记）：此后 Send 的 EndedErr 文案为「对端已
+// 关闭」，实情是本端主动 stream.close（对端 end 帧可能永不到达）；仓内唯一消费者
+// streamConn.Close 在 Client.Close() 后不再写、无命中路径，不值得为此新开原因枚举。
 func (s *ClientStream) Close(ctx context.Context) error {
 	_, err := s.c.Request(ctx, OpStreamClose, StreamCloseArgs{StreamID: s.ID})
 	if err == nil {

@@ -131,7 +131,7 @@ type termTarget struct {
 	remote   RemoteTerm    // nil = 本地面
 	hostRef  string        // --host 原始 ref
 	hostID   string        // 远程已解析 hex（拨号复用）
-	timeout  time.Duration // 远程总预算（连接 + stream.open）
+	timeout  time.Duration // 远程解析/打开各一次预算（默认各 10s、最坏相加 20s，仅 --host 可用）
 }
 
 // newTermTarget 按参数构造目标：远程模式 timeout 缺省补 defaultRemoteTimeout、
@@ -666,7 +666,7 @@ type explainOpts struct {
 	stateDir string // --file 模式的 manifest 覆盖目录（本地语义恒定；空 = 构造时补默认）
 	json     bool
 	hostRef  string        // 在线模式 --host（远程）
-	timeout  time.Duration // 远程总预算
+	timeout  time.Duration // 远程解析/打开各一次预算（默认各 10s、最坏相加 20s，仅 --host 可用）
 }
 
 func parseExplainArgs(args []string) (explainOpts, error) {
