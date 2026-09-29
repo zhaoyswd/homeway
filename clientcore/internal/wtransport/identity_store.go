@@ -13,8 +13,6 @@ import (
 
 	"github.com/zhaoyswd/homeway/pkg/proto"
 	"golang.zx2c4.com/wireguard/wgctrl/wgtypes"
-
-	"golang.org/x/sys/unix"
 )
 
 // 设备身份存储（openspec/changes/device-identity-persist）：
@@ -158,26 +156,11 @@ func loadOrCreateMaster(dir string) ([32]byte, IdentitySource, error) {
 //
 // flock 随 fd 关闭/进程退出由内核自动释放，崩溃不留死锁。目录不可用或文件系统不支持
 // flock 时返回 (nil,false)，调用方照旧走原有的等待/复用兜底（不因为拿不到锁而拒绝服务）。
-func lockIdentityDir(dir string) (func(), bool) {
-	if dir == "" {
-		return nil, false
-	}
-	if err := os.MkdirAll(dir, 0o700); err != nil {
-		return nil, false
-	}
-	lf, err := os.OpenFile(filepath.Join(dir, identityLockFile), os.O_CREATE|os.O_RDWR, 0o600)
-	if err != nil {
-		return nil, false
-	}
-	if err := unix.Flock(int(lf.Fd()), unix.LOCK_EX); err != nil {
-		_ = lf.Close()
-		return nil, false
-	}
-	return func() {
-		_ = unix.Flock(int(lf.Fd()), unix.LOCK_UN)
-		_ = lf.Close()
-	}, true
-}
+//
+// 平台实现拆分（host-registry-daemon 1.1，r1 A3）：unix 侧 flock 见
+// identity_store_unix.go；非 unix 平台降级为无锁（identity_store_other.go）——
+// windows 桩门（GOOS=windows CGO_ENABLED=0 go build ./clientcore/internal/...）
+// 依赖本文件不引 unix.Flock。
 
 // waitForCompleteFile：等一个「看起来还在写入」的文件变完整（10×20ms 有界）。
 // 返回 false = 超时仍是残缺（这才算真损坏，调用方走归档重建）。

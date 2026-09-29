@@ -1,3 +1,5 @@
+//go:build unix
+
 package wgcore
 
 // tunfd.go：把 VPN 扩展递进来的 TUN **裸 fd** 变成 wireguard-go 的 tun.Device。
