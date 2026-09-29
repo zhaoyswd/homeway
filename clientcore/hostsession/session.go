@@ -19,6 +19,7 @@ import (
 	"net"
 	"net/netip"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/zhaoyswd/homeway/clientcore/internal/wgcore"
@@ -129,11 +130,34 @@ func newCore(s ExitSession) *wgcore.Core {
 // 的降级口径，r1 N2）——Session 侧据此把 reason 记为 identity_ephemeral。
 var errIdentityEphemeral = errors.New("身份不可持久化（identity_ephemeral）")
 
+// tokenDecodes：token decode 计数器（**仅测试观察用**，host-registry-daemon 1.4）。
+// 递增点只有 decodeTokenOnce（各 Start 入口调它一次）；会话构建/整会话重建路径
+// 断言零增量——「decode 一次落结构」的单轨判据（D2/A5）。
+var tokenDecodes atomic.Int64
+
+// decodeTokenOnce 入口侧 decode 一次（手机 ClientCoreServiceStart/ClientCoreTunStart
+// 与 daemon Registry 各自的入口；错误文案与随迁前 buildExitSession 内联版逐字一致）。
+func decodeTokenOnce(token string) (proto.Token, error) {
+	tokenDecodes.Add(1)
+	if strings.TrimSpace(token) == "" {
+		return proto.Token{}, errors.New("新栈需要 homeway token（cfg.token 为空）")
+	}
+	tok, err := proto.DecodeToken(token)
+	if err != nil {
+		return proto.Token{}, fmt.Errorf("token 解析失败：%w", err)
+	}
+	return tok, nil
+}
+
 // BuildExitSession 出口会话的**共用构造**（openspec app-service-session 任务 2.1；
 // 手机语义：非严格身份——身份不可持久化时降级临时身份继续连）。
 // 严格身份（daemon：SourceEphemeral 视为失败）走包内 buildExitSession + Options。
 func BuildExitSession(cfg Config, logf Logf) (ExitSession, *wtransport.EndpointCache, error) {
-	return buildExitSession(cfg, Options{}, logf)
+	tok, err := decodeTokenOnce(cfg.Token)
+	if err != nil {
+		return nil, nil, err
+	}
+	return buildExitSession(cfg, Options{}, tok, logf)
 }
 
 // buildExitSession 出口会话构造本体：token 解码 → 候选解析 → 设备身份（同目录落盘
@@ -144,30 +168,16 @@ func BuildExitSession(cfg Config, logf Logf) (ExitSession, *wtransport.EndpointC
 // opts.StrictIdentity = true 时：身份不可持久化（SourceEphemeral）返回
 // errIdentityEphemeral（调用方按该主机会话 failed reason=identity_ephemeral 收工，
 // 可重试）——杜绝「每次重启换临时钥匙在出口多占一条设备记录」。
-func buildExitSession(cfg Config, opts Options, logf Logf) (ExitSession, *wtransport.EndpointCache, error) {
-	if strings.TrimSpace(cfg.Token) == "" {
-		return nil, nil, errors.New("新栈需要 homeway token（cfg.token 为空）")
-	}
-	tok, err := proto.DecodeToken(cfg.Token)
-	if err != nil {
-		return nil, nil, fmt.Errorf("token 解析失败：%w", err)
-	}
+func buildExitSession(cfg Config, opts Options, tok proto.Token, logf Logf) (ExitSession, *wtransport.EndpointCache, error) {
+	// token 已由入口 decode 一次（decodeTokenOnce，1.4 单轨）：这里只消费落好的结构；
+	// 域名条目仍带**未解析原文**，重解析语义见 sessionEndpointInputs 注释。
 	cands := resolveCandidates(tok.Endpoints, lookupIPv4, logf)
 	if len(cands) == 0 {
 		return nil, nil, errors.New("token 里没有任何可用端点")
 	}
 	// 域名条目拆出（endpoint-freshness D5）：静态 IP 组与域名首次解析组分开喂给 Transport，
 	// 重赛跑（Rearm）时域名组重解析并替换（静态组不动）。
-	staticEps, domainEps := splitTokenEndpoints(tok.Endpoints)
-	staticCands := resolveCandidates(staticEps, lookupIPv4, logf)
-	var domainCands []wtransport.Candidate
-	if len(domainEps) > 0 {
-		domainCands = resolveCandidates(domainEps, lookupIPv4, logf)
-		if len(domainCands) > 0 {
-			logf("token 域名条目 %d 个 → 建会话解析 %d 条候选（重赛跑时会重解析）",
-				len(domainEps), len(domainCands))
-		}
-	}
+	staticCands, domainCands, domainInputs := sessionEndpointInputs(tok, lookupIPv4, logf)
 	// 设备身份：按后端（token 里的静态公钥）从本设备主密钥派生，落盘复用。
 	// 身份稳定 ⇒ 出口设备表里一台设备只占一条记录（重连只刷新），
 	// 也修掉了「B 重连 8 次把长连的 A 挤掉」这条事故路径。
@@ -213,7 +223,7 @@ func buildExitSession(cfg Config, opts Options, logf Logf) (ExitSession, *wtrans
 		Cache:            cache,
 		StaticCandidates: staticCands,
 		DomainCandidates: domainCands,
-		DomainEndpoints:  domainEndpointPorts(domainEps, logf),
+		DomainEndpoints:  domainInputs,
 		LookupHost: func(ctx context.Context, host string) ([]netip.Addr, error) {
 			return lookupIPv4(ctx, host)
 		},
@@ -271,6 +281,24 @@ func buildExitSession(cfg Config, opts Options, logf Logf) (ExitSession, *wtrans
 			build, dns, gen, saw, rtt.Round(time.Millisecond))
 	}(cands[0].Addr)
 	return sess, cache, nil
+}
+
+// sessionEndpointInputs：token 端点 → 静态候选 / 域名首次解析候选 / 域名重解析输入
+// 三组（1.4 抽出为可测纯段）。**域名条目保留未解析原文**（DomainEndpoint.Host = 原串）：
+// 解析失败/漂移都不丢条目——R3/Rearm 的 LookupHost 重解析以原文为输入（endpoint-freshness
+// 在产行为；行为层由 wgcore transport_freshness_test 守：解析漂移后 Rearm 换新地址）。
+func sessionEndpointInputs(tok proto.Token, lookup endpointLookup, logf Logf) (static, domainCands []wtransport.Candidate, domainInputs []wgcore.DomainEndpoint) {
+	staticEps, domainEps := splitTokenEndpoints(tok.Endpoints)
+	static = resolveCandidates(staticEps, lookup, logf)
+	if len(domainEps) > 0 {
+		domainCands = resolveCandidates(domainEps, lookup, logf)
+		if len(domainCands) > 0 {
+			logf("token 域名条目 %d 个 → 建会话解析 %d 条候选（重赛跑时会重解析）",
+				len(domainEps), len(domainCands))
+		}
+	}
+	domainInputs = domainEndpointPorts(domainEps, logf)
+	return static, domainCands, domainInputs
 }
 
 // 出口能力位（与 homeway internal/server/udpcap.go 的同名常量同源）：

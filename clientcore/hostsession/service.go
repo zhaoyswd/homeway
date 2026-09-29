@@ -142,7 +142,10 @@ func (s *Session) buildSession(cfg Config, logf Logf) (ExitSession, *wtransport.
 	if sessionBuild != nil {
 		return sessionBuild(cfg, logf)
 	}
-	return buildExitSession(cfg, Options{}, logf)
+	// 手工构造的会话没有入口 decode 的 stash：这里即它的「入口」，decode 一次
+	//（重建走 buildSession 同一兜底时**不会**再走到这——手工会话的重建复用
+	// sessionBuild/生产闭包之外的路径仅出现在未注入且未 Start 的测试形态）。
+	return BuildExitSession(cfg, logf)
 }
 
 // NewSession 构造服务会话（starting 态、未启动——调 Start 起生命周期）。
@@ -163,8 +166,15 @@ func NewSession(cfg Config, opts Options) (*Session, error) {
 		lg := log.New(f, "", log.LstdFlags)
 		logf = WithPrefix(lg.Printf, "服务会话: ")
 	}
+	// token 单轨（1.4/D2）：入口 decode 一次落结构；生产构造与整会话重建（rebuildSession
+	// 复用同一闭包）不再 decode token 串——判据：tokenDecodes 在重建路径零增量。
+	tok, tokErr := decodeTokenOnce(cfg.Token)
 	build := func(cfg Config, logf Logf) (ExitSession, *wtransport.EndpointCache, error) {
-		return buildExitSession(cfg, opts, logf)
+		if tokErr != nil {
+			// 入口已判定 token 坏：构造期失败按原语义走异步 failed（finish 留 reason）。
+			return nil, nil, tokErr
+		}
+		return buildExitSession(cfg, opts, tok, logf)
 	}
 	if sessionBuild != nil {
 		build = sessionBuild // 测试注入优先（withFakeServiceBuild）
