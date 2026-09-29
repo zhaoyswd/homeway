@@ -7,7 +7,6 @@ package control
 
 import (
 	"bufio"
-	"bytes"
 	"context"
 	"crypto/rand"
 	"encoding/json"
@@ -113,18 +112,18 @@ func TestStreamPassthroughBinaryBytes(t *testing.T) {
 	}
 }
 
-// TestStreamSendShardingLargePayload host-cli 3b（exec-r2 ①）：Send 大块（512KiB
-// = 32 帧 16KiB 背靠背）自动分片——测试对端**持续读**（echo 后端逐块回投，服务端
-// 上行队列仅 8 槽、不持续读会红在背压 finish(gone) 而非分片）+ 逐字节重组断言 +
-// 分片帧长上限断言（每帧 body ≤ streamChunkSize+streamIDSize 前缀内的 256KiB 上限）。
-// TestSendShardFrameBound 分片帧长上限断言（单元级）：Send 大块产出的每个
-// stream.data 帧载荷 ≤ streamChunkSize（16KiB），帧数恰为 ceil——与服务端 256KiB
-// 帧上限的距离即安全余量（单帧 512KiB 会被 bad_frame 断连）。
+// TestSendShardFrameBound 分片帧长上限断言（单元级，512KiB = 32 帧背靠背）：Send
+// 大块产出的每个 stream.data 帧载荷 ≤ streamChunkSize（16KiB），帧数恰为 ceil、
+// 总字节守恒——与服务端 256KiB 帧上限的距离即安全余量（单帧 512KiB 会被
+// bad_frame 断连）。走 net.Pipe（不经服务器）⇒ 任意 CI 负载下确定性成立。
 func TestSendShardFrameBound(t *testing.T) {
 	pr, pw := net.Pipe()
 	c := &Client{nc: pw}
 	st := &ClientStream{c: c, ID: 5}
-	big := bytes.Repeat([]byte{0xa5}, 100<<10) // 100KiB → 恰 7 帧（6×16KiB + 4KiB）
+	big := make([]byte, 512<<10) // 512KiB → 恰 32 帧
+	if _, err := rand.Read(big); err != nil {
+		t.Fatal(err)
+	}
 	done := make(chan error, 1)
 	go func() {
 		done <- st.Send(big)
@@ -164,6 +163,13 @@ func TestSendShardFrameBound(t *testing.T) {
 	}
 }
 
+// TestStreamSendShardingLargePayload host-cli 3b（exec-r2 ①）：Send 大块自动分片
+// 经**真实服务器**逐字节重组（echo 对端持续读）。载荷 = 7 帧（112KiB）：帧数 ≤
+// 服务端上行队列 8 槽 ⇒ 无论调度如何 upC 都装得下整个突发、不会 finish(gone)——
+// 更大的突发（如 32 帧）在共享 runner 上是「泵一次调度空窗即红在背压（design D7
+// 注记的收流语义）而非分片」；512KiB/32 帧的帧界与守恒断言由 TestSendShardFrameBound
+// 在单元层确定性覆盖（2026-09-29 CI 实测：32 帧 e2e 在 ubuntu 共享 runner 红于
+// 「流 1 不在册（已关？），上行 16384 字节被拒」——upC 溢出收流，分片本身无误）。
 func TestStreamSendShardingLargePayload(t *testing.T) {
 	ts := startTestServer(t, BusConfig{})
 	echo := startEchoBackend(t)
@@ -176,19 +182,17 @@ func TestStreamSendShardingLargePayload(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// 512KiB 伪随机载荷（可逐字节校验；512KiB 单帧 = 超 256KiB-4 上限，不分片必炸）。
-	payload := make([]byte, 512<<10)
+	payload := make([]byte, 7*streamChunkSize) // 7 帧（< 8 槽 ⇒ 无溢出可能）
 	if _, err := rand.Read(payload); err != nil {
 		t.Fatal(err)
 	}
 
-	// 持续读对端：echo 回投逐块收进重组缓冲（Recv 通道 64 槽 × 回块 16KiB 量级，
-	// 读慢了服务端下行 dataC 16 槽满 → backendPump 背压，但只要持续消费即可）。
+	// 持续读对端：echo 回投逐块收进重组缓冲。
 	type chunk struct {
 		b   []byte
 		err error
 	}
-	chunks := make(chan chunk, 256)
+	chunks := make(chan chunk, 64)
 	go func() {
 		got := 0
 		for got < len(payload) {
@@ -207,10 +211,10 @@ func TestStreamSendShardingLargePayload(t *testing.T) {
 	}()
 
 	if err := st.Send(payload); err != nil {
-		t.Fatalf("512KiB Send：%v", err)
+		t.Fatalf("Send：%v", err)
 	}
 	got := make([]byte, 0, len(payload))
-	deadline := time.After(15 * time.Second)
+	deadline := time.After(30 * time.Second)
 	for len(got) < len(payload) {
 		select {
 		case ch := <-chunks:
@@ -227,6 +231,12 @@ func TestStreamSendShardingLargePayload(t *testing.T) {
 		if got[i] != payload[i] {
 			t.Fatalf("重组字节不符 @%d：%02x ≠ %02x", i, got[i], payload[i])
 		}
+	}
+	// 流未被背压收流（end 不应到达——对端与前端都没关）。
+	select {
+	case r := <-st.End():
+		t.Fatalf("不应收流（背压误判）：end=%q", r)
+	default:
 	}
 }
 
