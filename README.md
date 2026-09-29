@@ -149,8 +149,8 @@ homeway term explain <会话名> --host mac   # 在线 explain 远程往返（--
 state 目录收紧 **0700** 作第二层防御（同时护住目录里的身份密钥与 token 台账）——不要把
 state 目录开放给不可信用户/进程。
 （版本边界：`term.sock` 0600 自 v0.9.0 起；`files.sock` 0600 与 `OpenState` 收紧 0700 在
-f610f3f 起、**随下一版出口生效**——v0.9.0 出口重启后 files.sock 会回到 umask 值，但 state
-目录 700 下实际暴露面为零。）
+f610f3f 起、**自 v0.10.0 起已生效**——v0.9.0 及更早出口重启后 files.sock 会回到 umask 值，
+但 state 目录 700 下实际暴露面为零。）
 
 ### 桌面守护进程（`homeway daemon`，多主机客户端常驻）
 
