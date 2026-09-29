@@ -134,6 +134,33 @@ state 目录开放给不可信用户/进程。
 f610f3f 起、**随下一版出口生效**——v0.9.0 出口重启后 files.sock 会回到 umask 值，但 state
 目录 700 下实际暴露面为零。）
 
+### 桌面守护进程（`homeway daemon`，多主机客户端常驻）
+
+除手机 App 外的第二种客户端形态：桌面（Mac/Linux）上常驻一个守护进程，把**多台出口
+主机**的客户端会话同时拉起来（同一份会话状态机直 import 核包 `clientcore/hostsession`
+——与手机 cshared 包装共用同一实现与测试，行为零漂移）。
+
+```bash
+homeway daemon [--state DIR]   # 启动守护进程（默认 state ~/.config/homeway/daemon；
+                               # ⚠️ 与出口 state 禁止同目录——两角色组合未定义）
+homeway daemon status [--json] # 状态面（版本/代际/角色/主机+链路态；--json = 机器可读
+                               # 全量快照，供脚本与未来 Mac APP 消费）
+```
+
+- **控制面**：守护进程在 `<state>/control.sock`（Unix socket，0600；目录 0700）上提供
+  本地控制协议——快照/事件流（带游标续播）/term 字节流透传。**持有该 socket 的访问权 =
+  拥有这些主机会话的控制权**（与 term.sock 同口径），协议内无 token 类凭证。
+  契约真源 = 手机仓 openspec `daemon-control-plane` 能力域的 spec + 语言无关 fixtures
+  （`internal/control/testdata/fixtures/v1/`，含独立解码对拍脚本 `decode_check.py`——
+  非 Go 消费者可仅凭 spec + fixtures 实现对拍）。
+- **桌面消费形态**：CLI/未来 Mac APP 是控制面的薄前端——`daemon status --json` 是协议级
+  机器可读消费路径的实证；主机增删命令面（`host add/list` 等）与远程终端命令
+  （`term --host`）归后续版本。
+- **launchd 守护化**（macOS）：模板与安装说明见 `tools/launchd/`（RunAtLoad + KeepAlive
+  崩溃自动重拉；模板经 `launchctl load` 实测）。
+- **单实例**：state 目录 flock 排他锁，二次启动报「已在运行（pid N）」；进程死亡锁自动
+  释放。
+
 ## 运行细节
 
 ### 多实例
@@ -161,6 +188,7 @@ f610f3f 起、**随下一版出口生效**——v0.9.0 出口重启后 files.soc
 | 出口 | `<state>/events.log`（2MB×3） | 摘要：绑卡/换卡、UPnP、STUN、公网端点公布、服务就绪、运行告警、token 行 |
 | 出口 | `<state>/debug.log`（8MB×2） | 细节：peer 表流水、入站新源、周期观测、会话/流量过程 |
 | 中继 | `<state>/relay.log`（2MB×3） | 全部运行日志：注册腿/会话/回收/分钟统计/告警 |
+| 守护进程 | `<state>/events.log`（2MB×3）+ `debug.log`（8MB×2）+ `launchd.log` | 摘要（就绪/角色/控制面/主机增删）+ 细节（各主机会话过程）+ launchd 的 stdout/stderr |
 
 `./homeway --verbose` 把摘要+细节同时回显终端（现场排障用）。取最新 token：
 `grep 客户端 token <state>/events.log | tail -1`。

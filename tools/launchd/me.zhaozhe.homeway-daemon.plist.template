@@ -1,0 +1,36 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- homeway 桌面守护进程 launchd 用户代理模板（host-registry-daemon 4.2，HD「launchd 守护化」）。
+     安装前替换两处占位：
+       __HOMEWAY_BIN__  homeway 可执行文件绝对路径（如 /usr/local/bin/homeway）
+       __STATE_DIR__    守护进程 state 目录绝对路径（如 /Users/you/.config/homeway/daemon）
+     ⚠️ ⚠️ exit 与 daemon 禁止共用同一 state 目录（该组合未定义——两角色 state 语义不同，
+     单实例锁会互相拒绝；角色合并归后续能力域 3f）。检查：state 目录不得与任何
+     `homeway exit --state`/`homeway relay --state` 在役部署相同；本模板默认子目录
+     ~/.config/homeway/daemon 与在役出口 ~/.config/homeway 天然不同目录，可并存
+     （不同 label：me.zhaozhe.homeway-exit / me.zhaozhe.homeway-daemon）。
+     安装与验证步骤见同目录 README.md（模板必须经 launchctl load 实测——现役 exit
+     plist 的「exit --relay 子命令形态」之坑的教训）。 -->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>me.zhaozhe.homeway-daemon</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>__HOMEWAY_BIN__</string>
+		<string>daemon</string>
+		<string>--state</string>
+		<string>__STATE_DIR__</string>
+	</array>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>KeepAlive</key>
+	<true/>
+	<key>WorkingDirectory</key>
+	<string>__STATE_DIR__</string>
+	<key>StandardOutPath</key>
+	<string>__STATE_DIR__/launchd.log</string>
+	<key>StandardErrorPath</key>
+	<string>__STATE_DIR__/launchd.log</string>
+</dict>
+</plist>
