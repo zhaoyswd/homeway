@@ -74,6 +74,13 @@ const (
 // 连接层收到 = 回 goodbye(bad_frame) 后断连；调用方 MUST NOT 继续在该流上解码。
 var ErrBadFrame = errors.New("bad_frame")
 
+// fitsLimit 长度先验的 uint32 比较（host-cli 3b L1，exec-r2 ②）：**任意架构**下
+// 无符号溢出——32 位平台 `int(h.N)` 对 ≥2^31 的声明长度变负，直接 `int(n) > max`
+// 比较会绕过先验，随后 `make([]byte, n)` 以负长度 panic（conn goroutine 无
+// recover ⇒ 进程崩；armv7 是发版目标）。Go 不允许 uint32 与 int 直接比较
+// （无符号/有符号混比），抽 helper 使任意架构可红绿。
+func fitsLimit(n uint32, max int) bool { return uint64(n) <= uint64(max) }
+
 // ReadFrame 从 r 读一帧：[op:1][len:4 大端][body]。
 //
 // maxBody 是本帧的长度上限（控制/流两类各自传 spec 冻结值）。**先验 len**：声明
@@ -86,7 +93,7 @@ func ReadFrame(r io.Reader, maxBody int) (op byte, body []byte, err error) {
 	}
 	op = head[0]
 	n := binary.BigEndian.Uint32(head[1:5])
-	if int(n) > maxBody {
+	if !fitsLimit(n, maxBody) {
 		return op, nil, fmt.Errorf("%w: 声明长度 %d 超上限 %d（op=0x%02x）", ErrBadFrame, n, maxBody, op)
 	}
 	body = make([]byte, n)
@@ -114,14 +121,15 @@ func maxBodyFor(op byte) int {
 
 // ReadHeader 读 5 字节帧头并按 op 选上限做长度先验（超限**不读 body** 返回
 // ErrBadFrame）。服务器/客户端读循环用（ReadHeader+ReadBody 组合 = 按 op 的
-// 两档上限）；显式传 maxBody 的旧用法见 ReadFrame。
+// 两档上限）；显式传 maxBody 的旧用法见 ReadFrame。长度先验走 fitsLimit
+// （uint32 比较——32 位防绕过，见其注释）。
 func ReadHeader(r io.Reader) (FrameHead, error) {
 	var head [5]byte
 	if _, err := io.ReadFull(r, head[:]); err != nil {
 		return FrameHead{}, err
 	}
 	h := FrameHead{Op: head[0], N: binary.BigEndian.Uint32(head[1:5])}
-	if int(h.N) > maxBodyFor(h.Op) {
+	if !fitsLimit(h.N, maxBodyFor(h.Op)) {
 		return h, fmt.Errorf("%w: 声明长度 %d 超上限 %d（op=0x%02x）", ErrBadFrame, h.N, maxBodyFor(h.Op), h.Op)
 	}
 	return h, nil

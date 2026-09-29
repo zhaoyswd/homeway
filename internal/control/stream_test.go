@@ -7,10 +7,12 @@ package control
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"crypto/rand"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"sync"
@@ -108,6 +110,123 @@ func TestStreamPassthroughBinaryBytes(t *testing.T) {
 		}
 	case <-time.After(3 * time.Second):
 		t.Fatal("end 帧未到达")
+	}
+}
+
+// TestStreamSendShardingLargePayload host-cli 3b（exec-r2 ①）：Send 大块（512KiB
+// = 32 帧 16KiB 背靠背）自动分片——测试对端**持续读**（echo 后端逐块回投，服务端
+// 上行队列仅 8 槽、不持续读会红在背压 finish(gone) 而非分片）+ 逐字节重组断言 +
+// 分片帧长上限断言（每帧 body ≤ streamChunkSize+streamIDSize 前缀内的 256KiB 上限）。
+// TestSendShardFrameBound 分片帧长上限断言（单元级）：Send 大块产出的每个
+// stream.data 帧载荷 ≤ streamChunkSize（16KiB），帧数恰为 ceil——与服务端 256KiB
+// 帧上限的距离即安全余量（单帧 512KiB 会被 bad_frame 断连）。
+func TestSendShardFrameBound(t *testing.T) {
+	pr, pw := net.Pipe()
+	c := &Client{nc: pw}
+	st := &ClientStream{c: c, ID: 5}
+	big := bytes.Repeat([]byte{0xa5}, 100<<10) // 100KiB → 恰 7 帧（6×16KiB + 4KiB）
+	done := make(chan error, 1)
+	go func() {
+		done <- st.Send(big)
+		_ = pw.Close()
+	}()
+	total, frames := 0, 0
+	for total < len(big) {
+		head, err := ReadHeader(pr)
+		if err != nil {
+			t.Fatalf("读帧头：%v（已收 %d/%d）", err, total, len(big))
+		}
+		body, err := ReadBody(pr, head)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if head.Op != OpStreamData {
+			t.Fatalf("应为 stream.data 帧：0x%02x", head.Op)
+		}
+		id, payload, derr := DecodeStreamBody(body)
+		if derr != nil || id != 5 {
+			t.Fatalf("流 body：%v id=%d", derr, id)
+		}
+		if len(payload) > streamChunkSize {
+			t.Fatalf("分片帧载荷 %d 超 %d", len(payload), streamChunkSize)
+		}
+		total += len(payload)
+		frames++
+	}
+	if err := <-done; err != nil {
+		t.Fatalf("Send：%v", err)
+	}
+	if want := (len(big) + streamChunkSize - 1) / streamChunkSize; frames != want {
+		t.Fatalf("帧数 %d ≠ ceil(%d/%d)=%d", frames, len(big), streamChunkSize, want)
+	}
+	if total != len(big) {
+		t.Fatalf("总字节 %d ≠ %d", total, len(big))
+	}
+}
+
+func TestStreamSendShardingLargePayload(t *testing.T) {
+	ts := startTestServer(t, BusConfig{})
+	echo := startEchoBackend(t)
+	ts.backend.mu.Lock()
+	ts.backend.dialAddr = echo.ln.Addr().String()
+	ts.backend.mu.Unlock()
+	c, _ := dialTest(t, ts)
+
+	st, err := c.OpenStream(context.Background(), "aa")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 512KiB 伪随机载荷（可逐字节校验；512KiB 单帧 = 超 256KiB-4 上限，不分片必炸）。
+	payload := make([]byte, 512<<10)
+	if _, err := rand.Read(payload); err != nil {
+		t.Fatal(err)
+	}
+
+	// 持续读对端：echo 回投逐块收进重组缓冲（Recv 通道 64 槽 × 回块 16KiB 量级，
+	// 读慢了服务端下行 dataC 16 槽满 → backendPump 背压，但只要持续消费即可）。
+	type chunk struct {
+		b   []byte
+		err error
+	}
+	chunks := make(chan chunk, 256)
+	go func() {
+		got := 0
+		for got < len(payload) {
+			b, ok := <-st.Recv()
+			if !ok {
+				chunks <- chunk{err: fmt.Errorf("Recv 通道提前关闭 @%d", got)}
+				return
+			}
+			if len(b) > MaxStreamBody {
+				chunks <- chunk{err: fmt.Errorf("下行块 %d 字节超帧上限（分片失效）", len(b))}
+				return
+			}
+			got += len(b)
+			chunks <- chunk{b: b}
+		}
+	}()
+
+	if err := st.Send(payload); err != nil {
+		t.Fatalf("512KiB Send：%v", err)
+	}
+	got := make([]byte, 0, len(payload))
+	deadline := time.After(15 * time.Second)
+	for len(got) < len(payload) {
+		select {
+		case ch := <-chunks:
+			if ch.err != nil {
+				t.Fatal(ch.err)
+			}
+			got = append(got, ch.b...)
+		case <-deadline:
+			t.Fatalf("echo 未回齐：%d/%d", len(got), len(payload))
+		}
+	}
+	// 逐字节重组断言（字节流语义：分片不承诺边界，只承诺字节序）。
+	for i := range payload {
+		if got[i] != payload[i] {
+			t.Fatalf("重组字节不符 @%d：%02x ≠ %02x", i, got[i], payload[i])
+		}
 	}
 }
 

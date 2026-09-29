@@ -125,6 +125,68 @@ func TestValidOpTable(t *testing.T) {
 	}
 }
 
+// TestFitsLimitUint32Overflow host-cli 3b L1（exec-r2 ②）：uint32 比较辅助在
+// **任意架构**可红绿——32 位平台 `int(n)` 对 ≥2^31 变负，直接比较会绕过先验
+// （make 负长度 panic）。amd64 上 int 为 64 位，直接构造溢出恒绿测不出，helper
+// 让边界值本身成为判据；GOARCH=386 复跑作补充门。
+func TestFitsLimitUint32Overflow(t *testing.T) {
+	cases := []struct {
+		n    uint32
+		max  int
+		want bool
+	}{
+		{0, MaxControlBody, true},
+		{1, MaxControlBody, true},
+		{uint32(MaxControlBody), MaxControlBody, true},      // 恰在上限
+		{uint32(MaxControlBody) + 1, MaxControlBody, false}, // 上限+1
+		{uint32(MaxStreamBody) + 1, MaxStreamBody, false},   // 流帧上限+1
+		{0x7fffffff, MaxControlBody, false},                 // int32 正上界外（1MiB < 2^31）
+		{0x80000000, 8, false},                              // 2^31：32 位平台 int(n) 变负的位置
+		{0xffffff00, MaxControlBody, false},                 // 高位区
+		{0xffffffff, MaxControlBody, false},                 // uint32 上界
+		{1, 0, false},                                       // 零上限拒绝一切非零
+	}
+	for _, c := range cases {
+		if got := fitsLimit(c.n, c.max); got != c.want {
+			t.Fatalf("fitsLimit(%d(0x%x), %d) = %v，期望 %v", c.n, c.n, c.max, got, c.want)
+		}
+	}
+	// 32 位防绕过判据（386 上直接成立；amd64 上由 helper 保证同语义）：对任意
+	// max < 2^31，n ≥ 2^31 恒拒绝。
+	for _, n := range []uint32{0x80000000, 0x9abcdef0, 0xffffffff} {
+		if fitsLimit(n, MaxControlBody) {
+			t.Fatalf("n=0x%x 必须拒绝（32 位平台 int(n) 为负、直接比较会放行）", n)
+		}
+	}
+}
+
+// TestReadHeaderOverflowReject host-cli 3b L1：构造声明长度 0xfffffff0 的帧头
+// （≥2^31，32 位平台 int(n) 为负）——ReadHeader（生产读循环路径）必须 ErrBadFrame
+// 且不读 body，任意架构一致。
+func TestReadHeaderOverflowReject(t *testing.T) {
+	var head [5]byte
+	head[0] = OpReq
+	binary.BigEndian.PutUint32(head[1:5], 0xfffffff0)
+	probe := &lenProbeReader{r: io.MultiReader(bytes.NewReader(head[:]), bytes.NewReader(make([]byte, 16)))}
+	_, err := ReadHeader(probe)
+	if !errors.Is(err, ErrBadFrame) {
+		t.Fatalf("≥2^31 声明长度必须 ErrBadFrame（任意架构），得到 %v", err)
+	}
+	if probe.read != 5 {
+		t.Fatalf("拒绝必须不读 body：实际读了 %d 字节", probe.read)
+	}
+	// 流帧 op 同型（两档上限都走 helper）。
+	head[0] = OpStreamData
+	probe = &lenProbeReader{r: io.MultiReader(bytes.NewReader(head[:]), bytes.NewReader(make([]byte, 4)))}
+	if _, err := ReadHeader(probe); !errors.Is(err, ErrBadFrame) {
+		t.Fatalf("流帧 ≥2^31 声明长度必须 ErrBadFrame，得到 %v", err)
+	}
+	// ReadFrame（仅测试用路径）同型同守。
+	if _, _, err := ReadFrame(bytes.NewReader(append(head[:], make([]byte, 4)...)), MaxStreamBody); !errors.Is(err, ErrBadFrame) {
+		t.Fatalf("ReadFrame ≥2^31 声明长度必须 ErrBadFrame，得到 %v", err)
+	}
+}
+
 func TestStreamBodyCodec(t *testing.T) {
 	// 正常往返 + 二进制脏数据（0x00/0xff/换行/UTF-8 截断段）逐字节透传。
 	payload := []byte{0x00, 0xff, 0x0a, 0x00, 0xe4, 0xb8, 0xad, 0xc3, 0x28}

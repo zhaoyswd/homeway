@@ -372,3 +372,50 @@ func TestBusConcurrentUnsubscribeDomainsVsPublish(t *testing.T) {
 		t.Fatal("摘空全部域后订阅者应已从总线摘除")
 	}
 }
+
+// TestSubscribeReplacementNotUnion B4（host-cli 1.6，daemon-control-plane delta 钉死）：
+// 同订阅者重复 Subscribe = **替换**（生效域集合整体换为新载荷），非并集——先订
+// link 再订 session：此后 link 事件不再投递、session 事件照常（有判别力的行为
+// 断言层：并集实现下 link 事件仍投递，本测试红）。
+func TestSubscribeReplacementNotUnion(t *testing.T) {
+	b := NewBus("gen-b4", BusConfig{SubQueue: 64})
+	sub := b.NewSubscriber()
+	if _, err := b.Subscribe(sub, []string{DomainLink}, nil, ""); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := b.Subscribe(sub, []string{DomainSession}, nil, ""); err != nil {
+		t.Fatal(err)
+	}
+	// 生效域集合 = {session}（matches 为包内可见的过滤真源）。
+	if sub.matches(DomainLink) {
+		t.Fatal("重复订阅应为替换：link 域不应仍生效（并集 = B4 红路）")
+	}
+	if !sub.matches(DomainSession) {
+		t.Fatal("session 域应生效")
+	}
+	// 投递面：link 事件不投递、session 事件投递。
+	if _, err := b.Publish(DomainLink, KindLinkChanged, LinkChangedPayload{Host: "aa", Via: "direct"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := b.Publish(DomainSession, KindSessionStateChanged, SessionStateChangedPayload{Host: "bb", State: "ready"}); err != nil {
+		t.Fatal(err)
+	}
+	gotSession := false
+	deadline := time.After(2 * time.Second)
+	for {
+		select {
+		case ev := <-sub.Events():
+			if ev.Domain == DomainLink {
+				t.Fatalf("替换后不应再收到 link 事件：%+v", ev)
+			}
+			if ev.Domain == DomainSession {
+				gotSession = true
+			}
+		case <-deadline:
+			if !gotSession {
+				t.Fatal("session 事件应照常投递")
+			}
+			return
+		}
+	}
+}

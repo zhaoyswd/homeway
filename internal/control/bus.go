@@ -306,7 +306,8 @@ func (s *Subscriber) OverrunDone() bool { return s.overrun }
 func (s *Subscriber) matches(domain string) bool { return s.domains[domain] }
 
 // Subscribe 挂订阅 + 游标回放（原子：锁内检查游标、拷贝回放列表、注册生效——
-// 回放与在线推送之间零缝隙零重叠）。
+// 回放与在线推送之间零缝隙零重叠）。同连接重复订阅 = **替换**（sub.domains
+// 整体换为新载荷集合——daemon-control-plane delta 3b 钉死，B4 澄清：非并集）。
 //
 //   - generation != 当前代际 → ErrCursorStale（前端全量重快照）；
 //   - cursor 超前于当前序号 → ErrCursorFuture（bad_request）；

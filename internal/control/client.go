@@ -219,9 +219,21 @@ func mustMarshal(v any) []byte {
 	return b
 }
 
-// Send 上行数据（stream.data 帧；透传原始字节）。
+// Send 上行数据（stream.data 帧；透传原始字节）。按 streamChunkSize（16KiB，与
+// 服务端下行 backendPump 读块同款常量）自动分片——单帧 body 超 256KiB-4 会被
+// 服务端按帧长上限拒（bad_frame 断连），大块上行必须分片（host-cli 3b，exec-r2 ①）。
+// 流 = 字节流语义，不承诺帧边界（对端按序重组即可）。
 func (s *ClientStream) Send(b []byte) error {
-	return s.c.writeFrame(EncodeFrame(OpStreamData, EncodeStreamBody(s.ID, b)))
+	for off := 0; off < len(b); off += streamChunkSize {
+		end := off + streamChunkSize
+		if end > len(b) {
+			end = len(b)
+		}
+		if err := s.c.writeFrame(EncodeFrame(OpStreamData, EncodeStreamBody(s.ID, b[off:end]))); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // Recv 下行数据流。
