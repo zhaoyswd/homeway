@@ -520,8 +520,8 @@ type termSession struct {
 	hygiene        stateHygiene
 	lastScreenRule string // 上一拍命中的规则 id（agent 变化时用于清证据判定）
 	agent          byte
-	state          byte
-	// stateV2 是新枚举口径的当前状态（state 是它的 legacy 折价，见 agent.go 的 legacyState）。
+	// stateV2 是状态唯一口径（term-remote 3.3：legacy 折价字段已删，STATE/LIST 对
+	// 所有腿统一本枚举——值域见 agent.go）。
 	stateV2   byte
 	prevCPU   int64
 	prevQuiet int // 截至上一采样的连续安静拍数（classifyAgent 磁滞输入）
@@ -588,9 +588,9 @@ type termClient struct {
 	handshake *rawHandshake
 	// leg 是 surface 投递状态（仅 surface 腿非 nil）。
 	leg *surfaceLeg
-	// surface 表示这条腿声明了 surface 能力（任务 2.1 的能力协商置位）。
-	// 任务 4.8 的枚举兼容靠它分流：**新枚举只发给声明了 surface 能力的腿**，
-	// legacy 腿收到折价后的兼容值（旧 App 显示零回退）。
+	// surface 表示这条腿声明了 surface 能力（任务 2.1 的能力协商置位）。状态信令
+	// 自 term-remote 3.3 起对 surface 与 raw 腿统一 stateV2 枚举（不再按腿分流折价），
+	// 该位仍用于 surface 帧面（快照/差分/抽象输入）与应答代答的判别。
 	surface bool
 	// rawCapable：capability 块声明了 capsRawTerminal（真实终端客户端；应答让位与
 	// kind=host 的判据，任务 5.1 / 2.5）。
@@ -616,13 +616,8 @@ type termClient struct {
 	clipCache        string
 }
 
-// stateForLeg 按腿的能力选状态枚举值（任务 4.8 的兼容契约）。
-func stateForLeg(surface bool, stateV2, legacy byte) byte {
-	if surface {
-		return stateV2
-	}
-	return legacy
-}
+// stateForLeg 已随状态单轨化退役（term-remote 3.3，D6）：surface 与 raw 腿的
+// STATE/ATTACHED state 字节统一 stateV2 枚举，不再按腿类折价。
 
 func (c *termClient) frame(op byte, payload []byte) error {
 	c.wmu.Lock()
@@ -992,7 +987,6 @@ func (s *termSession) sample(now time.Time, procs []procInfo) {
 		return
 	}
 	s.agent, s.stateV2 = v.agent, nextState
-	s.state = legacyState(nextState)
 	if s.svc.logf != nil {
 		suffix := ""
 		if freeze {
@@ -1317,7 +1311,6 @@ func (s *termService) spawnLocked(name string, cols, rows uint16) (*termSession,
 		cmd:        cmd,
 		ring:       make([]byte, s.cfg.history), // 定长环：长度即历史上限
 		agent:      agentUnknown,
-		state:      stateUnknown,
 		lastOut:    now,
 		lastActive: now,
 		cols:       cols,
@@ -1624,11 +1617,9 @@ func (s *termService) listJSON() string {
 		LastActiveMs int64  `json:"lastActiveMs"`
 		Attached     bool   `json:"attached"`
 		Agent        string `json:"agent"`
-		// State 是**兼容字段**：对旧客户端保持既有取值语义（blocked 显示为既有的
-		// 「等待操作」= waiting），绝不出现「未知」回退（任务 4.8 的枚举兼容）。
-		State string `json:"state"`
-		// StateV2 是新枚举（working/blocked/idle/unknown）：旧客户端忽略未知 JSON 字段，
-		// 新客户端读它区分「跑完」与「等批准」。
+		// StateV2 是状态唯一字段（working/blocked/idle/unknown）。旧 `state` 键已随
+		// 状态单轨化退役（term-remote 3.3，D6 破坏性授权：不识 stateV2 的历史客户端
+		// 状态列降级为既有未知态；在役 App 已消费 stateV2，消费方同批改齐）。
 		StateV2 string `json:"stateV2"`
 		Title   string `json:"title"`
 		// Cwd 是会话内 shell 经 OSC 7 上报的工作目录（缺省不显示）。
@@ -1660,7 +1651,6 @@ func (s *termService) listJSON() string {
 				LastActiveMs: ss.lastActive.UnixMilli(),
 				Attached:     len(ss.legs) > 0,
 				Agent:        agentName(ss.agent),
-				State:        stateName(ss.state),
 				StateV2:      stateNameV2(ss.stateV2),
 				Title:        ss.scan.title,
 				Cwd:          ss.cwdLocked(),

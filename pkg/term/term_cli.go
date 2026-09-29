@@ -324,8 +324,7 @@ type cliSessionInfo struct {
 	LastActiveMs int64           `json:"lastActiveMs"`
 	Attached     bool            `json:"attached"`
 	Agent        string          `json:"agent"`
-	State        string          `json:"state"`
-	StateV2      string          `json:"stateV2"`
+	StateV2      string          `json:"stateV2"` // 状态唯一字段（旧 state 键已退役，term-remote 3.3）
 	Title        string          `json:"title"`
 	Cwd          string          `json:"cwd,omitempty"`
 	Cols         uint16          `json:"cols"`
@@ -436,7 +435,7 @@ func cliListPrint(w io.Writer, entries []cliSessionInfo, rawJSON []byte, asJSON 
 			clients = strings.Join(kinds, ",")
 		}
 		fmt.Fprintf(w, "%-20s %dx%-5d %-9s %-10s %-24s %s\n",
-			s.Name, s.Cols, s.Rows, firstNonEmpty(s.StateV2, s.State), s.Agent, title, clients)
+			s.Name, s.Cols, s.Rows, s.StateV2, s.Agent, title, clients)
 	}
 	return nil
 }

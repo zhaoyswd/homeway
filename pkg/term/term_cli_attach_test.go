@@ -849,3 +849,22 @@ func TestCLIAttachTitleIconOnlyNoLeak(t *testing.T) {
 		t.Fatalf("图标名应答泄漏进会话回显（超时路径未剥）：%q", ms.dump())
 	}
 }
+
+// 标题状态词表 = stateV2（term-remote 3.3 单轨化：stateName 已删，标题与表格/STATE
+// 帧同值域——blocked 不再折成 waiting）。
+func TestTitleLineStateV2(t *testing.T) {
+	for st, want := range map[byte]string{
+		stateV2Working: "working",
+		stateV2Blocked: "blocked",
+		stateV2Idle:    "idle",
+		stateV2Unknown: "unknown",
+	} {
+		got := titleLine("dev1", agentCodex, st, "批准")
+		if !strings.Contains(got, "dev1 · codex · "+want) {
+			t.Fatalf("state=%d 标题状态词应为 %q：%s", st, want, got)
+		}
+	}
+	if got := titleLine("dev1", agentCodex, stateV2Blocked, ""); strings.Contains(got, "waiting") {
+		t.Fatalf("标题不得再出现旧词表 waiting：%s", got)
+	}
+}

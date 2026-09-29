@@ -20,7 +20,7 @@ func TestTermFrameRoundTrip(t *testing.T) {
 		{opData, []byte("hello \x1b[31m世界\x1b[0m")},
 		{opReplayDone, encReplayDone(12345, replayFlagTruncated|replayFlagSizeChange)},
 		{opEnded, encEnded(termEndKilled, "killed")},
-		{opState, encState(agentCodex, stateRunning, "codex · 工作中")},
+		{opState, encState(agentCodex, stateV2Working, "codex · 工作中")},
 		{opError, encError("no_session", "会话不存在")},
 		{opOK, nil},
 		{opKill, encName(name)},

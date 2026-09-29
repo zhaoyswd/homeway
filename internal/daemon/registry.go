@@ -76,6 +76,12 @@ type Registry struct {
 	logf     hostsession.Logf
 	eventf   func(format string, args ...any)
 	events   RegistryEvents
+	// carried 装载时 id 非法条目的原样携带（D7-a，term-remote 3.1）：不启动会话、
+	// 不进寻址面（Hosts/Sessions 均不含），但**落盘时随有效记录一并写回**——「条目
+	// 保留」由 recordsLocked 兑现（改前装载日志声称保留、下次落盘却把它写掉）。
+	// 用户可见滞留（日志指路手工清理）；「不丢数据」优先于「表自洁」——自洁正是
+	// 被定为 bug 的行为。
+	carried []HostRecord
 
 	// newSession 会话构造接缝（默认 hostsession.NewSession；同包测试注入桩）。
 	newSession func(cfg hostsession.Config, opts hostsession.Options) (*hostsession.Session, error)
@@ -121,7 +127,12 @@ func OpenRegistry(stateDir string, opts RegistryOptions) (*Registry, error) {
 		var id [32]byte
 		b, derr := hex.DecodeString(rec.ID)
 		if derr != nil || len(b) != 32 {
-			r.logf("hosts: 记录 %q 的 id 非法（跳过启动，条目保留）：%v", rec.ID, derr)
+			why := fmt.Sprintf("长度 %d ≠ 64 位 hex", len(rec.ID))
+			if derr != nil {
+				why = derr.Error()
+			}
+			r.carried = append(r.carried, rec)
+			r.logf("hosts: 记录 %q 的 id 非法（%s）——保留在表、不启动会话、不参与寻址；可手工修正或删除该条目", rec.ID, why)
 			continue
 		}
 		copy(id[:], b)
@@ -321,13 +332,15 @@ func (r *Registry) Close() {
 	}
 }
 
-// recordsLocked 当前表记录快照（调用方持锁）。
+// recordsLocked 当前表记录快照（调用方持锁）。**含 carried**：非法 id 条目随每次
+// 落盘原样写回（D7-a「条目保留」由这里兑现——顺序：有效表在前、carried 原序在后；
+// Hosts/Sessions 的寻址面仍不含 carried，二者刻意不同源）。
 func (r *Registry) recordsLocked() []HostRecord {
-	recs := make([]HostRecord, 0, len(r.hosts))
+	recs := make([]HostRecord, 0, len(r.hosts)+len(r.carried))
 	for _, e := range r.hosts {
 		recs = append(recs, e.rec)
 	}
-	return recs
+	return append(recs, r.carried...)
 }
 
 // replaceRecord 记录集内同 ID 替换（无则追加）。

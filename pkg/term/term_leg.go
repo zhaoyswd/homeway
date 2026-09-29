@@ -626,9 +626,10 @@ func (s *termSession) registerLegLocked(c *termClient, takeover bool) *termErr {
 	}
 	if c.surface {
 		// ATTACHED 先入队再继续（D10-6：首帧必须 ATTACHED——此刻腿已在表内，但所有
-		// 生产者都要拿会话锁，而我们正持着，不可能有帧插到它前面）。
+		// 生产者都要拿会话锁，而我们正持着，不可能有帧插到它前面）。state 字节 =
+		// stateV2（单轨化后不按腿类折价，term-remote 3.3）。
 		c.out.enqueue(writeItem{op: opAttached, payload: encAttached(s.cols, s.rows, s.scan.modes,
-			s.agent, stateForLeg(true, s.stateV2, s.state), s.name)}, 0)
+			s.agent, s.stateV2, s.name)}, 0)
 		c.leg.markNeedSnapshot("attach")
 	} else {
 		c.handshake = s.buildRawHandshakeLocked(c, first)
@@ -656,8 +657,7 @@ func idDesc(id string) string {
 func (s *termSession) buildRawHandshakeLocked(c *termClient, first bool) *rawHandshake {
 	start, truncated := s.replayStartLocked()
 	return &rawHandshake{
-		attached: encAttached(s.cols, s.rows, s.scan.modes, s.agent,
-			stateForLeg(false, s.stateV2, s.state), s.name),
+		attached:   encAttached(s.cols, s.rows, s.scan.modes, s.agent, s.stateV2, s.name),
 		start:      start,
 		end:        s.written,
 		truncated:  truncated,
@@ -883,25 +883,15 @@ func (s *termSession) wakeRawLegsLocked() {
 	}
 }
 
-// pushStateToLegsLocked 给每条腿投递 STATE（任务 2.1b：每腿投递、按腿编码）。
+// pushStateToLegsLocked 给每条腿投递 STATE（任务 2.1b：每腿投递）。状态单轨化
+// （term-remote 3.3，D6）：surface 与 raw 腿**同一 stateV2 枚举**——不再按腿类折价，
+// 载荷只算一次（值域数值与折价前同构，旧客户端 raw 腿零 wire 差异）。
 func (s *termSession) pushStateToLegsLocked() {
 	if len(s.legs) == 0 {
 		return
 	}
-	var rawPayload, surfacePayload []byte
+	payload := encState(s.agent, s.stateV2, s.scan.title)
 	for _, l := range s.legs {
-		var payload []byte
-		if l.surface {
-			if surfacePayload == nil {
-				surfacePayload = encState(s.agent, stateForLeg(true, s.stateV2, s.state), s.scan.title)
-			}
-			payload = surfacePayload
-		} else {
-			if rawPayload == nil {
-				rawPayload = encState(s.agent, stateForLeg(false, s.stateV2, s.state), s.scan.title)
-			}
-			payload = rawPayload
-		}
 		l.out.enqueueState(writeItem{op: opState, payload: payload})
 	}
 }

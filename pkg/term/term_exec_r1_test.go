@@ -201,9 +201,15 @@ func TestRawStallRecoversAfterWriteTimeout(t *testing.T) {
 	if total < 4096 {
 		t.Fatalf("恢复读取后续投不足：%dB（<4KB = exec-r1 高2 停滞永久哑掉）", total)
 	}
-	// 停滞位随成功续投清除。
-	if stalled.out.isStalled() {
-		t.Fatal("恢复续投后停滞位应清除")
+	// 停滞位随成功续投清除。写者在退避 sleep 之后才做下一次写尝试（成功才清位）——
+	// 客户端读满 4KB 与写者的下一次成功写之间有窗口，立即断言在 race 模式/高负载下
+	// 偶发红（批 1 遗留 flake，批 2 修为轮询；bulkTermShell 持续产出 ⇒ 位必清）。
+	clearDeadline := deadline
+	for stalled.out.isStalled() {
+		if time.Now().After(clearDeadline) {
+			t.Fatal("恢复续投后停滞位应清除（5s 内）")
+		}
+		time.Sleep(20 * time.Millisecond)
 	}
 }
 

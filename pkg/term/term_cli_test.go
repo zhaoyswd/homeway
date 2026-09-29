@@ -290,7 +290,7 @@ func TestGenAutoName(t *testing.T) {
 func TestCLIListPrint(t *testing.T) {
 	entries := []cliSessionInfo{
 		{Name: "build", Cols: 120, Rows: 40, StateV2: "working", Agent: "codex", Title: "cargo build", Clients: []cliClientInfo{{Kind: "app"}, {Kind: "host", Active: true}}},
-		{Name: "old", Cols: 80, Rows: 24, State: "running", Agent: "shell"},
+		{Name: "old", Cols: 80, Rows: 24, StateV2: "idle", Agent: "shell"},
 	}
 	raw := []byte(`{"sessions":[{"name":"build"}]}`)
 	var buf bytes.Buffer
@@ -402,6 +402,23 @@ func TestCLIListAgainstService(t *testing.T) {
 	}
 }
 
+// waitSessionGone 轮询等会话从列表消失：KILL 的 OK 回包**先于**会话 teardown 完成
+// （kill 发信号即回包，done 由 pump 收尾路径置位），立即断言存在竞态——批 1 遗留
+// flake（三包并行跑时偶发「delete 后会话应消失」红），term-remote 批 2 修为轮询。
+func waitSessionGone(t *testing.T, ln net.Listener, name string) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if _, ok := listSession(listTerm(t, ln), name); !ok {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("会话 %s 应在 5s 内从列表消失（KILL 后 teardown）", name)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
 func TestCLIDeleteAgainstService(t *testing.T) {
 	_, ln, dir := startTestTermUDS(t)
 	c, _, _, _ := attachTerm(t, ln, "cli-del", true, 80, 24)
@@ -410,9 +427,7 @@ func TestCLIDeleteAgainstService(t *testing.T) {
 	if err := cliDelete([]string{"cli-del", "--state", dir}, nil); err != nil {
 		t.Fatalf("delete：%v", err)
 	}
-	if _, ok := listSession(listTerm(t, ln), "cli-del"); ok {
-		t.Fatal("delete 后会话应消失")
-	}
+	waitSessionGone(t, ln, "cli-del")
 	err := cliDelete([]string{"cli-del", "--state", dir}, nil)
 	if err == nil || !strings.Contains(err.Error(), "homeway term list") {
 		t.Fatalf("delete 不存在的会话应报可行动错误：%v", err)
@@ -551,5 +566,47 @@ func TestCLIListDeleteDefaultState(t *testing.T) {
 			t.Fatalf("cli-dflt2 应已被默认 state 的 delete 删除：%+v", entries)
 		}
 		time.Sleep(50 * time.Millisecond)
+	}
+}
+
+// ---- 3.2 D7-b（term-remote）：非属主无法连接 term.sock 的可自动化最小代理 ----
+//
+// 与 control.sock 用例（internal/daemon）同机制：权限位参与 connect 判定，chmod 0000
+// 后属主同样被拦（EACCES）——「非属主被 0600 拦」的同源最小代理。root 绕过权限位 ⇒
+// 跳过；真跨用户面留 live 复核（term-host-cli exec-r5 F3 双端手工实验已证）。
+
+func TestTermSockPermissionBlocksConnect(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root 绕过 socket 权限位，chmod 0000 代理用例不成立（真跨用户面留 live 复核）")
+	}
+	dir, err := os.MkdirTemp("", "termsockperm-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.RemoveAll(dir) })
+	sock := filepath.Join(dir, "term.sock")
+	ln, err := net.Listen("unix", sock)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = ln.Close() })
+
+	// 基线：默认权限下属主可 connect。
+	if c, derr := net.DialTimeout("unix", sock, time.Second); derr != nil {
+		t.Fatalf("基线：属主应能 connect：%v", derr)
+	} else {
+		_ = c.Close()
+	}
+
+	// chmod 0000 → cliDialTerm 本地面报「无权连接」（EACCES 翻文案 + socket 路径）。
+	if err := os.Chmod(sock, 0o0000); err != nil {
+		t.Fatal(err)
+	}
+	_, derr := cliDialTerm(newTermTarget(nil, dir, "", 0))
+	if derr == nil {
+		t.Fatal("chmod 0000 后本地面拨号应报错")
+	}
+	if !strings.Contains(derr.Error(), "无权连接") || !strings.Contains(derr.Error(), sock) {
+		t.Fatalf("应报 EACCES 翻文案（带 %s）：%v", sock, derr)
 	}
 }

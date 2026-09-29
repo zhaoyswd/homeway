@@ -274,3 +274,96 @@ func TestDaemonRefusesExitStateDir(t *testing.T) {
 		t.Fatalf("含 tokens.jsonl 的目录应报错拒启：%v", err)
 	}
 }
+
+// D7-a（term-remote 3.1）：hosts.json 含 id 非法条目 → 装载保留在表（不启动会话、
+// 不进寻址面）→ 后续任意落盘**原样写回**（不再写掉）、装载日志如实。红绿判据：
+// 改前行为 = 「条目保留」日志说谎——下次 Add 落盘即把坏条目写没。
+func TestRegistryCarriesInvalidIDEntries(t *testing.T) {
+	dir := t.TempDir()
+	tokA, peerA := testToken(t, 7, "127.0.0.1:40007")
+	bad := HostRecord{ID: "zz-not-hex", Name: "坏条目", Token: "token-x", AddedAt: time.Unix(1000, 0)}
+	seed := []HostRecord{bad, {ID: hex.EncodeToString(peerA[:]), Name: "甲", Token: tokA, AddedAt: time.Unix(2000, 0)}}
+	b, err := json.Marshal(seed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, hostsFileName), b, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	var logs []string
+	r, err := OpenRegistry(dir, RegistryOptions{
+		StrictIdentity: true,
+		Logf:           func(f string, a ...any) { logs = append(logs, fmt.Sprintf(f, a...)) },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer r.Close()
+
+	// 会话/寻址面：只有合法的「甲」；坏条目不进任何一面。
+	if got := len(r.Hosts()); got != 1 {
+		t.Fatalf("寻址面应只含合法条目 1 条，实际 %d（%+v）", got, r.Hosts())
+	}
+	if got := len(r.Sessions()); got != 1 {
+		t.Fatalf("会话面应只含合法条目 1 条，实际 %d", got)
+	}
+	sawTruth := false
+	for _, l := range logs {
+		if strings.Contains(l, "zz-not-hex") && strings.Contains(l, "保留") {
+			sawTruth = true
+		}
+	}
+	if !sawTruth {
+		t.Fatalf("装载日志应如实说明非法条目保留：%v", logs)
+	}
+
+	// host add 触发落盘 → 重读文件：坏条目**仍在**（改前在这里被写掉）且三台齐。
+	tokB, _ := testToken(t, 8, "127.0.0.1:40008")
+	if _, err := r.Add("乙", tokB); err != nil {
+		t.Fatal(err)
+	}
+	raw, err := os.ReadFile(filepath.Join(dir, hostsFileName))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var after []HostRecord
+	if err := json.Unmarshal(raw, &after); err != nil {
+		t.Fatalf("hosts.json 落盘不可解析：%v（%s）", err, raw)
+	}
+	var badOK, aOK, bOK bool
+	for _, rec := range after {
+		switch {
+		case rec.ID == bad.ID:
+			badOK = rec.Name == bad.Name && rec.Token == bad.Token && rec.AddedAt.Equal(bad.AddedAt)
+		case rec.ID == hex.EncodeToString(peerA[:]):
+			aOK = rec.Name == "甲"
+		case rec.Name == "乙":
+			bOK = true
+		}
+	}
+	if !badOK || !aOK || !bOK {
+		t.Fatalf("落盘后条目不齐：bad=%v 甲=%v 乙=%v（%s）", badOK, aOK, bOK, raw)
+	}
+	if got := len(r.Hosts()); got != 2 {
+		t.Fatalf("Add 后寻址面应 2 条（坏条目不进），实际 %d", got)
+	}
+
+	// 重启再装载：坏条目仍保留（幂等，不会第二次装载时漂移）。
+	r.Close()
+	r2, err := OpenRegistry(dir, RegistryOptions{StrictIdentity: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer r2.Close()
+	raw2, err := os.ReadFile(filepath.Join(dir, hostsFileName))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(raw2), bad.ID) {
+		t.Fatalf("重启后坏条目应仍在 hosts.json：%s", raw2)
+	}
+	if got := len(r2.Hosts()); got != 2 {
+		t.Fatalf("重启后寻址面应 2 条，实际 %d", got)
+	}
+}

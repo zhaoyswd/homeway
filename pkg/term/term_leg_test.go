@@ -532,11 +532,14 @@ func TestListClientsKinds(t *testing.T) {
 			t.Errorf("clients 缺 kind=%s（实际 %v）", want, kinds)
 		}
 	}
-	// 旧字段零回退：state/stateV2/title 等都在。
-	for _, field := range []string{"state", "stateV2", "title", "cols", "rows", "pid"} {
+	// 旧字段零回退：stateV2/title 等都在（旧 state 键已随单轨化退役，term-remote 3.3）。
+	for _, field := range []string{"stateV2", "title", "cols", "rows", "pid"} {
 		if _, ok := sess[field]; !ok {
-			t.Errorf("旧字段 %s 不该消失（只增不改）", field)
+			t.Errorf("字段 %s 不该消失（只增不改）", field)
 		}
+	}
+	if _, ok := sess["state"]; ok {
+		t.Error("旧 state 键应已退役（term-remote 3.3 单轨化）")
 	}
 }
 

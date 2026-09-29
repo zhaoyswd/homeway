@@ -693,3 +693,51 @@ func TestRemoteAttachEarlyExitOnDeadStream(t *testing.T) {
 	}
 	t.Logf("流死于第 %d 帧；假主机实收 %d 字节 / 已接受 %d 字节", failed, got, sent)
 }
+
+// ---- 3.2 D7-b：非属主无法连接 control.sock 的可自动化最小代理 ----
+//
+// 机制：socket 权限位在 linux 与 darwin 都参与 connect 判定——chmod 0000 后**属主
+// 同样被拦**（EACCES），即「非属主被 0600 拦」的同源最小代理（term-host-cli exec-r5
+// F3 双端手工实验已证跨用户面；本用例锁进 CI）。root 绕过权限位 ⇒ 跳过（容器/CI
+// root 下假红预防）；真跨用户 connect 不可自动化（无第二用户），留 live 复核。
+
+func TestControlSockPermissionBlocksConnect(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root 绕过 socket 权限位，chmod 0000 代理用例不成立（真跨用户面留 live 复核）")
+	}
+	dir, err := os.MkdirTemp("/tmp", "sockperm-") // 短路径（sun_path 上限）
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.RemoveAll(dir) })
+	sock, ln, err := control.ListenControl(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = ln.Close() })
+
+	// 基线：0600 下属主可 connect（证明后续 EACCES 来自权限位而非死 socket）。
+	if c, derr := net.DialTimeout("unix", sock, time.Second); derr != nil {
+		t.Fatalf("基线：0600 下属主应能 connect：%v", derr)
+	} else {
+		_ = c.Close()
+	}
+
+	// chmod 0000 → connect 报 EACCES（属主亦被权限位拦）。
+	if err := os.Chmod(sock, 0o0000); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	_, _, derr := control.Dial(ctx, sock, control.FrontendInfo{Kind: "cli", Name: "perm-test"})
+	if !errors.Is(derr, syscall.EACCES) {
+		t.Fatalf("chmod 0000 后 connect 应报 EACCES，实得 %v", derr)
+	}
+	// CLI 层①对 EACCES 的翻文案：带 socket 路径 + 「同一用户运行」可行动提示。
+	msg := controlDialErr(dir, sock, derr).Error()
+	for _, w := range []string{"无权连接", sock, "同一用户"} {
+		if !strings.Contains(msg, w) {
+			t.Fatalf("EACCES 文案缺 %q：%s", w, msg)
+		}
+	}
+}

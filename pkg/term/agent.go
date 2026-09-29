@@ -88,10 +88,8 @@ type screenEvidence struct {
 // agentVerdict：判定结果。
 type agentVerdict struct {
 	agent byte
-	// state 是 **legacy 口径**（working→stateRunning、blocked→stateWaiting）——旧客户端的
-	// 兼容值，见任务 4.8 的枚举兼容。
-	state byte
-	// stateV2 是新枚举（working/blocked/idle/unknown），新客户端读它区分「跑完」与「等批准」。
+	// stateV2 是状态枚举（working/blocked/idle/unknown）——term-remote 3.3 起唯一口径
+	//（legacy 折价已删：STATE/LIST 对所有腿统一本枚举，wire 值与折价前数值同构）。
 	stateV2 byte
 	cpu     int64 // 本轮采到的 CPU 刻度（下次采样当 prevCPU 用）
 	// quiet 截至本轮的连续安静拍数（working 时清零；调用方存下来当 prevQuiet）。
@@ -100,7 +98,8 @@ type agentVerdict struct {
 	evidence string
 }
 
-// stateV2 枚举（任务 4.8：LIST JSON 的 stateV2 字段与 STATE 帧的新枚举）。
+// stateV2 枚举（STATE 帧的 state 字节与 LIST JSON 的 stateV2 字段共用；值域见
+// frames.go 的 agent 枚举注释）。
 const (
 	stateV2Unknown byte = 0
 	stateV2Working byte = 1
@@ -108,7 +107,7 @@ const (
 	stateV2Idle    byte = 3
 )
 
-// stateNameV2 把新枚举渲染成字符串（LIST JSON 用）。
+// stateNameV2 把枚举渲染成字符串（LIST JSON 与 CLI 表格/标题用）。
 func stateNameV2(s byte) string {
 	switch s {
 	case stateV2Working:
@@ -119,23 +118,6 @@ func stateNameV2(s byte) string {
 		return "idle"
 	}
 	return "unknown"
-}
-
-// legacyState 把 stateV2 折成旧客户端的 state 值（**兼容契约**：blocked 在旧客户端显示为
-// 既有的「等待操作」语义 = stateWaiting，绝不出现「未知」回退）。
-func legacyState(v2 byte) byte {
-	switch v2 {
-	case stateV2Working:
-		return stateRunning
-	case stateV2Blocked, stateV2Idle:
-		// blocked 与 idle 在旧口径下都是「没在跑」的等待态：blocked 必须映射到 waiting
-		// （旧 App 显示「等待操作」），idle 保持 idle。
-		if v2 == stateV2Blocked {
-			return stateWaiting
-		}
-		return stateIdle
-	}
-	return stateUnknown
 }
 
 // 判定阈值（2026-09-18 实测标定，Mac mini / codex 1.x / opencode 1.18）：
@@ -172,10 +154,10 @@ var agentNames = []struct {
 
 // classifyAgent 从进程表里判断前台进程组「正在跑什么」。
 func classifyAgent(p agentProbe) agentVerdict {
-	v := agentVerdict{agent: agentShell, state: stateIdle, stateV2: stateV2Idle, cpu: -1}
+	v := agentVerdict{agent: agentShell, stateV2: stateV2Idle, cpu: -1}
 	if len(p.procs) == 0 || p.fgPgid == 0 {
 		v.agent = agentUnknown
-		v.state, v.stateV2 = stateUnknown, stateV2Unknown
+		v.stateV2 = stateV2Unknown
 		v.evidence = "no-procs"
 		return v
 	}
@@ -189,7 +171,7 @@ func classifyAgent(p agentProbe) agentVerdict {
 	}
 	if len(fg) == 0 {
 		v.agent = agentUnknown
-		v.state, v.stateV2 = stateUnknown, stateV2Unknown
+		v.stateV2 = stateV2Unknown
 		v.evidence = "no-fg"
 		return v
 	}
@@ -244,9 +226,10 @@ func classifyAgent(p agentProbe) agentVerdict {
 		if quiet > 99 {
 			quiet = 99
 		}
-		// 降级保护：上一拍 running 且安静拍数未超限 → 维持 running（升级即时、
-		// 降级要窗口排空后连续安静 agentQuietDegrade+1 拍）。
-		if p.prevState == stateRunning && quiet <= agentQuietDegrade {
+		// 降级保护：上一拍 working 且安静拍数未超限 → 维持 working（升级即时、
+		// 降级要窗口排空后连续安静 agentQuietDegrade+1 拍）。prevState 的值域 =
+		// stateV2（term-remote 3.3 单轨化后唯一枚举，数值与折价前同构）。
+		if p.prevState == stateV2Working && quiet <= agentQuietDegrade {
 			working = true
 		}
 	}
@@ -261,7 +244,6 @@ func classifyAgent(p agentProbe) agentVerdict {
 		screen:    p.screen,
 		prevState: p.prevState,
 	})
-	v.state = legacyState(v.stateV2)
 	return v
 }
 

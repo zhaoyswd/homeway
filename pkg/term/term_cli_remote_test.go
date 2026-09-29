@@ -135,9 +135,7 @@ func TestCLINewDeleteHostViaFakeRemote(t *testing.T) {
 	if err := cliDelete([]string{"ci-r1", "--host", "mac"}, f); err != nil {
 		t.Fatalf("远程 delete：%v", err)
 	}
-	if _, ok := listSession(listTerm(t, ln), "ci-r1"); ok {
-		t.Fatal("远程 delete 后会话应消失")
-	}
+	waitSessionGone(t, ln, "ci-r1") // KILL 回包先于 teardown（见 helper 注释）
 }
 
 func TestCLIAttachHostArgsParse(t *testing.T) {

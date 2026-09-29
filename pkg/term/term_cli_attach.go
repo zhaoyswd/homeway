@@ -418,13 +418,13 @@ func attachedAgentState(p []byte) (byte, byte) {
 	if _, _, _, agent, state, _, ok := decAttachedHead(p); ok {
 		return agent, state
 	}
-	return agentUnknown, stateUnknown
+	return agentUnknown, stateV2Unknown
 }
 
 // decStateTitle 解 STATE 载荷（agent(1) state(1) titleLen(2 LE) title）。
 func decStateTitle(p []byte) (agent, state byte, title string) {
 	if len(p) < 4 {
-		return agentUnknown, stateUnknown, ""
+		return agentUnknown, stateV2Unknown, ""
 	}
 	n := int(binary.LittleEndian.Uint16(p[2:4]))
 	if len(p) >= 4+n {
@@ -465,9 +465,11 @@ func endedMessage(name string, code int32, reason string) string {
 	}
 }
 
-// titleLine 组标题（7.6）：会话 · agent · 状态（· 标题，有才带）。
+// titleLine 组标题（7.6）：会话 · agent · 状态（· 标题，有才带）。状态词表 =
+// stateV2（working/blocked/idle/unknown——term-remote 3.3 单轨化，与 STATE/ATTACHED
+// 的 state 字节同值域）。
 func titleLine(name string, agent, state byte, title string) string {
-	parts := []string{name, agentName(agent), stateName(state)}
+	parts := []string{name, agentName(agent), stateNameV2(state)}
 	if t := strings.TrimSpace(title); t != "" {
 		r := []rune(t)
 		if len(r) > 24 {

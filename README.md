@@ -137,6 +137,9 @@ homeway term explain <会话名> --host mac   # 在线 explain 远程往返（--
   输入侧流死后逐帧报错早退——粘贴大段文本中途流死，余量不再写进死流。
 - **标题**：接入时终端标题设为「会话 · agent · 状态」，退出恢复原值；
   `HOMEWAY_TERM_TITLE=off` 可关。
+- **状态词表**：会话状态统一 stateV2 口径（working / blocked / idle / unknown）——
+  表格、标题与 `list --json` 同一值域；`--json` 的旧 `state` 字段已退役（不兼容
+  更改：消费 `stateV2` 键）。
 - **退出码**：分离 / 会话结束（含被接管 `-d`）/ 信号退出 = 0；连接或协议错误、断链 = 1；
   未知 term 子命令 = 1、顶层未知角色 = 2。
 

@@ -31,77 +31,77 @@ func TestClassifyAgent(t *testing.T) {
 			name:    "shell 空闲（zsh 唤醒烧 3 刻度 < 阈值）",
 			procs:   fixture(),
 			prevCPU: 10, outBytes: 0,
-			want: agentShell, wantSt: stateIdle, fg: 100,
+			want: agentShell, wantSt: stateV2Idle, fg: 100,
 		},
 		{
 			name:    "shell 有输出（输出腿）",
 			procs:   fixture(),
 			prevCPU: 10, outBytes: 500,
-			want: agentShell, wantSt: stateRunning, fg: 100,
+			want: agentShell, wantSt: stateV2Working, fg: 100,
 		},
 		{
 			name: "shell 跑安静命令（CPU ≥100ms/s，CPU 腿对 shell 生效）",
 			procs: fixture(procInfo{pid: 500, ppid: 100, pgid: 500, cpu: 1100,
 				args: "make -j8"}),
 			prevCPU: 1000, outBytes: 0,
-			want: agentOther, wantSt: stateRunning,
+			want: agentOther, wantSt: stateV2Working,
 		},
 		{
-			name: "agent 任务期（输出 ≥300B → running，CPU 零增量也成立）",
+			name: "agent 任务期（输出 ≥300B → working，CPU 零增量也成立）",
 			procs: fixture(procInfo{pid: 200, ppid: 100, pgid: 200, cpu: 5000,
 				args: "/usr/local/bin/codex --model gpt-5"}),
 			prevCPU: 5000, outBytes: 2500,
-			want: agentCodex, wantSt: stateRunning,
+			want: agentCodex, wantSt: stateV2Working,
 		},
 		{
 			name: "codex 空闲（输出 0，CPU 不涨）→ waiting",
 			procs: fixture(procInfo{pid: 200, ppid: 100, pgid: 200, cpu: 5000,
 				args: "/usr/local/bin/codex"}),
 			prevCPU: 5000, outBytes: 0,
-			want: agentCodex, wantSt: stateIdle,
+			want: agentCodex, wantSt: stateV2Idle,
 		},
 		{
 			// 2026-09-18 实测：用户 opencode 会话卡永久 running 的根因——MCP
 			// server（uvx/python 子进程）保活烧 20~70ms/s。agent 判定不看 CPU。
-			name: "agent 空闲但 MCP 保活烧 CPU（CPU 腿对 agent 失效）→ waiting",
+			name: "agent 空闲但 MCP 保活烧 CPU（CPU 腿对 agent 失效）→ idle",
 			procs: fixture(
 				procInfo{pid: 300, ppid: 100, pgid: 300, cpu: 5020, args: "/opt/homebrew/bin/opencode"},
 				procInfo{pid: 301, ppid: 300, pgid: 300, cpu: 7040, args: "uv tool uvx mcp-server-foo"},
 			),
 			prevCPU: 12000, outBytes: 0,
-			want: agentOpencode, wantSt: stateIdle,
+			want: agentOpencode, wantSt: stateV2Idle,
 		},
 		{
 			// 闪烁级重绘（几十字节/次）不触发输出腿。
-			name: "agent 闪烁级小重绘（50B < 阈值）→ waiting",
+			name: "agent 闪烁级小重绘（50B < 阈值）→ idle",
 			procs: fixture(procInfo{pid: 200, ppid: 100, pgid: 200, cpu: 5000,
 				args: "/usr/local/bin/codex"}),
 			prevCPU: 5000, outBytes: 50,
-			want: agentCodex, wantSt: stateIdle,
+			want: agentCodex, wantSt: stateV2Idle,
 		},
 		{
 			// 磁滞：任务刚停（窗口已排空），本拍是第 1 拍安静（quiet=1 ≤ 阈值）→ 维持。
-			name: "磁滞：running 后安静第 1 拍仍 running",
+			name: "磁滞：working 后安静第 1 拍仍 working",
 			procs: fixture(procInfo{pid: 200, ppid: 100, pgid: 200, cpu: 5000,
 				args: "/usr/local/bin/codex"}),
-			prevCPU: 5000, outBytes: 0, prevState: stateRunning, prevQuiet: 0,
-			want: agentCodex, wantSt: stateRunning,
+			prevCPU: 5000, outBytes: 0, prevState: stateV2Working, prevQuiet: 0,
+			want: agentCodex, wantSt: stateV2Working,
 		},
 		{
-			name: "磁滞：安静第 2 拍仍 running（agentQuietDegrade=2）",
+			name: "磁滞：安静第 2 拍仍 working（agentQuietDegrade=2）",
 			procs: fixture(procInfo{pid: 200, ppid: 100, pgid: 200, cpu: 5000,
 				args: "/usr/local/bin/codex"}),
-			prevCPU: 5000, outBytes: 0, prevState: stateRunning, prevQuiet: 1,
-			want: agentCodex, wantSt: stateRunning,
+			prevCPU: 5000, outBytes: 0, prevState: stateV2Working, prevQuiet: 1,
+			want: agentCodex, wantSt: stateV2Working,
 		},
 		{
-			name: "磁滞：安静第 3 拍降级 waiting",
+			name: "磁滞：安静第 3 拍降级 idle",
 			procs: fixture(procInfo{pid: 200, ppid: 100, pgid: 200, cpu: 5000,
 				args: "/usr/local/bin/codex"}),
-			prevCPU: 5000, outBytes: 0, prevState: stateRunning, prevQuiet: 2,
+			prevCPU: 5000, outBytes: 0, prevState: stateV2Working, prevQuiet: 2,
 			// 新语义：agent + 安静 + 无屏幕证据 ⇒ idle（旧口径这里是 waiting；
 			// waiting 现在只作 blocked 的 legacy 折价，见 agent.go 的 legacyState）。
-			want: agentCodex, wantSt: stateIdle,
+			want: agentCodex, wantSt: stateV2Idle,
 		},
 		{
 			name: "npx 包装（node 跑 codex.js）",
@@ -111,34 +111,34 @@ func TestClassifyAgent(t *testing.T) {
 					args: "node /Users/u/.npm/_npx/1/node_modules/@openai/codex/bin/codex.js"},
 			),
 			prevCPU: 900, outBytes: 800,
-			want: agentCodex, wantSt: stateRunning,
+			want: agentCodex, wantSt: stateV2Working,
 		},
 		{
-			name: "openclaw 有输出 → running",
+			name: "openclaw 有输出 → working",
 			procs: fixture(procInfo{pid: 400, ppid: 100, pgid: 400, cpu: 50,
 				args: "openclaw chat"}),
 			prevCPU: 0, outBytes: 1000,
-			want: agentOpenclaw, wantSt: stateRunning,
+			want: agentOpenclaw, wantSt: stateV2Working,
 		},
 		{
-			// 旧语义里这条是 running（CPU 从 0→50）；新语义 agent 不看 CPU。
-			name: "openclaw 纯 CPU 增量不算 running",
+			// 旧语义里这条是 working（CPU 从 0→50）；agent 不看 CPU。
+			name: "openclaw 纯 CPU 增量不算 working",
 			procs: fixture(procInfo{pid: 400, ppid: 100, pgid: 400, cpu: 50,
 				args: "openclaw chat"}),
 			prevCPU: 0, outBytes: 0,
-			want: agentOpenclaw, wantSt: stateIdle,
+			want: agentOpenclaw, wantSt: stateV2Idle,
 		},
 		{
 			name:    "前台是别的程序且安静 → other/idle",
 			procs:   fixture(procInfo{pid: 500, ppid: 100, pgid: 500, cpu: 5, args: "vim notes.md"}),
 			prevCPU: 5, outBytes: 0,
-			want: agentOther, wantSt: stateIdle,
+			want: agentOther, wantSt: stateV2Idle,
 		},
 		{
 			name:    "拿不到前台进程组 → unknown",
 			procs:   fixture(),
 			prevCPU: 10, outBytes: 0,
-			want: agentUnknown, wantSt: stateUnknown, fg: -1,
+			want: agentUnknown, wantSt: stateV2Unknown, fg: -1,
 		},
 	}
 	for _, c := range cases {
@@ -160,9 +160,9 @@ func TestClassifyAgent(t *testing.T) {
 				shellPID:  100,
 				now:       now,
 			})
-			if v.agent != c.want || v.state != c.wantSt {
+			if v.agent != c.want || v.stateV2 != c.wantSt {
 				t.Errorf("agent=%s state=%s；期望 agent=%s state=%s",
-					agentName(v.agent), stateName(v.state), agentName(c.want), stateName(c.wantSt))
+					agentName(v.agent), stateNameV2(v.stateV2), agentName(c.want), stateNameV2(c.wantSt))
 			}
 		})
 	}

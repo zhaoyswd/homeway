@@ -215,35 +215,10 @@ func TestRepublishBlocked(t *testing.T) {
 	}
 }
 
-// ---- 4.8 枚举兼容 ----
+// ---- 4.8 枚举兼容 → 3.3 单轨化（legacyState/stateForLeg 已删，D6）----
 
-func TestLegacyStateCompat(t *testing.T) {
-	cases := map[byte]byte{
-		stateV2Working: stateRunning,
-		stateV2Blocked: stateWaiting, // 旧 App 显示「等待操作」，不是「未知」
-		stateV2Idle:    stateIdle,
-		stateV2Unknown: stateUnknown,
-	}
-	for v2, want := range cases {
-		if got := legacyState(v2); got != want {
-			t.Errorf("legacyState(%d) = %s，期望 %s", v2, stateName(got), stateName(want))
-		}
-	}
-}
-
-func TestStateForLeg(t *testing.T) {
-	// surface 腿拿到新枚举（能区分 blocked 与 idle）。
-	if got := stateForLeg(true, stateV2Blocked, stateWaiting); got != stateV2Blocked {
-		t.Errorf("surface 腿应拿到 stateV2，实际 %d", got)
-	}
-	// legacy 腿拿到折价值。
-	if got := stateForLeg(false, stateV2Blocked, stateWaiting); got != stateWaiting {
-		t.Errorf("legacy 腿应拿到折价值，实际 %d", got)
-	}
-}
-
-// LIST JSON 必须同时带 state（兼容）与 stateV2（新）+ cwd（缺省不显示）。
-func TestListJSONHasStateV2(t *testing.T) {
+// LIST JSON 只带 stateV2（旧 state 键已退役，term-remote 3.3 破坏性授权）+ cwd 缺省不显示。
+func TestListJSONStateV2SingleTrack(t *testing.T) {
 	svc, ln := startTestTermService(t)
 	defer svc.Close()
 	defer ln.Close()
@@ -258,12 +233,39 @@ func TestListJSONHasStateV2(t *testing.T) {
 	if _, ok := sess["stateV2"]; !ok {
 		t.Error("LIST JSON 应有 stateV2 字段")
 	}
-	if _, ok := sess["state"]; !ok {
-		t.Error("LIST JSON 应保留 state 兼容字段")
+	if _, ok := sess["state"]; ok {
+		t.Error("LIST JSON 的旧 state 键应已退役（term-remote 3.3 单轨化）")
 	}
 	// 没有 vt 上报 cwd 时该字段缺省（omitempty）——不显示而不是显示空串。
 	if v, present := sess["cwd"]; present && v != "" {
 		t.Errorf("未上报 cwd 时应缺省，实际 %q", v)
+	}
+}
+
+// STATE 帧不按腿类折价（D6「状态口径统一」）：同一 stateV2 值发给 surface 与 raw 腿
+// （改前 raw 腿拿 legacy 折价值：blocked→waiting）。直接锁载荷的 state 字节。
+func TestStateFrameStateV2ForEveryLeg(t *testing.T) {
+	s := &termSession{svc: &termService{}, agent: agentCodex, stateV2: stateV2Blocked, scan: termScan{title: "批准"}}
+	s.legs = []*termClient{
+		{surface: true, out: newLegOut()},
+		{surface: false, out: newLegOut()},
+	}
+	s.pushStateToLegsLocked()
+	for _, l := range s.legs {
+		items, _, _ := l.out.take()
+		var got byte = 255
+		saw := false
+		for _, it := range items {
+			if it.op == opState && len(it.payload) >= 2 {
+				got, saw = it.payload[1], true
+			}
+		}
+		if !saw {
+			t.Fatal("腿未收到 STATE 帧")
+		}
+		if got != stateV2Blocked {
+			t.Fatalf("腿（surface=%v）state 字节 = %d，期望 stateV2Blocked=%d（不按腿类折价）", l.surface, got, stateV2Blocked)
+		}
 	}
 }
 

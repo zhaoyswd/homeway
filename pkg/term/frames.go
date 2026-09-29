@@ -79,7 +79,9 @@ const (
 	termFeatures = featList | featReplay | featModes | featAgent | featTitle | featSurfaceBit
 )
 
-// agent / state 枚举（与 App 侧一一对应）。
+// agent 枚举（与 App 侧一一对应）。STATE/ATTACHED 的 state 字节值域 = stateV2 枚举
+// （agent.go：working/blocked/idle/unknown = 1/2/3/0——数值与折价前的旧枚举
+// running/waiting/idle/unknown 同构，旧客户端零 wire 差异；term-remote 3.3 起单轨）。
 const (
 	agentShell    byte = 0
 	agentCodex    byte = 1
@@ -88,12 +90,6 @@ const (
 	agentOpenclaw byte = 4
 	agentOther    byte = 5
 	agentUnknown  byte = 255
-
-	stateUnknown byte = 0
-	stateRunning byte = 1
-	stateWaiting byte = 2
-	stateIdle    byte = 3
-	stateEnded   byte = 4
 )
 
 // ended 的 code：≥0 是子进程退出码；负数表示由服务侧给出的原因（见 reason）。
@@ -133,20 +129,8 @@ func agentName(a byte) string {
 	return "unknown"
 }
 
-// stateName 同上。
-func stateName(s byte) string {
-	switch s {
-	case stateRunning:
-		return "running"
-	case stateWaiting:
-		return "waiting"
-	case stateIdle:
-		return "idle"
-	case stateEnded:
-		return "ended"
-	}
-	return "unknown"
-}
+// stateName 已随 legacy 状态枚举退役（term-remote 3.3 单轨化）：STATE/ATTACHED/LIST
+// 统一 stateV2 词表，渲染用 agent.go 的 stateNameV2。
 
 type termFrame struct {
 	op      byte
