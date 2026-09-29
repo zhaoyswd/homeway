@@ -28,7 +28,16 @@ var (
 	ErrBadToken = errors.New("token 非法")
 	// errNoHost 主机不在表。
 	errNoHost = errors.New("host 不在表中")
+	// errStopTimeout 用户面操作（同键刷新/Remove）遇会话停止超时（host-cli 3b B7：
+	// 拒绝该操作 + events.log 记行——控制面按既有未知错误映射回 bad_request，
+	// 语义错位如实注记：不发明新错误码、不合成 state_changed 事件）。
+	errStopTimeout = errors.New("会话停止超时（垂死会话仍在收尾）")
 )
+
+// stopFunc 会话停步注入缝（host-cli 3b B7②，design D7）：同包测试注入 -1 走
+// 「用户面拒绝 + events.log 记行」与「清理面记行后继续」两条路径；生产 =
+// Session.Stop（0 = 已收工；-1 = 等待超时，此后 Start 一直 -1 直到真正退出）。
+var stopFunc = func(s *hostsession.Session) int { return s.Stop() }
 
 // RegistryEvents 注册表事件接缝（§3 事件面：控制面总线的 session 域事件源）。
 // 回调在 Registry 锁外调用（发射锁序：会话/注册表锁 → 总线锁单向，design A4）。
@@ -151,31 +160,49 @@ func (r *Registry) startEntryLocked(rec HostRecord) *hostEntry {
 }
 
 // Add 添加/刷新一台主机：同 token 重复添加 → errHostExists；同 peerID 新 token
-// （后端重签发）→ 刷新记录（停旧会话、按新 token 起会话）。落盘 hosts.json（0600）。
+// （后端重签发）→ 刷新记录。落盘 hosts.json（0600）。
+//
+// B5（host-cli 3b，design D7 拍板）：**先落盘再 Start/换会话**——新键 = 落盘成功
+// 才入表 + Start（落盘失败零副作用：内存未动、无会话已起）；同键刷新 = 先落盘新
+// token（内存暂不动——失败即回滚，内存不留新 token、旧会话照跑）→ 停旧 → 起新、
+// 内存记录换新值。一次落盘失败既不丢已登记主机也不留孤儿会话。
 func (r *Registry) Add(name, token string) (HostRecord, error) {
 	tok, err := proto.DecodeToken(token)
 	if err != nil {
 		return HostRecord{}, fmt.Errorf("%w：%v", ErrBadToken, err)
 	}
+	// B6：事件 payload 锁内拷贝、锁外 emit（回调重入 Hosts()/Sessions() 不再自死锁）。
+	var emitAdded func()
 	r.mu.Lock()
-	defer r.mu.Unlock()
+	defer func() {
+		r.mu.Unlock()
+		if emitAdded != nil {
+			emitAdded()
+		}
+	}()
 	if e, ok := r.hosts[tok.PeerID]; ok {
 		if e.rec.Token == token {
 			return HostRecord{}, errHostExists
 		}
 		// 同后端重签发：同键刷新（D2——「token 哈希」备选否决的理由）。
-		if e.sess != nil {
-			_ = e.sess.Stop()
-		}
-		e.rec.Token = token
+		newRec := e.rec
+		newRec.Token = token
 		if name != "" {
-			e.rec.Name = name
+			newRec.Name = name
 		}
-		ne := r.startEntryLocked(e.rec)
+		next := replaceRecord(r.recordsLocked(), newRec)
+		if err := r.saveRecordsLocked(next); err != nil {
+			return HostRecord{}, err // 内存保持旧 token、旧会话照跑（磁盘也未动）
+		}
+		// 停旧会话。B7①（用户面）：Stop -1 = 拒绝该操作 + events.log 记行——此时
+		// 磁盘或已含新 token、内存保持旧值，重试或重启按磁盘收敛（如实注记）。
+		if e.sess != nil && stopFunc(e.sess) < 0 {
+			r.eventf("hosts: %s（%s）token 刷新被拒——会话停止超时（-1，垂死会话仍在收尾；重试或重启按磁盘收敛）", e.rec.ID, e.rec.Name)
+			return HostRecord{}, errStopTimeout
+		}
+		e.rec = newRec
+		ne := r.startEntryLocked(newRec)
 		e.sess = ne.sess
-		if err := r.saveLocked(); err != nil {
-			return HostRecord{}, err
-		}
 		r.logf("hosts: %s（%s）token 已刷新（同后端重签发）", e.rec.ID, e.rec.Name)
 		return e.rec, nil
 	}
@@ -185,36 +212,48 @@ func (r *Registry) Add(name, token string) (HostRecord, error) {
 		Token:   token,
 		AddedAt: time.Now(),
 	}
-	r.hosts[tok.PeerID] = r.startEntryLocked(rec)
-	if err := r.saveLocked(); err != nil {
-		delete(r.hosts, tok.PeerID)
-		return HostRecord{}, err
+	if err := r.saveRecordsLocked(append(r.recordsLocked(), rec)); err != nil {
+		return HostRecord{}, err // 落盘失败零副作用：内存未动、无会话已起
 	}
+	r.hosts[tok.PeerID] = r.startEntryLocked(rec)
 	r.logf("hosts: + %s（%s）", rec.ID, rec.Name)
 	if r.events != nil {
-		r.events.HostAdded(rec.ID, rec.Name, rec.AddedAt.UnixMilli())
+		id, nm, at := rec.ID, rec.Name, rec.AddedAt.UnixMilli()
+		ev := r.events
+		emitAdded = func() { ev.HostAdded(id, nm, at) }
 	}
 	return rec, nil
 }
 
-// Remove 摘除一台主机（停会话、删条目、落盘）。
+// Remove 摘除一台主机（先落盘、停会话、删条目——B5 对称化：落盘失败 = 内存与会话
+// 均未动）。停会话遇 -1 = B7① 用户面拒绝 + events.log 记行（磁盘或已不含该记录，
+// 重试或重启按磁盘收敛）。
 func (r *Registry) Remove(id [32]byte) error {
+	var emitRemoved func()
 	r.mu.Lock()
-	defer r.mu.Unlock()
+	defer func() {
+		r.mu.Unlock()
+		if emitRemoved != nil {
+			emitRemoved()
+		}
+	}()
 	e, ok := r.hosts[id]
 	if !ok {
 		return fmt.Errorf("%w：%s", errNoHost, hex.EncodeToString(id[:]))
 	}
-	if e.sess != nil {
-		_ = e.sess.Stop()
+	if err := r.saveRecordsLocked(withoutRecord(r.recordsLocked(), e.rec.ID)); err != nil {
+		return err // 内存未动、会话未动
+	}
+	if e.sess != nil && stopFunc(e.sess) < 0 {
+		r.eventf("hosts: %s（%s）删除被拒——会话停止超时（-1，垂死会话仍在收尾；重试或重启按磁盘收敛）", e.rec.ID, e.rec.Name)
+		return errStopTimeout
 	}
 	delete(r.hosts, id)
-	if err := r.saveLocked(); err != nil {
-		return err
-	}
 	r.logf("hosts: - %s（%s）", e.rec.ID, e.rec.Name)
 	if r.events != nil {
-		r.events.HostRemoved(e.rec.ID, "user")
+		rid, reason := e.rec.ID, "user"
+		ev := r.events
+		emitRemoved = func() { ev.HostRemoved(rid, reason) }
 	}
 	return nil
 }
@@ -264,31 +303,60 @@ func (r *Registry) Session(id [32]byte) *hostsession.Session {
 	return nil
 }
 
-// Close 收工：停全部会话。
+// Close 收工：停全部会话。B7③（清理收工面）：Stop -1 记 events.log 后**继续**
+// ——垂死会话不绑架注册表收工与进程退出（尽力语义）。
 func (r *Registry) Close() {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	for id, e := range r.hosts {
-		if e.sess != nil {
-			_ = e.sess.Stop()
+		if e.sess != nil && stopFunc(e.sess) < 0 {
+			r.eventf("hosts: %s（%s）收工停止超时（-1），继续收下一台", e.rec.ID, e.rec.Name)
 		}
 		delete(r.hosts, id)
 	}
 }
 
-// saveLocked 落盘主机表（0600）。调用方持锁。
+// recordsLocked 当前表记录快照（调用方持锁）。
+func (r *Registry) recordsLocked() []HostRecord {
+	recs := make([]HostRecord, 0, len(r.hosts))
+	for _, e := range r.hosts {
+		recs = append(recs, e.rec)
+	}
+	return recs
+}
+
+// replaceRecord 记录集内同 ID 替换（无则追加）。
+func replaceRecord(recs []HostRecord, rec HostRecord) []HostRecord {
+	for i := range recs {
+		if recs[i].ID == rec.ID {
+			recs[i] = rec
+			return recs
+		}
+	}
+	return append(recs, rec)
+}
+
+// withoutRecord 记录集内剔除指定 ID。
+func withoutRecord(recs []HostRecord, id string) []HostRecord {
+	out := make([]HostRecord, 0, len(recs))
+	for _, rc := range recs {
+		if rc.ID != id {
+			out = append(out, rc)
+		}
+	}
+	return out
+}
+
+// saveRecordsLocked 落盘指定记录集（0600）。调用方持锁。B5：入表/换会话**之前**
+// 调用（本函数不要求内存表已含新记录——记录集由调用方组装）。
 //
 // temp + rename 原子替换：kill -9 落在写窗口也只会留下完整旧表或完整新表，
 // 不产生截断 JSON（此前裸 os.WriteFile 覆写 × 损坏即拒启 = 主机表不可恢复——
 // exec-r1 M2）。
-func (r *Registry) saveLocked() error {
+func (r *Registry) saveRecordsLocked(recs []HostRecord) error {
 	path := filepath.Join(r.stateDir, hostsFileName)
 	if err := os.MkdirAll(r.stateDir, 0o700); err != nil {
 		return err
-	}
-	recs := make([]HostRecord, 0, len(r.hosts))
-	for _, e := range r.hosts {
-		recs = append(recs, e.rec)
 	}
 	b, err := json.MarshalIndent(recs, "", "  ")
 	if err != nil {
