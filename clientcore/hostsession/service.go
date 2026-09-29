@@ -368,12 +368,16 @@ func bridgeSuffix(hasBridge bool) string {
 	return "，无桥直通"
 }
 
+// ErrSessionNotCurrent 会话不在（收工/重建窗口）哨兵——消费方（daemon 流腿，
+// host-registry-daemon §3）据此映射 stream_refused。
+var ErrSessionNotCurrent = errors.New("服务会话不在（收工/重建窗口）")
+
 // healingDialCurrent 服务桥拨号入口：动态取当前会话（rebuildSession 换会后 dial 自动
 // 落到新会话），会话不在（收工窗口）按错误返回。
 func (s *Session) healingDialCurrent(ctx context.Context, port uint16) (net.Conn, error) {
 	sess := s.curSession()
 	if sess == nil {
-		return nil, errors.New("服务会话不在（收工/重建窗口）")
+		return nil, ErrSessionNotCurrent
 	}
 	return s.healingDial(sess, ctx, port)
 }

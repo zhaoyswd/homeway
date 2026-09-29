@@ -19,8 +19,28 @@ import (
 // hostsFileName 主机表持久化文件（0600，D2/D3）。
 const hostsFileName = "hosts.json"
 
-// errHostExists 同 token 重复添加（键 = peerID：同后端不同 token = 刷新，不是这个错）。
-var errHostExists = errors.New("host 已在表中（同 token 重复添加）")
+// 哨兵错误（控制面 Backend 映射到错误码表：errHostExists → host_exists、
+// ErrBadToken → bad_token、errNoHost → no_host）。
+var (
+	// errHostExists 同 token 重复添加（键 = peerID：同后端不同 token = 刷新，不是这个错）。
+	errHostExists = errors.New("host 已在表中（同 token 重复添加）")
+	// ErrBadToken token 本地解析失败（3a 的 host.add 语义 = 仅解析入表）。
+	ErrBadToken = errors.New("token 非法")
+	// errNoHost 主机不在表。
+	errNoHost = errors.New("host 不在表中")
+)
+
+// RegistryEvents 注册表事件接缝（§3 事件面：控制面总线的 session 域事件源）。
+// 回调在 Registry 锁外调用（发射锁序：会话/注册表锁 → 总线锁单向，design A4）。
+type RegistryEvents interface {
+	// HostAdded 新主机入表（session.added）。
+	HostAdded(id, name string, addedAt int64)
+	// HostRemoved 主机摘除（session.removed）。
+	HostRemoved(id, reason string)
+	// HostStateChanged 会话状态迁移（session.state_changed——hostsession Observer
+	// 的转发；state 值域随状态机：starting/ready/failed/stopping/idle）。
+	HostStateChanged(id, from, to, reason string)
+}
 
 // HostRecord hosts.json 的一条：一台后端主机的登记（键 = ID = token 里的后端公钥）。
 type HostRecord struct {
@@ -45,6 +65,7 @@ type Registry struct {
 	hosts    map[[32]byte]*hostEntry
 	strict   bool
 	logf     hostsession.Logf
+	events   RegistryEvents
 
 	// newSession 会话构造接缝（默认 hostsession.NewSession；同包测试注入桩）。
 	newSession func(cfg hostsession.Config, opts hostsession.Options) (*hostsession.Session, error)
@@ -57,6 +78,8 @@ type RegistryOptions struct {
 	StrictIdentity bool
 	// Logf 注册表自身日志（nil = 丢弃）。
 	Logf hostsession.Logf
+	// Events 事件接缝（nil = 不发；控制面装配时注入总线适配）。
+	Events RegistryEvents
 }
 
 // OpenRegistry 打开注册表：读 hosts.json（缺失 = 空表）并按表逐后端拉会话
@@ -67,6 +90,7 @@ func OpenRegistry(stateDir string, opts RegistryOptions) (*Registry, error) {
 		hosts:      make(map[[32]byte]*hostEntry),
 		strict:     opts.StrictIdentity,
 		logf:       opts.Logf,
+		events:     opts.Events,
 		newSession: hostsession.NewSession,
 	}
 	if r.logf == nil {
@@ -98,7 +122,15 @@ func (r *Registry) startEntryLocked(rec HostRecord) *hostEntry {
 		EndpointCacheDir: filepath.Join(r.stateDir, "endpoints"), // 现布局天然按 peerID 分文件（D2）
 		Out:              filepath.Join(r.stateDir, "debug.log"), // 追加写；分级/轮转沿出口口径（D3，2.2/2.3 收口）
 	}
-	sess, err := r.newSession(cfg, hostsession.Options{StrictIdentity: r.strict})
+	var obs hostsession.Observer
+	if r.events != nil {
+		hostID := rec.ID
+		ev := r.events
+		obs = stateChangedFunc(func(s *hostsession.Session, from, to, reason string) {
+			ev.HostStateChanged(hostID, from, to, reason)
+		})
+	}
+	sess, err := r.newSession(cfg, hostsession.Options{StrictIdentity: r.strict, Observer: obs})
 	if err != nil {
 		// 构造期唯一错误源 = 日志文件打不开：条目仍入表（记录在案、状态面 failed），
 		// 不因日志问题丢主机登记。
@@ -115,7 +147,7 @@ func (r *Registry) startEntryLocked(rec HostRecord) *hostEntry {
 func (r *Registry) Add(name, token string) (HostRecord, error) {
 	tok, err := proto.DecodeToken(token)
 	if err != nil {
-		return HostRecord{}, fmt.Errorf("token 解析失败：%w", err)
+		return HostRecord{}, fmt.Errorf("%w：%v", ErrBadToken, err)
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -151,6 +183,9 @@ func (r *Registry) Add(name, token string) (HostRecord, error) {
 		return HostRecord{}, err
 	}
 	r.logf("hosts: + %s（%s）", rec.ID, rec.Name)
+	if r.events != nil {
+		r.events.HostAdded(rec.ID, rec.Name, rec.AddedAt.UnixMilli())
+	}
 	return rec, nil
 }
 
@@ -160,7 +195,7 @@ func (r *Registry) Remove(id [32]byte) error {
 	defer r.mu.Unlock()
 	e, ok := r.hosts[id]
 	if !ok {
-		return fmt.Errorf("host %s 不在表中", hex.EncodeToString(id[:]))
+		return fmt.Errorf("%w：%s", errNoHost, hex.EncodeToString(id[:]))
 	}
 	if e.sess != nil {
 		_ = e.sess.Stop()
@@ -170,6 +205,9 @@ func (r *Registry) Remove(id [32]byte) error {
 		return err
 	}
 	r.logf("hosts: - %s（%s）", e.rec.ID, e.rec.Name)
+	if r.events != nil {
+		r.events.HostRemoved(e.rec.ID, "user")
+	}
 	return nil
 }
 
@@ -186,6 +224,24 @@ func (r *Registry) Hosts() []HostRecord {
 		for j := i; j > 0 && out[j].ID < out[j-1].ID; j-- {
 			out[j], out[j-1] = out[j-1], out[j]
 		}
+	}
+	return out
+}
+
+// SessionEntry 一台主机的登记与会话对（Sessions 拷贝产物——调用方在锁外做
+// 会话快照，锁序路径②：Registry.mu 拷贝集合 → 各会话无锁快照 → 末读总线 seq）。
+type SessionEntry struct {
+	Rec  HostRecord
+	Sess *hostsession.Session
+}
+
+// Sessions 拷贝全部 (登记, 会话) 对（状态面/流腿用；每记录自持语义不变）。
+func (r *Registry) Sessions() []SessionEntry {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	out := make([]SessionEntry, 0, len(r.hosts))
+	for _, e := range r.hosts {
+		out = append(out, SessionEntry{Rec: e.rec, Sess: e.sess})
 	}
 	return out
 }
@@ -227,6 +283,13 @@ func (r *Registry) saveLocked() error {
 		return err
 	}
 	return os.WriteFile(path, append(b, '\n'), 0o600)
+}
+
+// stateChangedFunc hostsession.Observer 的函数适配。
+type stateChangedFunc func(s *hostsession.Session, from, to, reason string)
+
+func (f stateChangedFunc) StateChanged(s *hostsession.Session, from, to, reason string) {
+	f(s, from, to, reason)
 }
 
 // loadHosts 读主机表（缺失 = 空表；损坏 = 报错拒启——主机表是持久化真源，

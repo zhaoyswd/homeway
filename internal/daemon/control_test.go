@@ -1,0 +1,219 @@
+package daemon
+
+// control_test.go — §3.6 装配级集成：真实 Registry（角色子系统）+ 控制面全链
+//（control.Client 完整握手/请求/订阅），事件接线（session.added/state_changed）
+// 与 not_ready 窗口（角色未跑）。token 本地签发（registry_test 同法，不依赖真实
+// 后端；会话对不可达端点的暖机失败属异步预期，不影响登记面断言）。
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"os"
+	"path/filepath"
+	"testing"
+	"time"
+
+	"github.com/zhaoyswd/homeway/internal/control"
+	"github.com/zhaoyswd/homeway/pkg/proto"
+)
+
+// startDaemonForTest 最小 daemon 装配（无单实例锁——测试互不干扰；state 布局 +
+// supervisor + client 角色 + 控制面）。
+func startDaemonForTest(t *testing.T) (*DaemonState, string) {
+	t.Helper()
+	dir := shortTempDirDaemon(t)
+	st, err := OpenDaemonState(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(st.Close)
+	bus := control.NewBus(control.NewGeneration(), control.BusConfig{})
+	holder := newRegistryHolder(bus)
+	sup := newSupervisor(st.Eventf, st.Debugf)
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	role := newClientRole(dir, st, holder)
+	sup.Start(ctx, func() Role { return role }, nil)
+	srv, stop, err := startControlPlane("test-daemon", dir, sup, holder, bus, st.Eventf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(stop)
+	_ = srv
+	// 等注册表挂上（角色 goroutine 异步）。
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if holder.get() != nil {
+			return st, filepath.Join(dir, control.ControlSockName)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatal("注册表未在窗口内就绪")
+	return nil, ""
+}
+
+func shortTempDirDaemon(t *testing.T) string {
+	t.Helper()
+	// control.sock 在 state 目录下：t.TempDir() 的 /var/folders 长路径会超
+	// sockaddr_un 上限，用 /tmp 短路径。
+	dir, err := os.MkdirTemp("/tmp", "dmn")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(dir) })
+	return dir
+}
+
+func dialDaemon(t *testing.T, sock string) *control.Client {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	c, w, err := control.Dial(ctx, sock, control.FrontendInfo{Kind: "cli", Name: "test", Version: "0"})
+	if err != nil {
+		t.Fatalf("控制面握手失败：%v", err)
+	}
+	if w.ServerVersion != "test-daemon" || w.Generation == "" {
+		t.Fatalf("welcome 形状：%+v", w)
+	}
+	t.Cleanup(c.Close)
+	return c
+}
+
+func TestControlPlaneAssemblyEndToEnd(t *testing.T) {
+	_, sock := startDaemonForTest(t)
+	c := dialDaemon(t, sock)
+	ctx := context.Background()
+
+	// daemon.status：角色面可见（client 角色由 supervisor 起来）。
+	raw, err := c.Request(ctx, control.OpDaemonStatus, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var st control.DaemonStatusResult
+	if err := json.Unmarshal(raw, &st); err != nil {
+		t.Fatal(err)
+	}
+	if st.ServerVersion != "test-daemon" || st.Generation == "" {
+		t.Fatalf("daemon.status：%+v", st)
+	}
+	if len(st.Roles) == 0 || st.Roles[0].Name != "client" {
+		t.Fatalf("角色面应含 client：%+v", st.Roles)
+	}
+
+	// 订阅 session 域 → host.add（本地签发 token）→ session.added 事件到达。
+	if _, err := c.Subscribe(ctx, []string{control.DomainSession}, nil, "", ""); err != nil {
+		t.Fatal(err)
+	}
+	tok := proto.Token{PeerID: [32]byte{9}, Secret: [32]byte{9, 9}, Endpoints: []proto.Endpoint{{Addr: "203.0.113.99:41641"}}}
+	tokStr, err := proto.EncodeToken(tok)
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, err = c.Request(ctx, control.OpHostAdd, control.HostAddArgs{Name: "测试后端", Token: tokStr})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var added control.HostBrief
+	if err := json.Unmarshal(raw, &added); err != nil || added.ID == "" {
+		t.Fatalf("host.add：%v（%s）", err, raw)
+	}
+	select {
+	case ev := <-c.Events():
+		if ev.Kind != control.KindSessionAdded {
+			t.Fatalf("首个事件应为 session.added：%+v", ev)
+		}
+		var p control.SessionAddedPayload
+		_ = json.Unmarshal(ev.Payload, &p)
+		if p.Host != added.ID || p.Name != "测试后端" {
+			t.Fatalf("session.added 载荷：%+v", p)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("session.added 事件未到达（事件接线断？）")
+	}
+
+	// 错误码映射（真 Registry 哨兵路径）：重复添加 → host_exists；坏 token →
+	// bad_token；不存在 → no_host。
+	if _, err := c.Request(ctx, control.OpHostAdd, control.HostAddArgs{Token: tokStr}); !errors.Is(err, control.CodeError(control.CodeHostExists)) {
+		t.Fatalf("同 token 重复应 host_exists：%v", err)
+	}
+	if _, err := c.Request(ctx, control.OpHostAdd, control.HostAddArgs{Token: "hmw1garbage"}); !errors.Is(err, control.CodeError(control.CodeBadToken)) {
+		t.Fatalf("坏 token 应 bad_token：%v", err)
+	}
+	if _, err := c.Request(ctx, control.OpHostRemove, control.HostRemoveArgs{Host: "ff"}); !errors.Is(err, control.CodeError(control.CodeNoHost)) {
+		t.Fatalf("不存在应 no_host：%v", err)
+	}
+
+	// snapshot.get：主机动态面（会话对不可达端点异步暖机失败属预期，状态面可见）。
+	raw, err = c.Request(ctx, control.OpSnapshotGet, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var snap control.SnapshotResult
+	if err := json.Unmarshal(raw, &snap); err != nil {
+		t.Fatal(err)
+	}
+	if snap.Generation != st.Generation || len(snap.Hosts) != 1 || snap.Hosts[0].ID != added.ID {
+		t.Fatalf("snapshot.get：%+v", snap)
+	}
+
+	// 流腿寻址（真 Registry）：不存在的主机 → no_host（term 拨号路径的入口校验）。
+	if _, err := c.OpenStream(ctx, "0102"); !errors.Is(err, control.CodeError(control.CodeNoHost)) {
+		t.Fatalf("不存在主机流打开应 no_host：%v", err)
+	}
+
+	// host.remove → session.removed 事件。
+	if _, err := c.Request(ctx, control.OpHostRemove, control.HostRemoveArgs{Host: added.ID}); err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	deadline := time.After(3 * time.Second)
+	for !found {
+		select {
+		case ev := <-c.Events():
+			if ev.Kind == control.KindSessionRemoved {
+				found = true
+			}
+		case <-deadline:
+			t.Fatal("session.removed 事件未到达")
+		}
+	}
+}
+
+func TestControlPlaneNotReadyWhenRoleDisabled(t *testing.T) {
+	// 角色未挂（模拟 client 角色禁用/重建窗口）：host 类操作 not_ready，控制面
+	// 本身仍应答（骨架可用）。
+	dir := shortTempDirDaemon(t)
+	st, err := OpenDaemonState(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(st.Close)
+	bus := control.NewBus(control.NewGeneration(), control.BusConfig{})
+	holder := newRegistryHolder(bus) // 不挂角色
+	sup := newSupervisor(st.Eventf, st.Debugf)
+	_, stop, err := startControlPlane("test-daemon", dir, sup, holder, bus, st.Eventf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(stop)
+	c := dialDaemon(t, filepath.Join(dir, control.ControlSockName))
+	ctx := context.Background()
+	if _, err := c.Request(ctx, control.OpHostAdd, control.HostAddArgs{Token: "anything"}); !errors.Is(err, control.CodeError(control.CodeNotReady)) {
+		t.Fatalf("注册表未挂应 not_ready：%v", err)
+	}
+	if _, err := c.Request(ctx, control.OpHostList, nil); !errors.Is(err, control.CodeError(control.CodeNotReady)) {
+		t.Fatalf("host.list 未挂应 not_ready：%v", err)
+	}
+	// 控制面骨架仍应答（daemon.status 不依赖注册表——Backend.NotReady 只挡
+	// host/snapshot 面）。
+	raw, err := c.Request(ctx, control.OpDaemonStatus, nil)
+	if err != nil {
+		t.Fatalf("daemon.status 不应被 not_ready 挡：%v", err)
+	}
+	var stt control.DaemonStatusResult
+	_ = json.Unmarshal(raw, &stt)
+	if stt.Generation == "" {
+		t.Fatal("daemon.status 骨架应答形状错")
+	}
+}

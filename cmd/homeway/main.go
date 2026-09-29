@@ -55,7 +55,7 @@ func run(args []string) int {
 	case "term":
 		err = term.CLI(rest)
 	case "daemon":
-		err = daemon.CLI(rest)
+		err = daemon.CLI(rest, version)
 	default:
 		fmt.Fprintf(os.Stderr, "homeway: 不认识的子命令 %q（可用：exit、relay、term、daemon）\n", role)
 		usage(os.Stderr)

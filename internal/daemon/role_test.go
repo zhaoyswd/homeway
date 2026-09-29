@@ -91,15 +91,21 @@ func TestRolePersistentFailureKeepsBoundedRebuild(t *testing.T) {
 		return errorRole{name: "always-fail", runs: &runs}
 	}, []time.Duration{time.Millisecond, 2 * time.Millisecond, 3 * time.Millisecond})
 
-	// 表长 3：至少跑完一轮全表（4 次运行）仍在本进程内继续。
+	// 表长 3：至少跑完一轮全表（4 次运行）仍在本进程内继续。断言口径（race 下
+	// 修正）：观测到 failed **或其后的重建 running** 均成立——每次失败都经
+	// setStat(failed) 再重建，Restarts>=3 即证明失败可见与「仍在进程内按表尾
+	// 重建」两断言（严格「此刻恰为 failed」存在观测窗口竞态：runs 到 4 的瞬间
+	// 可能已进入第 5 次运行）。
 	deadline := time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
 		if runs.Load() >= 4 {
 			st := sup.statusOf("always-fail")
-			if st == nil || st.State != roleStateFailed {
-				t.Fatalf("持续失败的角色应停在 failed 可见：%+v", sup.Statuses())
+			if st == nil || (st.State != roleStateFailed && st.State != roleStateRunning) {
+				t.Fatalf("持续失败的角色状态面异常：%+v", sup.Statuses())
 			}
-			return // 退避耗尽后仍在进程内按表尾重建——断言达成
+			if st.Restarts >= 3 {
+				return // 全表耗尽后仍在进程内按表尾重建——断言达成
+			}
 		}
 		time.Sleep(5 * time.Millisecond)
 	}
