@@ -27,10 +27,6 @@ import (
 
 // 远端拨号参数。
 const (
-	// termResolveTimeout --host ref 解析（daemon.status 拉主机表）预算——与 host
-	// list/status/delete 的 5s 同款（--timeout 的 10s 预算管「连接 + stream.open」
-	// 组合，解析是一次性独立请求，r2 低④）。
-	termResolveTimeout = 5 * time.Second
 	// termStreamCloseBudget stream.close 尽力而为的兜底预算（错误忽略）。
 	termStreamCloseBudget = 2 * time.Second
 )
@@ -45,6 +41,8 @@ type termRemote struct{ version string }
 
 // ResolveHostRef 把 --host 的名称/全长 hex/无歧义短前缀解析为 hex id（寻址 = 与
 // host delete/status 同一份 resolveHostTarget：同一规则、同一歧义报错文案）。
+// 预算口径（exec-r1 L1 校正，原「总预算 10s」措辞不准）：解析与打开**各**用一次
+// `--timeout` 预算（CLI 侧两次独立的 context.WithTimeout；默认各 10s，最坏相加 20s）。
 func (r *termRemote) ResolveHostRef(ctx context.Context, stateDir, ref string) (string, string, error) {
 	dir := stateDir
 	if dir == "" {
@@ -181,8 +179,11 @@ func (sc *streamConn) Read(p []byte) (int, error) {
 			return n, nil
 		}
 		if sc.finished {
+			reason := sc.reason
 			sc.mu.Unlock()
-			return 0, &term.RemoteEndError{Reason: sc.reason}
+			// reason 只在锁内读（exec-r1 L5）：锁内先拷局部再解锁返回，守住「锁内
+			// 读写」约定——单 reader 调用下无实害，但并发 Read 一旦出现就是数据竞争。
+			return 0, &term.RemoteEndError{Reason: reason}
 		}
 		sc.mu.Unlock()
 		select {
@@ -235,8 +236,9 @@ func (sc *streamConn) Write(p []byte) (int, error) {
 // Close 收口。**顺序是死锁问题不是风格问题**（design D2 / r1 P0-2）：
 // ClientStream.Close 走 Request、其应答由唯一 reader 协程投递；L4 的阻塞投递
 // 恰会在下游停读（Ctrl-S 冻结输出）时把 reader 卡在 recv<-——若先 stream.Close
-// 等 rsp 则永远等不到（CLI 从不给 term 连接设 deadline），Client.Close 永不执行、
-// <-c.closed 逃生口失效。故：先 Client.Close()（closed 信号解阻塞 reader）；
+// 等 rsp 则等不到（CLI 从不给 term 连接设 deadline；有 ≤2s 兜底 ctx 时退化为等满
+// 该 ctx 才返回，**无界** ctx 才恒挂死），期间 Client.Close 迟迟不执行、<-c.closed
+// 逃生口形同失效。故：先 Client.Close()（closed 信号解阻塞 reader）；
 // stream.Close 尽力而为（≤2s 有界 ctx、并发发起、错误忽略——连接级断开即触发
 // daemon 对在册流全部 teardown（不发 end），出口腿照常回收）。一命令一连接，
 // CLI 场景无共享需求。

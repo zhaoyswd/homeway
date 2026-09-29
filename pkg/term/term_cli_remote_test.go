@@ -212,6 +212,41 @@ func TestCLIExplainFileHostComboRejected(t *testing.T) {
 	}
 }
 
+// TestCLILocalTimeoutRejected 本地面 --timeout 显式报错（exec-r1 L6）：--timeout 只属
+// --host 模式（远程的解析/打开预算），本地面连 <state>/term.sock 即时返回、无预算
+// 概念——静默忽略与本命令面「不认识的参数」严格风格不一致，改就地报错（MUST NOT
+// 发起连接，同 validateName 纪律）；--file 离线模式不经拨号缝，同样拒绝。远程模式
+// --timeout 照常（回归锁：拒绝只针对本地面）。
+func TestCLILocalTimeoutRejected(t *testing.T) {
+	f, _, _ := fakeRemoteFor(t) // 缝注入但不带 --host ⇒ 本地面；全程断言零解析/零拨号
+
+	for _, c := range []struct {
+		desc string
+		args []string
+		run  func([]string) error
+	}{
+		{"list 本地面", []string{"--timeout", "5s"}, func(a []string) error { return cliList(a, f) }},
+		{"delete 本地面", []string{"x", "--timeout", "1s"}, func(a []string) error { return cliDelete(a, f) }},
+		{"new -d 本地面", []string{"-d", "x", "--timeout", "1s"}, func(a []string) error { return cliNew(a, f) }},
+		{"explain 在线本地面", []string{"s1", "--timeout", "1s"}, func(a []string) error { return cliExplain(a, f) }},
+		{"explain --file 离线", []string{"--file", "f.txt", "--agent", "claude", "--timeout", "1s"}, func(a []string) error { return cliExplain(a, f) }},
+	} {
+		if err := c.run(c.args); err == nil || !strings.Contains(err.Error(), "--timeout 仅 --host 模式可用") {
+			t.Fatalf("%s --timeout 应显式报错：%v", c.desc, err)
+		}
+	}
+	resolved, dialed, _ := f.calls()
+	if len(resolved) != 0 || len(dialed) != 0 {
+		t.Fatalf("拒绝路径不应发起解析/拨号：resolved=%v dialed=%v", resolved, dialed)
+	}
+
+	// 远程模式 --timeout 不受影响。
+	f2, _, _ := fakeRemoteFor(t)
+	if err := cliList([]string{"--host", "mac", "--timeout", "1500ms"}, f2); err != nil {
+		t.Fatalf("远程 --timeout 不应被拒：%v", err)
+	}
+}
+
 // ---- 远程流终结三态文案（1.3，design D5 表）----
 
 func TestRemoteEndMessage(t *testing.T) {

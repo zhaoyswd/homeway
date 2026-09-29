@@ -121,7 +121,8 @@ homeway term explain <会话名> --host mac   # 在线 explain 远程往返（--
   过隧道到达目标主机的 term 服务——与手机 surface 腿同挂一条会话、互不顶替。
   ⚠️ **`--state` 的指代随 `--host` 切换**：远程模式下指 daemon state 目录
   （control.sock 所在，默认 `~/.config/homeway/daemon`），不再是出口 state；
-  `--timeout` 为「控制面连接 + 打开」总预算（默认 10s；attach 流本身不设 deadline）。
+  `--timeout` 为解析与打开**各**一次的预算（默认各 10s、最坏相加 20s，仅 `--host`
+  模式可用——本地面给出即报错；attach 流本身不设 deadline）。
   daemon 未运行 = 可行动错误（提示先启动 `homeway daemon`）。
 - **接入形态**：本地终端被置为 raw 双向透传，本地终端自己就是仿真器（raw 字节模式）。
   窗口尺寸变化自动同步（SIGWINCH → RESIZE）；会话级尺寸/主题以**最近活动的腿**为准。

@@ -34,6 +34,16 @@ var ErrStreamEnded = errors.New("流已终结")
 // endReason 值只进本地错误文案，不上 wire）。
 const endReasonConn = "conn"
 
+// slowDelivery 满槽投递计数——**测试判别力钩子**（exec-r1 M1②）：reader 向流 recv
+// 投递 stream.data 时发现队列已满（即将阻塞等消费方读/连接关闭）即 +1。仅供单测
+// 断言「flood 真灌满 recv、reader 真进过阻塞投递」（与「恰好没灌满」区分）；
+// 生产代码零读取、投递 select 原样保留 ⇒ 测试外零行为改动。
+var slowDelivery atomic.Uint64
+
+// SlowDeliveryCount 返回满槽投递的累计次数（测试判别力钩子，exec-r1 M1②：
+// 消费者 = internal/daemon 的 TestStreamConnCloseEscapeHatch 前置断言）。
+func SlowDeliveryCount() uint64 { return slowDelivery.Load() }
+
 // Client 控制面客户端（一连接一客户端）。
 type Client struct {
 	nc      net.Conn
@@ -306,9 +316,15 @@ func (s *ClientStream) Recv() <-chan []byte { return s.recv }
 // End 流终结信号（reason ∈ closed|gone；连接级断开不触发本信号——三者可区分）。
 func (s *ClientStream) End() <-chan string { return s.end }
 
-// Close 前端主动关（stream.close 操作，reason=closed）。
+// Close 前端主动关（stream.close 操作，reason=closed）。成功即置终结位
+// （markEnded(StreamEndClosed)，exec-r1 L4）：终结状态化原只覆盖「收到 stream.end /
+// 连接级断开」，本端主动关流后 Send 同样不再静默成功写进死流（与 2.2 的 proposal
+// 意图对齐；服务端对已关流的 data 另有 no_stream 回执兜底，此处是本端第一道闸）。
 func (s *ClientStream) Close(ctx context.Context) error {
 	_, err := s.c.Request(ctx, OpStreamClose, StreamCloseArgs{StreamID: s.ID})
+	if err == nil {
+		s.markEnded(StreamEndClosed)
+	}
 	return err
 }
 
@@ -411,6 +427,12 @@ func (c *Client) reader() {
 				continue
 			}
 			if st, ok := c.streams.Load(id); ok {
+				s := st.(*ClientStream)
+				// 测试判别力钩子（exec-r1 M1②）：满槽即计数（本次投递将阻塞等消费方
+				// 或连接关闭）；只探测计数，下面的投递 select 原样保留 ⇒ 零行为改动。
+				if len(s.recv) == cap(s.recv) {
+					slowDelivery.Add(1)
+				}
 				// L4 下行背压显式化（term-remote 2.1）：满槽时阻塞投递而非 default 丢弃
 				//——丢帧对 term 是无从感知的静默画面损坏（协议无重传/校验），阻塞是唯一
 				// 不丢的选项。背压沿链传导（本条链路的设计意图）：本端停读 → 这里阻塞 →
@@ -418,7 +440,8 @@ func (c *Client) reader() {
 				// 背压 → 出口侧 raw 腿跳环/追赶截断策略收尾（term-host-cli D5「慢腿自治」
 				// 本就是那一层的职责）。
 				// 逃生口 = 连接关闭（<-c.closed）：Close 先关连接即解阻塞（CLI 分离键/
-				// 信号路径，见 daemon streamConn 的 Close 定序——反序在 reader 阻塞时死锁）。
+				// 信号路径，见 daemon streamConn 的 Close 定序——反序在 reader 阻塞时
+				// 退化为等满 ≤2s 兜底 ctx 才返回，无界 ctx 才恒挂死）。
 				// 单流前端语义（r1 P0-1 拍板 = 接受）：reader 阻塞期间同连接的其它帧
 				//（应答/事件/别的流的 end）停摆是既定语义而非待修缺陷——CLI term attach
 				// 一条连接唯一 term 流、host 命令面是一次性独立连接，「另一条连接上的
@@ -426,7 +449,7 @@ func (c *Client) reader() {
 				// 4a 事件总线期。停读窗口内的可保证项：本流已接收数据零丢失、本流
 				// data/end 顺序不乱。
 				select {
-				case st.(*ClientStream).recv <- payload:
+				case s.recv <- payload:
 				case <-c.closed:
 				}
 			}

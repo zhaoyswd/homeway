@@ -366,6 +366,35 @@ func TestStreamNoStreamOnClosedAndData(t *testing.T) {
 	}
 }
 
+// TestStreamSendAfterLocalClose 本端主动 Close 成功后 Send 报 ErrStreamEnded
+// （exec-r1 L4）：Close 即置终结位，不依赖服务端 end 帧的到达时序。注记（判别力
+// 边界，如实登记）：服务端在 close rsp 后也会发 stream.end(closed)（同因 markEnded
+// 幂等），本用例锁的是「Close 返回后 Send 必报错」的契约；对「本端置位那一行」的
+// 红绿判别与 end 帧存在竞速——删掉 markEnded 后本用例可能仍绿（end 先到），该行的
+// 保障意义在「end 未到/永不到的窗口内不再静默成功」。
+func TestStreamSendAfterLocalClose(t *testing.T) {
+	ts := startTestServer(t, BusConfig{})
+	echo := startEchoBackend(t)
+	ts.backend.mu.Lock()
+	ts.backend.dialAddr = echo.ln.Addr().String()
+	ts.backend.mu.Unlock()
+	c, _ := dialTest(t, ts)
+	ctx := context.Background()
+	st, err := c.OpenStream(ctx, "aa")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := st.Close(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.Send([]byte("after-local-close")); !errors.Is(err, ErrStreamEnded) {
+		t.Fatalf("本端 Close 后 Send 应报 ErrStreamEnded（不静默写进死流）：%v", err)
+	}
+	if err := st.Send([]byte("again")); !errors.Is(err, ErrStreamEnded) {
+		t.Fatalf("二次 Send 仍应报 ErrStreamEnded（幂等终结）：%v", err)
+	}
+}
+
 func TestStreamLimitPerConnection(t *testing.T) {
 	// 每连接在册流上限（默认 8）：第 9 条 stream_refused；关闭后可再开。
 	ts := startTestServer(t, BusConfig{})

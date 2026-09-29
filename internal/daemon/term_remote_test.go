@@ -132,6 +132,15 @@ type fakeTermHost struct {
 	flood  bool
 	noread bool
 
+	// flood 参数（exec-r1 M1①）：默认 512×8KiB 全速（PTY 全链用例沿用——pty 缓冲
+	// 小，全速也能把链灌满）；要「确定灌满客户端 recv」的用例改 paced 形态（借
+	// internal/control TestStreamBackpressureNoLoss 的 200×4KiB + 2ms 节拍配方：
+	// 节拍防 TCP 合并、逐块成条目，>64 条必灌满 recv 64 槽——全速大块在 darwin 可被
+	// 自调 TCP 缓冲整段吸收，exec-r1 实测一条都进不了满槽投递）。
+	floodBlocks int           // ≤0 = 默认 512
+	floodChunk  int           // ≤0 = 默认 8KiB
+	floodEvery  time.Duration // 0 = 全速连发；>0 = 每块间隔节拍
+
 	mu      sync.Mutex
 	written int // 后端累计收到的上行字节数（写计数断言）
 	conns   map[net.Conn]struct{}
@@ -197,11 +206,21 @@ func (h *fakeTermHost) serve(c net.Conn) {
 			}
 			if h.flood {
 				// 狂吐：块大块写（不等读端），把服务端队列 + socket + 客户端 recv 全灌满。
-				chunk := make([]byte, 8<<10)
+				blocks, chunk, every := h.floodBlocks, h.floodChunk, h.floodEvery
+				if blocks <= 0 {
+					blocks = 512
+				}
+				if chunk <= 0 {
+					chunk = 8 << 10
+				}
 				go func() {
-					for i := 0; i < 512; i++ { // 4MiB，足够灌满全链缓冲
-						if !writeData(chunk) {
+					buf := make([]byte, chunk)
+					for i := 0; i < blocks; i++ { // 4MiB（默认），足够灌满全链缓冲
+						if !writeData(buf) {
 							return
+						}
+						if every > 0 {
+							time.Sleep(every) // paced：防 TCP 合并，逐块成条目（M1①）
 						}
 					}
 				}()
@@ -450,30 +469,50 @@ func TestStreamConnEndThenEOF(t *testing.T) {
 	}
 }
 
-// TestStreamConnCloseEscapeHatch Close 逃生口红绿（1.1/1.3 判据，r1 P0-2）：假主机
-// 持续狂吐（flood）→ 服务端队列 + socket + 客户端 recv（64 槽）全满、消费方停读
-// （不调 Read）→ reader 阻塞在 recv<- → 触发 Close —— 必须在有限时间内返回
-// （先 Client.Close()：closed 信号解阻塞 reader；不依赖 reader 前进）。反序
-// （先 stream.Close 等 rsp）在该场景恒挂死——rsp 由被阻塞的 reader 投递。
+// TestStreamConnCloseEscapeHatch Close 逃生口红绿（1.1/1.3 判据，r1 P0-2；exec-r1 M1
+// 判别力加固）：假主机 paced 狂吐（flood）→ 服务端队列 + socket + 客户端 recv（64 槽）
+// 全满、消费方停读（不调 Read）→ reader 阻塞在 recv<- → 触发 Close —— 必须在 500ms 内
+// 返回（先 Client.Close()：closed 信号解阻塞 reader；不依赖 reader 前进）。
+// 判别力三件（M1①②③）：flood 用 200×4KiB + 2ms 节拍（借 internal/control
+// TestStreamBackpressureNoLoss 的配方——节拍防 TCP 合并、逐块成条目，>64 条必灌满 recv；
+// 原全速 512×8KiB 在 darwin 被内核自调 TCP 缓冲整段吸收，实测一条都进不了满槽投递，
+// 该前置在本机不成立）；用 control.SlowDeliveryCount() 断言 reader 真进过满槽投递
+// （否则本用例对逃生口无判别力，前置不成立就地红）；Close 预算 8s→500ms，让「先
+// Client.Close()」定序可判——反序（先 stream.Close 等 rsp）退化为等满 ≤2s 兜底 ctx
+// 才返回（rsp 由被阻塞的 reader 投递；**无界** ctx 才恒挂死），500ms 预算下反序必红。
 func TestStreamConnCloseEscapeHatch(t *testing.T) {
 	rig := startRemoteTestRig(t, true, true, false) // flood
+	// M1①：paced flood 配方（详见 fakeTermHost.floodBlocks 注释）。
+	rig.host.floodBlocks, rig.host.floodChunk, rig.host.floodEvery = 200, 4<<10, 2*time.Millisecond
 	r := TermRemote("test")
 	ctx, cancel := rtCtx(t)
 	defer cancel()
+	before := control.SlowDeliveryCount()
 	conn, err := r.DialTerm(ctx, rig.dir, rig.macID)
 	if err != nil {
 		t.Fatal(err)
 	}
-	// 停读窗口：等 flood 灌满全链（客户端 recv 64 槽 + 服务端 16 条 + TCP）。
+	// 本用例不经 CLI（无 HELLO 拨号序列），手动补 HELLO 开闸 flood——ATTACHED 与
+	// flood 数据一并落进 recv，消费方照旧停读不动。
+	if _, err := conn.Write(encTermFrame(tOpHello, nil)); err != nil {
+		t.Fatal(err)
+	}
+	// 停读窗口：等 paced flood 逐块灌满全链（客户端 recv 64 槽 + 服务端 16 条 + TCP）。
 	time.Sleep(1200 * time.Millisecond)
-
+	// M1②：可断言前置——reader 确实进过满槽（阻塞）投递；=0 说明 flood 没灌满 recv，
+	// 本用例沦为「非阻塞态下 Close 有界返回」（对 P0 逃生口无判别力），就地红。
+	if got := control.SlowDeliveryCount() - before; got == 0 {
+		t.Fatal("前置不成立：reader 从未进入满槽投递（flood 未灌满客户端 recv）——本用例对逃生口无判别力")
+	} else {
+		t.Logf("满槽投递计数 +%d（前置成立：reader 已阻塞在 recv<-）", got)
+	}
 	done := make(chan error, 1)
 	go func() { done <- conn.Close() }()
 	select {
 	case <-done:
-		// 绿：有限时间内返回。
-	case <-time.After(8 * time.Second):
-		t.Fatal("Close 未在有限时间内返回（逃生口失效——检查 Client.Close 先行的定序）")
+		// 绿：500ms 内返回。
+	case <-time.After(500 * time.Millisecond): // M1③：原 8s 无判别力（反序等满 2s 兜底 ctx 也绿）
+		t.Fatal("Close 未在 500ms 内返回（逃生口失效——检查 Client.Close 先行的定序；反序需等满 ≤2s 兜底 ctx）")
 	}
 	// Close 后 Read 立即终结（连接断开路径），不再挂等 reader。
 	go func() {

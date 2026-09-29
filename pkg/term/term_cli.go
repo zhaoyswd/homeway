@@ -102,8 +102,9 @@ func expandFlagEq(args []string) []string {
 //
 // --host 非空 = 远程模式：--state 的指代切换为 daemon state 目录（control.sock
 // 所在；空串 = 实现侧默认 ~/.config/homeway/daemon）——同一 flag 重载、非互斥
-// 报错（r1 P2-5）；--timeout = 「控制面连接 + stream.open」总预算（默认 10s；
-// attach 流本身不设 deadline——两口径分开，r1 P2-9）。
+// 报错（r1 P2-5）；--timeout = 解析与打开**各**用一次的预算（CLI 侧两次独立
+// context.WithTimeout；默认各 10s，最坏相加 20s——exec-r1 L1 校正，原「总预算
+// 10s」措辞不准；attach 流本身不设 deadline——两口径分开，r1 P2-9）。
 type termCommon struct {
 	stateDir string
 	hostRef  string
@@ -115,9 +116,10 @@ func (c termCommon) target(remote RemoteTerm) *termTarget {
 	return newTermTarget(remote, c.stateDir, c.hostRef, c.timeout)
 }
 
-// defaultRemoteTimeout --host 模式「控制面连接 + stream.open」总预算（--timeout
-// 缺省；参照 host add 的 10s 预算口径——host list/status/delete 为 5s，取宽者
-// 覆盖「连接 + 打开」组合，r2 低④）。
+// defaultRemoteTimeout 远程「解析」与「连接 + stream.open」各一次的预算缺省
+// （--timeout 缺省；exec-r1 L1 校正：不是一次性总预算——解析、打开两次独立
+// context.WithTimeout 各取该值，默认各 10s、最坏相加 20s。参照 host add 的 10s
+// 预算口径——host list/status/delete 为 5s，取宽者，r2 低④）。
 const defaultRemoteTimeout = 10 * time.Second
 
 // termTarget 拨号目标：本地面（remote == nil 或 hostRef == ""，连
@@ -239,7 +241,8 @@ func dialErrText(sock string, err error) error {
 func cliDialTerm(t *termTarget) (io.ReadWriteCloser, error) {
 	var conn io.ReadWriteCloser
 	if t.remoteMode() {
-		// 远程：解析（幂等缓存）→ 拨号；预算覆盖「控制面连接 + stream.open」。
+		// 远程：解析（幂等缓存）→ 拨号；两步各用一次 --timeout 预算（默认各 10s，
+		// 最坏相加 20s——exec-r1 L1）。
 		if t.hostID == "" {
 			rctx, rcancel := context.WithTimeout(context.Background(), t.timeout)
 			id, _, rerr := t.remote.ResolveHostRef(rctx, t.stateDir, t.hostRef)
@@ -260,6 +263,11 @@ func cliDialTerm(t *termTarget) (io.ReadWriteCloser, error) {
 		if t.hostRef != "" {
 			// 防御：CLI 入口恒注入（cmd/homeway 接线）；只跑本地面的调用方给了 --host。
 			return nil, errors.New("--host 需要远程接入缝（本构建未注入）；本地面请去掉 --host")
+		}
+		if t.timeout > 0 {
+			// exec-r1 L6：本地面不设预算（连 <state>/term.sock 即时返回），静默忽略
+			// --timeout 与本命令面「不认识的参数」严格风格不一致——显式报错。
+			return nil, errors.New("--timeout 仅 --host 模式可用（远程的解析/打开预算）；本地面请去掉 --timeout")
 		}
 		if t.stateDir == "" {
 			return nil, errors.New("拿不到 state 目录（用 --state 指定）")
@@ -633,6 +641,10 @@ func cliExplain(args []string, remote RemoteTerm) error {
 	if opt.file != "" && opt.hostRef != "" {
 		return errors.New("--file 是本地面（规则判定在本地 manifest），不接受 --host；对远程主机的会话取实时判定：homeway term explain <会话名> --host <name|id>")
 	}
+	if opt.file != "" && opt.timeout > 0 {
+		// exec-r1 L6：--file 离线模式不经拨号缝，--timeout 同样只属 --host 模式。
+		return errors.New("--timeout 仅 --host 模式可用（远程的解析/打开预算）；--file 离线模式请去掉 --timeout")
+	}
 	var out explainOutput
 	if opt.file != "" {
 		out, err = explainFile(opt)
@@ -911,8 +923,9 @@ func termUsage(w io.Writer) {
                      hex / 无歧义短前缀；homeway host list 查看在表主机）
   ⚠ --host 模式下 --state 指守护进程 state 目录（control.sock 所在，默认
      ~/.config/homeway/daemon）——与本地面（出口 state，默认 ~/.config/homeway）
-     指代不同；--timeout 为「控制面连接 + 打开」总预算（默认 10s，如 10s/1500ms），
-     attach 流本身不设 deadline（长连接语义）。daemon 未运行时先启动：homeway daemon
+     指代不同；--timeout 为解析与打开各一次的预算（默认各 10s、最坏相加 20s，
+     如 10s/1500ms），仅 --host 模式可用（本地面给出即报错）；attach 流本身不设
+     deadline（长连接语义）。daemon 未运行时先启动：homeway daemon
   远程 attach 的流终结归因：gone = 主机不可达或上行过快（会话仍在目标主机运行，可
      重新 attach）；closed = 对端关闭（也可能是本端长时间停止读取、出口侧慢腿自治
      收尾）；连接级断开 = 与守护进程的连接断了，重新执行命令即可。

@@ -244,6 +244,10 @@ func TestListJSONStateV2SingleTrack(t *testing.T) {
 
 // STATE 帧不按腿类折价（D6「状态口径统一」）：同一 stateV2 值发给 surface 与 raw 腿
 // （改前 raw 腿拿 legacy 折价值：blocked→waiting）。直接锁载荷的 state 字节。
+// 判别力注记（exec-r1 L9，如实登记）：legacy 与 stateV2 **数值同构**（blocked=2=
+// waiting）⇒ 改前 stateForLeg(false, 2, 2) 与改后 stateV2Blocked 送出的是同一字节，
+// 本用例对「折价删除」无红绿判别力（改前改后恒真），只锁 stateV2 值域回归；折价
+// 删除的真判别 = 编译期符号消失（legacyState/stateForLeg 全仓零残留 grep，3.3 已验）。
 func TestStateFrameStateV2ForEveryLeg(t *testing.T) {
 	s := &termSession{svc: &termService{}, agent: agentCodex, stateV2: stateV2Blocked, scan: termScan{title: "批准"}}
 	s.legs = []*termClient{

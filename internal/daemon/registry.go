@@ -333,8 +333,11 @@ func (r *Registry) Close() {
 }
 
 // recordsLocked 当前表记录快照（调用方持锁）。**含 carried**：非法 id 条目随每次
-// 落盘原样写回（D7-a「条目保留」由这里兑现——顺序：有效表在前、carried 原序在后；
-// Hosts/Sessions 的寻址面仍不含 carried，二者刻意不同源）。
+// 落盘原样写回（D7-a「条目保留」由这里兑现——carried 与有效记录**同集落盘，相对
+// 顺序不承诺**：快照时有效表在前、carried 原序在后，但 Add 新键追加在集尾，跨多次
+// 落盘后的实际顺序是 addedAt 时间线而非固定口径〔exec-r1 L3 改述——原「有效表在
+// 前、carried 原序在后」只对当次落盘成立〕；Hosts/Sessions 的寻址面仍不含
+// carried，二者刻意不同源）。
 func (r *Registry) recordsLocked() []HostRecord {
 	recs := make([]HostRecord, 0, len(r.hosts)+len(r.carried))
 	for _, e := range r.hosts {
