@@ -4,6 +4,7 @@
 //	homeway exit [flags]       # 出口（显式）
 //	homeway relay [flags]      # 中继
 //	homeway term <子命令> …    # 终端命令面：list / new / attach / delete / explain
+//	homeway daemon [--state D] # 桌面守护进程（多主机会话注册表；host-registry-daemon）
 //	homeway --version
 //
 // 一台机器上可以同时跑多个进程（例如一个出口 + 一个中继）：各进程用 --state 区分身份、
@@ -15,6 +16,7 @@ import (
 	"os"
 	"strings"
 
+	"github.com/zhaoyswd/homeway/internal/daemon"
 	"github.com/zhaoyswd/homeway/internal/relay"
 	"github.com/zhaoyswd/homeway/internal/server"
 	"github.com/zhaoyswd/homeway/pkg/term"
@@ -52,8 +54,10 @@ func run(args []string) int {
 		err = relay.CLI(rest)
 	case "term":
 		err = term.CLI(rest)
+	case "daemon":
+		err = daemon.CLI(rest)
 	default:
-		fmt.Fprintf(os.Stderr, "homeway: 不认识的子命令 %q（可用：exit、relay、term）\n", role)
+		fmt.Fprintf(os.Stderr, "homeway: 不认识的子命令 %q（可用：exit、relay、term、daemon）\n", role)
 		usage(os.Stderr)
 		return 2
 	}
@@ -105,6 +109,8 @@ func resolveRole(args []string) (role string, rest []string) {
 		return "relay", args[1:]
 	case "term":
 		return "term", args[1:]
+	case "daemon":
+		return "daemon", args[1:]
 	}
 	// `homeway --relay 'rl1…'` 这类省略子命令的写法：首参是 flag 时按默认角色（出口）走。
 	if strings.HasPrefix(args[0], "-") {
@@ -122,6 +128,8 @@ func usage(w *os.File) {
   homeway relay [flags]        启动中继
   homeway term <子命令> …      终端命令面（list / new / attach / delete / explain；
                                与 App 同一份会话注册表，经 <state>/term.sock 本地直连）
+  homeway daemon [--state DIR] 桌面守护进程（多主机会话注册表；默认 state
+                               ~/.config/homeway/daemon——与出口 state 禁止同目录）
   homeway --version            打印版本
 
 一台机器上可以同时运行多个进程（如一个出口 + 一个中继）：用 --state 区分身份、
