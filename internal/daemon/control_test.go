@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/zhaoyswd/homeway/internal/control"
+	"github.com/zhaoyswd/homeway/pkg/probe"
 	"github.com/zhaoyswd/homeway/pkg/proto"
 )
 
@@ -105,6 +106,17 @@ func TestControlPlaneAssemblyEndToEnd(t *testing.T) {
 	if _, err := c.Subscribe(ctx, []string{control.DomainSession}, nil, "", ""); err != nil {
 		t.Fatal(err)
 	}
+	// host.add 3b 起带服务端探测：本用例端点不可达（TEST-NET），注入假探测（tier
+	// = direct）保持「解析入表 + 事件接线」的原断言面——真探测四路见
+	// host_add_test.go。
+	origProbe := reachProbe
+	reachProbe = func(ctx context.Context, token string) (*probe.ReachReport, error) {
+		return &probe.ReachReport{
+			Peer:    "090909090909",
+			Results: []probe.ReachResult{{EP: "203.0.113.99:41641", RTT: 7 * time.Millisecond, Build: "fake"}},
+		}, nil
+	}
+	t.Cleanup(func() { reachProbe = origProbe })
 	tok := proto.Token{PeerID: [32]byte{9}, Secret: [32]byte{9, 9}, Endpoints: []proto.Endpoint{{Addr: "203.0.113.99:41641"}}}
 	tokStr, err := proto.EncodeToken(tok)
 	if err != nil {
@@ -114,9 +126,12 @@ func TestControlPlaneAssemblyEndToEnd(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	var added control.HostBrief
+	var added control.HostAddResult
 	if err := json.Unmarshal(raw, &added); err != nil || added.ID == "" {
 		t.Fatalf("host.add：%v（%s）", err, raw)
+	}
+	if added.Reach == nil || added.Reach.Tier != control.ReachTierDirect {
+		t.Fatalf("host.add 结论载荷：%+v", added.Reach)
 	}
 	select {
 	case ev := <-c.Events():

@@ -14,12 +14,19 @@ import (
 
 	"github.com/zhaoyswd/homeway/clientcore/hostsession"
 	"github.com/zhaoyswd/homeway/internal/control"
+	"github.com/zhaoyswd/homeway/pkg/probe"
 )
 
 // termServicePort term 服务端口 = 客户端会话的核内约定（spec「流式通道」：
 // 端口 MUST NOT 出现在控制面词表；真源 = internal/server DefaultTermPort 7724，
 // 此处独立常量避免把出口服务大包拉进 daemon 依赖面）。
 const termServicePort = 7724
+
+// reachProbe 探测核注入缝（host-cli 3b，design D3：生产 = 共享核 pkg/probe.Reach
+// ——与手机 App 同一份实现；同包测试注入假探测走 1.2 四路单测，不动 Backend 契约）。
+var reachProbe = func(ctx context.Context, token string) (*probe.ReachReport, error) {
+	return probe.Reach(ctx, token)
+}
 
 // registryHolder Registry 的共享槽 + 控制面总线（client 角色持有 Registry、角色
 // 重建时换实例——总线与代际随进程唯一不变；控制面 Backend 经它读，角色未跑/
@@ -79,21 +86,52 @@ func (b *controlBackend) HostBriefs() []control.HostBrief {
 	return out
 }
 
-func (b *controlBackend) AddHost(name, token string) (control.HostBrief, error) {
+// AddHost host.add 服务端验证路径（host-cli 3b，design D1/D3）：decode（bad_token
+// 前置——force 不绕过）→ 有界旁路探测（≤3.5s，纯旁路不碰注册表任何会话状态）→
+// 入表。全不可达且未带 force → ErrBackendHostUnreachable（不入表，不产生任何
+// 注册表副作用）；force = 跳过探测直接入表（tier=skipped，端点未实测）。
+func (b *controlBackend) AddHost(name, token string, force bool) (control.HostAddResult, error) {
 	reg := b.holder.get()
 	if reg == nil {
-		return control.HostBrief{}, errors.New("注册表未就绪")
+		return control.HostAddResult{}, errors.New("注册表未就绪")
+	}
+	res := control.HostAddResult{}
+	if force {
+		res.Reach = &control.HostReach{Tier: control.ReachTierSkipped, Tested: []control.ReachTested{}}
+	} else {
+		rep, err := reachProbe(context.Background(), token)
+		if err != nil {
+			return control.HostAddResult{}, control.ErrBackendBadToken // decode 失败（bad_token 前置）
+		}
+		switch rep.Tier() {
+		case probe.TierNone:
+			return control.HostAddResult{}, control.ErrBackendHostUnreachable
+		case probe.TierDirect:
+			res.Reach = &control.HostReach{Tier: control.ReachTierDirect, Tested: []control.ReachTested{}}
+		case probe.TierRelay:
+			res.Reach = &control.HostReach{Tier: control.ReachTierRelay, Tested: []control.ReachTested{}}
+		}
+		for _, t := range rep.Results {
+			res.Reach.Tested = append(res.Reach.Tested, control.ReachTested{Ep: t.EP, Relay: t.Relay, RttMs: t.RTT.Milliseconds()})
+		}
+		if best := rep.Best(); best.EP != "" {
+			res.Reach.BestEp = best.EP
+			res.Reach.RttMs = best.RTT.Milliseconds()
+		}
 	}
 	rec, err := reg.Add(name, token)
 	switch {
 	case errors.Is(err, errHostExists):
-		return control.HostBrief{}, control.ErrBackendHostExists
+		return control.HostAddResult{}, control.ErrBackendHostExists
 	case errors.Is(err, ErrBadToken):
-		return control.HostBrief{}, control.ErrBackendBadToken
+		return control.HostAddResult{}, control.ErrBackendBadToken
 	case err != nil:
-		return control.HostBrief{}, err
+		return control.HostAddResult{}, err
 	}
-	return control.HostBrief{ID: rec.ID, Name: rec.Name, AddedAt: rec.AddedAt.UnixMilli()}, nil
+	res.ID = rec.ID
+	res.Name = rec.Name
+	res.AddedAt = rec.AddedAt.UnixMilli()
+	return res, nil
 }
 
 func (b *controlBackend) RemoveHost(id string) error {
@@ -126,7 +164,7 @@ func (b *controlBackend) HostStates() []control.HostState {
 	entries := reg.Sessions() // 锁内拷贝、锁外快照
 	out := make([]control.HostState, 0, len(entries))
 	for _, e := range entries {
-		hs := control.HostState{ID: e.Rec.ID, Name: e.Rec.Name}
+		hs := control.HostState{ID: e.Rec.ID, Name: e.Rec.Name, AddedAt: e.Rec.AddedAt.UnixMilli()}
 		if e.Sess == nil {
 			hs.State = "failed"
 			hs.Reason = "session_not_built" // 构造期失败（如日志文件打不开）的登记面可见性

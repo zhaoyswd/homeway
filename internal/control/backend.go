@@ -17,6 +17,9 @@ var (
 	ErrBackendBadToken = errors.New("token 非法")
 	// ErrBackendNoHost 主机不在表（no_host）。
 	ErrBackendNoHost = errors.New("host 不在表中")
+	// ErrBackendHostUnreachable host.add 验证结论为全不可达且未带 force
+	//（host_unreachable，不入表；host-cli 3b）。
+	ErrBackendHostUnreachable = errors.New("host 全不可达（探测无应答且未带 force）")
 	// ErrBackendNoSession 主机在表但会话不在（收工/重建窗口/未就绪）——流打开
 	// 被拒（stream_refused）。
 	ErrBackendNoSession = errors.New("会话不在（收工/重建窗口）")
@@ -32,8 +35,10 @@ type Backend interface {
 	RolesStatus() []RoleBrief
 	// HostBriefs 主机登记面（host.list / snapshot.get 的静态部分）。
 	HostBriefs() []HostBrief
-	// AddHost 解析入表（3a 语义：token 语法/本地解码校验；连通性验证归 3b）。
-	AddHost(name, token string) (HostBrief, error)
+	// AddHost 解析 + 有界旁路连通性验证 + 入表（host-cli 3b；internal API 非 wire
+	// 契约）。force = 跳过服务端探测直接入表（结论 tier=skipped）；全不可达且未带
+	// force → ErrBackendHostUnreachable（不入表、不产生任何注册表副作用）。
+	AddHost(name, token string, force bool) (HostAddResult, error)
 	// RemoveHost 摘除主机。
 	RemoveHost(id string) error
 	// HostStates 各主机动态面（state/reason/link/stats——各会话无锁快照汇成）。

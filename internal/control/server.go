@@ -452,16 +452,21 @@ func (c *conn) opHostAdd(corr uint64, args json.RawMessage) {
 		c.reply(corr, nil, errCode(CodeNotReady))
 		return
 	}
-	brief, err := c.s.cfg.Backend.AddHost(a.Name, a.Token)
+	// 服务端验证路径（host-cli 3b，design D1/D3）：decode（bad_token）→ 探测
+	//（≤3.5s，请求 goroutine 内——不阻塞同连接其它请求）→ 入表（host_exists）；
+	// 全不可达且未带 force → host_unreachable（不入表、不断连）。
+	res, err := c.s.cfg.Backend.AddHost(a.Name, a.Token, a.Force)
 	switch {
 	case errors.Is(err, ErrBackendHostExists):
 		c.reply(corr, nil, errCode(CodeHostExists))
 	case errors.Is(err, ErrBackendBadToken):
 		c.reply(corr, nil, errCode(CodeBadToken))
+	case errors.Is(err, ErrBackendHostUnreachable):
+		c.reply(corr, nil, errCode(CodeHostUnreachable))
 	case err != nil:
 		c.reply(corr, nil, errCode(CodeBadRequest))
 	default:
-		c.reply(corr, brief, nil)
+		c.reply(corr, res, nil)
 	}
 }
 
@@ -512,8 +517,10 @@ func (c *conn) opSnapshotGet(corr uint64, _ json.RawMessage) {
 }
 
 // opSubscribe 订阅：游标检查（cursor_stale/bad_request）、幂等（同域重复订阅 =
-// 成功并集）、view 回显；确认 rsp 先于回放批（writer 优先级），回放先于在线
-// 事件（seq 次序——锁内原子拷贝+注册，见 bus.Subscribe）。
+// 成功，语义 = **替换**：该连接的订阅域集合整体换为新载荷的 domains——
+// daemon-control-plane delta 3b 钉死，非并集；实现 = bus.Subscribe 的
+// sub.domains = dm 整体赋值）、view 回显；确认 rsp 先于回放批（writer 优先级），
+// 回放先于在线事件（seq 次序——锁内原子拷贝+注册，见 bus.Subscribe）。
 func (c *conn) opSubscribe(corr uint64, args json.RawMessage) {
 	var a SubscribeArgs
 	if err := parseArgs(args, &a); err != nil {
@@ -542,7 +549,7 @@ func (c *conn) opSubscribe(corr uint64, args json.RawMessage) {
 		return
 	}
 	c.reply(corr, SubscribeResult{
-		Domains:    a.Domains, // 幂等语义下回显本次声明（生效集合为其并集）
+		Domains:    a.Domains, // 替换语义下生效集合恰 = 本次声明（回显即生效域集合，spec「重复订阅替换而非并集」）
 		Cursor:     c.s.cfg.Bus.CurrentSeq(),
 		View:       a.View, // 只回显（spec：不参与需求判定——信号源归 facade 期）
 		Generation: c.s.Generation(),

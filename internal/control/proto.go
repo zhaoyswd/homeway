@@ -81,18 +81,19 @@ type ResponseBody struct {
 // 常量名为错误码字符串（Code* 前缀）；帧/总线层的 error 哨兵（Err* 前缀）另见
 // frame.go / bus.go。
 const (
-	CodeUnknownOp     = "unknown_op"     // 未知操作名（不断连）
-	CodeNoStream      = "no_stream"      // 未知/已关闭的 streamId（不断连）
-	CodeBadJSON       = "bad_json"       // 控制类 body 非法 JSON（断连）
-	CodeBadRequest    = "bad_request"    // 载荷字段缺失/类型不符/值域外（不断连）
-	CodeBadFrame      = "bad_frame"      // 帧长超限/非法 op（断连；超限在读 body 前）
-	CodeNotReady      = "not_ready"      // 守护进程未就绪（不断连）
-	CodeShuttingDown  = "shutting_down"  // 收工中（不断连）
-	CodeHostExists    = "host_exists"    // 重复添加同后端（不断连）
-	CodeNoHost        = "no_host"        // 主机不存在（不断连）
-	CodeBadToken      = "bad_token"      // token 非法（不断连）
-	CodeStreamRefused = "stream_refused" // 流打开被拒（含在册流超上限；不断连）
-	CodeCursorStale   = "cursor_stale"   // 订阅游标过旧/代际失配（resync 语义；不断连）
+	CodeUnknownOp       = "unknown_op"       // 未知操作名（不断连）
+	CodeNoStream        = "no_stream"        // 未知/已关闭的 streamId（不断连）
+	CodeBadJSON         = "bad_json"         // 控制类 body 非法 JSON（断连）
+	CodeBadRequest      = "bad_request"      // 载荷字段缺失/类型不符/值域外（不断连）
+	CodeBadFrame        = "bad_frame"        // 帧长超限/非法 op（断连；超限在读 body 前）
+	CodeNotReady        = "not_ready"        // 守护进程未就绪（不断连）
+	CodeShuttingDown    = "shutting_down"    // 收工中（不断连）
+	CodeHostExists      = "host_exists"      // 重复添加同后端（不断连）
+	CodeNoHost          = "no_host"          // 主机不存在（不断连）
+	CodeBadToken        = "bad_token"        // token 非法（不断连）
+	CodeHostUnreachable = "host_unreachable" // host.add 验证结论为全不可达且未带 force（不入表；不断连；host-cli 3b 只增）
+	CodeStreamRefused   = "stream_refused"   // 流打开被拒（含在册流超上限；不断连）
+	CodeCursorStale     = "cursor_stale"     // 订阅游标过旧/代际失配（resync 语义；不断连）
 )
 
 // ---------- 操作词表与各操作载荷 ----------
@@ -110,19 +111,45 @@ const (
 	OpStreamClose       = "stream.close"
 )
 
-// HostAddArgs host.add 载荷（3a 语义 = 仅「解析入表」：token 语法/本地解码校验；
-// 连通性验证与三档结论归 host 命令面能力域[3b]，结果以载荷字段只增扩展——spec
-// 「命令归属规则」）。
+// HostAddArgs host.add 载荷（3b 起含服务端有界连通性验证——验证契约本体见
+// host-management；结论以 HostAddResult.reach 字段只增返回）。
 type HostAddArgs struct {
 	Name  string `json:"name,omitempty"`
 	Token string `json:"token"`
+	// Force 「仍然添加」逃生口（字段只增）：true = 跳过服务端探测直接入表
+	//（端点未实测，首次连接时补全）。token 非法不被 force 绕过（语法校验前置）。
+	Force bool `json:"force,omitempty"`
 }
 
 // HostAddResult host.add 成功载荷。
 type HostAddResult struct {
-	ID      string `json:"id"`
-	Name    string `json:"name,omitempty"`
-	AddedAt int64  `json:"addedAt"`
+	ID      string     `json:"id"`
+	Name    string     `json:"name,omitempty"`
+	AddedAt int64      `json:"addedAt"`
+	Reach   *HostReach `json:"reach,omitempty"` // 3b 只增：验证三档结论（nil 不出现——服务端恒填）
+}
+
+// reach.tier 受控枚举（spec「命令归属规则」：direct|relay|skipped，只增不改）。
+const (
+	ReachTierDirect  = "direct"  // 有直连端点应答
+	ReachTierRelay   = "relay"   // 直连全无应答且中继有应答
+	ReachTierSkipped = "skipped" // force 跳过探测（端点未实测语义）
+)
+
+// HostReach host.add 成功载荷的验证结论（tier=none 不出现在成功载荷——全不可达
+// 用错误码 host_unreachable 表达，不入表不断连）。
+type HostReach struct {
+	Tier   string        `json:"tier"`
+	BestEp string        `json:"bestEp,omitempty"` // 实测最优端点（RTT 最小的对应档活端点；skipped 无
+	RttMs  int64         `json:"rttMs,omitempty"`
+	Tested []ReachTested `json:"tested"` // 逐端点实测集（恒非 nil；skipped = 空数组）
+}
+
+// ReachTested tested[] 单端点结论（只含应答端点）。
+type ReachTested struct {
+	Ep    string `json:"ep"`
+	Relay bool   `json:"relay"`
+	RttMs int64  `json:"rttMs"`
 }
 
 // HostRemoveArgs host.remove 载荷（host = peerID hex）。
@@ -362,12 +389,13 @@ type RoleBrief struct {
 // HostState snapshot.get / daemon.status 里一台主机的动态面（各会话无锁快照汇成——
 // 锁序三路径之②：Registry.mu 拷贝集合 → 会话无锁快照 → 末读总线 seq）。
 type HostState struct {
-	ID     string    `json:"id"`
-	Name   string    `json:"name,omitempty"`
-	State  string    `json:"state"`
-	Reason string    `json:"reason,omitempty"`
-	Link   *HostLink `json:"link,omitempty"`
-	Stats  *HostRxTx `json:"stats,omitempty"`
+	ID      string    `json:"id"`
+	Name    string    `json:"name,omitempty"`
+	State   string    `json:"state"`
+	Reason  string    `json:"reason,omitempty"`
+	Link    *HostLink `json:"link,omitempty"`
+	Stats   *HostRxTx `json:"stats,omitempty"`
+	AddedAt int64     `json:"addedAt,omitempty"` // 登记面添加时间（HostRecord.AddedAt 填充；host-cli 3b M1 只增——host status 详面/--json 的「添加时间」数据源）
 }
 
 // HostLink 链路态（via/ep/rttMs/at）。

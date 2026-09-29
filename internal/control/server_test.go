@@ -50,20 +50,29 @@ func (f *fakeBackend) HostBriefs() []HostBrief {
 	defer f.mu.Unlock()
 	return append([]HostBrief(nil), f.briefs...)
 }
-func (f *fakeBackend) AddHost(name, token string) (HostBrief, error) {
+func (f *fakeBackend) AddHost(name, token string, force bool) (HostAddResult, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if strings.HasPrefix(token, "BAD") {
-		return HostBrief{}, ErrBackendBadToken
+		return HostAddResult{}, ErrBackendBadToken
+	}
+	if strings.HasPrefix(token, "DEAD") && !force {
+		return HostAddResult{}, ErrBackendHostUnreachable // host-cli 3b：全不可达（force 不触发）
 	}
 	id := fmt.Sprintf("%064x", len(f.added)+1)
 	if _, ok := f.added[id]; ok || token == "DUP" {
-		return HostBrief{}, ErrBackendHostExists
+		return HostAddResult{}, ErrBackendHostExists
 	}
 	f.added[id] = token
 	b := HostBrief{ID: id, Name: name, AddedAt: 1700000000}
 	f.briefs = append(f.briefs, b)
-	return b, nil
+	res := HostAddResult{ID: id, Name: name, AddedAt: 1700000000}
+	if force {
+		res.Reach = &HostReach{Tier: ReachTierSkipped, Tested: []ReachTested{}}
+	} else {
+		res.Reach = &HostReach{Tier: ReachTierDirect, BestEp: "203.0.113.1:41641", RttMs: 12, Tested: []ReachTested{{Ep: "203.0.113.1:41641", RttMs: 12}}}
+	}
+	return res, nil
 }
 func (f *fakeBackend) RemoveHost(id string) error {
 	f.mu.Lock()
@@ -346,14 +355,17 @@ func TestOpsHappyPath(t *testing.T) {
 	if st.ServerVersion != "test-1.0" || st.Generation == "" || len(st.Roles) != 1 || len(st.Hosts) != 1 || st.Hosts[0].Link.RttMs != 12 {
 		t.Fatalf("daemon.status 载荷形状：%+v", st)
 	}
-	// host.add。
+	// host.add（host-cli 3b：响应类型 = HostAddResult，reach 结论字段上 wire）。
 	raw, err = c.Request(context.Background(), OpHostAdd, HostAddArgs{Name: "mbp", Token: "hmw1good"})
 	if err != nil {
 		t.Fatal(err)
 	}
-	var add HostBrief
+	var add HostAddResult
 	if err := json.Unmarshal(raw, &add); err != nil || add.ID == "" || add.AddedAt == 0 {
 		t.Fatalf("host.add 载荷：%v（%s）", err, raw)
+	}
+	if add.Reach == nil || add.Reach.Tier != ReachTierDirect || add.Reach.BestEp == "" || len(add.Reach.Tested) == 0 {
+		t.Fatalf("host.add reach 结论缺失：%+v", add.Reach)
 	}
 	// host.list。
 	raw, err = c.Request(context.Background(), OpHostList, nil)
@@ -411,6 +423,25 @@ func TestErrorCodeMappingNegativeCases(t *testing.T) {
 	}
 	if _, err := c.Request(ctx, OpHostAdd, HostAddArgs{Token: "DUP"}); !errors.Is(err, CodeError(CodeHostExists)) {
 		t.Fatalf("同后端重复添加应 host_exists：%v", err)
+	}
+	// host_unreachable（host-cli 3b 只增错误码）：全不可达且未带 force → 不入表、
+	// 不断连（后续请求照常）；带 force → 添加成功（tier=skipped）。
+	if _, err := c.Request(ctx, OpHostAdd, HostAddArgs{Token: "DEADx"}); !errors.Is(err, CodeError(CodeHostUnreachable)) {
+		t.Fatalf("全不可达应 host_unreachable：%v", err)
+	}
+	if _, err := c.Request(ctx, OpHostList, nil); err != nil {
+		t.Fatalf("host_unreachable 后连接应不断：%v", err)
+	}
+	raw, err := c.Request(ctx, OpHostAdd, HostAddArgs{Token: "DEADx", Force: true})
+	if err != nil {
+		t.Fatalf("force 应添加成功：%v", err)
+	}
+	var forced HostAddResult
+	if err := json.Unmarshal(raw, &forced); err != nil || forced.Reach == nil || forced.Reach.Tier != ReachTierSkipped || forced.Reach.Tested == nil || len(forced.Reach.Tested) != 0 {
+		t.Fatalf("force 载荷应为 skipped（端点未实测）：%s", raw)
+	}
+	if _, err := c.Request(ctx, OpHostRemove, HostRemoveArgs{Host: forced.ID}); err != nil {
+		t.Fatalf("清理 force 添加的主机：%v", err)
 	}
 	// no_host。
 	if _, err := c.Request(ctx, OpHostRemove, HostRemoveArgs{Host: "ff"}); !errors.Is(err, CodeError(CodeNoHost)) {
