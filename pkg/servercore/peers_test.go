@@ -291,36 +291,30 @@ func TestDeviceUnknownSecretRejected(t *testing.T) {
 	}
 }
 
-// 热加载：出口运行中新签发的 token（tokens.jsonl 追加）不改重启即可注册。
-func TestDeviceTableReloadsSecretsOnMiss(t *testing.T) {
+// 构造期 secrets 全集验证（secrets 单轨，host-registry-daemon D7：热重读分支已删——
+// `Secrets()` 仅启动期调用、`IssueToken` 先于建表入集，签发永远先于建表；重签发的
+// token 随出口重启进构造期集合）。全集里的每个 secret 都能注册，集合外的仍拒。
+func TestDeviceTableVerifiesFullSecretSetAtConstruction(t *testing.T) {
 	fc := newFakeCfg()
-	tb := NewDeviceTable(fc, [][32]byte{testSecret}, DeviceConfig{})
-	now := time.Now()
-
 	var fresh [32]byte
 	fresh[0] = 7
-	reg := proto.EncodeReg(fresh, pubN(6), devN(6), now)
-	if _, err := tb.Register(reg, now); !errors.Is(err, ErrNoToken) {
-		t.Fatal("未经 reload 的新 secret 不应通过")
-	}
+	// 构造期给全集（如出口重启后 tokens.jsonl 的全部 secret）。
+	tb := NewDeviceTable(fc, [][32]byte{testSecret, fresh}, DeviceConfig{})
+	now := time.Now()
 
-	reloads := 0
-	tb.SetSecretsReloader(func() ([][32]byte, error) {
-		reloads++
-		return [][32]byte{testSecret, fresh}, nil
-	})
-	if _, err := tb.Register(reg, now); err != nil {
-		t.Fatalf("reload 后应通过：%v", err)
+	// 旧 secret：通过。
+	if _, err := tb.Register(regFor(pubN(6), devN(6), now), now); err != nil {
+		t.Fatalf("构造期集合内的旧 secret 应通过：%v", err)
 	}
-	if reloads != 1 {
-		t.Fatalf("reload 次数 = %d，want 1", reloads)
+	// 新签发的 secret（已在构造期集合里）：同样通过。
+	if _, err := tb.Register(proto.EncodeReg(fresh, pubN(7), devN(7), now), now); err != nil {
+		t.Fatalf("构造期集合内的新 secret 应通过：%v", err)
 	}
-	// 命中已加载的 secret 时不再触发 reload（热路径零开销）
-	if _, err := tb.Register(regFor(pubN(7), devN(7), now), now); err != nil {
-		t.Fatal(err)
-	}
-	if reloads != 1 {
-		t.Fatalf("命中路径不该 reload：%d", reloads)
+	// 集合外的 secret：拒绝（无热重读路径——未命中即 ErrNoToken）。
+	var unknown [32]byte
+	unknown[0] = 9
+	if _, err := tb.Register(proto.EncodeReg(unknown, pubN(8), devN(8), now), now); !errors.Is(err, ErrNoToken) {
+		t.Fatalf("集合外 secret 应 ErrNoToken：%v", err)
 	}
 }
 

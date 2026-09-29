@@ -301,9 +301,6 @@ func Start(cfg ServeConfig) (*Server, error) {
 	s.Table.SetLogger(dlogf)
 	peerCap, peerTTL, peerGrace := s.Table.Limits()
 	dlogf("peer 表：设备表就绪（cap=%d，ttl=%v，grace=%v；按 devTag 记账/刷新/轮换）", peerCap, peerTTL, peerGrace)
-	// token 台账热加载：serve 自己重签 token（端点变化时）后，新 secret 立刻可用，
-	// 不需要重启出口（见 PeerTable.reload 的注释）。
-	s.Table.SetSecretsReloader(st.Secrets)
 	sbind.Table = s.Table
 
 	if err := s.dev.IpcSet(fmt.Sprintf("private_key=%s\nlisten_port=%d\n", hex.EncodeToString(priv[:]), cfg.ListenPort)); err != nil {

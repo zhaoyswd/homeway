@@ -100,13 +100,14 @@ type dentry struct {
 }
 
 // DeviceTable 以设备标签为键的动态设备表（wg-native-stack tasks 3.2 的换代）。
+// secrets 单轨（host-registry-daemon D7）：构造期给全量、之后不再有热重读——
+// `Secrets()` 仅启动期调用、`IssueToken` 先于建表入集（签发永远先于建表），
+// 热重载无生产场景。
 type DeviceTable struct {
 	mu      sync.Mutex
 	cfg     Configurer
 	secrets [][32]byte
-	// reload 可选：reg 验证失败时重新读一次 token 台账（serve 重签 token 后免重启生效）。
-	reload func() ([][32]byte, error)
-	logf   func(format string, args ...any)
+	logf    func(format string, args ...any)
 
 	max   int
 	ttl   time.Duration
@@ -205,44 +206,20 @@ func (t *DeviceTable) SetLogger(fn func(format string, args ...any)) {
 	t.mu.Unlock()
 }
 
-// SetSecretsReloader 注入「重读 token 台账」的回调（传 nil = 关闭热加载）。
-func (t *DeviceTable) SetSecretsReloader(fn func() ([][32]byte, error)) {
-	t.mu.Lock()
-	t.reload = fn
-	t.mu.Unlock()
-}
-
+// currentSecrets 读构造期 secrets 全集（verify 用）。
 func (t *DeviceTable) currentSecrets() [][32]byte {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	return t.secrets
 }
 
-// verify 逐一试 token secret，返回 (公钥, 设备标签, 命中的 secret)。
+// verify 逐一试构造期 secrets 全集，返回 (公钥, 设备标签, 命中的 secret)。
+// 单轨（D7）：未命中即 ErrNoToken——无热重读分支；重签发的 token 随出口重启
+// （或下个发版窗口的部署）进构造期集合。
 func (t *DeviceTable) verify(reg []byte, now time.Time) (pubkey [32]byte, devTag proto.DevTag, secret [32]byte, err error) {
-	try := func(secs [][32]byte) bool {
-		for _, sec := range secs {
-			if pk, dt, verr := proto.VerifyReg(sec, reg, now, 0); verr == nil {
-				pubkey, devTag, secret = pk, dt, sec
-				return true
-			}
-		}
-		return false
-	}
-	if try(t.currentSecrets()) {
-		return pubkey, devTag, secret, nil
-	}
-	t.mu.Lock()
-	reload := t.reload
-	t.mu.Unlock()
-	if reload != nil {
-		if secs, rerr := reload(); rerr == nil && len(secs) > 0 {
-			t.mu.Lock()
-			t.secrets = secs
-			t.mu.Unlock()
-			if try(secs) {
-				return pubkey, devTag, secret, nil
-			}
+	for _, sec := range t.currentSecrets() {
+		if pk, dt, verr := proto.VerifyReg(sec, reg, now, 0); verr == nil {
+			return pk, dt, sec, nil
 		}
 	}
 	return pubkey, devTag, secret, ErrNoToken
