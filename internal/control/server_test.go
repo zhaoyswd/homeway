@@ -142,7 +142,7 @@ func shortTempDir(t *testing.T) string {
 func startTestServer(t *testing.T, busCfg facade.BusConfig) *testServer {
 	t.Helper()
 	dir := shortTempDir(t)
-	bus := facade.NewBus(NewGeneration(), busCfg)
+	bus := facade.NewBus(facade.NewGeneration(), busCfg)
 	backend := newFakeBackend()
 	// 假 term 后端：一条 TCP listener（echo 模式由各测试自定）。
 	termLn, err := net.Listen("tcp", "127.0.0.1:0")
@@ -632,7 +632,7 @@ func TestClientDisconnectReleasesConnAndGoroutines(t *testing.T) {
 // （exec-r1 M1：此前 close(reason) 先走阻塞 sendHigh，唯一逃生口 closed 又在本
 // 函数更后面才关——互等挂死，Server.Close()（daemon 收工路径）收不了尾）。
 func TestConnCloseBoundedWhenHighQueueFull(t *testing.T) {
-	bus := facade.NewBus(NewGeneration(), facade.BusConfig{})
+	bus := facade.NewBus(facade.NewGeneration(), facade.BusConfig{})
 	srv := NewServer(ServerConfig{Bus: bus, Backend: newFakeBackend()})
 	a, _ := net.Pipe()
 	c := newConn(srv, a)

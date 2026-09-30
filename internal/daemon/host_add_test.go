@@ -29,6 +29,18 @@ import (
 	"golang.zx2c4.com/wireguard/wgctrl/wgtypes"
 )
 
+// isoDaemonFreeUDPPort 取一个空闲 UDP 端口（回环真出口装配用；原 registry_
+// isolation_test.go 的同名助手已随 §4 收拢迁 facade，daemon 侧装配自持一份）。
+func isoDaemonFreeUDPPort(t *testing.T) uint16 {
+	t.Helper()
+	c, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	return uint16(c.LocalAddr().(*net.UDPAddr).Port)
+}
+
 // addFakeProber 回环参照点应答器（就绪即回，带构建标记；hits 计收到的探测请求）。
 type addFakeProber struct {
 	pc   *net.UDPConn
@@ -73,7 +85,7 @@ func addDeadPort(t *testing.T) string {
 
 // TestHostAddFourPaths 直连/仅中继/全不可达/force 四路（真探测 + 真 UDS + 帧路径）。
 func TestHostAddFourPaths(t *testing.T) {
-	_, sock := startDaemonForTest(t)
+	_, sock := startDaemonForTest(t, nil)
 	c := dialDaemon(t, sock)
 	ctx := context.Background()
 
@@ -161,7 +173,7 @@ func TestHostAddFourPaths(t *testing.T) {
 // TestHostAddBadTokenNoProbe token 非法就地报错：不发起网络探测（HM「token 格式
 // 错误不进入探测」——应答器零命中 + bad_token 不被 force 绕过）。
 func TestHostAddBadTokenNoProbe(t *testing.T) {
-	_, sock := startDaemonForTest(t)
+	_, sock := startDaemonForTest(t, nil)
 	c := dialDaemon(t, sock)
 	ctx := context.Background()
 	fp := addStartProber(t, "exit-n")
@@ -222,7 +234,7 @@ func TestHostAddProbeZeroSideEffect(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	_, sock := startDaemonForTest(t)
+	_, sock := startDaemonForTest(t, nil)
 	c := dialDaemon(t, sock)
 	ctx := context.Background()
 

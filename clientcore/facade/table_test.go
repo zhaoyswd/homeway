@@ -1,13 +1,17 @@
-package daemon
+package facade
 
-// registry_test.go — 多主机会话注册表（host-registry-daemon 1.5，HD「多主机会话
-// 注册表」+ N2）：增删/持久化往返/重复添加/重启按表恢复/临时身份降级。
+// table_test.go — 多主机会话注册表（自 internal/daemon/registry_test.go 随迁，4a
+// 任务 3.1——断言不动；缝名随动：OpenRegistry→openTestTable、errHostExists→
+// ErrHostExists 等）：增删/持久化往返/重复添加/重启按表恢复/临时身份降级。
 // token 全部本地签发（proto.EncodeToken，端点不可达也能起会话——构造只建本地
 // socket；握手/暖机是异步的，不影响登记面断言）。
+// （原文件中的 TestDaemonRefusesExitStateDir 测 daemon 侧 checkNotExitState，
+// 留在 internal/daemon。）
 
 import (
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -34,9 +38,9 @@ func testToken(t *testing.T, peerByte byte, addr string) (string, [32]byte) {
 	return s, peer
 }
 
-func openTestRegistry(t *testing.T, dir string) *Registry {
+func openTestTable(t *testing.T, dir string, opts tableOptions) *hostTable {
 	t.Helper()
-	r, err := OpenRegistry(dir, RegistryOptions{StrictIdentity: true})
+	r, err := openTable(dir, opts)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -47,7 +51,7 @@ func openTestRegistry(t *testing.T, dir string) *Registry {
 // 增删 + 持久化往返（hosts.json 0600）+ 重启按表恢复。
 func TestRegistryAddRemovePersistAndRestart(t *testing.T) {
 	dir := t.TempDir()
-	r := openTestRegistry(t, dir)
+	r := openTestTable(t, dir, tableOptions{strict: true})
 
 	tokA, peerA := testToken(t, 1, "127.0.0.1:40001")
 	tokB, peerB := testToken(t, 2, "127.0.0.1:40002")
@@ -84,7 +88,7 @@ func TestRegistryAddRemovePersistAndRestart(t *testing.T) {
 
 	// 重启按表恢复：重开同 state，乙的记录在、会话被拉起。
 	r.Close()
-	r2, err := OpenRegistry(dir, RegistryOptions{StrictIdentity: true})
+	r2, err := openTable(dir, tableOptions{strict: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -95,7 +99,7 @@ func TestRegistryAddRemovePersistAndRestart(t *testing.T) {
 	if s := r2.Session(peerB); s == nil {
 		t.Fatal("重启后乙的会话未拉起")
 	}
-	// 身份/缓存目录按 D3 布局落在 state 内。
+	// 身份/缓存目录按既有布局落在 state 内。
 	if _, err := os.Stat(filepath.Join(dir, "identity")); err != nil {
 		t.Fatalf("identity 目录未建：%v", err)
 	}
@@ -104,14 +108,14 @@ func TestRegistryAddRemovePersistAndRestart(t *testing.T) {
 // 重复添加：同 token → host_exists；同 peerID 新 token → 同键刷新（不裂成两条）。
 func TestRegistryDuplicateAddAndRefresh(t *testing.T) {
 	dir := t.TempDir()
-	r := openTestRegistry(t, dir)
+	r := openTestTable(t, dir, tableOptions{strict: true})
 
 	tokA, peerA := testToken(t, 3, "127.0.0.1:40003")
 	if _, err := r.Add("甲", tokA); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := r.Add("甲again", tokA); err != errHostExists {
-		t.Fatalf("同 token 重复添加应 errHostExists，实得 %v", err)
+	if _, err := r.Add("甲again", tokA); !errors.Is(err, ErrHostExists) {
+		t.Fatalf("同 token 重复添加应 ErrHostExists，实得 %v", err)
 	}
 
 	tokA2, _ := testToken(t, 3, "127.0.0.1:40033") // 同 peerID（后端重签发：新 secret/端点）
@@ -138,7 +142,7 @@ func TestRegistryStrictIdentityEphemeral(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(dir, "identity"), []byte("x"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	r := openTestRegistry(t, dir)
+	r := openTestTable(t, dir, tableOptions{strict: true})
 
 	tokA, _ := testToken(t, 4, "127.0.0.1:40004")
 	rec, err := r.Add("甲", tokA)
@@ -177,9 +181,9 @@ func TestRegistryCorruptHostsBacksUpAndStartsEmpty(t *testing.T) {
 		t.Fatal(err)
 	}
 	var warns []string
-	r, err := OpenRegistry(dir, RegistryOptions{
-		StrictIdentity: true,
-		Eventf:         func(format string, args ...any) { warns = append(warns, fmt.Sprintf(format, args...)) },
+	r, err := openTable(dir, tableOptions{
+		strict: true,
+		eventf: func(format string, args ...any) { warns = append(warns, fmt.Sprintf(format, args...)) },
 	})
 	if err != nil {
 		t.Fatalf("损坏 hosts.json 应备份后空表启动，实得拒启：%v", err)
@@ -224,7 +228,7 @@ func TestRegistryCorruptHostsBacksUpAndStartsEmpty(t *testing.T) {
 // 完整旧表或完整新表，不再产生截断 JSON（此前裸 os.WriteFile 覆写）。
 func TestRegistrySaveAtomicRename(t *testing.T) {
 	dir := t.TempDir()
-	r := openTestRegistry(t, dir)
+	r := openTestTable(t, dir, tableOptions{strict: true})
 	// 预置陈旧 .tmp（上次写窗口被杀的残留）：rename 语义下被覆盖后挪走。
 	tmp := filepath.Join(dir, hostsFileName+".tmp")
 	if err := os.WriteFile(tmp, []byte("陈旧残tmp"), 0o600); err != nil {
@@ -259,22 +263,6 @@ func TestRegistrySaveAtomicRename(t *testing.T) {
 	}
 }
 
-// daemon 拒绝出口 state 目录（exec-r1 B11 硬拦）：tokens.jsonl = 出口身份特征
-// （签发审计 + 启动加载，D7；daemon 永不写它）。
-func TestDaemonRefusesExitStateDir(t *testing.T) {
-	dir := t.TempDir()
-	if err := checkNotExitState(dir); err != nil {
-		t.Fatalf("干净目录不应拦：%v", err)
-	}
-	if err := os.WriteFile(filepath.Join(dir, "tokens.jsonl"), []byte("{}\n"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	err := checkNotExitState(dir)
-	if err == nil || !strings.Contains(err.Error(), "tokens.jsonl") {
-		t.Fatalf("含 tokens.jsonl 的目录应报错拒启：%v", err)
-	}
-}
-
 // D7-a（term-remote 3.1）：hosts.json 含 id 非法条目 → 装载保留在表（不启动会话、
 // 不进寻址面）→ 后续任意落盘**原样写回**（不再写掉）、装载日志如实。红绿判据：
 // 改前行为 = 「条目保留」日志说谎——下次 Add 落盘即把坏条目写没。
@@ -292,9 +280,9 @@ func TestRegistryCarriesInvalidIDEntries(t *testing.T) {
 	}
 
 	var logs []string
-	r, err := OpenRegistry(dir, RegistryOptions{
-		StrictIdentity: true,
-		Logf:           func(f string, a ...any) { logs = append(logs, fmt.Sprintf(f, a...)) },
+	r, err := openTable(dir, tableOptions{
+		strict: true,
+		logf:   func(f string, a ...any) { logs = append(logs, fmt.Sprintf(f, a...)) },
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -351,7 +339,7 @@ func TestRegistryCarriesInvalidIDEntries(t *testing.T) {
 
 	// 重启再装载：坏条目仍保留（幂等，不会第二次装载时漂移）。
 	r.Close()
-	r2, err := OpenRegistry(dir, RegistryOptions{StrictIdentity: true})
+	r2, err := openTable(dir, tableOptions{strict: true})
 	if err != nil {
 		t.Fatal(err)
 	}

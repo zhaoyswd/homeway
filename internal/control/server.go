@@ -20,8 +20,6 @@ package control
 // spec 外的 reason 值）。
 
 import (
-	"crypto/rand"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"github.com/zhaoyswd/homeway/clientcore/facade"
@@ -75,20 +73,6 @@ func NewServer(cfg ServerConfig) *Server {
 
 // Generation 当前代际。
 func (s *Server) Generation() string { return s.cfg.Bus.Generation() }
-
-// NewGeneration 生成新代际（16 字节随机 hex——每次守护进程启动调用一次，
-// facade.Bus 与 Server 共用同一值）。
-func NewGeneration() string {
-	var b [16]byte
-	if _, err := rand.Read(b[:]); err != nil {
-		// crypto/rand 在真实平台不会失败；退化用时间熵兜底（仅可测性路径）。
-		now := time.Now().UnixNano()
-		for i := range b {
-			b[i] = byte(now >> (uint(i%8) * 8))
-		}
-	}
-	return hex.EncodeToString(b[:])
-}
 
 // Serve 接入循环（阻塞；listener 由 listen.go 提供，Close 后返回）。
 func (s *Server) Serve(ln net.Listener) error {

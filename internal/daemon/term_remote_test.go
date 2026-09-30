@@ -289,7 +289,7 @@ func startRemoteTestRig(t *testing.T, echo, flood, noread bool) *remoteTestRig {
 	}
 	srv := control.NewServer(control.ServerConfig{
 		ServerVersion: "test-1.0",
-		Bus:           facade.NewBus(control.NewGeneration(), facade.BusConfig{}),
+		Bus:           facade.NewBus(facade.NewGeneration(), facade.BusConfig{}),
 		Backend:       backend,
 		Logf:          t.Logf,
 	})

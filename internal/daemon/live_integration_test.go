@@ -76,7 +76,7 @@ func TestLiveStreamTermEndToEnd(t *testing.T) {
 	if token == "" {
 		t.Skip("未设置 HOMEWAY_IT_TOKEN（真实出口 token 现场注入；不进仓库/日志/报告）")
 	}
-	_, sock := startDaemonForTest(t)
+	_, sock := startDaemonForTest(t, nil)
 	c := dialDaemon(t, sock)
 	ctx := context.Background()
 

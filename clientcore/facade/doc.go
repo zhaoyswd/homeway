@@ -8,6 +8,6 @@
 // facade MUST NOT import 根 internal/（clientcore 子树纯洁——嵌套子模块后路）。
 //
 // 分文件：vocab.go（契约词汇）/ versions.go（版本空间台账）/ bus.go（事件总线）/
-// daemon.go（进程级 Daemon 与角色级主机表骨架）/ table.go、host.go、demand.go、
-// diag.go（§3/§6 落地）。
+// daemon.go（进程级 Daemon）/ table.go（角色级主机表与表操作面——Registry 语义
+// 迁入）/ host.go（每主机 Host 对象与进程面 DTO）/ demand.go、diag.go（§6 落地）。
 package facade

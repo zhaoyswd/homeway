@@ -67,8 +67,14 @@ func saveDesiredState(dir string, ds DesiredState) error {
 	return os.WriteFile(filepath.Join(dir, rolesFileName), append(b, '\n'), 0o600)
 }
 
-// roleEnabled 某角色是否期望启用（未登记 = 不启用，显式语义）。
+// roleEnabled 某角色是否期望启用。**未登记 = 默认 on**（v1 兼容语义，r2 新-2
+// 拍板）：既有仅含 client 的 roles.json 升级后 control 等新角色自动在位，仅显式
+// `enabled:false` 才关——存量 roles.json 原样不动（不回写用户 state 文件；
+// saveDesiredState 仍只服务默认值初始化与未来的控制面写入路径）。
 func (ds DesiredState) roleEnabled(name string) bool {
 	rs, ok := ds.Roles[name]
-	return ok && rs.Enabled
+	if !ok {
+		return true
+	}
+	return rs.Enabled
 }

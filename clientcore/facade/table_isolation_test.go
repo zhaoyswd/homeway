@@ -1,11 +1,13 @@
-package daemon
+package facade
 
-// registry_isolation_test.go — 5.2 注册表层隔离判据（HD「多主机会话注册表」）：
-// 真 Registry + 回环上的真出口（健康后端）+ 死端点（持续失败后端）并发——健康
-// 主机在注册表内就绪（真 WG 握手 + 链路 direct）、失败主机共存不干扰；摘除失败
-// 主机不影响健康主机会话对象（每记录自持 teardown）。恢复风暴的按会话归属断言
-// （阶梯/重建/限频计数互不串扰）在 hostsession 包 multihost_isolation_test.go
-// （真会话 + 可缩预算——本包够不到那三个未导出 var）。
+// table_isolation_test.go — 5.2 注册表层隔离判据（自 internal/daemon/
+// registry_isolation_test.go 随迁，4a 任务 3.1——断言不动；缝随动：OpenRegistry→
+// openTable/RegistryOptions→tableOptions，短路径助手换 t.TempDir——本面不经
+// control.sock，无 sun_path 限制）：真表 + 回环上的真出口（健康后端）+ 死端点
+// （持续失败后端）并发——健康主机在表内就绪（真 WG 握手 + 链路 direct）、失败
+// 主机共存不干扰；摘除失败主机不影响健康主机会话对象（每记录自持 teardown）。
+// 恢复风暴的按会话归属断言（阶梯/重建/限频计数互不串扰）在 hostsession 包
+// multihost_isolation_test.go（真会话 + 可缩预算——本包够不到那三个未导出 var）。
 
 import (
 	"encoding/hex"
@@ -92,8 +94,8 @@ func TestRegistryIsolationHealthyAndFailing(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	dir := shortTempDirDaemon(t)
-	reg, err := OpenRegistry(dir, RegistryOptions{StrictIdentity: true, Logf: t.Logf})
+	dir := t.TempDir()
+	reg, err := openTable(dir, tableOptions{strict: true, logf: t.Logf})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -113,7 +115,7 @@ func TestRegistryIsolationHealthyAndFailing(t *testing.T) {
 		t.Fatal("两后端不应同键")
 	}
 
-	// 健康主机：注册表内就绪 + 真 WG 握手（后端设备表见记录）+ 链路 direct。
+	// 健康主机：表内就绪 + 真 WG 握手（后端设备表见记录）+ 链路 direct。
 	// （ready 不保证健康——暖机软失败也到 ready；用链路面与后端设备表共同判。）
 	sessA := reg.Session(peerA)
 	if sessA == nil {

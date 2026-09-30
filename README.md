@@ -263,12 +263,26 @@ darwin 产物带 **ad-hoc 签名**（`codesign -dv` 显示 `Signature=adhoc`、`
 cmd/homeway         单入口：按角色（exit / relay）分发
 internal/server     出口（WG 端点 + 拦截层 + 本机服务 + 设备表）与它的 CLI
 internal/relay      中继（注册腿 + per-client 转发 + hint）与它的 CLI
+clientcore/facade   客户端会话面的唯一语义真源（词汇/版本台账/事件总线/主机表/Host 对象）
+internal/daemon     桌面守护进程（角色子系统 + 控制面装配——经 facade 单入口消费）
+internal/control    控制面 wire 绑定（UDS/帧/握手；词汇与总线真源在 clientcore/facade）
 pkg/proto           线上契约：token（hmw1 格式）/ reg 报文 / 中继帧 + golden vectors
 ```
 
 ```bash
 go test ./...
 ```
+
+**门禁**（与 gofmt/vet 并列）：桌面侧（`internal/`、`pkg/`、`cmd/`）对 clientcore
+内部件的直 import 必须为零（语义真源收拢在 `clientcore/facade`——openspec
+clientcore-facade「收拢判据」；4b 升 CI 门时沿用本命令）：
+
+```bash
+[ -z "$(grep -rn '"github.com/zhaoyswd/homeway/clientcore' internal/ pkg/ cmd/ --include='*.go' | grep -v 'clientcore/facade')" ] && echo PASS
+```
+
+（`[ -z ]` 口径：`grep -v` 全过滤时退出码 1，直接拿管道退出码当门会假红；排除
+模式不带尾引号——facade 子包同被排除。）
 
 发版 = 推 tag（`v0.x.y`），CI 出 darwin/linux 四目标产物 + sha256（见
 `.github/workflows/release.yml`）。

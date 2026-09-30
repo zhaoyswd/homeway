@@ -27,6 +27,9 @@ import (
 
 const (
 	rolesFileName = "roles.json"
+	// hostsFileName 主机表持久化文件（0600；表语义/落盘归 facade table.go，
+	// 这里只保证文件存在与权限位——原 registry.go 已随 §4 收拢删除）。
+	hostsFileName = "hosts.json"
 
 	// 日志分级与轮转沿出口口径（internal/server/logging.go 同款参数）。
 	eventsMaxBytes = 2 << 20 // 2MB

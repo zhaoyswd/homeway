@@ -13,7 +13,7 @@ import (
 )
 
 func TestDaemonStatusCLIEndToEnd(t *testing.T) {
-	st, _ := startDaemonForTest(t)
+	st, _ := startDaemonForTest(t, nil)
 	// 人类可读面：角色/主机/版本都在。
 	var buf bytes.Buffer
 	if err := statusCLI([]string{"--state", st.Dir}, "cli-test", &buf); err != nil {

@@ -1,28 +1,40 @@
 package daemon
 
-// control_test.go — §3.6 装配级集成：真实 Registry（角色子系统）+ 控制面全链
-//（control.Client 完整握手/请求/订阅），事件接线（session.added/state_changed）
-// 与 not_ready 窗口（角色未跑）。token 本地签发（registry_test 同法，不依赖真实
-// 后端；会话对不可达端点的暖机失败属异步预期，不影响登记面断言）。
+// control_test.go — §3.6 装配级集成：真实 facade 主机表（角色子系统 Attach/
+// Detach）+ 控制面全链（control.Client 完整握手/请求/订阅），事件接线
+//（session.added/state_changed）与 not_ready 窗口（角色未跑）。token 本地签发
+//（facade table_test 同法，不依赖真实后端；会话对不可达端点的暖机失败属异步
+// 预期，不影响登记面断言）。§4 收拢后：装配经 facade.New（探测注入缝 =
+// facade.Options.Probe——daemon 侧假探测注入点随迁，r1 低-10）。
 
 import (
 	"context"
 	"encoding/json"
 	"errors"
-	"github.com/zhaoyswd/homeway/clientcore/facade"
 	"os"
 	"path/filepath"
 	"testing"
 	"time"
 
+	"github.com/zhaoyswd/homeway/clientcore/facade"
 	"github.com/zhaoyswd/homeway/internal/control"
 	"github.com/zhaoyswd/homeway/pkg/probe"
 	"github.com/zhaoyswd/homeway/pkg/proto"
 )
 
+// fakeProbeDirect 恒 direct 的假探测（会话面端到端用例保持「解析入表 + 事件
+// 接线」断言面；真探测四路见 host_add_test.go）。
+func fakeProbeDirect(ctx context.Context, token string) (*probe.ReachReport, error) {
+	return &probe.ReachReport{
+		Peer:    "090909090909",
+		Results: []probe.ReachResult{{EP: "203.0.113.99:41641", RTT: 7 * time.Millisecond, Build: "fake"}},
+	}, nil
+}
+
 // startDaemonForTest 最小 daemon 装配（无单实例锁——测试互不干扰；state 布局 +
-// supervisor + client 角色 + 控制面）。
-func startDaemonForTest(t *testing.T) (*DaemonState, string) {
+// 进程级 facade.Daemon + supervisor + client 角色 + 控制面）。probe = nil 时用
+// 生产探测核（host_add_test 的真探测四路）。
+func startDaemonForTest(t *testing.T, probe func(ctx context.Context, token string) (*probe.ReachReport, error)) (*DaemonState, string) {
 	t.Helper()
 	dir := shortTempDirDaemon(t)
 	st, err := OpenDaemonState(dir)
@@ -30,28 +42,32 @@ func startDaemonForTest(t *testing.T) (*DaemonState, string) {
 		t.Fatal(err)
 	}
 	t.Cleanup(st.Close)
-	bus := facade.NewBus(control.NewGeneration(), facade.BusConfig{})
-	holder := newRegistryHolder(bus)
+	d := facade.New(facade.Options{
+		StrictIdentity: true,
+		Logf:           st.Debugf,
+		Eventf:         st.Eventf,
+		Probe:          probe,
+	})
+	t.Cleanup(d.Close)
 	sup := newSupervisor(st.Eventf, st.Debugf)
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
-	role := newClientRole(dir, st, holder)
+	role := newClientRole(dir, st, d)
 	sup.Start(ctx, func() Role { return role }, nil)
-	srv, stop, err := startControlPlane("test-daemon", dir, sup, holder, bus, st.Eventf)
+	_, stop, err := startControlPlane("test-daemon", dir, sup, d, st.Eventf)
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(stop)
-	_ = srv
-	// 等注册表挂上（角色 goroutine 异步）。
+	// 等主机表挂上（角色 goroutine 异步 attach）。
 	deadline := time.Now().Add(3 * time.Second)
 	for time.Now().Before(deadline) {
-		if holder.get() != nil {
+		if !d.NotReady() {
 			return st, filepath.Join(dir, control.ControlSockName)
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
-	t.Fatal("注册表未在窗口内就绪")
+	t.Fatal("主机表未在窗口内 attach")
 	return nil, ""
 }
 
@@ -83,7 +99,7 @@ func dialDaemon(t *testing.T, sock string) *control.Client {
 }
 
 func TestControlPlaneAssemblyEndToEnd(t *testing.T) {
-	_, sock := startDaemonForTest(t)
+	_, sock := startDaemonForTest(t, fakeProbeDirect)
 	c := dialDaemon(t, sock)
 	ctx := context.Background()
 
@@ -107,17 +123,6 @@ func TestControlPlaneAssemblyEndToEnd(t *testing.T) {
 	if _, err := c.Subscribe(ctx, []string{facade.DomainSession}, nil, "", ""); err != nil {
 		t.Fatal(err)
 	}
-	// host.add 3b 起带服务端探测：本用例端点不可达（TEST-NET），注入假探测（tier
-	// = direct）保持「解析入表 + 事件接线」的原断言面——真探测四路见
-	// host_add_test.go。
-	origProbe := reachProbe
-	reachProbe = func(ctx context.Context, token string) (*probe.ReachReport, error) {
-		return &probe.ReachReport{
-			Peer:    "090909090909",
-			Results: []probe.ReachResult{{EP: "203.0.113.99:41641", RTT: 7 * time.Millisecond, Build: "fake"}},
-		}, nil
-	}
-	t.Cleanup(func() { reachProbe = origProbe })
 	tok := proto.Token{PeerID: [32]byte{9}, Secret: [32]byte{9, 9}, Endpoints: []proto.Endpoint{{Addr: "203.0.113.99:41641"}}}
 	tokStr, err := proto.EncodeToken(tok)
 	if err != nil {
@@ -148,7 +153,7 @@ func TestControlPlaneAssemblyEndToEnd(t *testing.T) {
 		t.Fatal("session.added 事件未到达（事件接线断？）")
 	}
 
-	// 错误码映射（真 Registry 哨兵路径）：重复添加 → host_exists；坏 token →
+	// 错误码映射（facade 哨兵路径）：重复添加 → host_exists；坏 token →
 	// bad_token；不存在 → no_host。
 	if _, err := c.Request(ctx, facade.OpHostAdd, control.HostAddArgs{Token: tokStr}); !errors.Is(err, control.CodeError(facade.CodeHostExists)) {
 		t.Fatalf("同 token 重复应 host_exists：%v", err)
@@ -173,7 +178,7 @@ func TestControlPlaneAssemblyEndToEnd(t *testing.T) {
 		t.Fatalf("snapshot.get：%+v", snap)
 	}
 
-	// 流腿寻址（真 Registry）：不存在的主机 → no_host（term 拨号路径的入口校验）。
+	// 流腿寻址（真主机表）：不存在的主机 → no_host（term 拨号路径的入口校验）。
 	if _, err := c.OpenStream(ctx, "0102"); !errors.Is(err, control.CodeError(facade.CodeNoHost)) {
 		t.Fatalf("不存在主机流打开应 no_host：%v", err)
 	}
@@ -205,10 +210,10 @@ func TestControlPlaneNotReadyWhenRoleDisabled(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(st.Close)
-	bus := facade.NewBus(control.NewGeneration(), facade.BusConfig{})
-	holder := newRegistryHolder(bus) // 不挂角色
+	d := facade.New(facade.Options{StrictIdentity: true, Logf: st.Debugf, Eventf: st.Eventf})
+	t.Cleanup(d.Close) // 不挂角色（表未 attach = NotReady）
 	sup := newSupervisor(st.Eventf, st.Debugf)
-	_, stop, err := startControlPlane("test-daemon", dir, sup, holder, bus, st.Eventf)
+	_, stop, err := startControlPlane("test-daemon", dir, sup, d, st.Eventf)
 	if err != nil {
 		t.Fatal(err)
 	}

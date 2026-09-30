@@ -24,13 +24,27 @@ import (
 	"github.com/zhaoyswd/homeway/pkg/proto"
 )
 
-// injectFakeProbe 假探测注入（生产 = pkg/probe.Reach；四路真探测判据见
-// host_add_test.go——此处只驱动 CLI 呈现层的档位映射）。返回还原函数。
-func injectFakeProbe(t *testing.T, fn func(ctx context.Context, token string) (*probe.ReachReport, error)) {
-	t.Helper()
-	orig := reachProbe
-	reachProbe = fn
-	t.Cleanup(func() { reachProbe = orig })
+// 假探测注入（§4 收拢后 = 装配期经 facade.Options.Probe 传入 startDaemonForTest；
+// 生产 = pkg/probe.Reach，四路真探测判据见 host_add_test.go——此处只驱动 CLI
+// 呈现层的档位映射）。
+func unreachableProbe(ctx context.Context, token string) (*probe.ReachReport, error) {
+	return &probe.ReachReport{Peer: "16000000", Results: nil}, nil // 全不可达
+}
+
+func relayOnlyProbe(ctx context.Context, token string) (*probe.ReachReport, error) {
+	return &probe.ReachReport{
+		Peer: "17000000",
+		Results: []probe.ReachResult{
+			{EP: "203.0.113.9:41741", RTT: 33 * time.Millisecond, Build: "vtest", Relay: true},
+		},
+	}, nil
+}
+
+func directProbe(ctx context.Context, token string) (*probe.ReachReport, error) {
+	return &probe.ReachReport{
+		Peer:    "18000000",
+		Results: []probe.ReachResult{{EP: "203.0.113.20:41641", RTT: 8 * time.Millisecond}},
+	}, nil
 }
 
 func hostTok(t *testing.T, peer byte, name string) string {
@@ -78,31 +92,23 @@ func TestHostCLINoDaemonActionableError(t *testing.T) {
 }
 
 func TestHostCLIBadTokenLocalReject(t *testing.T) {
-	called := false
-	injectFakeProbe(t, func(ctx context.Context, token string) (*probe.ReachReport, error) {
-		called = true
-		return nil, nil
-	})
 	var buf bytes.Buffer
 	err := hostCLI([]string{"add", "hmw1-not-a-token"}, "cli-test", &buf)
 	if err == nil {
 		t.Fatal("坏 token 应就地报错")
 	}
-	if called {
-		t.Fatal("坏 token 不得触发探测（本地语法校验前置）")
-	}
 	if !strings.Contains(err.Error(), "token 非法") || !strings.Contains(err.Error(), "hmw1") {
 		t.Fatalf("坏 token 错误面：%v", err)
 	}
+	// 「坏 token 不得触发探测」由本地语法校验前置保证（CLI 在连 daemon 之前就地
+	// 拒绝——探测根本无从发起）；服务端对称断言见 host_add_test 的
+	// TestHostAddBadTokenNoProbe（真探测核 + 应答器零命中）。
 }
 
 func TestHostCLIUnreachableThenForce(t *testing.T) {
-	_, sock := startDaemonForTest(t)
+	_, sock := startDaemonForTest(t, unreachableProbe)
 	dir := strings.TrimSuffix(sock, "/control.sock")
 	tok := hostTok(t, 22, "")
-	injectFakeProbe(t, func(ctx context.Context, token string) (*probe.ReachReport, error) {
-		return &probe.ReachReport{Peer: "16000000", Results: nil}, nil // 全不可达
-	})
 
 	var buf bytes.Buffer
 	err := hostCLI([]string{"add", "--state", dir, "--name", "失联", tok}, "cli-test", &buf)
@@ -135,17 +141,9 @@ func TestHostCLIUnreachableThenForce(t *testing.T) {
 // TestHostCLIRelayTierHint 仅中继可达假探测 e2e（relay 档场景证据，r1 ④-2）：
 // 直连无应答 + 中继应答 → 入表 + 中继提示行。
 func TestHostCLIRelayTierHint(t *testing.T) {
-	_, sock := startDaemonForTest(t)
+	_, sock := startDaemonForTest(t, relayOnlyProbe)
 	dir := strings.TrimSuffix(sock, "/control.sock")
 	tok := hostTok(t, 23, "")
-	injectFakeProbe(t, func(ctx context.Context, token string) (*probe.ReachReport, error) {
-		return &probe.ReachReport{
-			Peer: "17000000",
-			Results: []probe.ReachResult{
-				{EP: "203.0.113.9:41741", RTT: 33 * time.Millisecond, Build: "vtest", Relay: true},
-			},
-		}, nil
-	})
 	var buf bytes.Buffer
 	if err := hostCLI([]string{"add", "--state", dir, "--name", "中继后端", tok}, "cli-test", &buf); err != nil {
 		t.Fatalf("仅中继应添加成功：%v", err)
@@ -160,11 +158,8 @@ func TestHostCLIRelayTierHint(t *testing.T) {
 // TestHostCLIListStatusJSON 两主机列表含添加时间 + --json 形状（hosts 数组原样、
 // 无包裹对象；status <name> = 单元素数组）+ 不存在报错。
 func TestHostCLIListStatusJSON(t *testing.T) {
-	_, sock := startDaemonForTest(t)
+	_, sock := startDaemonForTest(t, directProbe)
 	dir := strings.TrimSuffix(sock, "/control.sock")
-	injectFakeProbe(t, func(ctx context.Context, token string) (*probe.ReachReport, error) {
-		return &probe.ReachReport{Peer: "18000000", Results: []probe.ReachResult{{EP: "203.0.113.20:41641", RTT: 8 * time.Millisecond}}}, nil
-	})
 	for _, tc := range []struct {
 		peer byte
 		name string
@@ -231,11 +226,8 @@ func TestHostCLIListStatusJSON(t *testing.T) {
 }
 
 func TestHostCLIDeleteScenarios(t *testing.T) {
-	_, sock := startDaemonForTest(t)
+	_, sock := startDaemonForTest(t, directProbe)
 	dir := strings.TrimSuffix(sock, "/control.sock")
-	injectFakeProbe(t, func(ctx context.Context, token string) (*probe.ReachReport, error) {
-		return &probe.ReachReport{Peer: "19000000", Results: []probe.ReachResult{{EP: "203.0.113.30:41641", RTT: 5 * time.Millisecond}}}, nil
-	})
 	if err := hostCLI([]string{"add", "--state", dir, "--name", "待删", hostTok(t, 26, "")}, "cli-test", &bytes.Buffer{}); err != nil {
 		t.Fatal(err)
 	}
@@ -340,7 +332,7 @@ func (b *skewBackend) AddHost(name, token string, force bool) (control.HostAddRe
 // daemon 后复核，退出码 0（主机确实已被旧 daemon 入表）。
 func TestHostCLIAddVersionSkewNoReach(t *testing.T) {
 	dir := shortTempDirDaemon(t)
-	bus := facade.NewBus(control.NewGeneration(), facade.BusConfig{})
+	bus := facade.NewBus(facade.NewGeneration(), facade.BusConfig{})
 	srv := control.NewServer(control.ServerConfig{ServerVersion: "0.9.0-old", Bus: bus, Backend: &skewBackend{}})
 	sock, ln, err := control.ListenControl(dir)
 	if err != nil {
@@ -386,7 +378,7 @@ func TestResolveHostTargetEmptyRejected(t *testing.T) {
 	origTTY := stdinIsTerminal
 	stdinIsTerminal = func() bool { return false }
 	t.Cleanup(func() { stdinIsTerminal = origTTY })
-	_, sock := startDaemonForTest(t)
+	_, sock := startDaemonForTest(t, directProbe)
 	dir := strings.TrimSuffix(sock, "/"+control.ControlSockName)
 	var buf bytes.Buffer
 	if err := hostCLI([]string{"delete", "--state", dir, "--yes", ""}, "cli-test", &buf); err == nil || !strings.Contains(err.Error(), "空寻址串") {

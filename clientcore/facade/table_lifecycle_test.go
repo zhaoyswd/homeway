@@ -1,7 +1,8 @@
-package daemon
+package facade
 
-// registry_lifecycle_test.go — Registry 生命周期三登记项红绿用例（host-cli 1.3，
-// 3a exec 登记 B5/B6/B7，design D7 拍板口径）：
+// table_lifecycle_test.go — 表生命周期三登记项红绿用例（自 internal/daemon/
+// registry_lifecycle_test.go 随迁，4a 任务 3.1——断言不动；缝随动：stopFunc/
+// newSession 改 facade 包级注入缝、Registry→hostTable）：
 //
 //	B5 先落盘再 Start/换会话：落盘失败注入（新键零副作用、刷新内存保持旧 token
 //	   且旧会话在跑；Remove 对称化——落盘失败 = 内存与会话均未动）；
@@ -10,7 +11,7 @@ package daemon
 //	   清理收工面（Close）记行后继续。
 //
 // 落盘失败注入 = state 目录转只读（saveRecordsLocked 的 MkdirAll 对已存在目录
-// 恒成功、WriteFile 落 EACCES）；会话构造计数经 Registry.newSession 同包接缝。
+// 恒成功、WriteFile 落 EACCES）；会话构造计数经 newSession 包级接缝。
 
 import (
 	"errors"
@@ -39,12 +40,15 @@ func readOnly(t *testing.T, dir string) func() {
 }
 
 // countingSessions 覆写 newSession 为计数桩（不真起会话——B5 判据只看「是否构造」）。
-func countingSessions(r *Registry) *int {
+func countingSessions(t *testing.T, r *hostTable) *int {
+	t.Helper()
 	n := 0
-	r.newSession = func(cfg hostsession.Config, opts hostsession.Options) (*hostsession.Session, error) {
+	orig := newSession
+	newSession = func(cfg hostsession.Config, opts hostsession.Options) (*hostsession.Session, error) {
 		n++
 		return hostsession.NewSession(cfg, opts)
 	}
+	t.Cleanup(func() { newSession = orig })
 	return &n
 }
 
@@ -52,8 +56,8 @@ func countingSessions(r *Registry) *int {
 // 无会话已起（旧实现先 Start 再落盘、失败后只删表不收会话 = 孤儿会话）。
 func TestB5NewKeyPersistFailZeroSideEffect(t *testing.T) {
 	dir := t.TempDir()
-	r := openTestRegistry(t, dir)
-	n := countingSessions(r)
+	r := openTestTable(t, dir, tableOptions{strict: true})
+	n := countingSessions(t, r)
 
 	restore := readOnly(t, dir)
 	tokA, peerA := testToken(t, 11, "127.0.0.1:40011")
@@ -85,8 +89,8 @@ func TestB5NewKeyPersistFailZeroSideEffect(t *testing.T) {
 // 内存留新 token、死表风险）。
 func TestB5RefreshPersistFailKeepsOld(t *testing.T) {
 	dir := t.TempDir()
-	r := openTestRegistry(t, dir)
-	n := countingSessions(r)
+	r := openTestTable(t, dir, tableOptions{strict: true})
+	n := countingSessions(t, r)
 
 	tokA, peerA := testToken(t, 12, "127.0.0.1:40012")
 	if _, err := r.Add("甲", tokA); err != nil {
@@ -124,11 +128,11 @@ func TestB5RefreshPersistFailKeepsOld(t *testing.T) {
 	}
 }
 
-// TestB5RemovePersistFailKeepsEntry Remove 对称化（r2 ④(c)③）：落盘失败 =
-// 内存条目与会话均未动（旧实现先 Stop 再删内存、落盘失败才报错 = 丢内存条目）。
+// TestB5RemovePersistFailKeepsEntry Remove 对称化：落盘失败 = 内存条目与会话
+// 均未动（旧实现先 Stop 再删内存、落盘失败才报错 = 丢内存条目）。
 func TestB5RemovePersistFailKeepsEntry(t *testing.T) {
 	dir := t.TempDir()
-	r := openTestRegistry(t, dir)
+	r := openTestTable(t, dir, tableOptions{strict: true})
 
 	tokA, peerA := testToken(t, 13, "127.0.0.1:40013")
 	if _, err := r.Add("甲", tokA); err != nil {
@@ -160,13 +164,13 @@ func TestB5RemovePersistFailKeepsEntry(t *testing.T) {
 // reentrantEvents 重入回调（B6 红路构造：锁内发射时回调重入 Hosts()/Sessions()
 // 自死锁——锁外 emit 后可重入）。
 type reentrantEvents struct {
-	r    *Registry
+	r    *hostTable
 	mu   sync.Mutex
 	fast []string // 重入成功的主机 id
 }
 
 func (e *reentrantEvents) HostAdded(id, name string, addedAt int64) {
-	_ = e.r.Hosts() // 重入读表（旧实现：Registry.mu 已被 Add 持有 → 死锁）
+	_ = e.r.Hosts() // 重入读表（旧实现：表锁已被 Add 持有 → 死锁）
 	e.mu.Lock()
 	e.fast = append(e.fast, id)
 	e.mu.Unlock()
@@ -186,7 +190,7 @@ func (e *reentrantEvents) HostStateChanged(id, from, to, reason string) {}
 func TestB6ReentrantCallbackNoDeadlock(t *testing.T) {
 	dir := t.TempDir()
 	ev := &reentrantEvents{}
-	r, err := OpenRegistry(dir, RegistryOptions{StrictIdentity: true, Events: ev})
+	r, err := openTable(dir, tableOptions{strict: true, events: ev})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -232,9 +236,9 @@ func TestB7RefreshRejectOnStopTimeout(t *testing.T) {
 	dir := t.TempDir()
 	var lines []string
 	var mu sync.Mutex
-	r, err := OpenRegistry(dir, RegistryOptions{
-		StrictIdentity: true,
-		Eventf: func(format string, args ...any) {
+	r, err := openTable(dir, tableOptions{
+		strict: true,
+		eventf: func(format string, args ...any) {
 			mu.Lock()
 			lines = append(lines, fmt.Sprintf(format, args...))
 			mu.Unlock()
@@ -278,11 +282,10 @@ func TestB7RefreshRejectOnStopTimeout(t *testing.T) {
 	if r.Session(peerA) != oldSess {
 		t.Fatal("拒绝后旧会话对象应未动")
 	}
-	// exec-r1 第 7 条措辞对齐：对象未换 ≠ 会话在跑——stopFunc 已返回 -1（真实
-	// 语义 = Session.Stop 的 stopOnce 已触发、等待收尾超时），旧会话已进入垂死/
-	// 收尾，该主机短暂离线属预期；本用例注入缝直接短路返回，真实 Stop 语义见
-	// hostsession/service.go 的 stopOnce 注释。落盘失败路径（上一用例）才是
-	// 「会话完全未动」。
+	// 对象未换 ≠ 会话在跑——stopFunc 已返回 -1（真实语义 = Session.Stop 的
+	// stopOnce 已触发、等待收尾超时），旧会话已进入垂死/收尾，该主机短暂离线属
+	// 预期；本用例注入缝直接短路返回，真实 Stop 语义见 hostsession/service.go
+	// 的 stopOnce 注释。落盘失败路径（上一用例）才是「会话完全未动」。
 	// 磁盘或已含新 token（B5 先落盘语义——拒绝只回滚内存，磁盘收敛如实注记）：
 	// 重试（stopFunc 恢复）后内存与磁盘一致。
 	b, err := os.ReadFile(filepath.Join(dir, hostsFileName))
@@ -304,9 +307,9 @@ func TestB7RemoveRejectOnStopTimeout(t *testing.T) {
 	dir := t.TempDir()
 	var lines []string
 	var mu sync.Mutex
-	r, err := OpenRegistry(dir, RegistryOptions{
-		StrictIdentity: true,
-		Eventf: func(format string, args ...any) {
+	r, err := openTable(dir, tableOptions{
+		strict: true,
+		eventf: func(format string, args ...any) {
 			mu.Lock()
 			lines = append(lines, fmt.Sprintf(format, args...))
 			mu.Unlock()
@@ -353,9 +356,9 @@ func TestB7CloseContinuesOnStopTimeout(t *testing.T) {
 	dir := t.TempDir()
 	var lines []string
 	var mu sync.Mutex
-	r, err := OpenRegistry(dir, RegistryOptions{
-		StrictIdentity: true,
-		Eventf: func(format string, args ...any) {
+	r, err := openTable(dir, tableOptions{
+		strict: true,
+		eventf: func(format string, args ...any) {
 			mu.Lock()
 			lines = append(lines, fmt.Sprintf(format, args...))
 			mu.Unlock()
@@ -405,7 +408,7 @@ func TestB7CloseContinuesOnStopTimeout(t *testing.T) {
 	if len(r.Hosts()) != 0 {
 		t.Fatal("Close 后表应清空")
 	}
-	// 收尾：恢复真停步并逐台真收——注入 -1 时 Close 记行后继续但**不会真停会话**，
+	// 收尾：恢复真停步并逐台真停——注入 -1 时 Close 记行后继续但**不会真停会话**，
 	// 在跑会话的 identity 写入会与 TempDir 清理竞争（CI 实测 unlinkat "directory
 	// not empty"——2026-09-29 v0.10.0 tag 首跑）。
 	stopFunc = origStop

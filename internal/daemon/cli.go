@@ -1,9 +1,10 @@
 package daemon
 
 // cli.go — homeway daemon [--state DIR]（host-registry-daemon 2.3 + §3.6 控制面
-// 装配）：装配序（D4）：取锁 → OpenState → 读期望态（损坏按默认 + 告警不拒启）→
-// client 角色挂注册表（角色子系统，2.4）→ 控制面（§3：internal/control——
-// control.sock 0600、事件总线、流腿）→ 等信号收工。
+// 装配；§4 收拢后经 facade 单入口）：装配序（D4）：取锁 → OpenState → 读期望态
+// （损坏按默认 + 告警不拒启）→ 进程级 facade.Daemon（总线/代际/词汇随进程唯一）
+// + client 角色挂主机表（Attach/Detach，角色子系统）→ 控制面（§3：
+// internal/control——control.sock 0600、事件总线、流腿）→ 等信号收工。
 //
 // ⚠️ 与出口禁止同 state 目录（D2 组合处置）：daemon 侧硬拦（checkNotExitState——
 // state 下有 tokens.jsonl 即拒启）；exit/relay 侧不检测（锁只约束 daemon），方向上
@@ -20,8 +21,7 @@ import (
 	"syscall"
 
 	"github.com/zhaoyswd/homeway/clientcore/facade"
-	"github.com/zhaoyswd/homeway/clientcore/hostsession"
-	"github.com/zhaoyswd/homeway/internal/control"
+	"github.com/zhaoyswd/homeway/pkg/probe"
 )
 
 // CLI daemon 子命令入口（cmd/homeway 转发；version 随构建注入——welcome/
@@ -72,27 +72,33 @@ func CLI(args []string, version string) error {
 	}
 	defer st.Close()
 
-	// ③ 期望态（损坏按默认 + 告警不拒启，HD「角色期望态」）。
+	// ③ 期望态（损坏按默认 + 告警不拒启，HD「角色期望态」——client/control
+	// 未登记均默认 on，v1 兼容，r2 新-2）。
 	desired := loadDesiredState(*stateDir, st.Eventf)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	// ④ 角色子系统：本期仅 client（注册表按 hosts.json 逐后端拉会话）；注册表
-	// 经 holder 与控制面共享（角色重建时换实例，重建窗口 = not_ready）。总线
-	// 先建（holder 引用；代际每次启动随机）。
-	bus := facade.NewBus(control.NewGeneration(), facade.BusConfig{})
-	holder := newRegistryHolder(bus)
+	// ④ 进程级 facade.Daemon（总线/代际/词汇随进程唯一——角色重建不换不换代际，
+	// r1 高-2）+ 角色子系统（client = 主机表宿主：Attach → 等 ctx → Detach；
+	// 注册表语义与 host.add 服务端验证全在 facade）。
+	d := facade.New(facade.Options{
+		StrictIdentity: true, // daemon = 严格身份（D2/N2）
+		Logf:           st.Debugf,
+		Eventf:         st.Eventf,
+		Probe:          probe.Reach, // 生产探测核透传（与手机 App 同源；daemon 侧测试注入假探测经此缝）
+	})
+	defer d.Close() // Close 唯一调用点 = 进程收工（先 Detach 再总线收尾，r2 新-15）
 	sup := newSupervisor(st.Eventf, st.Debugf)
 	if desired.roleEnabled("client") {
-		sup.Start(ctx, func() Role { return newClientRole(*stateDir, st, holder) }, nil)
+		sup.Start(ctx, func() Role { return newClientRole(*stateDir, st, d) }, nil)
 	} else {
 		st.Eventf("daemon: client 角色未启用（roles.json）——控制面只读骨架")
 	}
 
 	// ⑤ 控制面（§3）：server（control.sock 0600；监听失败 = 报错退出——控制面
 	// 是 daemon 的用户面，静默缺失无从排查）。
-	srv, stopControl, err := startControlPlane(version, *stateDir, sup, holder, bus, st.Eventf)
+	srv, stopControl, err := startControlPlane(version, *stateDir, sup, d, st.Eventf)
 	if err != nil {
 		cancel()
 		return err
@@ -123,38 +129,27 @@ func checkNotExitState(stateDir string) error {
 	return nil
 }
 
-// clientRole client 角色：多主机会话注册表的宿主（失败由 supervisor 退避重建——
-// 重建时重新 OpenRegistry，按 hosts.json 恢复会话；Registry 事件接进控制面总线）。
+// clientRole client 角色：主机表的生命周期宿主（r1 高-2 两层拆分——角色级
+// Attach/Detach）：attach → 等待 ctx → detach；失败/panic 由 supervisor 退避
+// 重建 = 重新 attach（重建窗口 = NotReady；总线与代际随进程唯一不变）。
 type clientRole struct {
 	stateDir string
 	st       *DaemonState
-	holder   *registryHolder
+	d        *facade.Daemon
 }
 
-func newClientRole(stateDir string, st *DaemonState, holder *registryHolder) *clientRole {
-	return &clientRole{stateDir: stateDir, st: st, holder: holder}
+func newClientRole(stateDir string, st *DaemonState, d *facade.Daemon) *clientRole {
+	return &clientRole{stateDir: stateDir, st: st, d: d}
 }
 
 func (r *clientRole) Name() string { return "client" }
 
 func (r *clientRole) Run(ctx context.Context) error {
-	// 事件接线：Registry 事件 → 控制面总线 session 域（bus 随进程唯一；角色重建
-	// 换 Registry 实例、总线与代际不变）。
-	reg, err := OpenRegistry(r.stateDir, RegistryOptions{
-		StrictIdentity: true, // daemon = 严格身份（D2/N2）
-		Logf:           hostsession.Logf(r.st.Debugf),
-		Eventf:         r.st.Eventf, // hosts.json 损坏备份等用户应见异常 → events.log
-		Events:         &registryEventsAdaptor{bus: r.holder.bus()},
-	})
-	if err != nil {
-		return err // 角色失败 → 退避重建
+	if err := r.d.Attach(r.stateDir); err != nil {
+		return err // 角色失败 → 退避重建（重新 attach）
 	}
-	r.holder.set(reg)
-	defer func() {
-		r.holder.set(nil)
-		reg.Close()
-	}()
-	r.st.Eventf("client: 注册表就绪（主机 %d 台，state=%s）", len(reg.Hosts()), r.stateDir)
+	defer r.d.Detach()
+	r.st.Eventf("client: 注册表就绪（主机 %d 台，state=%s）", len(r.d.HostBriefs()), r.stateDir)
 	<-ctx.Done()
 	return ctx.Err() // ctx 取消族 = 正常收工
 }
