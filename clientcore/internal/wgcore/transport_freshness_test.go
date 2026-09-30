@@ -155,16 +155,31 @@ func TestDomainResolveFailureKeepsLast(t *testing.T) {
 	}
 }
 
-// injectAdopt：从 src 直接往 Bind 端口发一个包，让 Bind 采纳该来源（device 会丢弃
-// 无效载荷，但采纳已发生）。relay=true 时按腿帧形态发（src 须是 relay 候选）。
-func injectAdopt(t *testing.T, tr *Transport, relay bool) netip.AddrPort {
+// adoptSock：注入源 socket（injectAdopt 的前半拆分）——源地址先拿到、注入时机交给
+// 调用方：中继采纳用例必须**先 SetCandidates（源进 relayEps）再注入**，见 injectFrom。
+func adoptSock(t *testing.T) *net.UDPConn {
 	t.Helper()
 	sock, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = sock.Close() })
-	src := sock.LocalAddr().(*net.UDPAddr).AddrPort()
+	return sock
+}
+
+// adoptSrc：注入源 socket 的对外地址（候选表登记用）。
+func adoptSrc(sock *net.UDPConn) netip.AddrPort {
+	return sock.LocalAddr().(*net.UDPAddr).AddrPort()
+}
+
+// injectFrom：从 sock 往 Bind 端口发一个包，让 Bind 采纳该来源（device 会丢弃
+// 无效载荷，但采纳已发生）。relay=true 时按腿帧形态发——**src 须已在候选表的
+// Relay 位**：采纳点的 relay 判定查的是收包当拍的 relayEps 表，包先于
+// SetCandidates 到达会被采纳成 direct，且之后再无包来纠正 ⇒ waitFor 必超时
+// （2026-09-30 v0.12.0 发版前 dispatch 验腿 linux CI 连红的根因——读 goroutine
+// 与 SetCandidates/rebuildRelayEps 的真竞态；真实次序也是 token 候选先于腿帧）。
+func injectFrom(t *testing.T, tr *Transport, sock *net.UDPConn, relay bool) {
+	t.Helper()
 	bind := tr.core.Bind()
 	deadline := time.Now().Add(3 * time.Second)
 	for bind.Port() == 0 && time.Now().Before(deadline) {
@@ -181,6 +196,15 @@ func injectAdopt(t *testing.T, tr *Transport, relay bool) netip.AddrPort {
 	if _, err := sock.WriteToUDP(payload, dst); err != nil {
 		t.Fatal(err)
 	}
+}
+
+// injectAdopt：一条龙（开 socket + 立即注入）——直连采纳用例专属（direct 判定不查
+// relayEps，无注入次序约束）；中继形态用例走 adoptSock + SetCandidates + injectFrom。
+func injectAdopt(t *testing.T, tr *Transport, relay bool) netip.AddrPort {
+	t.Helper()
+	sock := adoptSock(t)
+	src := adoptSrc(sock)
+	injectFrom(t, tr, sock, relay)
 	return src
 }
 
@@ -192,11 +216,14 @@ func TestLateDomainResolveSoftRearmOnRelay(t *testing.T) {
 			return []netip.Addr{netip.MustParseAddr("192.0.2.50")}, nil
 		})
 	// 造一条中继候选并注入腿帧 ⇒ 赛跑以中继「结算」（adopted=relay）。
-	relaySrc := injectAdopt(t, tr, true)
+	// 先入表再注入（次序约束见 injectFrom）：包先到会被采纳成 direct 且无法纠正。
+	relaySock := adoptSock(t)
+	relaySrc := adoptSrc(relaySock)
 	tr.core.Bind().SetCandidates([]wtransport.Candidate{
 		{Addr: netip.MustParseAddrPort("192.0.2.10:41641")},
 		{Addr: relaySrc, Relay: true},
 	})
+	injectFrom(t, tr, relaySock, true)
 	waitFor(t, 10*time.Second, func() bool {
 		_, relay, ok := tr.core.Bind().Adopted()
 		return ok && relay
@@ -279,9 +306,12 @@ func TestNotePathAliveSkipsRelay(t *testing.T) {
 	}
 
 	// 中继来源：不落（学习地址一律 direct，中继腿由 token/带内给）。
+	// 先入表再注入（次序约束见 injectFrom）。
 	before := len(cache.Entries(time.Now()))
-	relaySrc := injectAdopt(t, tr, true)
+	relaySock := adoptSock(t)
+	relaySrc := adoptSrc(relaySock)
 	tr.core.Bind().SetCandidates([]wtransport.Candidate{{Addr: relaySrc, Relay: true}})
+	injectFrom(t, tr, relaySock, true)
 	waitFor(t, 10*time.Second, func() bool {
 		_, relay, ok := tr.core.Bind().Adopted()
 		return ok && relay
