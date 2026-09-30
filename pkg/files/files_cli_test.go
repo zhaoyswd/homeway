@@ -893,9 +893,11 @@ func TestFilesCLITokenBucketBurstCapAfterPause(t *testing.T) {
 	}
 }
 
-// Await 吃 ctx（exec-r1 F5 用例）：小速率下单帧等待可达秒级（16KiB @1024B/s =
-// 16s），ctx 取消必须即时打断等待并返回 ctx.Err()——退出时间有界，不被拖到
-// 「一帧/速率」烧尽。
+// Await 吃 ctx（exec-r1 F5 用例）：小速率下单块等待可达秒级乃至分钟级（真实配额
+// 单位 = 本地读块 ≤ MaxChunk = 256KiB，--rate-limit 1024 下满读块 = 256s；本例以
+// 16KiB 配额缩短等待窗口），ctx 取消必须即时打断等待并返回 ctx.Err()——退出时间
+// 有界，不被拖到「一块/速率」烧尽。n=16KiB > burst=1024 ⇒ 走 N1 整块配额分支
+// （等待 = n/rate = 16s，取消在 ~150ms 打断）。
 func TestFilesCLITokenBucketAwaitCancelBounded(t *testing.T) {
 	tb := newTokenBucket(1024) // --rate-limit 1024（合法值域下界附近）
 	ctx, cancel := context.WithCancel(context.Background())
@@ -904,7 +906,7 @@ func TestFilesCLITokenBucketAwaitCancelBounded(t *testing.T) {
 		cancel()
 	}()
 	start := time.Now()
-	err := tb.Await(ctx, 16*1024) // 需 ~16s 的等待——取消应 ~150ms 内打断
+	err := tb.Await(ctx, 16*1024) // 需 ~16s 的等待（16KiB @1024B/s）——取消应 ~150ms 内打断
 	el := time.Since(start)
 	if err == nil {
 		t.Fatal("取消后 Await 必须返回错误（ctx.Err）")
@@ -914,6 +916,51 @@ func TestFilesCLITokenBucketAwaitCancelBounded(t *testing.T) {
 	}
 	if el > 3*time.Second {
 		t.Fatalf("取消后退出被拖到 %v——sleep 不可打断（F5 未生效，应 ~150ms）", el)
+	}
+}
+
+// 小速率有界等待（exec-r2 N1 用例，随 3e 发版窗口修）：配额单位 = 本地读块
+// （≤ MaxChunk = 256KiB，client.go 上传循环按读块取配额），不是 16KiB 线帧。
+// 0 < rate < n 时 burst = min(rate, 256KiB) < n，旧实现 tokens 恒被高水位截在
+// burst 以下 ⇒ 永攒不够一块、Await 无界不返回（exec-r2 探针实测：131072/262143
+// 5s 未返回——合法 flag 值下 put 永久挂死；262144 起 1s）。修复后单块配额不受
+// 高水位约束，一律按 n/rate 节拍有界返回（边界 rate=n 走正常路径，节拍不变）。
+// 131072 档连取两块：第二块仍按整块节拍等待（积累作废，不得凭上一块等待期间的
+// 积累立刻放行）。
+func TestFilesCLITokenBucketSmallRateBounded(t *testing.T) {
+	if testing.Short() {
+		t.Skip("节拍用例需要真实时间")
+	}
+	for _, tc := range []struct {
+		name  string
+		rate  int64
+		calls int
+		was   string // 旧实现行为（exec-r2 探针留档）
+	}{
+		{name: "rate=131072（旧实现挂死）", rate: 131072, calls: 2, was: "5s 未返回"},
+		{name: "rate=262143（旧实现挂死）", rate: 262143, calls: 1, was: "5s 未返回"},
+		{name: "rate=262144（边界 = MaxChunk，正常路径）", rate: MaxChunk, calls: 1, was: "1s 返回"},
+		{name: "rate=524288（正常路径）", rate: 512 << 10, calls: 1, was: "500ms 返回"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			tb := newTokenBucket(tc.rate)
+			want := time.Duration(float64(MaxChunk) / float64(tc.rate) * float64(time.Second))
+			for call := 1; call <= tc.calls; call++ {
+				start := time.Now()
+				if err := tb.Await(context.Background(), MaxChunk); err != nil {
+					t.Fatalf("无取消 ctx 下 Await 不应报错：%v", err)
+				}
+				el := time.Since(start)
+				if el < want*9/10 {
+					t.Fatalf("第 %d 块节拍失守：256KiB @%dB/s 用时 %v（期望 ≥%v 的 90%%）——空桶起步应按 n/rate 等待",
+						call, tc.rate, el, want)
+				}
+				if el > want*3+2*time.Second {
+					t.Fatalf("第 %d 块等待过长：用时 %v 超期望 %v 的 3 倍——小速率下仍近无界（旧实现：%s）",
+						call, el, want, tc.was)
+				}
+			}
+		})
 	}
 }
 

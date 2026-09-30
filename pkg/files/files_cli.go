@@ -982,19 +982,31 @@ type tokenBucket struct {
 	last   time.Time
 }
 
-// Await 为 n 字节的发送配额等待（每帧发送前调用；sleep 粒度 = 攒够本帧的差额）。
+// Await 为 n 字节的发送配额等待（上传循环按**本地读块**调用，配额单位 = 读块
+// （≤ MaxChunk = 256KiB），不是 16KiB 线帧；sleep 粒度 = 攒够本块的差额）。
 // ctx 取消即时打断等待并返回 ctx.Err()（exec-r1 F5，2026-09-30）：time.Sleep 不可
-// 打断，小速率下单帧等待可达秒级（--rate-limit 1024 下 16KiB 帧 = 16s），Ctrl-C
-// 退出不应被拖到单帧等待烧尽——由上传循环收流取消。
+// 打断，小速率下单块等待可达秒级乃至分钟级（--rate-limit 1024 下满读块 = 256s），
+// Ctrl-C 退出不应被拖到单块等待烧尽——由上传循环收流取消。
+// 单块配额 > burst（0 < rate < MaxChunk）时**不走高水位攒额**：按 n/rate 等满整块
+// 配额后置 tokens=0 放行（exec-r2 N1，随 3e 发版窗口修）——否则 tokens 恒被高水位
+// 截在 burst 以下、永攒不够一块，Await 无界不返回（旧实现 = 该值域下 put 永久挂
+// 死）。已积累令牌一并作废：上一块的等待时间已花在上一块上，不得凭积累立刻放行
+// 整块（burst 仍约束桶内可立即灌入的增量，F2 停顿削峰不削弱）；稳态（背靠背读块）
+// tokens≈0，每块恰按 n/rate 节拍。
 func (b *tokenBucket) Await(ctx context.Context, n int) error {
 	for {
 		b.mu.Lock()
 		now := time.Now()
 		b.tokens += now.Sub(b.last).Seconds() * float64(b.rate)
+		b.last = now
+		if int64(n) > b.burst {
+			b.tokens = 0 // 整块配额放行 = 积累作废（见函数注释）
+			b.mu.Unlock()
+			return sleepCtx(ctx, time.Duration(float64(n)/float64(b.rate)*float64(time.Second)))
+		}
 		if b.tokens > float64(b.burst) {
 			b.tokens = float64(b.burst)
 		}
-		b.last = now
 		if float64(n) <= b.tokens {
 			b.tokens -= float64(n)
 			b.mu.Unlock()
