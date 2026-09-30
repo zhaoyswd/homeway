@@ -209,7 +209,7 @@ func (c *conn) lookupStream(id uint32) *stream {
 // → 收流（gone——如实边界，非无限缓速排空；发送端仍义务分片节流）。
 // 边界注记（exec-r1 低-7）：「永不阻塞」限定**转投路径**（select default）；缓冲
 // 耗尽路径的内联 finish 会阻塞在 dataC <- end（前端不读下行时）——该阻塞受写停滞
-// 看门狗兜底（UpStallTimeout 30s 量级，非无界）。
+// 看门狗兜底（writeStallTimeout 30s 量级，非无界）。
 func (c *conn) handleStreamData(body []byte) {
 	id, payload, err := DecodeStreamBody(body)
 	if err != nil {

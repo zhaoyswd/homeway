@@ -169,6 +169,9 @@ homeway daemon status --watch  # live 渲染：快照 + 订阅续播（state/rea
                                # ——watch 期间被显示主机（启动时列表）视为有需求（门控
                                # 不压制其巡检证据），退出后贡献消失。视图声明 = 启动时
                                # 列表（期间增删的主机照常渲染、不追溯进视图声明）。
+                               # daemon 角色重建（detach/attach）时补发的 session.added
+                               # 仅恢复登记面（host/name），state/link 待后续事件或前端
+                               # 重快照（exec-r2 新-2 口径）。
                                # （不叫 homeway status --watch——3f 的 homeway status
                                # 聚合命令落地时按其同升清单吸收迁移。）
 ```
@@ -296,6 +299,13 @@ clientcore-facade「收拢判据」；4b 升 CI 门时沿用本命令）：
 
 （`[ -z ]` 口径：`grep -v` 全过滤时退出码 1，直接拿管道退出码当门会假红；排除
 模式不带尾引号——facade 子包同被排除。）
+
+race 门（4a 终态口径，五包——hostsession 自 demand/diag 批起是改动面，exec-r2 后
+入列；4b 升 CI 门时沿用本命令）：
+
+```bash
+go test -race -count=1 ./clientcore/facade/ ./clientcore/hostsession/ ./internal/control/ ./internal/daemon/ ./pkg/term/
+```
 
 发版 = 推 tag（`v0.x.y`），CI 出 darwin/linux 四目标产物 + sha256（见
 `.github/workflows/release.yml`）。

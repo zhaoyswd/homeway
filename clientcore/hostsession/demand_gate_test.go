@@ -312,12 +312,26 @@ func TestRecoverGateProbeWindowDiag(t *testing.T) {
 	if got := diagCap.snapshot(); len(got) != 1 || got[0] != "probe_window" {
 		t.Fatalf("在途轮期间 probe_window 应单飞恰一条：%v", got)
 	}
-	// 轮结束：清态。
+	// 轮结束：清态。清位发生在 merge 的 g.mu 临界区内、而等待者从 <-r.done
+	// 返回不经 g.mu——清位可能尚未落到测试 goroutine，故锁内读 + 有界轮询
+	// 等清位（exec-r2 新-1：测试无锁读 diagActive 是数据竞争，基线即有）。
 	close(roundHold)
 	<-waiter1
 	<-waiter2
-	if _, still := s.diagActive["probe_window"]; still {
-		t.Fatal("轮结束应清 probe_window 态")
+	deadline = time.After(3 * time.Second)
+	for {
+		s.mu.Lock()
+		_, still := s.diagActive["probe_window"]
+		s.mu.Unlock()
+		if !still {
+			break
+		}
+		select {
+		case <-deadline:
+			t.Fatal("轮结束应清 probe_window 态")
+		default:
+			time.Sleep(5 * time.Millisecond)
+		}
 	}
 
 	// 下一轮的等待者可再发（状态离开过）。
