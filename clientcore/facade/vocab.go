@@ -42,6 +42,17 @@ const (
 	OpEventsUnsubscribe = "events.unsubscribe"
 	OpStreamOpen        = "stream.open"
 	OpStreamClose       = "stream.close"
+	// forward-socks-speedtest（3e）只增 9 op：承载面（forward/socks/speedtest）
+	// 守护托管操作——语义入口 = Carriers 三管理器（carriers.go，镜像同源契约）。
+	OpForwardAdd      = "forward.add"
+	OpForwardRemove   = "forward.remove"
+	OpForwardList     = "forward.list"
+	OpSocksOn         = "socks.on"
+	OpSocksOff        = "socks.off"
+	OpSocksStatus     = "socks.status"
+	OpSpeedtestStart  = "speedtest.start"
+	OpSpeedtestStatus = "speedtest.status"
+	OpSpeedtestCancel = "speedtest.cancel"
 )
 
 // ---------- reach.tier ----------

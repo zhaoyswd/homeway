@@ -247,6 +247,33 @@ func (b *noopBackend) NotReady() bool { return true }
 
 func (b *noopBackend) DemandStatus() []control.HostDemandBrief { return nil }
 
+// 承载面 9 op（3e）：noop 空 impl（本文件只考 control 角色，不走承载面路径）。
+func (b *noopBackend) ForwardAdd(a control.ForwardAddArgs) (control.ForwardAddResult, error) {
+	return control.ForwardAddResult{}, control.ErrBackendNoHost
+}
+func (b *noopBackend) ForwardRemove(a control.ForwardRemoveArgs) error {
+	return control.ErrBackendNoHost
+}
+func (b *noopBackend) ForwardList(host string) control.ForwardListResult {
+	return control.ForwardListResult{Forwards: []control.ForwardRuleBrief{}}
+}
+func (b *noopBackend) SocksOn(host string, listen uint16) (control.SocksOnResult, error) {
+	return control.SocksOnResult{}, control.ErrBackendNoHost
+}
+func (b *noopBackend) SocksOff(host string) (control.SocksOffResult, error) {
+	return control.SocksOffResult{}, control.ErrBackendNoHost
+}
+func (b *noopBackend) SocksStatus() control.SocksStatusResult {
+	return control.SocksStatusResult{Socks: []control.SocksBrief{}}
+}
+func (b *noopBackend) SpeedtestStart(a control.SpeedtestStartArgs) (control.SpeedtestStartAck, error) {
+	return control.SpeedtestStartAck{}, control.ErrBackendNoHost
+}
+func (b *noopBackend) SpeedtestStatus(host string) (control.SpeedtestStatusResult, error) {
+	return control.SpeedtestStatusResult{}, control.ErrBackendNoHost
+}
+func (b *noopBackend) SpeedtestCancel(host string) error { return control.ErrBackendNoHost }
+
 // TestControlRoleV1RolesJsonDefaultOn ④（r2 新-2）：既有 v1 roles.json（仅 client）
 // → 未登记的 control 按默认 on 装配——roles 面可见 control=running、控制面可拨。
 func TestControlRoleV1RolesJsonDefaultOn(t *testing.T) {

@@ -54,4 +54,31 @@ type Backend interface {
 	// DemandStatus 各主机最近一拍的需求判定（daemon.status 的 demand 段，4a
 	// §6.2——词表只增；宿主无需求面时返回 nil）。
 	DemandStatus() []HostDemandBrief
+
+	// ---------- 承载面（3e 只增 9 op 的宿主面；语义全在 facade.Carriers） ----------
+	//
+	// 错误族：主机不在表（host 载荷值域）= ErrBackendNoHost → no_host；值域外/
+	// 冲突/监听失败等 = 其它 error → bad_request（错误码零新增，dispatch 层统一
+	// 映射）。busy 是 SpeedtestStart 成功载荷里的 reason，不占错误族。
+
+	// ForwardAdd 建规则并当场起监听（失败不入表）。
+	ForwardAdd(args ForwardAddArgs) (ForwardAddResult, error)
+	// ForwardRemove 删规则（不强关在世连接）。
+	ForwardRemove(args ForwardRemoveArgs) error
+	// ForwardList 规则表快照（host 空 = 全部）。
+	ForwardList(host string) ForwardListResult
+	// SocksOn 开 SOCKS 监听（listen 0 = 沿用记忆/1080），返回实际端口。
+	SocksOn(host string, listen uint16) (SocksOnResult, error)
+	// SocksOff 关监听（显式 RST 在世连接；端口记忆保留），返回记忆端口。
+	SocksOff(host string) (SocksOffResult, error)
+	// SocksStatus 各主机承载态快照。
+	SocksStatus() SocksStatusResult
+	// SpeedtestStart 开跑（立即返回 waiting/busy 相位——busy = 成功载荷 reason；
+	// host 不在表 = ErrBackendNoHost）。
+	SpeedtestStart(args SpeedtestStartArgs) (SpeedtestStartAck, error)
+	// SpeedtestStatus 该主机运行态（无运行面 = Phase 空闲形态；host 不在表 =
+	// ErrBackendNoHost）。
+	SpeedtestStatus(host string) (SpeedtestStatusResult, error)
+	// SpeedtestCancel 取消该主机当前轮（幂等；host 不在表 = ErrBackendNoHost）。
+	SpeedtestCancel(host string) error
 }

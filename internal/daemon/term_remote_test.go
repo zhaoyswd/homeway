@@ -98,6 +98,33 @@ func (b *remoteTestBackend) NotReady() bool {
 
 func (b *remoteTestBackend) DemandStatus() []control.HostDemandBrief { return nil }
 
+// 承载面 9 op（3e）：term/files 面测试不走承载路径——noop。
+func (b *remoteTestBackend) ForwardAdd(a control.ForwardAddArgs) (control.ForwardAddResult, error) {
+	return control.ForwardAddResult{}, control.ErrBackendNoHost
+}
+func (b *remoteTestBackend) ForwardRemove(a control.ForwardRemoveArgs) error {
+	return control.ErrBackendNoHost
+}
+func (b *remoteTestBackend) ForwardList(host string) control.ForwardListResult {
+	return control.ForwardListResult{Forwards: []control.ForwardRuleBrief{}}
+}
+func (b *remoteTestBackend) SocksOn(host string, listen uint16) (control.SocksOnResult, error) {
+	return control.SocksOnResult{}, control.ErrBackendNoHost
+}
+func (b *remoteTestBackend) SocksOff(host string) (control.SocksOffResult, error) {
+	return control.SocksOffResult{}, control.ErrBackendNoHost
+}
+func (b *remoteTestBackend) SocksStatus() control.SocksStatusResult {
+	return control.SocksStatusResult{Socks: []control.SocksBrief{}}
+}
+func (b *remoteTestBackend) SpeedtestStart(a control.SpeedtestStartArgs) (control.SpeedtestStartAck, error) {
+	return control.SpeedtestStartAck{}, control.ErrBackendNoHost
+}
+func (b *remoteTestBackend) SpeedtestStatus(host string) (control.SpeedtestStatusResult, error) {
+	return control.SpeedtestStatusResult{}, control.ErrBackendNoHost
+}
+func (b *remoteTestBackend) SpeedtestCancel(host string) error { return control.ErrBackendNoHost }
+
 // ---- term 帧最小编解码（pkg/term 帧格式：[op:1][len:2 LE][payload]）----
 
 func encTermFrame(op byte, payload []byte) []byte {

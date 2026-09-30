@@ -328,6 +328,33 @@ func (b *skewBackend) AddHost(name, token string, force bool) (control.HostAddRe
 	return control.HostAddResult{ID: fmt.Sprintf("%064x", 7), Name: name, AddedAt: 1760000000000}, nil
 }
 
+// 承载面 9 op（3e）：旧 daemon 语义 = 全 unknown_op 由 dispatch 兜（不会到达这里）。
+func (b *skewBackend) ForwardAdd(a control.ForwardAddArgs) (control.ForwardAddResult, error) {
+	return control.ForwardAddResult{}, control.ErrBackendNoHost
+}
+func (b *skewBackend) ForwardRemove(a control.ForwardRemoveArgs) error {
+	return control.ErrBackendNoHost
+}
+func (b *skewBackend) ForwardList(host string) control.ForwardListResult {
+	return control.ForwardListResult{Forwards: []control.ForwardRuleBrief{}}
+}
+func (b *skewBackend) SocksOn(host string, listen uint16) (control.SocksOnResult, error) {
+	return control.SocksOnResult{}, control.ErrBackendNoHost
+}
+func (b *skewBackend) SocksOff(host string) (control.SocksOffResult, error) {
+	return control.SocksOffResult{}, control.ErrBackendNoHost
+}
+func (b *skewBackend) SocksStatus() control.SocksStatusResult {
+	return control.SocksStatusResult{Socks: []control.SocksBrief{}}
+}
+func (b *skewBackend) SpeedtestStart(a control.SpeedtestStartArgs) (control.SpeedtestStartAck, error) {
+	return control.SpeedtestStartAck{}, control.ErrBackendNoHost
+}
+func (b *skewBackend) SpeedtestStatus(host string) (control.SpeedtestStatusResult, error) {
+	return control.SpeedtestStatusResult{}, control.ErrBackendNoHost
+}
+func (b *skewBackend) SpeedtestCancel(host string) error { return control.ErrBackendNoHost }
+
 // TestHostCLIAddVersionSkewNoReach 版本偏斜（exec-r1 第 1 条，P0）：旧 daemon 的
 // host.add 响应无 reach 字段——新 CLI 不得 panic、不得静默，走降级分支提示重启
 // daemon 后复核，退出码 0（主机确实已被旧 daemon 入表）。

@@ -12,9 +12,11 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"time"
 
 	"github.com/zhaoyswd/homeway/clientcore/facade"
 	"github.com/zhaoyswd/homeway/internal/control"
+	"github.com/zhaoyswd/homeway/pkg/speedtest"
 )
 
 // 流腿的服务端口 = 客户端会话的核内约定（spec「流式通道」：端口 MUST NOT 出现在
@@ -188,6 +190,193 @@ func (b *controlBackend) DialStream(ctx context.Context, kind, host string) (net
 
 // NotReady 表未 attach（角色未跑/重建窗口——facade 化的「holder 为 nil」判定）。
 func (b *controlBackend) NotReady() bool { return b.d.NotReady() }
+
+// ---------- 承载面绑定（3e §3.1）：op ↔ facade.Carriers 的字段映射（纯绑定） ----------
+//
+// 语义全在 facade（规则校验/监听生命周期/runner 状态机）；本层只做 host hex 存在性
+// 闸（no_host 族）与结果字段映射。错误透传给 control dispatch 统一落 bad_request。
+
+// hostInTable host 载荷存在性闸：非法 hex 或不在表 = ErrBackendNoHost（no_host）。
+func (b *controlBackend) hostInTable(host string) error {
+	var pid [32]byte
+	raw, err := hex.DecodeString(host)
+	if err != nil || len(raw) != 32 {
+		return control.ErrBackendNoHost
+	}
+	copy(pid[:], raw)
+	if b.d.Host(pid) == nil {
+		return control.ErrBackendNoHost
+	}
+	return nil
+}
+
+// carriers 承载面束（表已 attach 才非 nil；dispatch 层 NotReady 门在前，此处防御）。
+func (b *controlBackend) carriers() (*facade.Carriers, error) {
+	c := b.d.Carriers()
+	if c == nil {
+		return nil, control.ErrBackendNoHost
+	}
+	return c, nil
+}
+
+func (b *controlBackend) ForwardAdd(a control.ForwardAddArgs) (control.ForwardAddResult, error) {
+	if err := b.hostInTable(a.Host); err != nil {
+		return control.ForwardAddResult{}, err
+	}
+	c, err := b.carriers()
+	if err != nil {
+		return control.ForwardAddResult{}, err
+	}
+	rule := facade.ForwardRule{Host: a.Host, Listen: a.Listen, TargetIP: a.TargetIP, TargetPort: a.TargetPort}
+	if err := c.AddForward(rule); err != nil {
+		return control.ForwardAddResult{}, err
+	}
+	return control.ForwardAddResult{Rule: forwardBriefOf(facade.ForwardState{Rule: rule, State: "listening"})}, nil
+}
+
+func (b *controlBackend) ForwardRemove(a control.ForwardRemoveArgs) error {
+	if err := b.hostInTable(a.Host); err != nil {
+		return err
+	}
+	c, err := b.carriers()
+	if err != nil {
+		return err
+	}
+	return c.RemoveForward(a.Host, a.Listen)
+}
+
+func (b *controlBackend) ForwardList(host string) control.ForwardListResult {
+	c, err := b.carriers()
+	if err != nil || (host != "" && b.hostInTable(host) != nil) {
+		return control.ForwardListResult{Forwards: []control.ForwardRuleBrief{}}
+	}
+	states := c.ForwardStates(host)
+	out := make([]control.ForwardRuleBrief, 0, len(states))
+	for _, st := range states {
+		out = append(out, forwardBriefOf(st))
+	}
+	return control.ForwardListResult{Forwards: out}
+}
+
+func forwardBriefOf(st facade.ForwardState) control.ForwardRuleBrief {
+	return control.ForwardRuleBrief{
+		Host: st.Rule.Host, Listen: st.Rule.Listen,
+		TargetIP: st.Rule.TargetIP, TargetPort: st.Rule.TargetPort,
+		State: st.State, Err: st.Err, Conns: st.Conns,
+	}
+}
+
+func (b *controlBackend) SocksOn(host string, listen uint16) (control.SocksOnResult, error) {
+	if err := b.hostInTable(host); err != nil {
+		return control.SocksOnResult{}, err
+	}
+	c, err := b.carriers()
+	if err != nil {
+		return control.SocksOnResult{}, err
+	}
+	port, err := c.SocksOn(host, listen)
+	if err != nil {
+		return control.SocksOnResult{}, err
+	}
+	return control.SocksOnResult{Listen: port}, nil
+}
+
+func (b *controlBackend) SocksOff(host string) (control.SocksOffResult, error) {
+	if err := b.hostInTable(host); err != nil {
+		return control.SocksOffResult{}, err
+	}
+	c, err := b.carriers()
+	if err != nil {
+		return control.SocksOffResult{}, err
+	}
+	if err := c.SocksOff(host); err != nil {
+		return control.SocksOffResult{}, err
+	}
+	// 记忆端口回显（off 不抹记忆——CLI 文案「下次 on 沿用」的数据源）。
+	for _, st := range c.SocksStates() {
+		if st.Host == host {
+			return control.SocksOffResult{Listen: st.Listen}, nil
+		}
+	}
+	return control.SocksOffResult{}, nil
+}
+
+func (b *controlBackend) SocksStatus() control.SocksStatusResult {
+	c, err := b.carriers()
+	if err != nil {
+		return control.SocksStatusResult{Socks: []control.SocksBrief{}}
+	}
+	states := c.SocksStates()
+	out := make([]control.SocksBrief, 0, len(states))
+	for _, st := range states {
+		out = append(out, control.SocksBrief{Host: st.Host, On: st.On, Listen: st.Listen, Conns: st.Conns, Err: st.Err})
+	}
+	return control.SocksStatusResult{Socks: out}
+}
+
+func (b *controlBackend) SpeedtestStart(a control.SpeedtestStartArgs) (control.SpeedtestStartAck, error) {
+	if err := b.hostInTable(a.Host); err != nil {
+		return control.SpeedtestStartAck{}, err
+	}
+	c, err := b.carriers()
+	if err != nil {
+		return control.SpeedtestStartAck{}, err
+	}
+	ack := c.SpeedtestStart(a.Host, facade.SpeedtestStart{
+		Down:    time.Duration(a.DownMs) * time.Millisecond,
+		Up:      time.Duration(a.UpMs) * time.Millisecond,
+		Warmup:  time.Duration(a.WarmupMs) * time.Millisecond,
+		Streams: a.Streams,
+		WaitMs:  a.WaitMs,
+	})
+	return control.SpeedtestStartAck{Phase: ack.Phase, Reason: ack.Reason}, nil
+}
+
+func (b *controlBackend) SpeedtestStatus(host string) (control.SpeedtestStatusResult, error) {
+	if err := b.hostInTable(host); err != nil {
+		return control.SpeedtestStatusResult{}, err
+	}
+	res := control.SpeedtestStatusResult{Host: host, Phase: string(speedtest.PhaseIdle)}
+	c, err := b.carriers()
+	if err != nil {
+		return res, nil
+	}
+	st := c.SpeedtestStatus(host)
+	if st == nil {
+		return res, nil // 无运行面（从未 start / 守护进程重启后）——idle 形态
+	}
+	res.Waiting = st.Waiting
+	res.WaitRemainMs = st.WaitRemainMs
+	res.Phase = st.Snap.Phase
+	res.Reason = st.Snap.Reason
+	if st.Snap.Usage != nil {
+		res.UsageDown, res.UsageUp = st.Snap.Usage.Down, st.Snap.Usage.Up
+	}
+	if st.Snap.Live != nil {
+		res.Dir, res.Bytes, res.InstBps = st.Snap.Live.Dir, st.Snap.Live.Bytes, st.Snap.Live.InstBps
+	}
+	res.ElapsedMs = st.Snap.ElapsedMs
+	if st.Result != nil {
+		res.Result = &control.SpeedtestResultBrief{
+			OK: st.Result.OK, Reason: st.Result.Reason, Msg: st.Result.Msg,
+			DownBps: st.Result.DownBps, UpBps: st.Result.UpBps,
+			UsageDown: st.Result.UsageDown, UsageUp: st.Result.UsageUp, WallMs: st.Result.WallMs,
+		}
+	}
+	return res, nil
+}
+
+func (b *controlBackend) SpeedtestCancel(host string) error {
+	if err := b.hostInTable(host); err != nil {
+		return err
+	}
+	c, err := b.carriers()
+	if err != nil {
+		return err
+	}
+	c.SpeedtestCancel(host)
+	return nil
+}
 
 // DemandStatus daemon.status 的 demand 段（4a §6.2：各主机最近一拍需求判定——
 // facade hostDemand 的 sticky 快照；表未 attach = nil）。

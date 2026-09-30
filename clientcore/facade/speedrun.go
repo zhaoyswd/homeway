@@ -46,12 +46,15 @@ type SpeedtestStartAck struct {
 	Listen uint16 // 无意义占位（对齐未来的 ack 面）——当前恒 0
 }
 
-// SpeedtestStatus status 面单条：waiting 相位或引擎快照。
+// SpeedtestStatus status 面单条：waiting 相位或引擎快照；轮次到终态时 Result 携带
+// 完整结果（3e §3.1：CLI 轮询 status 的终态数据源——快照只有相位/用量，终速率在
+// Result；nil = 未到终态）。
 type SpeedtestStatus struct {
 	Host         string
 	Waiting      bool
 	WaitRemainMs int64 // waiting 剩余预算
 	Snap         speedtest.Snapshot
+	Result       *speedtest.Result
 }
 
 // speedHostRun 一台主机的运行时。
@@ -59,7 +62,8 @@ type speedHostRun struct {
 	engine    *speedtest.Engine
 	cancel    context.CancelFunc
 	waitUntil time.Time
-	waiting   bool // start 已返回、引擎未真正开跑（link_down 重试窗）
+	waiting   bool              // start 已返回、引擎未真正开跑（link_down 重试窗）
+	result    *speedtest.Result // 终态（runner 收场时写回；nil = 未到终态）
 	mu        sync.Mutex
 }
 
@@ -109,7 +113,9 @@ func (m *SpeedtestManager) Start(host string, p SpeedtestStart) SpeedtestStartAc
 }
 
 // runLoop 整轮承载：link_down 在 waitMs 预算内保持 waiting 重试（恢复阶梯自愈后开跑）；
-// 其余终态（含 not_supported——refused-like，MUST NOT 落等待支）立即收场。
+// 其余终态（含 not_supported——refused-like，MUST NOT 落等待支）立即收场。全部终态
+// 写回 result（CLI 轮询的终态数据源——等待期被取消也合成 cancelled 终态，不留给
+// 轮询方一个永远 idle 的歧义快照）。
 func (m *SpeedtestManager) runLoop(ctx context.Context, host string, r *speedHostRun, p SpeedtestStart) {
 	params := speedtest.Params{Down: p.Down, Up: p.Up, Warmup: p.Warmup, Streams: p.Streams}
 	for {
@@ -118,15 +124,18 @@ func (m *SpeedtestManager) runLoop(ctx context.Context, host string, r *speedHos
 		r.setWaiting(false)
 		res := r.engine.Start(ctx, m.dialFn(host), params)
 		if res.OK || res.Reason != speedtest.ReasonLinkDown {
+			r.setResult(&res)
 			return
 		}
 		if time.Now().After(r.waitUntil) {
-			return // link_down 到点（预算耗尽，如实收场）
+			r.setResult(&res) // link_down 到点（预算耗尽，如实收场）
+			return
 		}
 		r.setWaiting(true)
 		select {
 		case <-ctx.Done():
 			r.setWaiting(false)
+			r.setResult(&speedtest.Result{OK: false, Reason: speedtest.ReasonCancelled, Msg: "等待链路就绪期间测速被取消"})
 			return
 		case <-time.After(speedRetryInterval):
 		}
@@ -175,7 +184,7 @@ func (m *SpeedtestManager) Status(host string) *SpeedtestStatus {
 		return nil
 	}
 	r.mu.Lock()
-	waiting, waitUntil := r.waiting, r.waitUntil
+	waiting, waitUntil, result := r.waiting, r.waitUntil, r.result
 	r.mu.Unlock()
 	if waiting {
 		remain := int64(0)
@@ -185,7 +194,7 @@ func (m *SpeedtestManager) Status(host string) *SpeedtestStatus {
 		return &SpeedtestStatus{Host: host, Waiting: true, WaitRemainMs: remain,
 			Snap: speedtest.Snapshot{Phase: "waiting", ElapsedMs: -1}}
 	}
-	return &SpeedtestStatus{Host: host, Snap: r.engine.Snapshot()}
+	return &SpeedtestStatus{Host: host, Snap: r.engine.Snapshot(), Result: result}
 }
 
 // RemoveHost 级联（host.remove）：取消该主机在跑的测速。
@@ -210,5 +219,11 @@ func (m *SpeedtestManager) Close() {
 func (r *speedHostRun) setWaiting(v bool) {
 	r.mu.Lock()
 	r.waiting = v
+	r.mu.Unlock()
+}
+
+func (r *speedHostRun) setResult(res *speedtest.Result) {
+	r.mu.Lock()
+	r.result = res
 	r.mu.Unlock()
 }

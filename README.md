@@ -265,6 +265,80 @@ homeway host delete <name|id> [--yes]
 - **单实例**：state 目录 flock 排他锁，二次启动报「已在运行（pid N）」；进程死亡锁自动
   释放。
 
+### 端口转发（`homeway forward`，守护托管命令面）
+
+桌面侧的端口转发规则——监听器在 daemon 进程内跑（127.0.0.1 仅回环，会话无关长活：
+add 即起、delete 即关、daemon 重启按持久化表重建），入站连接经 facade 拨号缝过隧道
+由指定主机出口出网。与手机 App 的端口转发面（App 配置 + `ClientCoreTunSetPortForwards`）
+零耦合、互不同步（两套规则表、两套监听宿主；语义与校验口径有意镜像——用户心智一份）：
+
+```bash
+homeway forward add --host <ref> --listen <P> [--target <ip:P>|:<P>]
+    # 建规则并立即起监听。--host = 名称/完整 ID/无歧义短前缀（与 host delete 同一份
+    # 寻址）；目标缺省 = 该主机出口自己的同监听端口，:<P> = 出口自己的指定端口，
+    # <ip:P> = 出口可达的任意 IPv4 目标（出口侧过境重拨）。
+homeway forward list [--host <ref>] [--json]
+    # 规则表 + 运行态（listening / failed+原因 / 在世连接数）。
+homeway forward delete --host <ref> --listen <P>
+    # 删规则并关监听；已建立的转发连接不强关（自然收口——同手机口径）。
+# 全部子命令 --state 恒指 daemon state（默认 ~/.config/homeway/daemon，control.sock
+# 所在——本命令面无本地面）；daemon 未运行 = 可行动错误。
+```
+
+规则校验：监听端口 1024–65535、目标须为空（出口自己）或 IPv4 字面量、每主机 ≤8 条；
+**监听端口在全部 forward 规则与 socks 监听之间全局唯一**（多主机会话并发在世、共享同一
+回环命名空间——与手机「每主机唯一」的桌面差异）。add 当场监听失败（如端口被守护进程
+外进程占用）= 错误、规则不入表（「failed 软状态」只出现在 daemon 重启重建路径）。规则
+持久化于 `<daemon-state>/forwards.json`（0600、原子写、损坏按空表重建）；删除主机时其
+全部规则与监听级联消失（不复活）。
+
+### SOCKS5 承载面（`homeway socks`，按主机开关）
+
+桌面浏览器/工具免 VPN 走隧道的承载面——每主机至多一个 SOCKS5 监听（127.0.0.1，多主机
+= 多端口，浏览器按端口选出口）；子集契约 = no-auth + CONNECT only + IPv4/域名地址类型：
+
+```bash
+homeway socks on --host <ref> [--listen 1080]
+    # 开 SOCKS5 监听；--listen 缺省 = 沿用该主机上次端口（无记忆则 1080；1024–65535，
+    # 与 forward 同一条值域）。
+homeway socks off --host <ref>
+    # 关监听并**显式关在世连接**（RST 收口——「off」之后不再有代理流量经隧道跑）；
+    # 端口记忆保留，下次 on 缺省沿用。
+homeway socks status [--json]
+    # 每主机开关态 + 端口（--json 含 off 但记住的端口）+ 在世连接数 + 链路态 via/rtt。
+```
+
+**域名目标的解析在出口侧远程完成**（MUST NOT 本地解析）：CONNECT 带主机名时 daemon
+经隧道拨该主机出口的 DNS 代答（TCP 查询 → `Host.DialPort(5300)` → 出口
+`127.0.0.1:5300`）发 A 查询，以应答 IPv4 拨隧道——fake-ip/内网 DNS/geo 场景下解析权
+跟着指定出口走（`curl --socks5-hostname` 强制域名形态）。解析结果按应答 TTL 缓存
+（每 listener 一份 = 按出口主机隔离，有界 256、逐出即弃、否定不缓存；多 A 记录顺序
+尝试）。采证判据：出口侧 dns 计数行（TCP 查询）+ intercept 豁免/transit dialok 行。
+
+### 隧道测速（`homeway speedtest`，口径与手机一致）
+
+对指定后端（或全部主机顺序轮流）做隧道上下行测速——**测量口径与手机 App 由共享实现
+保证一致**（引擎 `pkg/speedtest` 只有一份，手机核壳与 daemon 侧 runner 都是消费者）：
+
+```bash
+homeway speedtest [--host <ref>] [--json] [--down 10s] [--up 10s] [--warmup 2s]
+                  [--streams 4] [--wait 60s] [--quiet]
+    # --host 缺省 = 主机表内全部主机顺序轮流（开跑前打印「将依次测 N 台」；并行互抢
+    #   带宽会使读数失真，故 MUST 顺序）。参数默认与边界 = 手机口径（窗口 ≤15s、
+    #   预热 ≤5s、流数 1–6）。输出双口径：显示行（1024 进位、≥1MB/s 用 MB/s、
+    #   四舍五入整数、上行在前）+ 精确值行（B/s 与 Mbps/MB/s 带小数、用量、墙钟）。
+    # --wait = 链路未就绪的有界等待（0 = 不等即报错；默认 60s 覆盖恢复阶梯最坏时长；
+    #   预算经 start 载荷 waitMs 交 daemon 侧 runner 状态机承载，start 立即返回）。
+    # --json = 逐主机结果对象（host/name/ok/reason/downBps/upBps/usageDown/usageUp/
+    #   wallMs/via/rttMs——via/rtt 为开跑时冻结标签）。
+    # Ctrl-C 终止整个轮转：先 speedtest.cancel 当前主机、未测主机不再测量，退出码非零。
+```
+
+守护托管：引擎在 daemon 进程内跑（测速数据腿直连隧道，MUST NOT 经控制面流承载——
+流通道的有界上行缓冲与全速泵送矛盾）；同主机单飞（在跑时重复 start 报 busy）；记账
+差异如实声明——daemon 侧测速拨号照常计入该主机的需求合成（前台显式动作 = 真实需求；
+手机侧的豁免口径不适用）。退出码：全部主机失败或 Ctrl-C = 非零，至少一台成功 = 0。
+
 ## 运行细节
 
 ### 多实例

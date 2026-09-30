@@ -21,6 +21,11 @@ func TestResolveRole(t *testing.T) {
 		{"relay 裸调", []string{"relay"}, "relay", []string{}},
 		{"host 角色（host-cli 3b）", []string{"host", "add", "--name", "mbp", "hmw1x"}, "host", []string{"add", "--name", "mbp", "hmw1x"}},
 		{"host 裸调（usage 面）", []string{"host"}, "host", []string{}},
+		{"forward 角色（3e）", []string{"forward", "add", "--host", "ali", "--listen", "8080"}, "forward", []string{"add", "--host", "ali", "--listen", "8080"}},
+		{"forward 裸调（usage 面）", []string{"forward"}, "forward", []string{}},
+		{"socks 角色（3e）", []string{"socks", "on", "--host", "ali"}, "socks", []string{"on", "--host", "ali"}},
+		{"speedtest 角色（3e）", []string{"speedtest", "--host", "ali", "--json"}, "speedtest", []string{"--host", "ali", "--json"}},
+		{"speedtest 裸跑（全主机轮流）", []string{"speedtest"}, "speedtest", []string{}},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {

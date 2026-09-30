@@ -8,6 +8,9 @@
 //	homeway daemon [--state D] # 桌面守护进程（多主机会话注册表；host-registry-daemon）
 //	homeway daemon status …    # 守护进程状态（控制面读面；--json 机器可读快照）
 //	homeway host <子命令> …    # 主机表管理命令面：add / list / status / delete
+//	homeway forward <子命令> … # 端口转发命令面：add / list / delete（守护托管）
+//	homeway socks <子命令> …   # SOCKS5 承载面命令面：on / off / status（守护托管）
+//	homeway speedtest […]      # 隧道测速（守护托管；--host 缺省 = 全主机轮流）
 //	homeway --version
 //
 // 一台机器上可以同时跑多个进程（例如一个出口 + 一个中继）：各进程用 --state 区分身份、
@@ -68,8 +71,14 @@ func run(args []string) int {
 		err = daemon.CLI(rest, version)
 	case "host":
 		err = daemon.CLI(append([]string{"host"}, rest...), version)
+	case "forward":
+		err = daemon.CLI(append([]string{"forward"}, rest...), version)
+	case "socks":
+		err = daemon.CLI(append([]string{"socks"}, rest...), version)
+	case "speedtest":
+		err = daemon.CLI(append([]string{"speedtest"}, rest...), version)
 	default:
-		fmt.Fprintf(os.Stderr, "homeway: 不认识的子命令 %q（可用：exit、relay、term、files、daemon、host）\n", role)
+		fmt.Fprintf(os.Stderr, "homeway: 不认识的子命令 %q（可用：exit、relay、term、files、daemon、host、forward、socks、speedtest）\n", role)
 		usage(os.Stderr)
 		return 2
 	}
@@ -127,6 +136,12 @@ func resolveRole(args []string) (role string, rest []string) {
 		return "daemon", args[1:]
 	case "host":
 		return "host", args[1:]
+	case "forward":
+		return "forward", args[1:]
+	case "socks":
+		return "socks", args[1:]
+	case "speedtest":
+		return "speedtest", args[1:]
 	}
 	// `homeway --relay 'rl1…'` 这类省略子命令的写法：首参是 flag 时按默认角色（出口）走。
 	if strings.HasPrefix(args[0], "-") {
@@ -160,6 +175,22 @@ func usage(w *os.File) {
                                单台主机详面（省略 name = 全部）
   homeway host delete <name|id> [--yes]
                                删除主机（交互确认默认 N；非终端 stdin 需 --yes）
+  homeway forward add --host <ref> --listen <P> [--target <ip:P>|:<P>]
+                               建端口转发规则并立即起监听（127.0.0.1:P；目标缺省 =
+                               该主机出口自己同端口；--state 恒指 daemon state）
+  homeway forward list [--host <ref>] [--json]
+                               规则表 + 运行态（listening/failed/在世连接数）
+  homeway forward delete --host <ref> --listen <P>
+                               删规则并关监听（在世连接不强关、自然收口）
+  homeway socks on --host <ref> [--listen 1080]
+                               该主机开 SOCKS5 监听（仅回环；域名经出口远程解析）
+  homeway socks off --host <ref>
+                               关监听并显式关在世连接（端口记忆保留）
+  homeway socks status [--json]
+                               每主机开关态 + 端口 + 在世连接数 + 链路态
+  homeway speedtest [--host <ref>] [--json] [--down/--up/--warmup/--streams/--wait]
+                               隧道测速（缺省 --host = 全部主机顺序轮流；口径与
+                               手机一致；Ctrl-C 终止轮转）
   homeway --version            打印版本
 
 一台机器上可以同时运行多个进程（如一个出口 + 一个中继）：用 --state 区分身份、

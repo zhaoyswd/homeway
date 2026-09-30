@@ -52,10 +52,24 @@ type fakeBackend struct {
 	pipeDrained    atomic.Int64
 	// demand 段注入（4a §6.2 用例）。
 	demand []HostDemandBrief
+	// 承载面（3e §3.1 用例）：假 forward 规则表 / socks 态 / speedtest 运行面。
+	// hostInTableOf 判定 = briefs 里存在同 ID（假表登记面）。
+	fwdMu      sync.Mutex
+	fwdRules   map[string]ForwardAddArgs         // key = host/listen
+	fwdErr     map[string]error                  // key 同上 → Add/Remove 注入错误
+	socksOn    map[string]uint16                 // host → 实际监听端口（开着）
+	socksMem   map[string]uint16                 // host → 记忆端口（off 保留）
+	socksConns map[string]int                    // host → 在世连接数
+	speedBusy  map[string]bool                   // host → 在跑（busy 桩）
+	speedStat  map[string]*SpeedtestStatusResult // host → status 注入面
+	speedCanc  map[string]int                    // host → cancel 次数
 }
 
 func newFakeBackend() *fakeBackend {
-	return &fakeBackend{added: map[string]string{}, dialErr: map[string]error{}}
+	return &fakeBackend{added: map[string]string{}, dialErr: map[string]error{},
+		fwdRules: map[string]ForwardAddArgs{}, fwdErr: map[string]error{},
+		socksOn: map[string]uint16{}, socksMem: map[string]uint16{}, socksConns: map[string]int{},
+		speedBusy: map[string]bool{}, speedStat: map[string]*SpeedtestStatusResult{}, speedCanc: map[string]int{}}
 }
 
 // pipeDialAddr 特殊 dialAddr：DialTerm 返回无缓冲 net.Pipe（对端存 pipePeers、
@@ -199,6 +213,184 @@ func (f *fakeBackend) DemandStatus() []HostDemandBrief {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return append([]HostDemandBrief(nil), f.demand...)
+}
+
+// ---------- 承载面假实现（3e §3.1：语义桩——校验/状态面最小集，供 dispatch 用例） ----------
+
+// hostInTableOf host 存在性（登记面 = briefs）。
+func (f *fakeBackend) hostInTableOf(host string) bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for _, b := range f.briefs {
+		if b.ID == host {
+			return true
+		}
+	}
+	return false
+}
+
+func fwdKey(host string, listen uint16) string { return fmt.Sprintf("%s/%d", host, listen) }
+
+func (f *fakeBackend) ForwardAdd(args ForwardAddArgs) (ForwardAddResult, error) {
+	if !f.hostInTableOf(args.Host) {
+		return ForwardAddResult{}, ErrBackendNoHost
+	}
+	f.fwdMu.Lock()
+	defer f.fwdMu.Unlock()
+	key := fwdKey(args.Host, args.Listen)
+	if err, ok := f.fwdErr[key]; ok {
+		return ForwardAddResult{}, err
+	}
+	for k, r := range f.fwdRules {
+		if r.Listen == args.Listen && k != key {
+			return ForwardAddResult{}, errors.New("监听端口已被其它 forward 规则占用")
+		}
+	}
+	if p, ok := f.socksOn[args.Host]; ok && p == args.Listen {
+		return ForwardAddResult{}, errors.New("监听端口已被 socks 监听占用")
+	}
+	for h, p := range f.socksOn {
+		if h != args.Host && p == args.Listen {
+			return ForwardAddResult{}, errors.New("监听端口已被其它主机的 socks 监听占用")
+		}
+	}
+	f.fwdRules[key] = args
+	return ForwardAddResult{Rule: ForwardRuleBrief{Host: args.Host, Listen: args.Listen,
+		TargetIP: args.TargetIP, TargetPort: args.TargetPort, State: "listening"}}, nil
+}
+
+func (f *fakeBackend) ForwardRemove(args ForwardRemoveArgs) error {
+	if !f.hostInTableOf(args.Host) {
+		return ErrBackendNoHost
+	}
+	f.fwdMu.Lock()
+	defer f.fwdMu.Unlock()
+	key := fwdKey(args.Host, args.Listen)
+	if err, ok := f.fwdErr[key]; ok {
+		return err
+	}
+	if _, ok := f.fwdRules[key]; !ok {
+		return errors.New("forward 规则不存在")
+	}
+	delete(f.fwdRules, key)
+	return nil
+}
+
+func (f *fakeBackend) ForwardList(host string) ForwardListResult {
+	f.fwdMu.Lock()
+	defer f.fwdMu.Unlock()
+	out := ForwardListResult{Forwards: []ForwardRuleBrief{}}
+	for _, r := range f.fwdRules {
+		if host != "" && r.Host != host {
+			continue
+		}
+		out.Forwards = append(out.Forwards, ForwardRuleBrief{Host: r.Host, Listen: r.Listen,
+			TargetIP: r.TargetIP, TargetPort: r.TargetPort, State: "listening", Conns: 1})
+	}
+	return out
+}
+
+func (f *fakeBackend) SocksOn(host string, listen uint16) (SocksOnResult, error) {
+	if !f.hostInTableOf(host) {
+		return SocksOnResult{}, ErrBackendNoHost
+	}
+	f.fwdMu.Lock()
+	defer f.fwdMu.Unlock()
+	if listen == 0 {
+		if mem, ok := f.socksMem[host]; ok {
+			listen = mem
+		} else {
+			listen = 1080
+		}
+	}
+	if listen < 1024 {
+		return SocksOnResult{}, errors.New("监听端口须在 1024–65535")
+	}
+	for _, r := range f.fwdRules {
+		if r.Listen == listen {
+			return SocksOnResult{}, errors.New("监听端口已被 forward 规则占用")
+		}
+	}
+	for h, p := range f.socksOn {
+		if h != host && p == listen {
+			return SocksOnResult{}, errors.New("监听端口已被其它主机的 socks 监听占用")
+		}
+	}
+	f.socksOn[host] = listen
+	f.socksMem[host] = listen
+	return SocksOnResult{Listen: listen}, nil
+}
+
+func (f *fakeBackend) SocksOff(host string) (SocksOffResult, error) {
+	if !f.hostInTableOf(host) {
+		return SocksOffResult{}, ErrBackendNoHost
+	}
+	f.fwdMu.Lock()
+	defer f.fwdMu.Unlock()
+	if _, ok := f.socksOn[host]; !ok {
+		if _, ok := f.socksMem[host]; !ok {
+			return SocksOffResult{}, errors.New("socks 监听不存在")
+		}
+		return SocksOffResult{Listen: f.socksMem[host]}, nil // 已 off：幂等（记忆在）
+	}
+	delete(f.socksOn, host)
+	return SocksOffResult{Listen: f.socksMem[host]}, nil
+}
+
+func (f *fakeBackend) SocksStatus() SocksStatusResult {
+	f.fwdMu.Lock()
+	defer f.fwdMu.Unlock()
+	out := SocksStatusResult{Socks: []SocksBrief{}}
+	for host, mem := range f.socksMem {
+		on, conns := false, 0
+		if p, ok := f.socksOn[host]; ok {
+			on, conns = true, f.socksConns[host]
+			_ = p
+		}
+		out.Socks = append(out.Socks, SocksBrief{Host: host, On: on, Listen: mem, Conns: conns})
+	}
+	return out
+}
+
+func (f *fakeBackend) SpeedtestStart(args SpeedtestStartArgs) (SpeedtestStartAck, error) {
+	if !f.hostInTableOf(args.Host) {
+		return SpeedtestStartAck{}, ErrBackendNoHost
+	}
+	f.fwdMu.Lock()
+	defer f.fwdMu.Unlock()
+	if f.speedBusy[args.Host] {
+		return SpeedtestStartAck{Phase: "busy", Reason: "busy"}, nil
+	}
+	f.speedBusy[args.Host] = true
+	if f.speedStat[args.Host] == nil {
+		f.speedStat[args.Host] = &SpeedtestStatusResult{Host: args.Host, Phase: "waiting", Waiting: true}
+	}
+	return SpeedtestStartAck{Phase: "waiting"}, nil
+}
+
+func (f *fakeBackend) SpeedtestStatus(host string) (SpeedtestStatusResult, error) {
+	if !f.hostInTableOf(host) {
+		return SpeedtestStatusResult{}, ErrBackendNoHost
+	}
+	f.fwdMu.Lock()
+	defer f.fwdMu.Unlock()
+	if st, ok := f.speedStat[host]; ok && st != nil {
+		return *st, nil
+	}
+	return SpeedtestStatusResult{Host: host, Phase: "idle"}, nil
+}
+
+func (f *fakeBackend) SpeedtestCancel(host string) error {
+	if !f.hostInTableOf(host) {
+		return ErrBackendNoHost
+	}
+	f.fwdMu.Lock()
+	defer f.fwdMu.Unlock()
+	f.speedCanc[host]++
+	delete(f.speedBusy, host)
+	f.speedStat[host] = &SpeedtestStatusResult{Host: host, Phase: "cancelled",
+		Result: &SpeedtestResultBrief{OK: false, Reason: "cancelled"}}
+	return nil
 }
 
 // testServer 一套装配好的服务器（临时 state + bus + backend + 假 term 后端）。

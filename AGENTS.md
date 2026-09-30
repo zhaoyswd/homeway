@@ -11,6 +11,13 @@ LIST/CLI 状态单轨 stateV2，旧 `state` 键退役）、
 本地面直连 `<state>/files.sock`〔默认出口 state〕、`--host <ref>` 远程面经控制面
 `stream.open{kind:files}` 纯透传，寻址与 host/term 面同源；`--state` 指代随 `--host` 切换、
 `--rate-limit` 上行限速〔默认 2MiB/s 发送端义务〕，详见 README「文件命令面」节）；
+`forward add/list/delete` = 端口转发命令面（forward-socks-speedtest 起：守护托管，规则
+`<daemon-state>/forwards.json`、监听器住 daemon 进程仅回环、与手机 portfwd 面零耦合——
+监听端口跨全部规则与 socks 全局唯一）、`socks on/off/status` = 按主机 SOCKS5 承载面
+（同上：域名经指定出口远程解析〔DNS-over-TCP→5300〕、每 listener 一份缓存、off 显式
+RST 在世连接且端口记忆保留）、`speedtest` = 隧道测速 CLI（守护托管：引擎
+`pkg/speedtest` 与手机壳同一产物，`--host` 缺省 = 全主机顺序轮流、Ctrl-C 先 cancel
+当前主机再退出；详见 README 三节）；
 `clientcore/` = 手机核
 （tier App 经其仓库的 submodule 钉定检出消费，产物 `libclientcore.so`）。本文件只放跨会话
 都要知道的硬规则；工程细节看本仓 `README.md` 与 tier 仓（`github.com/zhaoyswd/tier`）的

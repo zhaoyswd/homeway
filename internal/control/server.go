@@ -599,6 +599,27 @@ func (c *conn) handlerFor(op string) opHandler {
 		return c.opStreamOpen
 	case facade.OpStreamClose:
 		return c.opStreamClose
+	// 承载面 9 op（3e，D6）：守护托管——语义全在宿主 Backend（facade.Carriers 镜像），
+	// 本层只做载荷解析与错误码映射（值域外/冲突 = bad_request、无主机 = no_host——
+	// 错误码零新增，spec 场景「三面新 op 复用既有错误码」锁死该映射）。
+	case facade.OpForwardAdd:
+		return c.opForwardAdd
+	case facade.OpForwardRemove:
+		return c.opForwardRemove
+	case facade.OpForwardList:
+		return c.opForwardList
+	case facade.OpSocksOn:
+		return c.opSocksOn
+	case facade.OpSocksOff:
+		return c.opSocksOff
+	case facade.OpSocksStatus:
+		return c.opSocksStatus
+	case facade.OpSpeedtestStart:
+		return c.opSpeedtestStart
+	case facade.OpSpeedtestStatus:
+		return c.opSpeedtestStatus
+	case facade.OpSpeedtestCancel:
+		return c.opSpeedtestCancel
 	}
 	return nil
 }
@@ -770,6 +791,183 @@ func (c *conn) opUnsubscribe(corr uint64, args json.RawMessage) {
 		c.s.cfg.Bus.UnsubscribeDomains(c.sub, a.Domains)
 	}
 	c.reply(corr, UnsubscribeResult{Domains: a.Domains}, nil)
+}
+
+// ---------- 承载面 op（3e，D6）：forward / socks / speedtest ----------
+
+// mapCarrierErr 承载面错误的统一映射：无主机 = no_host，其余（值域外/冲突/监听
+// 失败/落盘失败）= bad_request——错误码零新增。
+func mapCarrierErr(err error) error {
+	if err == nil {
+		return nil
+	}
+	if errors.Is(err, ErrBackendNoHost) {
+		return errCode(facade.CodeNoHost)
+	}
+	return errCode(facade.CodeBadRequest)
+}
+
+func (c *conn) opForwardAdd(corr uint64, args json.RawMessage) {
+	var a ForwardAddArgs
+	if err := parseArgs(args, &a); err != nil {
+		c.reply(corr, nil, err)
+		return
+	}
+	if a.Host == "" || a.Listen == 0 {
+		c.reply(corr, nil, errCode(facade.CodeBadRequest))
+		return
+	}
+	if c.s.cfg.Backend.NotReady() {
+		c.reply(corr, nil, errCode(facade.CodeNotReady))
+		return
+	}
+	res, err := c.s.cfg.Backend.ForwardAdd(a)
+	c.reply(corr, res, mapCarrierErr(err))
+}
+
+func (c *conn) opForwardRemove(corr uint64, args json.RawMessage) {
+	var a ForwardRemoveArgs
+	if err := parseArgs(args, &a); err != nil {
+		c.reply(corr, nil, err)
+		return
+	}
+	if a.Host == "" || a.Listen == 0 {
+		c.reply(corr, nil, errCode(facade.CodeBadRequest))
+		return
+	}
+	if c.s.cfg.Backend.NotReady() {
+		c.reply(corr, nil, errCode(facade.CodeNotReady))
+		return
+	}
+	err := c.s.cfg.Backend.ForwardRemove(a)
+	if err != nil {
+		c.reply(corr, nil, mapCarrierErr(err))
+		return
+	}
+	c.reply(corr, ForwardRemoveResult{Removed: true}, nil)
+}
+
+func (c *conn) opForwardList(corr uint64, args json.RawMessage) {
+	var a ForwardListArgs
+	if err := parseArgs(args, &a); err != nil {
+		c.reply(corr, nil, err)
+		return
+	}
+	if c.s.cfg.Backend.NotReady() {
+		c.reply(corr, nil, errCode(facade.CodeNotReady))
+		return
+	}
+	c.reply(corr, c.s.cfg.Backend.ForwardList(a.Host), nil)
+}
+
+func (c *conn) opSocksOn(corr uint64, args json.RawMessage) {
+	var a SocksOnArgs
+	if err := parseArgs(args, &a); err != nil {
+		c.reply(corr, nil, err)
+		return
+	}
+	if a.Host == "" {
+		c.reply(corr, nil, errCode(facade.CodeBadRequest))
+		return
+	}
+	if c.s.cfg.Backend.NotReady() {
+		c.reply(corr, nil, errCode(facade.CodeNotReady))
+		return
+	}
+	res, err := c.s.cfg.Backend.SocksOn(a.Host, a.Listen)
+	c.reply(corr, res, mapCarrierErr(err))
+}
+
+func (c *conn) opSocksOff(corr uint64, args json.RawMessage) {
+	var a SocksOffArgs
+	if err := parseArgs(args, &a); err != nil {
+		c.reply(corr, nil, err)
+		return
+	}
+	if a.Host == "" {
+		c.reply(corr, nil, errCode(facade.CodeBadRequest))
+		return
+	}
+	if c.s.cfg.Backend.NotReady() {
+		c.reply(corr, nil, errCode(facade.CodeNotReady))
+		return
+	}
+	res, err := c.s.cfg.Backend.SocksOff(a.Host)
+	c.reply(corr, res, mapCarrierErr(err))
+}
+
+func (c *conn) opSocksStatus(corr uint64, _ json.RawMessage) {
+	if c.s.cfg.Backend.NotReady() {
+		c.reply(corr, nil, errCode(facade.CodeNotReady))
+		return
+	}
+	c.reply(corr, c.s.cfg.Backend.SocksStatus(), nil)
+}
+
+func (c *conn) opSpeedtestStart(corr uint64, args json.RawMessage) {
+	var a SpeedtestStartArgs
+	if err := parseArgs(args, &a); err != nil {
+		c.reply(corr, nil, err)
+		return
+	}
+	if a.Host == "" {
+		c.reply(corr, nil, errCode(facade.CodeBadRequest))
+		return
+	}
+	if c.s.cfg.Backend.NotReady() {
+		c.reply(corr, nil, errCode(facade.CodeNotReady))
+		return
+	}
+	// busy 是成功载荷里的 reason（同手机信封形态），不进错误码表。
+	ack, err := c.s.cfg.Backend.SpeedtestStart(a)
+	if err != nil {
+		c.reply(corr, nil, mapCarrierErr(err))
+		return
+	}
+	c.reply(corr, ack, nil)
+}
+
+func (c *conn) opSpeedtestStatus(corr uint64, args json.RawMessage) {
+	var a SpeedtestStatusArgs
+	if err := parseArgs(args, &a); err != nil {
+		c.reply(corr, nil, err)
+		return
+	}
+	if a.Host == "" {
+		c.reply(corr, nil, errCode(facade.CodeBadRequest))
+		return
+	}
+	if c.s.cfg.Backend.NotReady() {
+		c.reply(corr, nil, errCode(facade.CodeNotReady))
+		return
+	}
+	res, err := c.s.cfg.Backend.SpeedtestStatus(a.Host)
+	if err != nil {
+		c.reply(corr, nil, mapCarrierErr(err))
+		return
+	}
+	c.reply(corr, res, nil)
+}
+
+func (c *conn) opSpeedtestCancel(corr uint64, args json.RawMessage) {
+	var a SpeedtestCancelArgs
+	if err := parseArgs(args, &a); err != nil {
+		c.reply(corr, nil, err)
+		return
+	}
+	if a.Host == "" {
+		c.reply(corr, nil, errCode(facade.CodeBadRequest))
+		return
+	}
+	if c.s.cfg.Backend.NotReady() {
+		c.reply(corr, nil, errCode(facade.CodeNotReady))
+		return
+	}
+	if err := c.s.cfg.Backend.SpeedtestCancel(a.Host); err != nil {
+		c.reply(corr, nil, mapCarrierErr(err))
+		return
+	}
+	c.reply(corr, SpeedtestCancelResult{Cancelled: true}, nil)
 }
 
 // ---------- writer：唯一 socket 写者（优先级排空） ----------

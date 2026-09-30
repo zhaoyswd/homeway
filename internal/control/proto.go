@@ -181,6 +181,156 @@ type StreamCloseArgs struct {
 	StreamID uint32 `json:"streamId"`
 }
 
+// ---------- forward / socks / speedtest（3e 只增，design D6） ----------
+//
+// host 载荷 = peerID hex（CLI 侧 resolveHostTarget 先行解析，同 term/files）。
+// 错误码零新增：值域外/冲突 = bad_request、主机不在表 = no_host（用例锁死映射）。
+
+// ForwardAddArgs forward.add 载荷。TargetIP 空 = 出口自己；TargetPort 0 = 同监听端口。
+type ForwardAddArgs struct {
+	Host       string `json:"host"`
+	Listen     uint16 `json:"listen"`
+	TargetIP   string `json:"targetIp,omitempty"`
+	TargetPort uint16 `json:"targetPort,omitempty"`
+}
+
+// ForwardAddResult forward.add 成功载荷（建成的规则面，listening 态）。
+type ForwardAddResult struct {
+	Rule ForwardRuleBrief `json:"rule"`
+}
+
+// ForwardRemoveArgs forward.remove 载荷。
+type ForwardRemoveArgs struct {
+	Host   string `json:"host"`
+	Listen uint16 `json:"listen"`
+}
+
+// ForwardRemoveResult forward.remove 成功载荷。
+type ForwardRemoveResult struct {
+	Removed bool `json:"removed"`
+}
+
+// ForwardListArgs forward.list 载荷（host 空 = 全部）。
+type ForwardListArgs struct {
+	Host string `json:"host,omitempty"`
+}
+
+// ForwardRuleBrief forward.list 单条（规则 + 运行态——listening/failed+原因/conns，
+// 镜像手机 pfState 口径的桌面版）。
+type ForwardRuleBrief struct {
+	Host       string `json:"host"`
+	Listen     uint16 `json:"listen"`
+	TargetIP   string `json:"targetIp,omitempty"`
+	TargetPort uint16 `json:"targetPort,omitempty"`
+	State      string `json:"state"`
+	Err        string `json:"err,omitempty"`
+	Conns      int    `json:"conns"`
+}
+
+// ForwardListResult forward.list 成功载荷。
+type ForwardListResult struct {
+	Forwards []ForwardRuleBrief `json:"forwards"`
+}
+
+// SocksOnArgs socks.on 载荷（listen 0 = 沿用记忆端口，无记忆则 1080）。
+type SocksOnArgs struct {
+	Host   string `json:"host"`
+	Listen uint16 `json:"listen,omitempty"`
+}
+
+// SocksOnResult socks.on 成功载荷（实际监听端口）。
+type SocksOnResult struct {
+	Listen uint16 `json:"listen"`
+}
+
+// SocksOffArgs socks.off 载荷。
+type SocksOffArgs struct {
+	Host string `json:"host"`
+}
+
+// SocksOffResult socks.off 成功载荷（Listen = 记忆保留的端口，下次 on 缺省沿用）。
+type SocksOffResult struct {
+	Listen uint16 `json:"listen"`
+}
+
+// SocksBrief socks.status 单条（off 也出现——Listen = 记住的端口，拍板②）。
+type SocksBrief struct {
+	Host   string `json:"host"`
+	On     bool   `json:"on"`
+	Listen uint16 `json:"listen"`
+	Conns  int    `json:"conns"`
+	Err    string `json:"err,omitempty"`
+}
+
+// SocksStatusResult socks.status 成功载荷。
+type SocksStatusResult struct {
+	Socks []SocksBrief `json:"socks"`
+}
+
+// SpeedtestStartArgs speedtest.start 载荷（0 = 手机口径默认；waitMs 0 = 不等——
+// start 立即返回 waiting 相位、等待由 runner 状态机承载，r1 中-3）。
+type SpeedtestStartArgs struct {
+	Host     string `json:"host"`
+	DownMs   int64  `json:"downMs,omitempty"`
+	UpMs     int64  `json:"upMs,omitempty"`
+	WarmupMs int64  `json:"warmupMs,omitempty"`
+	Streams  int    `json:"streams,omitempty"`
+	WaitMs   int64  `json:"waitMs,omitempty"`
+}
+
+// SpeedtestStartAck speedtest.start 成功载荷（waiting 或 busy——busy 是载荷里的
+// reason，同手机信封形态、不占错误码表）。
+type SpeedtestStartAck struct {
+	Phase  string `json:"phase"`            // waiting | busy
+	Reason string `json:"reason,omitempty"` // busy 时携带
+}
+
+// SpeedtestStatusArgs speedtest.status 载荷。
+type SpeedtestStatusArgs struct {
+	Host string `json:"host"`
+}
+
+// SpeedtestResultBrief speedtest 终态结果（镜像引擎 Result 字段名——与手机信封
+// downBps/upBps/usageDown/usageUp/wallMs/reason 同名，CLI --json 对拍真源）。
+type SpeedtestResultBrief struct {
+	OK        bool    `json:"ok"`
+	Reason    string  `json:"reason,omitempty"`
+	Msg       string  `json:"msg,omitempty"`
+	DownBps   float64 `json:"downBps,omitempty"`
+	UpBps     float64 `json:"upBps,omitempty"`
+	UsageDown int64   `json:"usageDown,omitempty"`
+	UsageUp   int64   `json:"usageUp,omitempty"`
+	WallMs    int64   `json:"wallMs,omitempty"`
+}
+
+// SpeedtestStatusResult speedtest.status 成功载荷：waiting 相位（waitRemainMs）
+// 或引擎快照（phase/reason/usage/live/elapsedMs，字段名与手机 Status 信封一致）；
+// 轮次到终态时 Result 携带完整结果（nil = 未到终态）。
+type SpeedtestStatusResult struct {
+	Host         string                `json:"host"`
+	Waiting      bool                  `json:"waiting,omitempty"`
+	WaitRemainMs int64                 `json:"waitRemainMs,omitempty"`
+	Phase        string                `json:"phase"`
+	Reason       string                `json:"reason,omitempty"`
+	UsageDown    int64                 `json:"usageDown,omitempty"`
+	UsageUp      int64                 `json:"usageUp,omitempty"`
+	Dir          string                `json:"dir,omitempty"`
+	Bytes        int64                 `json:"bytes,omitempty"`
+	InstBps      float64               `json:"instBps,omitempty"`
+	ElapsedMs    int64                 `json:"elapsedMs,omitempty"`
+	Result       *SpeedtestResultBrief `json:"result,omitempty"`
+}
+
+// SpeedtestCancelArgs speedtest.cancel 载荷（只作用指定主机，不波及轮转，r1 低-8）。
+type SpeedtestCancelArgs struct {
+	Host string `json:"host"`
+}
+
+// SpeedtestCancelResult speedtest.cancel 成功载荷。
+type SpeedtestCancelResult struct {
+	Cancelled bool `json:"cancelled"`
+}
+
 // ---------- 事件流（域与 kind 词表、载荷字段表） ----------
 
 // （订阅域 Domain*/事件 kind Kind* 词表、kindDomains 归属表与 validDomains 已迁

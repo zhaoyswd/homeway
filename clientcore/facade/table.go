@@ -539,11 +539,16 @@ func (d *Daemon) Attach(stateDir string) error {
 	d.attachMu.Lock()
 	defer d.attachMu.Unlock()
 	// 契约①：先收工当前表（等价 Detach——先摘指针再收工，窗口内 NotReady 与
-	// Detach 同款；session.removed 照发）。
+	// Detach 同款；session.removed 照发；承载面随表同收）。
 	d.mu.Lock()
 	old := d.table
+	oldCar := d.carriers
 	d.table = nil
+	d.carriers = nil
 	d.mu.Unlock()
+	if oldCar != nil {
+		oldCar.Close() // 先收承载面再收表
+	}
 	if old != nil {
 		old.Close()
 	}
@@ -558,8 +563,17 @@ func (d *Daemon) Attach(stateDir string) error {
 		// 契约②：表未挂载（d.table 保持 nil = 未 attach 态）。
 		return err
 	}
+	// 承载面（3e §3.1）：与表同生命周期、stateDir 同源；拨号缝 = Host 面
+	//（DialPort/Dial 家族，同记账同重建感知）。半途失败收尾 = 先关表再返回
+	//（不留半挂面，下一次 Attach 从盘上状态重来）。
+	car, err := openCarriers(stateDir, carrierDialOf(d), d.opts.Logf, d.opts.Eventf)
+	if err != nil {
+		tbl.Close()
+		return err
+	}
 	d.mu.Lock()
 	d.table = tbl
+	d.carriers = car
 	d.mu.Unlock()
 	// 契约③（added 方向）：装载完成的每台主机补发 session.added（锁外 emit；表已
 	// 挂载 = 前端据 added 重取视图时 NotReady 已为假）。首次 Attach（空总线）天然
@@ -579,8 +593,13 @@ func (d *Daemon) Detach() {
 	defer d.attachMu.Unlock()
 	d.mu.Lock()
 	tbl := d.table
+	car := d.carriers
 	d.table = nil
+	d.carriers = nil
 	d.mu.Unlock()
+	if car != nil {
+		car.Close() // 先收承载面（socks 显式关在世连接/speedtest 取消）再收表
+	}
 	if tbl != nil {
 		tbl.Close()
 	}
@@ -638,13 +657,21 @@ func (d *Daemon) AddHost(ctx context.Context, name, token string, force bool) (H
 	return res, nil
 }
 
-// RemoveHost host.remove 的进程内面（id = peerID [32]byte）。
+// RemoveHost host.remove 的进程内面（id = peerID [32]byte）。删除成功后级联清理
+// 承载面（3e §3.1：forward 规则 delete 语义不强关、socks off 语义显式关 + 记忆消失、
+// speedtest cancel——D8 级联）。
 func (d *Daemon) RemoveHost(id [32]byte) error {
 	tbl := d.tableRef()
 	if tbl == nil {
 		return ErrNotReady
 	}
-	return tbl.Remove(id)
+	if err := tbl.Remove(id); err != nil {
+		return err
+	}
+	if c := d.Carriers(); c != nil {
+		c.RemoveHost(id)
+	}
+	return nil
 }
 
 // HostBriefs 主机登记面（host.list / snapshot.get 的静态部分；按 ID 排序）。

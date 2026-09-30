@@ -27,14 +27,23 @@ import (
 // CLI daemon 子命令入口（cmd/homeway 转发；version 随构建注入——welcome/
 // daemon.status 的 serverVersion）。
 //
-// 子命令：status（4.1，控制面读面）、host（host-cli 3b：主机表管理命令面）；
-// 其余参数 = 守护进程本体。
+// 子命令：status（4.1，控制面读面）、host（host-cli 3b：主机表管理命令面）、
+// forward/socks/speedtest（3e：承载面三命令面，守护托管）；其余参数 = 守护进程本体。
 func CLI(args []string, version string) error {
 	if len(args) > 0 && args[0] == "status" {
 		return statusCLI(args[1:], version, os.Stdout)
 	}
 	if len(args) > 0 && args[0] == "host" {
 		return hostCLI(args[1:], version, os.Stdout)
+	}
+	if len(args) > 0 && args[0] == "forward" {
+		return forwardCLI(args[1:], version, os.Stdout)
+	}
+	if len(args) > 0 && args[0] == "socks" {
+		return socksCLI(args[1:], version, os.Stdout)
+	}
+	if len(args) > 0 && args[0] == "speedtest" {
+		return speedtestCLI(args[1:], version, os.Stdout, os.Stderr)
 	}
 	fs := flag.NewFlagSet("homeway daemon", flag.ContinueOnError)
 	fs.SetOutput(os.Stdout)
@@ -50,7 +59,7 @@ func CLI(args []string, version string) error {
 	// B15：flag 解析后的意外位置参数报错（此前 `homeway daemon --state X status`
 	// 静默吞掉 status 起守护进程）。
 	if fs.NArg() > 0 {
-		return fmt.Errorf("daemon 不接受位置参数 %q（子命令：status / host；启动守护进程 = 无子命令）", fs.Args())
+		return fmt.Errorf("daemon 不接受位置参数 %q（子命令：status / host / forward / socks / speedtest；启动守护进程 = 无子命令）", fs.Args())
 	}
 
 	// ⓪ 与出口/中继禁止同 state 目录（硬拦，见 checkNotExitState）。
