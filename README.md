@@ -156,14 +156,21 @@ f610f3f 起、**自 v0.10.0 起已生效**——v0.9.0 及更早出口重启后 
 ### 桌面守护进程（`homeway daemon`，多主机客户端常驻）
 
 除手机 App 外的第二种客户端形态：桌面（Mac/Linux）上常驻一个守护进程，把**多台出口
-主机**的客户端会话同时拉起来（同一份会话状态机直 import 核包 `clientcore/hostsession`
-——与手机 cshared 包装共用同一实现与测试，行为零漂移）。
+主机**的客户端会话同时拉起来（经 `clientcore/facade` 单入口消费——与手机 cshared
+包装共用同一份会话状态机与测试，行为零漂移）。
 
 ```bash
 homeway daemon [--state DIR]   # 启动守护进程（默认 state ~/.config/homeway/daemon；
                                # ⚠️ 与出口 state 禁止同目录——两角色组合未定义）
 homeway daemon status [--json] # 状态面（版本/代际/角色/主机+链路态；--json = 机器可读
                                # 全量快照，供脚本与未来 Mac APP 消费）
+homeway daemon status --watch  # live 渲染：快照 + 订阅续播（state/reason/via/rtt 随事件
+                               # 刷新，Ctrl-C 退出）。⚠️ 观测副作用：view 参与需求合成
+                               # ——watch 期间被显示主机（启动时列表）视为有需求（门控
+                               # 不压制其巡检证据），退出后贡献消失。视图声明 = 启动时
+                               # 列表（期间增删的主机照常渲染、不追溯进视图声明）。
+                               # （不叫 homeway status --watch——3f 的 homeway status
+                               # 聚合命令落地时按其同升清单吸收迁移。）
 ```
 
 - **控制面**：守护进程在 `<state>/control.sock`（Unix socket，0600；目录 0700）上提供
@@ -173,7 +180,13 @@ homeway daemon status [--json] # 状态面（版本/代际/角色/主机+链路�
   （`internal/control/testdata/fixtures/v1/`，含独立解码对拍脚本 `decode_check.py`——
   非 Go 消费者可仅凭 spec + fixtures 实现对拍）。
 - **桌面消费形态**：CLI/未来 Mac APP 是控制面的薄前端——`daemon status --json` 与
-  `host list --json`（见下）是协议级机器可读消费路径的实证。
+  `host list --json`（见下）是协议级机器可读消费路径的实证；`daemon status --watch`
+  是订阅面（快照 + 游标续播）的第一个真实只读消费者，纯绑定落地（零 facade 语义
+  改动——「新只读消费者只加绑定」的实证）。
+- **需求门控与诊因**（4a 起）：守护进程的会话恢复按需求门控——三源保守或合成（出站
+  流量增量 / 在场消费连接 / 订阅视图覆盖），无需求期的巡检失败不计恢复证据（手机 App
+  路径不受影响）；恢复被门控/限频/探测窗口拦下时发 `session.diag` 诊因事件
+  （reason = gated/budget/probe_window——「为什么没在恢复」在事件面可观测）。
 
 ### 主机表管理（`homeway host`，守护托管命令面）
 

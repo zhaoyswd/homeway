@@ -1,10 +1,12 @@
 package daemon
 
-// status_cli.go — homeway daemon status [--json] [--state DIR]（host-registry-daemon
-// 4.1）：控制面的 CLI 消费面。命令归属 = 守护托管（读面）：经 §3.8 Go 客户端走完整
-// 握手 → daemon.status（载荷 = 版本/代际/角色/主机摘要+链路态——snapshot 的超集），
-// --json 原样打印机器可读全量快照（UI 半边判据的替代载体之一，design E2）。
-// 守护进程未运行/不可达时报可行动错误（提示启动命令——spec「命令归属规则」场景）。
+// status_cli.go — homeway daemon status [--json] [--watch] [--state DIR]
+// （host-registry-daemon 4.1；--watch = 4a §7.1，D7 只读消费者——主体在
+// status_watch.go）：控制面的 CLI 消费面。命令归属 = 守护托管（读面）：经 §3.8 Go
+// 客户端走完整握手 → daemon.status（载荷 = 版本/代际/角色/主机摘要+链路态——
+// snapshot 的超集），--json 原样打印机器可读全量快照（UI 半边判据的替代载体
+// 之一，design E2）。守护进程未运行/不可达时报可行动错误（提示启动命令——
+// spec「命令归属规则」场景）。
 
 import (
 	"context"
@@ -14,7 +16,10 @@ import (
 	"fmt"
 	"github.com/zhaoyswd/homeway/clientcore/facade"
 	"io"
+	"os"
+	"os/signal"
 	"path/filepath"
+	"syscall"
 	"time"
 
 	"github.com/zhaoyswd/homeway/internal/control"
@@ -26,6 +31,7 @@ func statusCLI(args []string, version string, w io.Writer) error {
 	fs.SetOutput(w) // usage/解析错误随命令输出（生产 = stdout；--help 常规去向）
 	stateDir := fs.String("state", DefaultStateDir(), "守护进程 state 目录（从中找 control.sock）")
 	jsonOut := fs.Bool("json", false, "机器可读全量快照（stdout 一行 JSON，UI/脚本消费）")
+	watch := fs.Bool("watch", false, "live 渲染：快照 + 订阅续播（state/reason/via/rtt 随事件刷新，Ctrl-C 退出）。⚠️ 观测副作用：watch 期间被显示主机（启动时列表）视为有需求（订阅视图参与需求合成），退出后贡献消失")
 	timeout := fs.Duration("timeout", 5*time.Second, "连接与请求的总预算")
 	if err := fs.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
@@ -33,7 +39,17 @@ func statusCLI(args []string, version string, w io.Writer) error {
 		}
 		return err
 	}
+	if *watch && *jsonOut {
+		return fmt.Errorf("--json 与 --watch 互斥（--watch = 人类可读 live 渲染；机器可读消费走 --json）")
+	}
 	sock := filepath.Join(*stateDir, control.ControlSockName)
+	if *watch {
+		// Ctrl-C/SIGTERM → 正常退出（退订由连接关闭承载——view 的需求贡献消失）；
+		// timeout 只限定初始阶段（Dial+快照+订阅），渲染期不设预算。
+		wctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+		defer stop()
+		return statusWatch(wctx, sock, version, *stateDir, *timeout, w)
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), *timeout)
 	defer cancel()
 	c, _, err := control.Dial(ctx, sock, control.FrontendInfo{Kind: "cli", Name: "homeway", Version: version})
