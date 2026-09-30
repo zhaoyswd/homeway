@@ -40,6 +40,7 @@ type Net struct {
 	stack    *stack.Stack
 	events   chan tun.Event
 	incoming chan *buffer.View
+	done     chan struct{} // 收工阀门（见 WriteNotify/Close 的收期死锁修复）
 	notify   *channel.NotificationHandle
 	mtu      int
 }
@@ -67,6 +68,7 @@ func CreateOpts(localAddresses []netip.Addr, mtu int, opts Opts) (tun.Device, *N
 		}),
 		events:   make(chan tun.Event, 10),
 		incoming: make(chan *buffer.View),
+		done:     make(chan struct{}),
 		mtu:      mtu,
 	}
 	sack := tcpip.TCPSACKEnabled(true)
@@ -110,6 +112,13 @@ func CreateOpts(localAddresses []netip.Addr, mtu int, opts Opts) (tun.Device, *N
 }
 
 // WriteNotify 实现 channel.Notification（协议栈有出站包时投递给 device 的 tun.Read）。
+//
+// 收期死锁修复（2026-09-30，v0.12.0 发版前 dispatch 验腿实测）：无界阻塞发送在收工
+// 竞态里会把整个拆栈挂死——读方（wireguard-go 的 tun 读例程）先于 Net.Close 退出，
+// 而 gvisor 的 TCP worker 此时往往还持着端点锁在发最后一帧 ACK/FIN，worker 死等读方
+// ⇒ Net.Close 的 stack.Close→Abort 等同一把端点锁 ⇒ Close 永不返回（真机形态 =
+// TestRecoverAfterDeviceRecordReaped 在 linux CI 上 10 分钟超时）。done 已关 = 没有
+// 读方了：丢弃该包（视图交给 GC），worker 立即返回；正常期（done 开着）语义不变。
 func (n *Net) WriteNotify() {
 	pkt := n.ep.Read()
 	if pkt == nil {
@@ -117,7 +126,10 @@ func (n *Net) WriteNotify() {
 	}
 	view := pkt.ToView()
 	pkt.DecRef()
-	n.incoming <- view
+	select {
+	case n.incoming <- view:
+	case <-n.done:
+	}
 }
 
 // ---------- tun.Device（给 wireguard-go 的 NewDevice） ----------
@@ -127,8 +139,14 @@ func (n *Net) File() *os.File           { return nil }
 func (n *Net) Events() <-chan tun.Event { return n.events }
 
 func (n *Net) Read(buf [][]byte, sizes []int, offset int) (int, error) {
-	view, ok := <-n.incoming
-	if !ok {
+	var view *buffer.View
+	select {
+	case v, ok := <-n.incoming:
+		if !ok {
+			return 0, os.ErrClosed
+		}
+		view = v
+	case <-n.done:
 		return 0, os.ErrClosed
 	}
 	sz, err := view.Read(buf[0][offset:])
@@ -159,12 +177,17 @@ func (n *Net) Write(buf [][]byte, offset int) (int, error) {
 }
 
 func (n *Net) Close() error {
+	// 先关收工阀门再拆栈：stack.Close 的 Abort 路径上 gvisor worker 可能持端点锁
+	// 调 WriteNotify——done 先关让它们丢弃出队包而非死等读方（见 WriteNotify 注释）。
+	close(n.done)
 	n.stack.RemoveNIC(1)
 	n.stack.Close()
 	n.ep.RemoveNotify(n.notify)
 	n.ep.Close()
 	close(n.events)
-	close(n.incoming)
+	// n.incoming 不再显式 close：收工竞态下「select 已选中发送分支」的在途发送与
+	// close(incoming) 相遇即 panic（对已关闭通道的发送在 select 里同样 panic）；
+	// 读侧改经 done 解阻塞（os.ErrClosed 契约不变），通道与滞留视图交给 GC。
 	return nil
 }
 
