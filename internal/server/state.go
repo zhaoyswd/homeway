@@ -81,6 +81,41 @@ func (s *State) IssueToken(eps []proto.Endpoint) (proto.Token, error) {
 	tok.Secret = secret
 	tok.Endpoints = eps
 
+	if err := appendTokenRecord(s.dir, secret, eps); err != nil {
+		return proto.Token{}, err
+	}
+	return tok, nil
+}
+
+// AppendToken 台账写入纪律的追加入口（role-management 2.4，r1 高-1 / r2 新-1）：
+// 每次铸出与台账末行**不同**的 token 即追加一条（含启动首轮；无变化不追加）——
+// 由此「台账末行 = 最近在用 token」成为不变量（`serve token` 未跑直读与 status
+// 掩码指纹都以末行为准）。追加记录 = 调用方传入的在用 secret〔secrets[0]〕+ 该枚
+// token 的实时端点，append-only 语义不变。
+//
+// **不复用 IssueToken**：其内部 rand.Read 每次新签发 secret，与「secret 复用在用
+// secret」矛盾（照字面调用会写出「末行 secret ≠ 在用 secret」的记录）。
+// 去重判据（secret + endpoints 都相同 = 无变化）收在本函数里，调用方每轮铸出后
+// 直接调它即可（进程内存 lastToken 去重只管终端一轮制，与台账追加是两回事）。
+func (s *State) AppendToken(secret [32]byte, eps []proto.Endpoint) error {
+	last, err := s.lastRecord()
+	if err != nil {
+		return err
+	}
+	if last != nil {
+		var lastSecret [32]byte
+		if raw, derr := base64.RawURLEncoding.DecodeString(last.Secret); derr == nil && len(raw) == 32 {
+			copy(lastSecret[:], raw)
+			if lastSecret == secret && endpointSetEqual(last.Endpoints, eps) {
+				return nil // 无变化不追加
+			}
+		}
+	}
+	return appendTokenRecord(s.dir, secret, eps)
+}
+
+// appendTokenRecord 追加一条台账行（0600、O_APPEND）。
+func appendTokenRecord(dir string, secret [32]byte, eps []proto.Endpoint) error {
 	rec := tokenRecord{
 		Secret:    base64.RawURLEncoding.EncodeToString(secret[:]),
 		Endpoints: eps,
@@ -88,17 +123,53 @@ func (s *State) IssueToken(eps []proto.Endpoint) (proto.Token, error) {
 	}
 	line, err := json.Marshal(rec)
 	if err != nil {
-		return proto.Token{}, err
+		return err
 	}
-	f, err := os.OpenFile(filepath.Join(s.dir, "tokens.jsonl"), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
+	f, err := os.OpenFile(filepath.Join(dir, "tokens.jsonl"), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
 	if err != nil {
-		return proto.Token{}, err
+		return err
 	}
 	defer f.Close()
 	if _, err := f.Write(append(line, '\n')); err != nil {
-		return proto.Token{}, err
+		return err
 	}
-	return tok, nil
+	return nil
+}
+
+// lastRecord 台账末行（nil = 空台账）——「末行 = 最近在用 token」的读半边。
+func (s *State) lastRecord() (*tokenRecord, error) {
+	b, err := os.ReadFile(filepath.Join(s.dir, "tokens.jsonl"))
+	if errors.Is(err, os.ErrNotExist) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	lines := splitLines(b)
+	for i := len(lines) - 1; i >= 0; i-- {
+		if len(lines[i]) == 0 {
+			continue
+		}
+		var rec tokenRecord
+		if err := json.Unmarshal(lines[i], &rec); err != nil {
+			return nil, fmt.Errorf("state: tokens.jsonl 坏行: %w", err)
+		}
+		return &rec, nil
+	}
+	return nil, nil
+}
+
+// endpointSetEqual 端点列表等值比较（顺序敏感——同一轮铸出的端点序固定）。
+func endpointSetEqual(a, b []proto.Endpoint) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }
 
 // Secrets 加载全部已签发 token 的 secret（reg 验证时逐一试 HMAC，个人规模下 N 极小）。
