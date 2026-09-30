@@ -23,18 +23,8 @@ func startServer(t *testing.T, lim Limits) (*Server, string) {
 	return srv, ln.Addr().String()
 }
 
+// dial：普通拨号（3e 去问候帧后首帧 = 客户端会话请求，无预读）。
 func dial(t *testing.T, addr string) (net.Conn, *bufio.Reader, *bufio.Writer) {
-	t.Helper()
-	conn, br, bw := dialRaw(t, addr)
-	// 服务端 accept 后恒先发问候（协议序：greeting → request）。
-	if err := ReadGreeting(br); err != nil {
-		t.Fatalf("greeting: %v", err)
-	}
-	return conn, br, bw
-}
-
-// dialRaw：不消费问候的拨号（拒绝路径/坏流测试用）。
-func dialRaw(t *testing.T, addr string) (net.Conn, *bufio.Reader, *bufio.Writer) {
 	t.Helper()
 	conn, err := net.DialTimeout("tcp", addr, 2*time.Second)
 	if err != nil {
@@ -168,7 +158,7 @@ func TestConcurrencyLimit(t *testing.T) {
 	srv, addr := startServer(t, Limits{MaxConns: 1})
 
 	// 占住唯一名额：服务端在发、客户端慢慢读。
-	_, br1, bw1 := dial(t, addr)
+	conn1, br1, bw1 := dial(t, addr)
 	if err := WriteRequest(bw1, RoleRecv, 200*time.Millisecond, 1200*time.Millisecond); err != nil {
 		t.Fatalf("request1: %v", err)
 	}
@@ -176,17 +166,27 @@ func TestConcurrencyLimit(t *testing.T) {
 		t.Fatalf("flush1: %v", err)
 	}
 
-	// 第二路应被拒：满员拒绝发生在问候之前，问候期直接拿到 busy。
-	_, br2, bw2 := dialRaw(t, addr)
+	// 等第一路真实进入会话（peek 到下行数据 = 已受理注册），保证第二路撞满员。
+	// peek 走 bufio（不动缓冲），别用裸 Read 抢字节（会偷走首帧魔数）。
+	_ = conn1.SetReadDeadline(time.Now().Add(2 * time.Second))
+	if _, err := br1.Peek(1); err != nil {
+		t.Fatalf("第一路应先收到下行数据：%v", err)
+	}
+
+	// 第二路应被拒：满员拒绝 = 读掉请求后回 report{busy} 再有序收口。
+	_, br2, bw2 := dial(t, addr)
 	if err := WriteRequest(bw2, RoleSend, 100*time.Millisecond, 100*time.Millisecond); err != nil {
 		t.Fatalf("request2: %v", err)
 	}
 	if err := bw2.Flush(); err != nil {
 		t.Fatalf("flush2: %v", err)
 	}
-	gerr := ReadGreeting(br2)
-	if gerr == nil || gerr.Error() != "busy" {
-		t.Fatalf("第二路问候应报 busy，got %v", gerr)
+	rep2, rerr := ReadReport(br2)
+	if rerr != nil && rep2.Error == "" {
+		t.Fatalf("第二路应收到 busy report，got err=%v", rerr)
+	}
+	if rep2.Error != "busy" {
+		t.Fatalf("第二路 report.Error = %q，期望 busy", rep2.Error)
 	}
 
 	// 等第一路自然收尾，再连第三路应放行。
@@ -267,9 +267,6 @@ func TestServeOverUnixSocket(t *testing.T) {
 	}
 	defer conn.Close()
 	br, bw := bufio.NewReader(conn), bufio.NewWriter(conn)
-	if err := ReadGreeting(br); err != nil {
-		t.Fatalf("greeting: %v", err)
-	}
 
 	// 一轮 send（上行方向）在 UDS 上跑通：预热 → START → 泵 → FINISH → report 对账。
 	if err := WriteRequest(bw, RoleSend, 100*time.Millisecond, 200*time.Millisecond); err != nil {
@@ -311,7 +308,7 @@ func TestCorruptMagic(t *testing.T) {
 		t.Fatalf("flush: %v", err)
 	}
 	conn.SetReadDeadline(time.Now().Add(2 * time.Second))
-	// 服务端会先发问候再读请求失败关连接：读到问候是合法的，之后必须以 EOF/错误收场。
+	// 服务端读请求帧失败关连接：直接以 EOF/错误收场（3e 起无预发问候）。
 	buf := make([]byte, 64)
 	for {
 		_, err := conn.Read(buf)

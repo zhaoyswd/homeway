@@ -9,6 +9,7 @@ import (
 	"context"
 	"errors"
 	"net"
+	"net/netip"
 
 	"github.com/zhaoyswd/homeway/clientcore/hostsession"
 )
@@ -95,6 +96,12 @@ var dialPort = func(s *hostsession.Session, ctx context.Context, port uint16) (n
 	return s.DialPort(ctx, port)
 }
 
+// dialAddr 任意目标拨号注入缝（3e §2.1，D5；生产 = Session.DialAddr——与 dialPort
+// 同 healing 路径，测试注入桩同形状）。
+var dialAddr = func(s *hostsession.Session, ctx context.Context, dst netip.AddrPort) (net.Conn, error) {
+	return s.DialAddr(ctx, dst)
+}
+
 // DialPort 重建感知的隧道端口拨号（hostsession D1 导出面）：会话不在（收工/
 // 重建窗口）→ ErrSessionNotCurrent（facade 哨兵，vocab.go）；登记在册但会话
 // 对象不在（构造期失败）→ ErrNoHost（绑定点沿 no_host 族映射——保持既有 wire
@@ -107,6 +114,31 @@ func (h *Host) DialPort(ctx context.Context, port uint16) (net.Conn, error) {
 		h.dm.dials.Add(1) // 源①：本拍拨号尝试
 	}
 	conn, err := dialPort(h.sess, ctx, port)
+	if err != nil {
+		if errors.Is(err, hostsession.ErrSessionNotCurrent) {
+			return nil, ErrSessionNotCurrent
+		}
+		return nil, err
+	}
+	if h.dm != nil {
+		h.dm.activeNx.Add(1) // 源②：在场腿（连接关闭时递减——countedConn）
+		return countedConn{Conn: conn, dm: h.dm, onClose: func() { h.dm.activeNx.Add(-1) }}, nil
+	}
+	return conn, nil
+}
+
+// Dial 任意目标拨号缝（3e §2.1，D5）：与 DialPort 同 healing 路径、同 demand 记账
+// （源① 拨号尝试 + 源② 在场腿 countedConn）、同重建窗口语义——消费方 = forward 的
+// 任意 IP 目标与 socks 承载面（出口可达目标）；DialPort 仍是出口本机服务端口的
+// 文档主缝（term/files/speedtest/5300 既有消费者零改动）。
+func (h *Host) Dial(ctx context.Context, dst netip.AddrPort) (net.Conn, error) {
+	if h.sess == nil {
+		return nil, ErrNoHost
+	}
+	if h.dm != nil {
+		h.dm.dials.Add(1) // 源①：本拍拨号尝试
+	}
+	conn, err := dialAddr(h.sess, ctx, dst)
 	if err != nil {
 		if errors.Is(err, hostsession.ErrSessionNotCurrent) {
 			return nil, ErrSessionNotCurrent

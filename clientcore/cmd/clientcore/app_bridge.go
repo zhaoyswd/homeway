@@ -22,6 +22,7 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"crypto/rand"
@@ -41,6 +42,7 @@ import (
 	"time"
 
 	"github.com/zhaoyswd/homeway/clientcore/internal/wgcore"
+	"github.com/zhaoyswd/homeway/pkg/speedtest"
 )
 
 // bridgeDirName 桥 socket 的子目录（<filesDir>/bridge/）。socket 路径随状态 JSON
@@ -480,11 +482,13 @@ func (h *bridgeHost) acceptLoop(ln net.Listener, port uint16, lim *bridgeConns, 
 			if err != nil {
 				h.logf("%s: 经会话拨出口 %d 失败: %v", name, port, err)
 				if name == "speed-bridge" && !wgcore.IsRefusedLike(err) {
-					// 测速客户端在等 greeting。按错误种类分流（评审 r2-N2）：
-					//   refused 类 = 出口活着、该端口没服务（老出口没有测速服务，
+					// 按错误种类分流（评审 r2-N2；3e 去问候帧后的收口形态 r1 中-1②）：
+					//   refused 类 = 出口活着、该端口没服务（出口未配置 state 目录，
 					//   intercept 对豁免拨号失败回 RST）⇒ **不回帧直接关**——客户端
-					//   greeting 期 EOF ⇒ not_supported（「请升级出口」）；
-					//   其余 = 出口不在/正在恢复 ⇒ 回 link_down ⇒ 页面回等待循环自动续跑。
+					//   请求后零字节 EOF ⇒ not_supported（「请升级出口」，判据②）；
+					//   其余 = 出口不在/正在恢复 ⇒ 回 report{link_down}（先有界读掉
+					//   客户端已写出的请求帧再回帧并有序收口，保证 report 先于任何
+					//   复位送达）⇒ 页面回等待循环自动续跑。
 					// 该路径在桥鉴权之后，回帧不向未鉴权探测者泄任何信息。
 					speedLinkDownReply(c)
 				}
@@ -494,6 +498,14 @@ func (h *bridgeHost) acceptLoop(ln net.Listener, port uint16, lim *bridgeConns, 
 			pipeBoth(h.logf, c, remote)
 		}(c)
 	}
+}
+
+// speedLinkDownReply 桥宿主拨出口失败（非 refused 类）时对 speed 桥回 report{link_down}
+// 再关——客户端把它归 link_down（页面回等待循环自动续跑）。3e 去问候帧后客户端**先写
+// 请求再读**：直接回帧后关会走 RST 路径、已发出的 report 可能被对端丢弃，故走
+// pkg/speedtest.ReplyThenClose 的「读掉请求帧 → 回帧 → 有序收口」。
+func speedLinkDownReply(conn net.Conn) {
+	speedtest.ReplyThenClose(conn, bufio.NewReader(conn), speedtest.Report{Error: "link_down"})
 }
 
 // tokenForTest 暴露原始令牌给单测（不进任何状态面）。

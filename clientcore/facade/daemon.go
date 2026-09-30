@@ -43,6 +43,9 @@ type Daemon struct {
 
 	mu    sync.Mutex
 	table *hostTable
+	// carriers 承载面管理器束（3e §2.4：forward/socks/speedtest；随 Attach/Detach
+	// 生命周期，stateDir 与表同源）。
+	carriers *Carriers
 	// attachMu Attach/Detach 串行化（低-2：导出 API 防并发——两个并发 Attach 互相
 	// 覆盖时输者的表不会被 Close〔会话不 Stop、无 session.removed〕且同 stateDir 下
 	// 互踩 hosts.json.tmp；当前装配不可达〔client 角色单 goroutine〕，导出面自守）。
@@ -118,4 +121,12 @@ func (d *Daemon) DemandStatus() []HostDemandBrief {
 		return nil
 	}
 	return tbl.demandBriefs()
+}
+
+// Carriers 承载面管理器束（forward/socks/speedtest 的进程内语义入口——控制面 op
+// 的镜像同源；未 attach = nil，绑定层走 not_ready 门）。
+func (d *Daemon) Carriers() *Carriers {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return d.carriers
 }

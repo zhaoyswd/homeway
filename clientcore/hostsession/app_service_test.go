@@ -25,6 +25,7 @@ import (
 // fakeExitSession 可编排的假会话：probe 行为可注入，Close 被记录。
 type fakeExitSession struct {
 	probe   func(ctx context.Context) error
+	dialTCP func(ctx context.Context, dst netip.AddrPort) (net.Conn, error) // 3e §2.1：DialAddr 用例注入
 	closed  chan struct{}
 	closeAt time.Time
 }
@@ -47,6 +48,9 @@ func (f *fakeExitSession) DialTCPPort(ctx context.Context, port uint16) (net.Con
 }
 
 func (f *fakeExitSession) DialTCP(ctx context.Context, dst netip.AddrPort) (net.Conn, error) {
+	if f.dialTCP != nil {
+		return f.dialTCP(ctx, dst)
+	}
 	return f.DialTCPPort(ctx, 1)
 }
 
@@ -312,5 +316,40 @@ func TestServiceFinishSavesCache(t *testing.T) {
 	}
 	if !found {
 		t.Fatalf("finish 后缓存未落盘（目录 %s，条目 %v）", dir, entries)
+	}
+}
+
+// TestSessionDialAddr（3e §2.1）：任意目标拨号缝——dst 原样透传到当代会话的
+// DialTCP；会话不在（收工/重建窗口）= ErrSessionNotCurrent（与 DialPort 同语义）。
+func TestSessionDialAddr(t *testing.T) {
+	dst := netip.MustParseAddrPort("192.168.3.5:5000")
+	var gotDst netip.AddrPort
+	c1, c2 := net.Pipe()
+	defer c1.Close()
+	defer c2.Close()
+	f := newFakeExitSession()
+	f.dialTCP = func(ctx context.Context, d netip.AddrPort) (net.Conn, error) {
+		gotDst = d
+		return c1, nil
+	}
+	s := &Session{state: svcStateReady, since: time.Now(), stopCh: make(chan struct{}), done: make(chan struct{}), logf: Discard}
+	s.mu.Lock()
+	s.sess = f
+	s.mu.Unlock()
+	conn, err := s.DialAddr(context.Background(), dst)
+	if err != nil {
+		t.Fatalf("DialAddr: %v", err)
+	}
+	if conn != c1 {
+		t.Fatal("应返回会话拨号产物")
+	}
+	if gotDst != dst {
+		t.Fatalf("dst 应原样透传，实得 %v", gotDst)
+	}
+
+	// 会话不在：ErrSessionNotCurrent。
+	s2 := &Session{state: svcStateReady, since: time.Now(), stopCh: make(chan struct{}), done: make(chan struct{}), logf: Discard}
+	if _, err := s2.DialAddr(context.Background(), dst); !errors.Is(err, ErrSessionNotCurrent) {
+		t.Fatalf("会话不在应 ErrSessionNotCurrent，实得 %v", err)
 	}
 }

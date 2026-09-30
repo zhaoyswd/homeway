@@ -27,6 +27,7 @@ import (
 	"fmt"
 	"log"
 	"net"
+	"net/netip"
 	"os"
 	"sync"
 	"time"
@@ -420,13 +421,27 @@ func (s *Session) healingDialCurrent(ctx context.Context, port uint16) (net.Conn
 	if sess == nil {
 		return nil, ErrSessionNotCurrent
 	}
-	return s.healingDial(sess, ctx, port)
+	return s.healingDial(sess, ctx, func(c context.Context, cur ExitSession) (net.Conn, error) {
+		return cur.DialTCPPort(c, port)
+	})
 }
 
 // DialPort 重建感知的隧道端口拨号（D1 导出面；daemon 流腿用，D5）：动态取当前会话，
 // 拨出口主机本机端口；首段短预算试探 + 失败自愈（healingDial 同路径）。
 func (s *Session) DialPort(ctx context.Context, port uint16) (net.Conn, error) {
 	return s.healingDialCurrent(ctx, port)
+}
+
+// DialAddr 重建感知的任意目标隧道拨号（3e §2.1，D5）：与 DialPort 同 healing 路径、
+// 同重建感知——消费方 = facade.Host.Dial（forward 任意 IP 目标 / socks 承载面）。
+func (s *Session) DialAddr(ctx context.Context, dst netip.AddrPort) (net.Conn, error) {
+	sess := s.curSession()
+	if sess == nil {
+		return nil, ErrSessionNotCurrent
+	}
+	return s.healingDial(sess, ctx, func(c context.Context, cur ExitSession) (net.Conn, error) {
+		return cur.DialTCP(c, dst)
+	})
 }
 
 // healingDial 服务桥的拨号路径（files/term 的内部流都从这里走）：
@@ -438,10 +453,11 @@ func (s *Session) DialPort(ctx context.Context, port uint16) (net.Conn, error) {
 //     行为与原先「一路等到超时」等价，只是错误归因更早。
 //
 // 幂等安全：Rebind/Rearm/RefreshReg 只动本地状态；并发拨号（files+term
-// 同时失败）各自触发一次也无害。
-func (s *Session) healingDial(sess ExitSession, ctx context.Context, port uint16) (net.Conn, error) {
+// 同时失败）各自触发一次也无害。dial 参数 = 对「某一代会话」的一次拨号闭包
+// （DialPort/DialAddr 两缝共用本路径——同试探、同自愈、同重试语义）。
+func (s *Session) healingDial(sess ExitSession, ctx context.Context, dial func(context.Context, ExitSession) (net.Conn, error)) (net.Conn, error) {
 	firstCtx, cancel := context.WithTimeout(ctx, serviceDialFirstTry)
-	conn, err := sess.DialTCPPort(firstCtx, port)
+	conn, err := dial(firstCtx, sess)
 	cancel()
 	if err == nil {
 		return conn, nil
@@ -456,7 +472,7 @@ func (s *Session) healingDial(sess ExitSession, ctx context.Context, port uint16
 	if cur := s.curSession(); cur != nil && cur != sess {
 		sess = cur
 	}
-	return sess.DialTCPPort(ctx, port)
+	return dial(ctx, sess)
 }
 
 // curSession 当前会话（收工/重建窗口为 nil）。

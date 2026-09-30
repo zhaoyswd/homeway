@@ -343,9 +343,10 @@ func TestBridgeStopNotDeleteSuccessor(t *testing.T) {
 // TestSpeedBridgeHostBehavior：宿主侧第三座桥的护栏测试（评审 r2-N13——引擎单测的
 // 仿桥绕开了宿主 acceptLoop，N2 正是从这条缝隙漏出去的）。用**真 bridgeHost** +
 // 注入三种拨号结局，钉住「refused ⇒ 无帧 EOF（not_supported 路径）/ 其它错误 ⇒
-// report{link_down} / 成功 ⇒ greeting 透传且全轮可用」的分流契约。
+// report{link_down}（先读掉请求帧再回帧）/ 成功 ⇒ 请求-应答全轮可用」的分流契约
+// （3e 去问候帧后客户端先写请求、再读首帧）。
 func TestSpeedBridgeHostBehavior(t *testing.T) {
-	// 真出口：本地 speedtest 服务（greeting/协议全真）。
+	// 真出口：本地 speedtest 服务（线协议全真）。
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatalf("listen: %v", err)
@@ -357,12 +358,12 @@ func TestSpeedBridgeHostBehavior(t *testing.T) {
 	cases := []struct {
 		name         string
 		dialErr      error // nil = 拨真出口成功
-		wantLinkDown bool  // true = 期望问候期读到 report{link_down}
-		isSuccess    bool  // true = 期望 greeting 透传 + 完整收一轮
+		wantLinkDown bool  // true = 期望首帧 report{link_down}
+		isSuccess    bool  // true = 期望完整收一轮
 	}{
-		{"refused ⇒ 无帧 EOF（老出口 not_supported 路径）", wgnet.ErrRefused, false, false},
+		{"refused ⇒ 无帧 EOF（出口无测速服务 not_supported 路径）", wgnet.ErrRefused, false, false},
 		{"其它错误 ⇒ link_down 帧（恢复期）", errors.New("boom（会话未就绪）"), true, false},
-		{"成功 ⇒ greeting 透传", nil, false, true},
+		{"成功 ⇒ 请求-应答全轮", nil, false, true},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -401,56 +402,58 @@ func TestSpeedBridgeHostBehavior(t *testing.T) {
 				t.Fatalf("发鉴权失败：%v", err)
 			}
 			bw := bufio.NewWriter(c)
-			// refused 路径桥会先关连接：写请求可能 EPIPE，忽略写错、以读端为准。
-			// 该请求在 greeting 消费前发出（协议序 greeting→request 由服务端保证），
-			// 成功路径的整轮收数用的就是它——不要发第二次。
+			// 客户端先写请求（去问候帧后的协议序）；refused 路径桥会先关连接，
+			// 写可能 EPIPE——忽略写错、以读端为准。
 			_ = speedtest.WriteRequest(bw, speedtest.RoleRecv, 100*time.Millisecond, 150*time.Millisecond)
 			_ = bw.Flush()
-			// greeting 与后续帧共用同一个 bufio.Reader：ReadGreeting 若自建临时 reader，
-			// 首次 Read 会把 greeting 之后的帧字节一并吸进缓冲，reader 丢弃后字节永久丢失，
-			// 后续读帧从中间开始 ⇒ 帧魔数不符（linux 上概率红，exec-r4 高-1）。
 			br := bufio.NewReader(c)
-			gerr := speedtest.ReadGreeting(br)
 			_ = c.SetDeadline(time.Time{})
 
-			if tc.wantLinkDown {
-				if gerr == nil || gerr.Error() != "link_down" {
-					t.Fatalf("期望 link_down，got %v", gerr)
+			// 首帧分流：report{link_down}（恢复期）/ data→report（成功）/ EOF（refused）。
+			ctrl := make([]byte, 1024)
+			sawLinkDown := false
+			for {
+				tt, _, n, payload, rerr := speedtest.ReadFrameLoose(br, ctrl)
+				if rerr != nil {
+					break // EOF/读错收场（refused 路径的唯一出口）
 				}
-				return
+				if tt == speedtest.TypeData {
+					if derr := speedtest.DiscardPayload(br, n); derr != nil {
+						t.Fatalf("读载荷：%v", derr)
+					}
+					continue
+				}
+				if tt == speedtest.TypeReport {
+					var rep speedtest.Report
+					if jerr := json.Unmarshal(payload, &rep); jerr != nil {
+						t.Fatalf("report 解析：%v", jerr)
+					}
+					if rep.Error == "link_down" {
+						sawLinkDown = true
+						break
+					}
+					if rep.Error != "" {
+						t.Fatalf("意外错误 report：%+v", rep)
+					}
+					if !tc.isSuccess {
+						t.Fatalf("该用例不应成功收轮：%+v", rep)
+					}
+					if rep.Bytes <= 0 {
+						t.Fatalf("report 异常：%+v", rep)
+					}
+					return // 成功：完整收一轮（协议在真实宿主透传下可用）
+				}
+			}
+			if tc.wantLinkDown && !sawLinkDown {
+				t.Fatal("期望 link_down report，未读到")
+			}
+			// refused：必须无 link_down 帧（EOF 都行，就是不能是 link_down——
+			// 否则出口无服务会被误判成恢复期）。
+			if !tc.wantLinkDown && sawLinkDown {
+				t.Fatalf("该用例不应回 link_down")
 			}
 			if tc.isSuccess {
-				if gerr != nil {
-					t.Fatalf("greeting 应透传：%v", gerr)
-				}
-				// 完整收一轮小窗口（协议在真实宿主透传下可用；请求已发过，不再重发）
-				ctrl := make([]byte, 1024)
-				for {
-					tt, _, n, payload, rerr := speedtest.ReadFrameLoose(br, ctrl)
-					if rerr != nil {
-						t.Fatalf("读帧：%v", rerr)
-					}
-					if tt == speedtest.TypeData {
-						if derr := speedtest.DiscardPayload(br, n); derr != nil {
-							t.Fatalf("读载荷：%v", derr)
-						}
-						continue
-					}
-					if tt == speedtest.TypeReport {
-						var rep speedtest.Report
-						if jerr := json.Unmarshal(payload, &rep); jerr != nil {
-							t.Fatalf("report 解析：%v", jerr)
-						}
-						if rep.Error != "" || rep.Bytes <= 0 {
-							t.Fatalf("report 异常：%+v", rep)
-						}
-						return
-					}
-				}
-			}
-			// refused：必须无 link_down 帧（EOF 或其它读错都行，就是不能是 link_down）
-			if gerr != nil && gerr.Error() == "link_down" {
-				t.Fatalf("refused 类不应回 link_down（会把老出口误判成恢复期）")
+				t.Fatal("成功用例必须收到 report 收轮")
 			}
 		})
 	}

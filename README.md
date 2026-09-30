@@ -342,11 +342,11 @@ clientcore-facade「收拢判据」；4b 升 CI 门时沿用本命令）：
 （`[ -z ]` 口径：`grep -v` 全过滤时退出码 1，直接拿管道退出码当门会假红；排除
 模式不带尾引号——facade 子包同被排除。）
 
-race 门（4a 终态口径，五包——hostsession 自 demand/diag 批起是改动面，exec-r2 后
-入列；4b 升 CI 门时沿用本命令）：
+race 门（六包——4a 终态五包〔hostsession 自 demand/diag 批起是改动面，exec-r2 后
+入列〕+ 3e 起 `pkg/socks`〔每连接起 goroutine〕；后续升 CI 门时沿用本命令）：
 
 ```bash
-go test -race -count=1 ./clientcore/facade/ ./clientcore/hostsession/ ./internal/control/ ./internal/daemon/ ./pkg/term/
+go test -race -count=1 ./clientcore/facade/ ./clientcore/hostsession/ ./internal/control/ ./internal/daemon/ ./pkg/term/ ./pkg/socks/
 ```
 
 发版 = 推 tag（`v0.x.y`），CI 出 darwin/linux 四目标产物 + sha256（见

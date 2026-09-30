@@ -42,11 +42,6 @@ const (
 	TypeFinish  FrameType = 3 // client→server：role=send 收口，服务端回 report（空载荷）
 	TypeData    FrameType = 4 // 双向：数据块（payload 全零，goodput 只计它）
 	TypeReport  FrameType = 5 // server→client：收口报告（含 error 时为失败收场）
-
-	// TypeGreeting server→client：accept 后**第一个**发（files/term 的 GREETING 同款）。
-	// 客户端据此立刻分辨「出口有测速服务」与「桥那头拨空了（老出口）」——
-	// 不用读超时探活（那会让每条连接白等一个超时周期）。
-	TypeGreeting FrameType = 6
 )
 
 // Role 会话角色。
@@ -164,14 +159,16 @@ func (s *Server) Serve(ln net.Listener) error {
 }
 
 func (s *Server) serveConn(conn net.Conn) {
+	br := bufio.NewReader(conn)
+	bw := bufio.NewWriter(conn)
 	s.mu.Lock()
 	if len(s.conns) >= s.lim.MaxConns {
 		s.rejected++
 		s.mu.Unlock()
 		s.logf("speedtest: 会话拒绝（并发上限 %d）", s.lim.MaxConns)
-		conn.SetWriteDeadline(time.Now().Add(time.Second))
-		replyReport(conn, Report{Error: "busy"})
-		conn.Close()
+		// 先有界读掉请求帧再回帧（r1 中-1②）：去问候帧后客户端先写请求，回帧后立刻关
+		// 会走 RST 路径、已发出的 report 可能被对端丢弃。
+		ReplyThenClose(conn, br, Report{Error: "busy"})
 		return
 	}
 	s.total++
@@ -188,18 +185,7 @@ func (s *Server) serveConn(conn net.Conn) {
 	// 单连接硬超时：覆盖最大预热 + 最大窗口 + 控制帧余量（spec：单会话时长上限）。
 	conn.SetDeadline(time.Now().Add(s.lim.ConnTimeout))
 
-	br := bufio.NewReader(conn)
-	bw := bufio.NewWriter(conn)
-
-	// 恒第一帧：greeting（客户端等它判「服务在不在」，读超时探活已废）。
-	if err := WriteControl(bw, TypeGreeting, greetingPayload); err != nil {
-		return
-	}
-	if err := bw.Flush(); err != nil {
-		return
-	}
-
-	// 恒第二帧：request。
+	// 恒第一帧（去问候帧后首帧 = 会话请求，客户端先写、服务端后答）。
 	t, _, payload, err := readFrame(br)
 	if err != nil {
 		s.logf("speedtest: 会话异常（读请求帧：%v）", err)
@@ -441,6 +427,29 @@ func replyReport(conn net.Conn, rep Report) {
 	_ = bw.Flush()
 }
 
+// ReplyThenClose busy/link_down 类拒绝回帧的有序收口（3e 去问候帧，r1 中-1②）：
+// 客户端已先写请求，直接回帧后关连接会因「对端尚有未读数据」走 RST 路径、已发出的
+// report 可能被对端丢弃。顺序：有界读掉一帧（请求）→ 回 report 并冲刷 → 半关写侧
+// （FIN 先于任何复位）→ 短窗继续吞掉后续输入（role=send 的泵送数据）→ 关。
+// 消费方：服务端 busy 路径与手机桥宿主的 link_down 回复（app_bridge.go speedLinkDownReply）。
+func ReplyThenClose(conn net.Conn, br *bufio.Reader, rep Report) {
+	_ = conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+	_, _, _, _ = readFrame(br) // 有界吞一帧；失败也继续回帧（连接本就异常，尽力而为）
+	_ = conn.SetReadDeadline(time.Time{})
+	_ = conn.SetWriteDeadline(time.Now().Add(2 * time.Second))
+	bw := bufio.NewWriter(conn)
+	_ = writeReport(bw, rep)
+	// 继续吞输入一小窗（send 角色在回帧抵达前还在泵）后整关；期限内对端先关则自然提前结束。
+	_ = conn.SetReadDeadline(time.Now().Add(time.Second))
+	discard := make([]byte, 4096)
+	for {
+		if _, err := br.Read(discard); err != nil {
+			break
+		}
+	}
+	_ = conn.Close()
+}
+
 func writeReport(bw *bufio.Writer, rep Report) error {
 	b, err := json.Marshal(rep)
 	if err != nil {
@@ -451,30 +460,6 @@ func writeReport(bw *bufio.Writer, rep Report) error {
 	}
 	// 立刻冲：写完 report 的下一步就是关连接，不冲会把报告留在 bufio 缓冲里丢掉。
 	return bw.Flush()
-}
-
-// greetingPayload 问候帧载荷（版本位留进化余地；当前恒 1）。
-var greetingPayload = []byte(`{"proto":1}`)
-
-// ReadGreeting 连接建立后读服务端问候（客户端拨号路径用）。
-// 服务端在并发满员等拒绝场景会直接回 report——这里把它的 error 透传出来
-// （如 "busy"），调用方据此归因。
-func ReadGreeting(br *bufio.Reader) error {
-	t, _, payload, err := readFrame(br)
-	if err != nil {
-		return err // EOF/复位 = 桥那头拨空（老出口）或流错位
-	}
-	if t == TypeReport {
-		var rep Report
-		if jerr := json.Unmarshal(payload, &rep); jerr == nil && rep.Error != "" {
-			return errors.New(rep.Error)
-		}
-		return errors.New("问候期收到错误 report")
-	}
-	if t != TypeGreeting {
-		return fmt.Errorf("期望 greeting 帧，收到类型 %d", t)
-	}
-	return nil
 }
 
 // ReadReport 读服务端报告（客户端收口用）。

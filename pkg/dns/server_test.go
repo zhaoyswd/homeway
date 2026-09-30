@@ -5,6 +5,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -296,6 +297,44 @@ func TestServerTCPClient(t *testing.T) {
 	}
 	if binary.BigEndian.Uint16(resp[0:2]) != 6 || binary.BigEndian.Uint16(resp[6:8]) != 1 {
 		t.Fatal("TCP 客户端应拿到正确应答")
+	}
+}
+
+// TestStatsLineTCPSplit（3e §1.3）：TCP/UDP 双面各发查询——q 与 qtcp 两计数独立增长、
+// StatsLine 出 qtcp 字段（「出口 5300 收到 TCP 查询」判据行）。
+func TestStatsLineTCPSplit(t *testing.T) {
+	up := startFakeUpstream(t, func(q []byte) []byte {
+		return buildResponse(q, 0, 33)
+	})
+	s := newTestServer(t, "nameserver 127.0.0.1:"+portOf(t, up.udp.LocalAddr()), "127.0.0.1:1")
+	// UDP 面 2 条。
+	for i := 0; i < 2; i++ {
+		udpQuery(t, s.Addr(), buildQuery(uint16(i), "u.example", 1), time.Second)
+	}
+	// TCP 面 3 条（同一连接多查询 = serveTCP 的循环形态）。
+	conn, err := net.Dial("tcp", s.Addr())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	_ = conn.SetDeadline(time.Now().Add(2 * time.Second))
+	for i := 0; i < 3; i++ {
+		if err := writeTCPMessage(conn, buildQuery(uint16(i), "t.example", 1)); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := readTCPMessage(conn); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if got := s.q.Load(); got != 2 {
+		t.Fatalf("UDP 计数 q = %d，应为 2（UDP 语义不变）", got)
+	}
+	if got := s.qtcp.Load(); got != 3 {
+		t.Fatalf("TCP 计数 qtcp = %d，应为 3", got)
+	}
+	line := s.StatsLine()
+	if !strings.Contains(line, "qtcp=3") || !strings.Contains(line, "q=2 ") {
+		t.Fatalf("StatsLine 应含 q=2 与 qtcp=3：%s", line)
 	}
 }
 

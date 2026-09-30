@@ -38,7 +38,7 @@ type Server struct {
 	connsMu   sync.Mutex
 	conns     map[net.Conn]bool
 
-	q, resp, filtered, trunc, fallback, fail, dropped, malformed, aaaaMixed atomic.Uint64
+	q, qtcp, resp, filtered, trunc, fallback, fail, dropped, malformed, aaaaMixed atomic.Uint64
 }
 
 // Config 代答配置（零值用默认；Dial 上游不可注入——测试用 ResolvPath +
@@ -151,10 +151,11 @@ func (s *Server) Close() error {
 	return nil
 }
 
-// StatsLine 判据行（debug.log 周期输出）。
+// StatsLine 判据行（debug.log 周期输出）。qtcp = serveTCP 受理的查询单列（3e §1.3——
+// 「出口 5300 收到 TCP 查询」的判据面；q 的 UDP 计数语义不变）。
 func (s *Server) StatsLine() string {
-	return fmt.Sprintf("dns: q=%d resp=%d filter=%d trunc=%d fallback=%d fail=%d drop=%d malformed=%d aaaa-mixed=%d",
-		s.q.Load(), s.resp.Load(), s.filtered.Load(), s.trunc.Load(), s.fallback.Load(),
+	return fmt.Sprintf("dns: q=%d qtcp=%d resp=%d filter=%d trunc=%d fallback=%d fail=%d drop=%d malformed=%d aaaa-mixed=%d",
+		s.q.Load(), s.qtcp.Load(), s.resp.Load(), s.filtered.Load(), s.trunc.Load(), s.fallback.Load(),
 		s.fail.Load(), s.dropped.Load(), s.malformed.Load(), s.aaaaMixed.Load())
 }
 
@@ -286,7 +287,7 @@ func (s *Server) serveTCP() {
 				if err != nil {
 					return
 				}
-				s.q.Add(1)
+				s.qtcp.Add(1) // TCP 面单列（StatsLine 判据行；UDP 的 q 语义不变）
 				if int(s.inFlight.Add(1)) > s.cfg.MaxInFlight {
 					s.inFlight.Add(-1)
 					s.dropped.Add(1)
