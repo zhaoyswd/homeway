@@ -236,7 +236,7 @@ func forwardAddErr(ctx context.Context, c *control.Client, hosts []control.HostS
 	if !errors.As(err, &code) || string(code) != facade.CodeBadRequest {
 		return carrierOpErr("forward.add", err)
 	}
-	if owner, found := findPortOwner(ctx, c, hosts, a.Listen); found {
+	if owner, found := findPortOwner(ctx, c, hosts, a.Listen, ""); found {
 		return fmt.Errorf("监听端口 %d 已被 %s 占用（forward/socks 全局唯一，非每主机）——可用 --listen 另选", a.Listen, owner)
 	}
 	// 守护进程外占用探测：短暂在本机回环试听同端口（立即关闭；不做任何物理接口监听）。
@@ -249,7 +249,11 @@ func forwardAddErr(ctx context.Context, c *control.Client, hosts []control.HostS
 }
 
 // findPortOwner 端口占用方现场复查（forward.list + socks.status；文案含主机名）。
-func findPortOwner(ctx context.Context, c *control.Client, hosts []control.HostState, port uint16) (string, bool) {
+// socks 侧按「规则在册」口径连 off 记忆端口一起认（exec-r1 L1：与守护侧
+// SocksManager.portOwner 同口径——此前漏记忆端口，被拒后落到误导性通用文案）；
+// excludeSocksHost 排除请求主机自己的 socks 条目（exec-r1 L2：on 的缺省解析落自己
+// 记忆端口时，别报「被自己占用」；forward 面传空）。
+func findPortOwner(ctx context.Context, c *control.Client, hosts []control.HostState, port uint16, excludeSocksHost string) (string, bool) {
 	if raw, err := c.Request(ctx, facade.OpForwardList, control.ForwardListArgs{}); err == nil {
 		var lst control.ForwardListResult
 		if json.Unmarshal(raw, &lst) == nil {
@@ -264,8 +268,14 @@ func findPortOwner(ctx context.Context, c *control.Client, hosts []control.HostS
 		var st control.SocksStatusResult
 		if json.Unmarshal(raw, &st) == nil {
 			for _, s := range st.Socks {
-				if s.On && s.Listen == port {
-					return nameOfHost(hosts, s.Host) + " 的 socks 监听", true
+				if s.Listen == port {
+					if s.Host == excludeSocksHost {
+						continue
+					}
+					if s.On {
+						return nameOfHost(hosts, s.Host) + " 的 socks 监听", true
+					}
+					return nameOfHost(hosts, s.Host) + " 的 socks 监听（含记忆端口）", true
 				}
 			}
 		}
@@ -323,7 +333,7 @@ func forwardListCLI(args []string, version string, w io.Writer) error {
 			out = append(out, map[string]any{
 				"host": r.Host, "name": nameOfHost(hosts, r.Host),
 				"listen": r.Listen, "targetIp": r.TargetIP, "targetPort": r.TargetPort,
-				"state": r.State, "err": r.Err, "conns": r.Conns,
+				"state": r.State, "err": r.Err, "conns": r.Conns, "rejected": r.Rejected,
 			})
 		}
 		b, err := json.Marshal(out)

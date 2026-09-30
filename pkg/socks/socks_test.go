@@ -10,6 +10,8 @@ import (
 	"io"
 	"net"
 	"net/netip"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -45,10 +47,72 @@ func startSocks(t *testing.T, cfg ServerConfig) string {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { ln.Close() })
+	startSocksOn(t, cfg, ln)
+	return ln.Addr().String()
+}
+
+// startSocksOn 在给定 listener 上起服务端（B3-a：accept 侧注入观测桩用）。
+func startSocksOn(t *testing.T, cfg ServerConfig, ln net.Listener) *Server {
+	t.Helper()
 	srv := New(cfg)
 	go func() { _ = srv.Serve(ln) }()
 	t.Cleanup(func() { srv.Close() })
-	return ln.Addr().String()
+	return srv
+}
+
+// lingerSpy accept 侧连接的 SetLinger 观测桩（exec-r1 B3-a：让「上游失败 RST 收口」
+// 的判据有判别力——此前 FIN 也能过）。记录 SetLinger(0) 意图且不透传（保持 FIN
+// 投递，rep 帧可靠到达；真 RST 对端的投递语义由 facade 层 off 用例〔真 TCP〕覆盖）。
+type lingerSpy struct {
+	net.Conn
+	set atomic.Bool
+}
+
+func (c *lingerSpy) SetLinger(sec int) error {
+	if sec == 0 {
+		c.set.Store(true)
+	}
+	return nil
+}
+
+// spyListener 包装真 listener，Accept 回来的连接全部带 lingerSpy。
+type spyListener struct {
+	ln  net.Listener
+	mu  sync.Mutex
+	spy []*lingerSpy
+}
+
+func (l *spyListener) Accept() (net.Conn, error) {
+	c, err := l.ln.Accept()
+	if err != nil {
+		return nil, err
+	}
+	s := &lingerSpy{Conn: c}
+	l.mu.Lock()
+	l.spy = append(l.spy, s)
+	l.mu.Unlock()
+	return s, nil
+}
+
+func (l *spyListener) Close() error   { return l.ln.Close() }
+func (l *spyListener) Addr() net.Addr { return l.ln.Addr() }
+
+// waitLinger 等到任一 accept 连接记录到 SetLinger(0)。
+func (l *spyListener) waitLinger(t *testing.T) {
+	t.Helper()
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		l.mu.Lock()
+		for _, s := range l.spy {
+			if s.set.Load() {
+				l.mu.Unlock()
+				return
+			}
+		}
+		l.mu.Unlock()
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatal("上游失败分支未置 SetLinger(0)（RST 收口判据未落地）")
 }
 
 // socksClient 最小 SOCKS5 客户端：no-auth 协商 + CONNECT。
@@ -232,18 +296,23 @@ func TestCommandAndATYPRejects(t *testing.T) {
 	}
 }
 
-// TestUpstreamFailureRST 上游失败 → rep=0x01 + 本地 RST 收口（SetLinger(0)）。
+// TestUpstreamFailureRST 上游失败 → rep=0x01 + 本地 RST 收口（SetLinger(0)——有判别力
+// 形态：linger 意图经观测桩断言，exec-r1 B3-a 整改；此前只断言「读得错误」，FIN 也能过）。
 func TestUpstreamFailureRST(t *testing.T) {
-	// 拨一个必然拒绝的本地端口（listen 后立即 close，内核多半回 refused；更稳的是
-	// 直接注入恒失败 dialer——两种都验证，这里注入恒失败 + 一个「首候选死次候选活」
-	// 的按序回退用例见 TestMultiAFallback）。
+	// 注入恒失败 dialer（「首候选死次候选活」的按序回退用例见 TestMultiAFallback）。
 	var dialed int
 	dead := Dialer(func(ctx context.Context, dst netip.AddrPort) (net.Conn, error) {
 		dialed++
 		return nil, errors.New("boom（会话重建窗口）")
 	})
-	addr := startSocks(t, ServerConfig{Resolver: fixedResolver(netip.MustParseAddr("203.0.113.1")), Dialer: dead})
-	cl := dialSocks(t, addr)
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { ln.Close() })
+	sln := &spyListener{ln: ln}
+	startSocksOn(t, ServerConfig{Resolver: fixedResolver(netip.MustParseAddr("203.0.113.1")), Dialer: dead}, sln)
+	cl := dialSocks(t, ln.Addr().String())
 	cl.negotiate(0x00)
 	if rep := cl.connect("dead.example", netip.Addr{}, 0); rep != repGeneralFailure {
 		t.Fatalf("rep = %#x，期望 0x01", rep)
@@ -251,7 +320,9 @@ func TestUpstreamFailureRST(t *testing.T) {
 	if dialed != 1 {
 		t.Fatalf("单候选应只拨一次，实得 %d", dialed)
 	}
-	// RST 收口：后续读应得错误（reset/EOF），且写大块也会失败——不静默挂住。
+	// RST 收口判据（B3-a 核心）：失败分支确实置了 SetLinger(0)。
+	sln.waitLinger(t)
+	// 连接随后收口（桩不透传 linger ⇒ FIN 投递——读到 EOF；rep 帧已完整到达）。
 	cl.conn.SetReadDeadline(time.Now().Add(2 * time.Second))
 	if _, err := cl.br.ReadByte(); err == nil {
 		t.Fatal("失败后连接应收口（读到字节）")

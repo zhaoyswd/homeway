@@ -50,12 +50,13 @@ func startFakeUpstream(t *testing.T, mode string) string {
 	}
 	t.Cleanup(func() { ln.Close() })
 	go func() {
+		var conns atomic.Int32
 		for {
 			c, err := ln.Accept()
 			if err != nil {
 				return
 			}
-			go func(c net.Conn) {
+			go func(c net.Conn, idx int32) {
 				defer c.Close()
 				switch mode {
 				case "close":
@@ -72,11 +73,85 @@ func startFakeUpstream(t *testing.T, mode string) string {
 					return
 				case "delay":
 					time.Sleep(15 * time.Second)
+				case "hold": // 吞一切、永不回帧（L4：下行首帧前的读期限到点形态）
+					buf := make([]byte, 8192)
+					for {
+						if _, err := c.Read(buf); err != nil {
+							return
+						}
+					}
+				case "halfhold": // L4：首条（recv 角色，Streams=1）回空 report 让下行收场；
+					// 之后（send 角色）只吞不发——上行收口 report 缺席到点。
+					br := bufio.NewReader(c)
+					if _, _, _, err := readFrame(br); err != nil {
+						return
+					}
+					if idx == 0 {
+						bw := bufio.NewWriter(c)
+						_ = WriteControl(bw, TypeReport, []byte(`{}`))
+						_ = bw.Flush()
+					}
+					buf := make([]byte, 8192)
+					for {
+						if _, err := c.Read(buf); err != nil {
+							return
+						}
+					}
 				}
-			}(c)
+			}(c, conns.Add(1)-1)
 		}
 	}()
 	return ln.Addr().String()
+}
+
+// clampConn 把引擎设置的读写期限钳到短窗（测试用——引擎的硬期限是
+// warmup+window+15s〔connBudget〕，钳后「读期限到点」无需真烧 15s 即可复现）。
+type clampConn struct {
+	net.Conn
+	limit time.Duration
+}
+
+func (c clampConn) SetDeadline(t time.Time) error {
+	if d := time.Until(t); d > c.limit {
+		t = time.Now().Add(c.limit)
+	}
+	return c.Conn.SetDeadline(t)
+}
+
+func (c clampConn) SetReadDeadline(t time.Time) error {
+	if d := time.Until(t); d > c.limit {
+		t = time.Now().Add(c.limit)
+	}
+	return c.Conn.SetReadDeadline(t)
+}
+
+// TestEngineReadDeadlineInterrupted L4（exec-r1）：读期限到点 ≠ 判据②——下行首帧前
+// 与上行收口两处的「到点」均按 interrupted 通道错误呈现（EOF/复位才归 not_supported；
+// 此前「链路在 END 相位断掉」会误报「出口没有测速服务（请升级出口）」）。
+func TestEngineReadDeadlineInterrupted(t *testing.T) {
+	clampDial := func(addr string) DialFunc {
+		return func(ctx context.Context) (net.Conn, error) {
+			conn, err := tcpDial(addr)(ctx)
+			if err != nil {
+				return nil, err
+			}
+			return clampConn{Conn: conn, limit: 700 * time.Millisecond}, nil
+		}
+	}
+	p := Params{Down: 200 * time.Millisecond, Up: 200 * time.Millisecond, Warmup: 100 * time.Millisecond, Streams: 1}
+
+	// 形态一：请求后上游永不应答（下行首帧前期限到点）。
+	e := NewEngine(nil)
+	res := e.Start(context.Background(), clampDial(startFakeUpstream(t, "hold")), p)
+	if res.OK || res.Reason != ReasonInterrupted {
+		t.Fatalf("reason = %s（msg=%s），期望 interrupted（读期限到点不冒充 not_supported）", res.Reason, res.Msg)
+	}
+
+	// 形态二：下行相位正常收场、上行收口 report 缺席到点。
+	res2 := NewEngine(nil).Start(context.Background(), clampDial(startFakeUpstream(t, "halfhold")), p)
+	if res2.OK || res2.Reason != ReasonInterrupted {
+		t.Fatalf("reason = %s（msg=%s），期望 interrupted（收口期限到点不冒充 not_supported）", res2.Reason, res2.Msg)
+	}
 }
 
 // TestEngineFullRun 全流程（下行 + 上行，2 流）——成功终态、用量为正、相位真实流转。
@@ -192,7 +267,6 @@ func TestEngineNonDataFrame(t *testing.T) {
 // 不得吞成 interrupted；report 缺席的零字节形态按判据② 归 not_supported（r2 新-3）。
 func TestEngineWriteEPIPEEatsReport(t *testing.T) {
 	addr := startFakeUpstream(t, "linkdown")
-	e := NewEngine(nil)
 	for i := 0; i < 3; i++ { // 多跑几轮放大两种竞态交错
 		e2 := NewEngine(nil)
 		res := e2.Start(context.Background(), tcpDial(addr), Params{Down: time.Second, Up: time.Second, Streams: 2})
@@ -200,7 +274,6 @@ func TestEngineWriteEPIPEEatsReport(t *testing.T) {
 			t.Fatalf("第 %d 轮 reason = %s（msg=%s），期望 link_down（写失败仍吃到 report）", i, res.Reason, res.Msg)
 		}
 	}
-	_ = e
 }
 
 // TestEngineWriteEPIPEZeroByteNotSupported r2 新-3 parity：写失败 + 零字节读（无 report）

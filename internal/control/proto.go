@@ -225,6 +225,7 @@ type ForwardRuleBrief struct {
 	State      string `json:"state"`
 	Err        string `json:"err,omitempty"`
 	Conns      int    `json:"conns"`
+	Rejected   int    `json:"rejected,omitempty"` // 超并发上限被拒计数（exec-r1 B3-b）
 }
 
 // ForwardListResult forward.list 成功载荷。

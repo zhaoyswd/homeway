@@ -93,20 +93,17 @@ func socksOnCLI(args []string, version string, w io.Writer) error {
 	if err != nil {
 		var code control.CodeError
 		if errors.As(err, &code) && string(code) == facade.CodeBadRequest {
-			// 冲突现场诊断（FS Scenario「第二主机需另选端口」：文案含占用方与 --listen 提示）。
+			// 冲突现场诊断（FS Scenario「第二主机需另选端口」：文案含占用方与 --listen
+			// 提示；占用复查含 off 记忆端口〔exec-r1 L1〕且排除请求主机自己〔L2——防
+			// 「被自己占用」的误导文案〕）。
 			port := uint16(*listen)
 			if port == 0 {
 				port = rememberedSocksPort(ctx, c, id)
 			}
-			if owner, found := findPortOwner(ctx, c, hosts, port); found {
+			if owner, found := findPortOwner(ctx, c, hosts, port, id); found {
 				return fmt.Errorf("监听端口 %d 已被 %s 占用（可用 --listen 另选端口）", port, owner)
 			}
-			if port != 0 {
-				if owner, found := findPortOwnerAll(ctx, c, hosts, port); found {
-					return fmt.Errorf("监听端口 %d 已被 %s 占用（可用 --listen 另选端口）", port, owner)
-				}
-			}
-			return errors.New("socks.on 被拒（bad_request；核对 --listen（1024–65535，与 forward 全局唯一）后重试")
+			return errors.New("socks.on 被拒（bad_request；核对 --listen（1024–65535，与 forward 全局唯一）后重试）")
 		}
 		return carrierOpErr("socks.on", err)
 	}
@@ -135,25 +132,6 @@ func rememberedSocksPort(ctx context.Context, c *control.Client, host string) ui
 		}
 	}
 	return 1080
-}
-
-// findPortOwnerAll 含 off 但记住的端口占用（socks 记忆端口按「规则在册」参与全局
-// 唯一——on 回来不得撞别台已记端口）。
-func findPortOwnerAll(ctx context.Context, c *control.Client, hosts []control.HostState, port uint16) (string, bool) {
-	if port == 0 {
-		return "", false
-	}
-	if raw, err := c.Request(ctx, facade.OpSocksStatus, nil); err == nil {
-		var st control.SocksStatusResult
-		if json.Unmarshal(raw, &st) == nil {
-			for _, s := range st.Socks {
-				if s.Listen == port {
-					return nameOfHost(hosts, s.Host) + " 的 socks 监听（含记忆端口）", true
-				}
-			}
-		}
-	}
-	return "", false
 }
 
 // socksOffCLI off --host <ref>。

@@ -23,6 +23,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/zhaoyswd/homeway/clientcore/hostsession"
 	"github.com/zhaoyswd/homeway/pkg/speedtest"
 	"github.com/zhaoyswd/homeway/pkg/wgnet"
 )
@@ -68,10 +69,19 @@ func (f *fakeDial) snapshot() (ports []string, addrs []string) {
 
 func discardLogf(string, ...any) {}
 
-// openTestCarriers 假拨号缝的 Carriers。
+// openTestCarriers 假拨号缝的 Carriers——socks 缺省端口注入 0 = 内核选空闲端口
+// （exec-r1 B4：门禁与「在役 daemon 持 1080」解耦；「无记忆 → 1080」的纯面断言见
+// TestSocksOnOffStatus 的 DefaultListen 段）。
 func openTestCarriers(t *testing.T, fd *fakeDial) *Carriers {
 	t.Helper()
-	c, err := openCarriers(t.TempDir(), carrierDial{dialPort: fd.dialPort, dial: fd.dial}, discardLogf, discardLogf)
+	return openTestCarriersWithDefault(t, fd, 0)
+}
+
+// openTestCarriersWithDefault 指定 socks 缺省端口的 Carriers（B1 用例注入「被占的
+// 缺省端口」形态）。
+func openTestCarriersWithDefault(t *testing.T, fd *fakeDial, def uint16) *Carriers {
+	t.Helper()
+	c, err := openCarriersWithSocksDefault(t.TempDir(), carrierDial{dialPort: fd.dialPort, dial: fd.dial}, def, discardLogf, discardLogf)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -504,32 +514,47 @@ func serveDNSOverPipe(serverEnd net.Conn, ipFor func(hostKey string) netip.Addr,
 	_, _ = serverEnd.Write(framed)
 }
 
-// TestSocksOnOffStatus 开关与状态：默认端口、off 记忆保留、再次 on 沿用、同端口幂等。
+// TestSocksOnOffStatus 开关与状态：缺省端口解析（纯面）、注入缺省 0 的实际开关流、
+// off 记忆保留、再次 on 沿用、同端口幂等（exec-r1 B4：与「真绑 1080」解耦）。
 func TestSocksOnOffStatus(t *testing.T) {
 	c := openTestCarriers(t, &fakeDial{})
 	hostA, hostB := strings.Repeat("aa", 32), strings.Repeat("bb", 32)
 
-	port, err := c.SocksOn(hostA, 0)
-	if err != nil || port != socksDefaultListen {
-		t.Fatalf("默认端口应 %d，got %d %v", socksDefaultListen, port, err)
+	// 缺省解析纯面：无记忆 = 注入的缺省（测试注入 0 = 内核选空闲端口）。
+	if got := c.Sks.DefaultListen(hostA); got != 0 {
+		t.Fatalf("无记忆应返回注入缺省 0，got %d", got)
 	}
-	if _, err := c.SocksOn(hostA, 0); err != nil { // 同端口幂等
+	// 生产口径的纯面断言（openCarriers = 1080；不绑端口——与在役 daemon 无冲突）。
+	prod, err := openCarriers(t.TempDir(), carrierDial{dialPort: (&fakeDial{}).dialPort, dial: (&fakeDial{}).dial}, discardLogf, discardLogf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer prod.Close()
+	if got := prod.Sks.DefaultListen(hostA); got != socksDefaultListen {
+		t.Fatalf("生产缺省应 %d（无记忆→1080），got %d", socksDefaultListen, got)
+	}
+
+	port, err := c.SocksOn(hostA, 0)
+	if err != nil || port == 0 {
+		t.Fatalf("缺省 on 应落到实际端口，got %d %v", port, err)
+	}
+	if _, err := c.SocksOn(hostA, 0); err != nil { // 同端口幂等（缺省解析回记忆端口）
 		t.Fatalf("同端口重复 on 应幂等：%v", err)
 	}
 	st := c.SocksStates()
-	if len(st) != 1 || !st[0].On || st[0].Listen != socksDefaultListen {
+	if len(st) != 1 || !st[0].On || st[0].Listen != port {
 		t.Fatalf("status 形态：%v", st)
 	}
 	if err := c.SocksOff(hostA); err != nil {
 		t.Fatal(err)
 	}
 	st = c.SocksStates()
-	if st[0].On || st[0].Listen != socksDefaultListen {
+	if st[0].On || st[0].Listen != port {
 		t.Fatalf("off 后应保留端口记忆：%v", st)
 	}
-	port, err = c.SocksOn(hostA, 0) // 沿用记忆
-	if err != nil || port != socksDefaultListen {
-		t.Fatalf("on 应沿用记忆端口：%d %v", port, err)
+	port2, err := c.SocksOn(hostA, 0) // 沿用记忆（exec-r1 B1：非缺省值的记忆端口也沿用）
+	if err != nil || port2 != port {
+		t.Fatalf("on 应沿用记忆端口 %d，got %d %v", port, port2, err)
 	}
 	// 端口值域。
 	if _, err := c.SocksOn(hostB, 80); !errors.Is(err, ErrPortRange) {
@@ -537,33 +562,106 @@ func TestSocksOnOffStatus(t *testing.T) {
 	}
 }
 
+// TestSocksOnDefaultMemoryWins exec-r1 B1 主判据：on 缺省**沿用记忆端口**——即使
+// 缺省端口本身已被占（此前恒落 1080：记忆被静默改写，空闲记忆端口不用、反在占用
+// 上失败）。
+func TestSocksOnDefaultMemoryWins(t *testing.T) {
+	// 缺省端口 Q 先被外部监听占住。
+	occ, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer occ.Close()
+	def := uint16(occ.Addr().(*net.TCPAddr).Port)
+	c := openTestCarriersWithDefault(t, &fakeDial{}, def)
+	host := strings.Repeat("aa", 32)
+
+	mem := freePort(t) // 非缺省值的记忆端口
+	if p, err := c.SocksOn(host, mem); err != nil || p != mem {
+		t.Fatalf("显式 on：%d %v", p, err)
+	}
+	if err := c.SocksOff(host); err != nil {
+		t.Fatal(err)
+	}
+	// 缺省 on：应落到记忆端口 mem（缺省 Q 被占不受影响——修复前会去绑 Q 而失败）。
+	p, err := c.SocksOn(host, 0)
+	if err != nil || p != mem {
+		t.Fatalf("缺省 on 应沿用记忆端口 %d（缺省 %d 被占不影响），got %d %v", mem, def, p, err)
+	}
+	if st := c.SocksStates(); len(st) != 1 || !st[0].On || st[0].Listen != mem {
+		t.Fatalf("记忆不得被改写：%v", st)
+	}
+	// 记忆端口真的在听。
+	if conn, derr := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", mem), time.Second); derr != nil {
+		t.Fatalf("记忆端口应可连：%v", derr)
+	} else {
+		_ = conn.Close()
+	}
+}
+
+// TestSocksOnDefaultResolvedPortConflict exec-r1 B1 冲突形态：缺省解析后的端口被
+// forward 规则占 → ErrPortTaken 指名该端口（Carriers.SocksOn 此前 listen==0 时整个
+// 跳过 forward 检查）。单进程内两条路互挡 ⇒ 跨重启状态面构造（先落 forward 规则、
+// 再手写 socks 记忆）。
+func TestSocksOnDefaultResolvedPortConflict(t *testing.T) {
+	dir := t.TempDir()
+	hostA, hostB := strings.Repeat("aa", 32), strings.Repeat("bb", 32)
+	fd := &fakeDial{}
+	mk := func() *Carriers {
+		c, err := openCarriers(dir, carrierDial{dialPort: fd.dialPort, dial: fd.dial}, discardLogf, discardLogf)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return c
+	}
+	p := freePort(t)
+	c1 := mk()
+	if err := c1.AddForward(ForwardRule{Host: hostB, Listen: p}); err != nil {
+		t.Fatal(err)
+	}
+	c1.Close()
+	// 手写 socks.json：hostA off 记忆 p（重开后 forward 重建监听 p、socks 保持 off）。
+	socksRec := fmt.Sprintf(`[{"host":%q,"on":false,"listen":%d}]`+"\n", hostA, p)
+	if err := os.WriteFile(filepath.Join(dir, socksFileName), []byte(socksRec), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	c2 := mk()
+	defer c2.Close()
+	_, err := c2.SocksOn(hostA, 0)
+	if !errors.Is(err, ErrPortTaken) || !strings.Contains(err.Error(), "forward 规则") || !strings.Contains(err.Error(), fmt.Sprint(p)) {
+		t.Fatalf("缺省解析端口被 forward 占应 ErrPortTaken 指名 %d，got %v", p, err)
+	}
+}
+
 // TestGlobalPortConflicts 全局端口冲突矩阵：socks×socks 跨主机、socks×forward、
-// forward×socks（r1 低-12 同款文案口径——含占用方与另选提示）。
+// forward×socks（r1 低-12 同款文案口径——含占用方与另选提示；exec-r1 B4：改用空闲
+// 端口，不绑产品默认 1080）。
 func TestGlobalPortConflicts(t *testing.T) {
 	c := openTestCarriers(t, &fakeDial{})
 	hostA, hostB := strings.Repeat("aa", 32), strings.Repeat("bb", 32)
+	p1, p2, p3 := freePort(t), freePort(t), freePort(t)
 
-	if _, err := c.SocksOn(hostA, 1080); err != nil {
+	if _, err := c.SocksOn(hostA, p1); err != nil {
 		t.Fatal(err)
 	}
 	// socks × socks。
-	_, err := c.SocksOn(hostB, 1080)
+	_, err := c.SocksOn(hostB, p1)
 	if !errors.Is(err, ErrPortTaken) || !strings.Contains(err.Error(), "另选") {
 		t.Fatalf("socks 跨主机冲突文案不符：%v", err)
 	}
 	// forward × socks（在监听的）。
-	if err := c.AddForward(ForwardRule{Host: hostB, Listen: 1080}); !errors.Is(err, ErrPortTaken) {
+	if err := c.AddForward(ForwardRule{Host: hostB, Listen: p1}); !errors.Is(err, ErrPortTaken) {
 		t.Fatalf("forward 撞 socks 应 ErrPortTaken，got %v", err)
 	}
 	// socks × forward。
-	if err := c.AddForward(ForwardRule{Host: hostB, Listen: 1090}); err != nil {
+	if err := c.AddForward(ForwardRule{Host: hostB, Listen: p2}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := c.SocksOn(hostA, 1090); !errors.Is(err, ErrPortTaken) {
+	if _, err := c.SocksOn(hostA, p2); !errors.Is(err, ErrPortTaken) {
 		t.Fatalf("socks 撞 forward 应 ErrPortTaken，got %v", err)
 	}
 	// 另选端口成功。
-	if p, err := c.SocksOn(hostB, 1081); err != nil || p != 1081 {
+	if p, err := c.SocksOn(hostB, p3); err != nil || p != p3 {
 		t.Fatalf("另选端口应成功：%d %v", p, err)
 	}
 }
@@ -587,10 +685,11 @@ func TestSocksOffRSTLiveConns(t *testing.T) {
 	}
 	c := openTestCarriers(t, fd)
 	host := strings.Repeat("aa", 32)
-	if _, err := c.SocksOn(host, 0); err != nil {
-		t.Fatal(err)
+	sport, err := c.SocksOn(host, 0) // 注入缺省 0 = 空闲端口（exec-r1 B4）
+	if err != nil || sport == 0 {
+		t.Fatal(sport, err)
 	}
-	conn := miniSocksClient(t, "127.0.0.1:1080", "echo.example", up.Port())
+	conn := miniSocksClient(t, fmt.Sprintf("127.0.0.1:%d", sport), "echo.example", up.Port())
 	if conn == nil {
 		t.Fatal("CONNECT 应成功")
 	}
@@ -640,18 +739,19 @@ func TestSocksCacheIsolationAndTTL(t *testing.T) {
 	}
 	c := openTestCarriers(t, fd)
 	hostA, hostB := strings.Repeat("aa", 32), strings.Repeat("bb", 32)
-	if _, err := c.SocksOn(hostA, 1080); err != nil {
+	pA, pB := freePort(t), freePort(t)
+	if _, err := c.SocksOn(hostA, pA); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := c.SocksOn(hostB, 1081); err != nil {
+	if _, err := c.SocksOn(hostB, pB); err != nil {
 		t.Fatal(err)
 	}
 
 	// 各自首次 CONNECT 同域名。
-	if miniSocksClient(t, "127.0.0.1:1080", "same.example", up.Port()) == nil {
+	if miniSocksClient(t, fmt.Sprintf("127.0.0.1:%d", pA), "same.example", up.Port()) == nil {
 		t.Fatal("A 应连通")
 	}
-	if miniSocksClient(t, "127.0.0.1:1081", "same.example", up.Port()) == nil {
+	if miniSocksClient(t, fmt.Sprintf("127.0.0.1:%d", pB), "same.example", up.Port()) == nil {
 		t.Fatal("B 应连通")
 	}
 	if n := dnsQueries.Load(); n != 2 {
@@ -666,7 +766,7 @@ func TestSocksCacheIsolationAndTTL(t *testing.T) {
 	}
 
 	// TTL 内同主机二次 CONNECT：免查（缓存命中）。
-	if miniSocksClient(t, "127.0.0.1:1080", "same.example", up.Port()) == nil {
+	if miniSocksClient(t, fmt.Sprintf("127.0.0.1:%d", pA), "same.example", up.Port()) == nil {
 		t.Fatal("缓存命中应连通")
 	}
 	if n := dnsQueries.Load(); n != 2 {
@@ -680,10 +780,10 @@ func TestSocksCacheIsolationAndTTL(t *testing.T) {
 		go serveDNSOverPipe(serverEnd, func(string) netip.Addr { return netip.Addr{} }, host) // 空 = NXDOMAIN
 		return clientEnd, nil
 	}
-	if conn := miniSocksClient(t, "127.0.0.1:1080", "nx.example", up.Port()); conn != nil {
+	if conn := miniSocksClient(t, fmt.Sprintf("127.0.0.1:%d", pA), "nx.example", up.Port()); conn != nil {
 		t.Fatal("NXDOMAIN 应 CONNECT 失败")
 	}
-	if conn := miniSocksClient(t, "127.0.0.1:1080", "nx.example", up.Port()); conn != nil {
+	if conn := miniSocksClient(t, fmt.Sprintf("127.0.0.1:%d", pA), "nx.example", up.Port()); conn != nil {
 		t.Fatal("NXDOMAIN 应 CONNECT 失败")
 	}
 	if n := dnsQueries.Load(); n != 4 {
@@ -853,14 +953,14 @@ func TestRemoveHostCascade(t *testing.T) {
 	}
 	defer c.Close()
 	hostA, hostB := strings.Repeat("aa", 32), strings.Repeat("bb", 32)
-	listenA, listenB := freePort(t), freePort(t)
+	listenA, listenB, sport := freePort(t), freePort(t), freePort(t)
 	if err := c.AddForward(ForwardRule{Host: hostA, Listen: listenA, TargetPort: up.Port()}); err != nil {
 		t.Fatal(err)
 	}
 	if err := c.AddForward(ForwardRule{Host: hostB, Listen: listenB, TargetPort: up.Port()}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := c.SocksOn(hostA, 1080); err != nil {
+	if _, err := c.SocksOn(hostA, sport); err != nil {
 		t.Fatal(err)
 	}
 
@@ -884,7 +984,7 @@ func TestRemoveHostCascade(t *testing.T) {
 		}
 	}
 	// 监听关闭：连不上。
-	if _, err := net.DialTimeout("tcp", "127.0.0.1:1080", 300*time.Millisecond); err == nil {
+	if _, err := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", sport), 300*time.Millisecond); err == nil {
 		t.Fatal("socks 监听应已关")
 	}
 	// 磁盘同步：hostA 的 forward 规则不在 forwards.json。
@@ -929,14 +1029,15 @@ func TestSocksPersistenceRebuild(t *testing.T) {
 		return c
 	}
 	hostA, hostB := strings.Repeat("aa", 32), strings.Repeat("bb", 32)
+	pA, pB := freePort(t), freePort(t)
 	c1 := mk()
-	if _, err := c1.SocksOn(hostA, 1080); err != nil {
+	if _, err := c1.SocksOn(hostA, pA); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := c1.SocksOn(hostB, 1081); err != nil {
+	if _, err := c1.SocksOn(hostB, pB); err != nil {
 		t.Fatal(err)
 	}
-	if err := c1.SocksOff(hostB); err != nil { // B off（记忆 1081）
+	if err := c1.SocksOff(hostB); err != nil { // B off（记忆 pB）
 		t.Fatal(err)
 	}
 	c1.Close()
@@ -948,15 +1049,15 @@ func TestSocksPersistenceRebuild(t *testing.T) {
 		t.Fatalf("重建应 2 条：%v", st)
 	}
 	for _, e := range st {
-		if e.Host == hostA && (!e.On || e.Listen != 1080) {
+		if e.Host == hostA && (!e.On || e.Listen != pA) {
 			t.Fatalf("A 应恢复监听：%v", e)
 		}
-		if e.Host == hostB && (e.On || e.Listen != 1081) {
+		if e.Host == hostB && (e.On || e.Listen != pB) {
 			t.Fatalf("B 应保持 off 且记忆端口：%v", e)
 		}
 	}
 	// A 的监听真实可用。
-	if miniSocksClient(t, "127.0.0.1:1080", "echo.example", up.Port()) == nil {
+	if miniSocksClient(t, fmt.Sprintf("127.0.0.1:%d", pA), "echo.example", up.Port()) == nil {
 		t.Fatal("重建后 A 的 socks 应可用")
 	}
 	// 重建后 json 内容自洽（不含测试残留字段以外的内容）。
@@ -964,5 +1065,106 @@ func TestSocksPersistenceRebuild(t *testing.T) {
 	var recs []SocksEntry
 	if err := json.Unmarshal(b, &recs); err != nil || len(recs) != 2 {
 		t.Fatalf("socks.json 形态：%v %s", err, b)
+	}
+}
+
+// TestForwardConnLimit exec-r1 B3-b：每监听并发上限（256，与 socks MaxConns 同值）——
+// 超限拒绝并计数、状态面可见（spec「每监听 SHALL 有并发连接上限（超限拒绝并计数）」）。
+func TestForwardConnLimit(t *testing.T) {
+	var mu sync.Mutex
+	var upstreams []net.Conn // 保留 pipe 服务端防 GC 提前收口
+	fd := &fakeDial{}
+	fd.dialPortF = func(ctx context.Context, host string, port uint16) (net.Conn, error) {
+		a, b := net.Pipe() // 上游「拨通但永不结束」——连接全程在世
+		mu.Lock()
+		upstreams = append(upstreams, b)
+		mu.Unlock()
+		return a, nil
+	}
+	c := openTestCarriers(t, fd)
+	host := strings.Repeat("aa", 32)
+	listen := freePort(t)
+	if err := c.AddForward(ForwardRule{Host: host, Listen: listen}); err != nil {
+		t.Fatal(err)
+	}
+	conns := make([]net.Conn, 0, forwardMaxConns+1)
+	for i := 0; i <= forwardMaxConns; i++ {
+		conn, err := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", listen), 3*time.Second)
+		if err != nil {
+			t.Fatalf("第 %d 条连接拨入失败：%v", i, err)
+		}
+		conns = append(conns, conn)
+	}
+	// 第 257 条被拒：读到收口（连接即关，无应答字节）。
+	last := conns[forwardMaxConns]
+	_ = last.SetReadDeadline(time.Now().Add(3 * time.Second))
+	buf := make([]byte, 16)
+	if n, err := last.Read(buf); err == nil && n > 0 {
+		t.Fatalf("超限连接不应有应答，got %q", buf[:n])
+	}
+	waitFor(t, 5*time.Second, func() bool {
+		st := c.ForwardStates(host)
+		return len(st) == 1 && st[0].Conns == forwardMaxConns && st[0].Rejected >= 1
+	}, "在世计数=256 且超限拒绝计数≥1")
+	for _, conn := range conns {
+		_ = conn.Close()
+	}
+}
+
+// TestSpeedRunnerValueConnThroughHostSeam exec-r1 §8 建议（同类面加固）：countedConn
+// 值类型（含 func 字段、不可哈希）经真 Host.DialPort 进引擎跑全轮——v0.13.1 的
+// 「run.conns map 键」崩溃只在「成功拨通 + 值类型 conn」的生产组合成立，此前无
+// 自动化护栏（单测桩全是指针型 conn 或拨号即拒路径）。
+func TestSpeedRunnerValueConnThroughHostSeam(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { ln.Close() })
+	srv := speedtest.NewServer(nil)
+	srv.SetLimits(speedtest.Limits{ConnTimeout: 20 * time.Second})
+	go func() { _ = srv.Serve(ln) }()
+	t.Cleanup(func() { srv.Close() })
+
+	// 覆写 facade 拨号缝（生产 = Session.DialPort；零值会话桩不经其本体）——返回
+	// 到本地测速服务的真 TCP conn，经 Host.DialPort 包装成 countedConn 值类型。
+	oldDial := dialPort
+	dialPort = func(_ *hostsession.Session, ctx context.Context, port uint16) (net.Conn, error) {
+		var d net.Dialer
+		return d.DialContext(ctx, "tcp", ln.Addr().String())
+	}
+	t.Cleanup(func() { dialPort = oldDial })
+
+	host := strings.Repeat("aa", 32)
+	h := &Host{rec: HostRecord{ID: host}, sess: &hostsession.Session{}, dm: &hostDemand{}}
+	c, err := openCarriersWithSocksDefault(t.TempDir(), carrierDial{
+		dialPort: func(ctx context.Context, hostID string, port uint16) (net.Conn, error) {
+			if hostID != host {
+				return nil, errors.New("表外主机")
+			}
+			return h.DialPort(ctx, port)
+		},
+		dial: func(ctx context.Context, hostID string, dst netip.AddrPort) (net.Conn, error) {
+			if hostID != host {
+				return nil, errors.New("表外主机")
+			}
+			return h.Dial(ctx, dst)
+		},
+	}, 0, discardLogf, discardLogf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+
+	ack := c.SpeedtestStart(host, SpeedtestStart{Down: 2 * time.Second, Up: 2 * time.Second, Warmup: 100 * time.Millisecond, Streams: 2, WaitMs: 0})
+	if ack.Phase != "waiting" {
+		t.Fatalf("start 应返回 waiting：%+v", ack)
+	}
+	waitFor(t, 15*time.Second, func() bool {
+		st := c.SpeedtestStatus(host)
+		return st != nil && st.Result != nil && st.Result.OK
+	}, "countedConn 值类型经 Host.DialPort 应跑完全轮")
+	if n := h.dm.activeNx.Load(); n != 0 {
+		t.Fatalf("收场后在场腿应归零，实得 %d", n)
 	}
 }

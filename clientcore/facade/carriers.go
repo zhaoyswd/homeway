@@ -42,6 +42,13 @@ type Carriers struct {
 
 // openCarriers 打开三个管理器（读各自持久化文件、按表重建监听/运行面）。
 func openCarriers(stateDir string, dial carrierDial, logf, warnf func(string, ...any)) (*Carriers, error) {
+	return openCarriersWithSocksDefault(stateDir, dial, socksDefaultListen, logf, warnf)
+}
+
+// openCarriersWithSocksDefault 同 openCarriers，但注入 socks on 的缺省端口
+// （exec-r1 B4：测试注入 0 = 内核选空闲端口，让门禁与「在役 daemon 持 1080」解耦；
+// 生产一律走 openCarriers = 1080）。
+func openCarriersWithSocksDefault(stateDir string, dial carrierDial, socksDefListen uint16, logf, warnf func(string, ...any)) (*Carriers, error) {
 	c := &Carriers{stateDir: stateDir, dial: dial, logf: logf, warnf: warnf}
 	if logf == nil {
 		c.logf = func(string, ...any) {}
@@ -53,7 +60,7 @@ func openCarriers(stateDir string, dial carrierDial, logf, warnf func(string, ..
 	if err != nil {
 		return nil, err
 	}
-	sks, err := openSocksManager(stateDir, dial, logf, warnf)
+	sks, err := openSocksManager(stateDir, dial, socksDefListen, logf, warnf)
 	if err != nil {
 		fwd.Close()
 		return nil, err
@@ -85,14 +92,21 @@ func (c *Carriers) RemoveForward(host string, listen uint16) error {
 // ForwardStates 规则表快照（host 空 = 全部）。
 func (c *Carriers) ForwardStates(host string) []ForwardState { return c.Fwd.List(host) }
 
-// SocksOn 开 SOCKS 监听（listen 0 = 沿用记忆/1080）；全局端口检查后委托。返回实际端口。
+// SocksOn 开 SOCKS 监听（listen 0 = 沿用记忆/缺省）；全局端口检查后委托。返回实际端口。
 func (c *Carriers) SocksOn(host string, listen uint16) (uint16, error) {
 	c.addMu.Lock()
 	defer c.addMu.Unlock()
 	// socks×socks 的跨主机冲突（含记忆端口、文案含另选提示）由 SocksManager.On
-	// 自带；这里只补 forward 侧的占用检查。
-	if owner, taken := c.Fwd.portOwner(listen); taken && listen != 0 {
-		return 0, fmt.Errorf("%w：%d 已被 %s 占用（可用 --listen 另选）", ErrPortTaken, listen, owner)
+	// 自带；这里只补 forward 侧的占用检查——按**解析后的端口**判（exec-r1 B1：
+	// 此前 listen==0 时整个跳过，靠 On 恒落 1080 的〔错误〕假设兜着）。
+	port := listen
+	if port == 0 {
+		port = c.Sks.DefaultListen(host)
+	}
+	if port != 0 {
+		if owner, taken := c.Fwd.portOwner(port); taken {
+			return 0, fmt.Errorf("%w：%d 已被 %s 占用（可用 --listen 另选）", ErrPortTaken, port, owner)
+		}
 	}
 	return c.Sks.On(host, listen)
 }

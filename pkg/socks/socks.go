@@ -59,12 +59,21 @@ const (
 	defaultResolveBudget = 5 * time.Second // design D3：单次解析预算 5s（超时归因、不缓存）
 	handshakeReadBudget  = 10 * time.Second
 	maxAddrLen           = 1 + 255 + 2 // ATYP + 域名 + 端口
+
+	// accept 瞬态错误的有界线性退避（L6/exec-r1）。
+	serveAcceptRetryMax  = 8 // 烧尽 = 返回错误（监听失效如实呈现）
+	serveAcceptRetryStep = 50 * time.Millisecond
 )
 
 // Server SOCKS5 子集服务端（监听器由消费方创建并交给 Serve；Close 显式关全部在世
 // 连接——RST 收口，与「socks off」语义同款）。
 type Server struct {
 	cfg ServerConfig
+
+	// base 服务端生命周期 ctx：Close 即断（L7/exec-r1——上游拨号预算挂它上，
+	// socks off 后不再悬挂等 DialBudget）。
+	base       context.Context
+	baseCancel context.CancelFunc
 
 	mu    sync.Mutex
 	conns map[net.Conn]struct{}
@@ -84,34 +93,48 @@ func New(cfg ServerConfig) *Server {
 	if cfg.Logf == nil {
 		cfg.Logf = func(string, ...any) {}
 	}
-	return &Server{cfg: cfg, conns: map[net.Conn]struct{}{}}
+	s := &Server{cfg: cfg, conns: map[net.Conn]struct{}{}}
+	s.base, s.baseCancel = context.WithCancel(context.Background())
+	return s
 }
 
-// Serve 在 listener 上受理（每连接一个 goroutine）；listener 关闭即返回。
+// Serve 在 listener 上受理（每连接一个 goroutine）；listener 关闭即返回。accept 的
+// 瞬态错误（EMFILE 等）按有界线性退避重试（L6/exec-r1：一次瞬态错误即退 = 无人
+// 受理的僵尸监听）；烧尽后返回该错误（消费方按监听失效收口）。
 func (s *Server) Serve(ln net.Listener) error {
+	backoff := 0
 	for {
 		conn, err := ln.Accept()
-		if err != nil {
-			return err
-		}
-		s.mu.Lock()
-		if len(s.conns) >= s.cfg.MaxConns {
+		if err == nil {
+			backoff = 0
+			s.mu.Lock()
+			if len(s.conns) >= s.cfg.MaxConns {
+				s.mu.Unlock()
+				s.cfg.Logf("socks: 连接拒绝（并发上限 %d）", s.cfg.MaxConns)
+				_ = conn.Close()
+				continue
+			}
+			s.conns[conn] = struct{}{}
 			s.mu.Unlock()
-			s.cfg.Logf("socks: 连接拒绝（并发上限 %d）", s.cfg.MaxConns)
-			_ = conn.Close()
+			go func(conn net.Conn) {
+				defer func() {
+					s.mu.Lock()
+					delete(s.conns, conn)
+					s.mu.Unlock()
+					_ = conn.Close()
+				}()
+				s.serveConn(conn)
+			}(conn)
 			continue
 		}
-		s.conns[conn] = struct{}{}
-		s.mu.Unlock()
-		go func(conn net.Conn) {
-			defer func() {
-				s.mu.Lock()
-				delete(s.conns, conn)
-				s.mu.Unlock()
-				_ = conn.Close()
-			}()
-			s.serveConn(conn)
-		}(conn)
+		if errors.Is(err, net.ErrClosed) {
+			return err // 监听器被关（off/级联/收工）——正常收口
+		}
+		if backoff >= serveAcceptRetryMax {
+			return fmt.Errorf("accept 连续失败（%d 次）：%w", backoff+1, err)
+		}
+		backoff++
+		time.Sleep(time.Duration(backoff) * serveAcceptRetryStep)
 	}
 }
 
@@ -123,8 +146,10 @@ func (s *Server) Conns() int {
 }
 
 // Close 显式关全部在世连接（RST 收口——SetLinger(0)：优雅 FIN 会让浏览器 keep-alive
-// 静默挂住；「off」之后不得仍有代理流量经隧道跑）。
+// 静默挂住；「off」之后不得仍有代理流量经隧道跑）。同时断服务端生命周期 ctx——
+// 在途的上游拨号/解析预算随之收口（L7/exec-r1）。
 func (s *Server) Close() {
+	s.baseCancel()
 	s.mu.Lock()
 	cs := make([]net.Conn, 0, len(s.conns))
 	for c := range s.conns {
@@ -138,10 +163,10 @@ func (s *Server) Close() {
 	}
 }
 
-// rstClose 置 RST 收口（尽力而为——非 TCP 连接忽略）。
+// rstClose 置 RST 收口（尽力而为——按接口断言：非 TCP 形态〔含包装连接〕静默忽略）。
 func rstClose(c net.Conn) {
-	if tc, ok := c.(*net.TCPConn); ok {
-		_ = tc.SetLinger(0)
+	if l, ok := c.(interface{ SetLinger(int) error }); ok {
+		_ = l.SetLinger(0)
 	}
 }
 
@@ -173,10 +198,11 @@ func (s *Server) serveConn(conn net.Conn) {
 		s.replyRep(conn, repHostUnreach)
 		return
 	}
-	upstream, err := s.dialAny(conn.RemoteAddr(), addrs, dstPort)
+	upstream, err := s.dialAny(addrs, dstPort)
 	if err != nil {
 		s.cfg.Logf("socks: 拨 %s:%d 失败（rep=0x01）：%v", dstHost, dstPort, err)
 		s.replyRep(conn, repGeneralFailure)
+		rstClose(conn) // B3-a/exec-r1：上游失败本地 RST 收口（tasks 2.3 判据——FIN 会让浏览器静默挂住）
 		return
 	}
 	defer upstream.Close()
@@ -309,16 +335,22 @@ func (s *Server) resolveTargets(conn net.Conn, atyp byte, host string) ([]netip.
 }
 
 // dialAny 按序拨候选（多 A 回退，r2 新-1）：首个拨不通换下一个，全部不通才回错误。
-func (s *Server) dialAny(remote net.Addr, addrs []netip.Addr, port uint16) (net.Conn, error) {
+// L7/exec-r1：总预算 = 一份 DialBudget（N 候选共享——最坏不再 N×15s 悬挂）且挂在
+// 服务端生命周期 ctx 上（Server.Close / socks off 即断）；预算耗尽/服务已关不再试
+// 下一候选。
+func (s *Server) dialAny(addrs []netip.Addr, port uint16) (net.Conn, error) {
+	ctx, cancel := context.WithTimeout(s.base, s.cfg.DialBudget)
+	defer cancel()
 	var lastErr error
 	for _, ip := range addrs {
-		ctx, cancel := context.WithTimeout(context.Background(), s.cfg.DialBudget)
 		upstream, err := s.cfg.Dialer(ctx, netip.AddrPortFrom(ip, port))
-		cancel()
 		if err == nil {
 			return upstream, nil
 		}
 		lastErr = err
+		if ctx.Err() != nil {
+			break // 总预算耗尽 / 服务端已关
+		}
 		s.cfg.Logf("socks: 候选 %s 拨不通，换下一个：%v", ip, err)
 	}
 	if lastErr == nil {

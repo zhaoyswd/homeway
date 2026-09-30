@@ -34,6 +34,14 @@ const (
 	forwardMinPort    = 1024
 	forwardMaxPort    = 65535
 	forwardMaxPerHost = 8
+	// forwardMaxConns 每监听并发连接上限（exec-r1 B3-b：spec「每监听 SHALL 有并发
+	// 连接上限（超限拒绝并计数）」——与 pkg/socks 的 MaxConns 同值 256；无上限时
+	// 任一本机进程可打满 daemon 的 goroutine/fd）。
+	forwardMaxConns = 256
+	// accept 瞬态错误的有界线性退避（exec-r1 L6：一次瞬态错误即退 = 无人受理的
+	// 僵尸监听）。
+	forwardAcceptRetryMax  = 8
+	forwardAcceptRetryStep = 50 * time.Millisecond
 )
 
 // 管理器哨兵（绑定层映射 bad_request / no_host 族；§3 接线）。
@@ -61,19 +69,21 @@ type ForwardRule struct {
 
 // ForwardState 规则运行态（forward list 面）。
 type ForwardState struct {
-	Rule  ForwardRule
-	State string // listening | failed
-	Err   string
-	Conns int
+	Rule     ForwardRule
+	State    string // listening | failed
+	Err      string
+	Conns    int
+	Rejected int // 超并发上限被拒的连接计数（exec-r1 B3-b）
 }
 
 // forwardEntry 一条规则的运行时。
 type forwardEntry struct {
-	rule  ForwardRule
-	state string
-	err   string
-	ln    net.Listener
-	conns atomic.Int32
+	rule     ForwardRule
+	state    string
+	err      string
+	ln       net.Listener
+	conns    atomic.Int32
+	rejected atomic.Int32
 }
 
 // ForwardManager forward 规则管理器（Carriers 持有；全局端口唯一性检查在 Carriers
@@ -208,7 +218,7 @@ func (m *ForwardManager) List(host string) []ForwardState {
 		if host != "" && e.rule.Host != host {
 			continue
 		}
-		st := ForwardState{Rule: e.rule, State: e.state, Err: e.err, Conns: int(e.conns.Load())}
+		st := ForwardState{Rule: e.rule, State: e.state, Err: e.err, Conns: int(e.conns.Load()), Rejected: int(e.rejected.Load())}
 		out = append(out, st)
 	}
 	for i := 1; i < len(out); i++ {
@@ -258,13 +268,40 @@ func (m *ForwardManager) startListener(e *forwardEntry) error {
 }
 
 func (m *ForwardManager) acceptLoop(e *forwardEntry) {
+	backoff := 0
 	for {
 		conn, err := e.ln.Accept()
-		if err != nil {
-			return // 监听器被关（delete/级联/收工）
+		if err == nil {
+			backoff = 0
+			// exec-r1 B3-b：每监听并发上限（256，与 socks MaxConns 同值）——超限
+			// 拒绝并计数（单 accept goroutine 串行判-增，不会超上限）。
+			if int(e.conns.Load()) >= forwardMaxConns {
+				e.rejected.Add(1)
+				m.logf("forward: %s:%d 连接拒绝（并发上限 %d）", shortHost(e.rule.Host), e.rule.Listen, forwardMaxConns)
+				_ = conn.Close()
+				continue
+			}
+			e.conns.Add(1)
+			go m.serveConn(e, conn)
+			continue
 		}
-		e.conns.Add(1)
-		go m.serveConn(e, conn)
+		if errors.Is(err, net.ErrClosed) {
+			return // 监听器被关（delete/级联/收工）——正常收口
+		}
+		// L6/exec-r1：瞬态错误（EMFILE 等）有界线性退避；烧尽 = 置 failed+原因
+		//（与重启重建的 failed 软状态同款），防「状态说在听、实际没人 accept」。
+		if backoff >= forwardAcceptRetryMax {
+			m.mu.Lock()
+			if e.ln != nil {
+				_ = e.ln.Close()
+				e.state, e.err = "failed", fmt.Sprintf("accept 连续失败（%d 次）：%v", backoff+1, err)
+			}
+			m.mu.Unlock()
+			m.warnf("forward: %s:%d %s", shortHost(e.rule.Host), e.rule.Listen, e.err)
+			return
+		}
+		backoff++
+		time.Sleep(time.Duration(backoff) * forwardAcceptRetryStep)
 	}
 }
 
@@ -363,10 +400,10 @@ func shortHost(host string) string {
 	return host
 }
 
-// rstCloseConn RST 收口（尽力而为——非 TCP 忽略）。
+// rstCloseConn RST 收口（尽力而为——按接口断言：非 TCP 形态〔含包装连接〕静默忽略）。
 func rstCloseConn(c net.Conn) {
-	if tc, ok := c.(*net.TCPConn); ok {
-		_ = tc.SetLinger(0)
+	if l, ok := c.(interface{ SetLinger(int) error }); ok {
+		_ = l.SetLinger(0)
 	}
 }
 

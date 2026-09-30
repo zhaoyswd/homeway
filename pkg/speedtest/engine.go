@@ -30,6 +30,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"os"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -604,11 +605,23 @@ func reportMsg(code string) string {
 	return ""
 }
 
+// isReadTimeout 读侧期限到点判定（conn deadline 触发 = i/o 超时；EOF/复位不是）。
+// L4/exec-r1：判据② 的零字节形态只认 EOF/复位；期限到点按 interrupted 通道错误分流
+// ——「链路在 END 相位断掉」不得误报「出口没有测速服务（请升级出口）」。
+func isReadTimeout(err error) bool {
+	var ne net.Error
+	if errors.As(err, &ne) && ne.Timeout() {
+		return true
+	}
+	return errors.Is(err, os.ErrDeadlineExceeded)
+}
+
 // readDownStream 读一条下行流：预热期字节只进用量；窗口期字节进读数。收 report 正常收场。
 // 用量只计**实收字节**（迁移前评审 F7：rep.WarmupBytes 与实收的预热是同一批字节）。
 // data 帧走 header+discard 零分配路径（评审 F9），report 帧读进小缓冲。
-// 归因：任何帧未收到前的读失败（EOF/复位/期限）= 判据② not_supported（连接已建立、
-// 请求已发出）；已收帧后的失败 = 通道错误；report{error} = busy/link_down/通道错误。
+// 归因：任何帧未收到前的读失败——EOF/复位 = 判据② not_supported（连接已建立、请求
+// 已发出），读期限到点 = interrupted 通道错误（L4/exec-r1 分流）；已收帧后的失败 =
+// 通道错误；report{error} = busy/link_down/通道错误。
 func (e *Engine) readDownStream(r *run, br *bufio.Reader) (got, used, srvBytes, srvWarm int64, ae *attrError) {
 	ctrl := make([]byte, 1024)
 	frames := 0
@@ -616,6 +629,12 @@ func (e *Engine) readDownStream(r *run, br *bufio.Reader) (got, used, srvBytes, 
 		t, _, n, payload, rerr := ReadFrameLoose(br, ctrl)
 		if rerr != nil {
 			if frames == 0 {
+				if isReadTimeout(rerr) {
+					// L4/exec-r1：读期限到点 ≠ 判据②（那只认 EOF/复位）——期限到点 =
+					// 链路在数据期断掉（END 相位典型形态），按通道错误如实呈现。
+					return got, used, srvBytes, srvWarm, &attrError{ReasonInterrupted,
+						fmt.Sprintf("请求后无应答且读期限到点（%v）", rerr)}
+				}
 				return got, used, srvBytes, srvWarm, &attrError{ReasonNotSupported,
 					fmt.Sprintf("出口没有测速服务（请升级出口）：请求后无应答（%v）", rerr)}
 			}
@@ -700,10 +719,15 @@ func (e *Engine) runUpStream(r *run, conn net.Conn, br *bufio.Reader, warmup, wi
 		return e.upWriteFailure(conn, br, warm+sent, werr)
 	}
 	// 收口 report：读侧零字节 = 判据②（连接已建立、请求已发出——对端不答即无服务形态）；
-	// 非 report 帧（旧出口预发问候帧）= 判据③。
+	// 读期限到点 = 通道错误（L4/exec-r1，同 readDownStream 分流）；非 report 帧（旧出口
+	// 预发问候帧）= 判据③。
 	ctrl := make([]byte, 1024)
 	t, _, _, payload, rerr := ReadFrameLoose(br, ctrl)
 	if rerr != nil {
+		if isReadTimeout(rerr) {
+			return 0, warm + sent, warm + sent, &attrError{ReasonInterrupted,
+				fmt.Sprintf("收口无应答且读期限到点（%v）", rerr)}
+		}
 		return 0, warm + sent, warm + sent, &attrError{ReasonNotSupported,
 			fmt.Sprintf("出口没有测速服务（请升级出口）：收口无应答（%v）", rerr)}
 	}

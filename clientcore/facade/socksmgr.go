@@ -68,18 +68,21 @@ type socksEntryRT struct {
 
 // SocksManager socks 承载面管理器（Carriers 持有；全局端口唯一性检查在 Carriers 层）。
 type SocksManager struct {
-	mu       sync.Mutex
-	stateDir string
-	dial     carrierDial
-	entries  []*socksEntryRT
-	logf     func(format string, args ...any)
-	warnf    func(format string, args ...any)
+	mu        sync.Mutex
+	stateDir  string
+	dial      carrierDial
+	defListen uint16 // on 缺省端口（无记忆时的落点；生产 = 1080；测试可注入 0 = 取空闲端口）
+	entries   []*socksEntryRT
+	logf      func(format string, args ...any)
+	warnf     func(format string, args ...any)
 }
 
 // openSocksManager 打开开关记忆：读 socks.json、按 on 条目重建监听（失败 = off 呈现 +
-// 告警，不拒启）。
-func openSocksManager(stateDir string, dial carrierDial, logf, warnf func(string, ...any)) (*SocksManager, error) {
-	m := &SocksManager{stateDir: stateDir, dial: dial, logf: logf, warnf: warnf}
+// 告警，不拒启）。defListen = on 缺省端口的落点：生产（openCarriers）恒传 1080；
+// 测试经 openCarriersWithSocksDefault 注入 0 = 让内核选空闲端口（exec-r1 B4：门禁
+// 与「在役 daemon 持 1080」解耦——「无记忆 → 1080」的纯面断言见 DefaultListen）。
+func openSocksManager(stateDir string, dial carrierDial, defListen uint16, logf, warnf func(string, ...any)) (*SocksManager, error) {
+	m := &SocksManager{stateDir: stateDir, dial: dial, defListen: defListen, logf: logf, warnf: warnf}
 	if logf == nil {
 		m.logf = func(string, ...any) {}
 	}
@@ -103,13 +106,14 @@ func openSocksManager(stateDir string, dial carrierDial, logf, warnf func(string
 	return m, nil
 }
 
-// On 开监听（listen 0 = 沿用记忆端口，无记忆则 1080）。同主机重复 on：同端口 = 幂等
-// 成功；换端口 = 关旧开新。返回实际端口。
+// On 开监听（listen 0 = 沿用记忆端口，无记忆则缺省——生产 1080、注入面见
+// openSocksManager；exec-r1 B1：此前恒落 1080，把记忆静默改写）。同主机重复 on：
+// 同端口 = 幂等成功；换端口 = 关旧开新。返回实际端口。
 func (m *SocksManager) On(host string, listen uint16) (uint16, error) {
 	if listen == 0 {
-		listen = socksDefaultListen
+		listen = m.DefaultListen(host)
 	}
-	if listen < forwardMinPort || listen > forwardMaxPort {
+	if listen != 0 && (listen < forwardMinPort || listen > forwardMaxPort) {
 		return 0, fmt.Errorf("%w：%d", ErrPortRange, listen)
 	}
 	m.mu.Lock()
@@ -118,12 +122,12 @@ func (m *SocksManager) On(host string, listen uint16) (uint16, error) {
 		if e.rec.Host != host {
 			// 其它主机的端口一律挡（含 off 但记住的——「全局唯一」按规则在册判，
 			// 防 on 回来撞上别台已占/已记的端口）。
-			if e.rec.Listen == listen {
+			if listen != 0 && e.rec.Listen == listen {
 				return 0, fmt.Errorf("%w：%d 已被 %s 的 socks 监听占用（可用 --listen 另选）", ErrPortTaken, listen, shortHost(e.rec.Host))
 			}
 			continue
 		}
-		if e.ln != nil && e.rec.Listen == listen {
+		if e.ln != nil && listen != 0 && e.rec.Listen == listen {
 			return listen, nil // 幂等：同端口已开
 		}
 		if e.ln != nil {
@@ -135,13 +139,12 @@ func (m *SocksManager) On(host string, listen uint16) (uint16, error) {
 			_ = m.saveLocked()
 			return 0, fmt.Errorf("监听 127.0.0.1:%d 失败（%w）", listen, err)
 		}
-		if err := m.saveLocked(); err != nil {
-			m.stopListener(e)
-			_ = m.saveLocked()
+		port, err := m.settleListenPortLocked(e)
+		if err != nil {
 			return 0, err
 		}
-		m.logf("socks: %s on 127.0.0.1:%d", shortHost(host), listen)
-		return listen, nil
+		m.logf("socks: %s on 127.0.0.1:%d", shortHost(host), port)
+		return port, nil
 	}
 	e := &socksEntryRT{rec: SocksEntry{Host: host, On: true, Listen: listen}}
 	if err := m.startListener(e); err != nil {
@@ -149,13 +152,53 @@ func (m *SocksManager) On(host string, listen uint16) (uint16, error) {
 	}
 	// 先入表再落盘；落盘失败撤回——零副作用。
 	m.entries = append(m.entries, e)
-	if err := m.saveLocked(); err != nil {
-		m.stopListener(e)
+	if _, err := m.settleListenPortLocked(e); err != nil {
 		m.entries = m.entries[:len(m.entries)-1]
 		return 0, err
 	}
-	m.logf("socks: %s on 127.0.0.1:%d", shortHost(host), listen)
-	return listen, nil
+	m.logf("socks: %s on 127.0.0.1:%d", shortHost(host), e.rec.Listen)
+	return e.rec.Listen, nil
+}
+
+// DefaultListen on 缺省端口的解析面（纯查询、不绑端口）：该主机的记忆端口，
+// 无记忆/记忆为 0 = 注入的缺省（生产 1080；测试注入 0 = 内核选空闲端口）。
+// spec「on 的监听端口缺省 SHALL 沿用该主机上次使用的端口（无记忆则 1080）」的
+// 唯一真源（exec-r1 B1）。
+func (m *SocksManager) DefaultListen(host string) uint16 {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for _, e := range m.entries {
+		if e.rec.Host == host && e.rec.Listen != 0 {
+			return e.rec.Listen
+		}
+	}
+	return m.defListen
+}
+
+// settleListenPortLocked 落记忆并落盘；注入缺省 = 0（内核选空闲端口）时先把记忆
+// 落成实际端口。失败路径统一收口监听（调用方只撤表）。调用方持锁。
+func (m *SocksManager) settleListenPortLocked(e *socksEntryRT) (uint16, error) {
+	if e.rec.Listen == 0 {
+		e.rec.Listen = listenerPort(e.ln)
+	}
+	if e.rec.Listen == 0 {
+		m.stopListener(e)
+		return 0, errors.New("socks: 无法确定监听端口")
+	}
+	if err := m.saveLocked(); err != nil {
+		m.stopListener(e)
+		_ = m.saveLocked()
+		return 0, err
+	}
+	return e.rec.Listen, nil
+}
+
+// listenerPort 从监听器读实际端口（测试注入缺省 0 的形态用；非 TCP 返回 0）。
+func listenerPort(ln net.Listener) uint16 {
+	if t, ok := ln.Addr().(*net.TCPAddr); ok {
+		return uint16(t.Port)
+	}
+	return 0
 }
 
 // Off 关监听并**显式关在世连接**（RST 收口）；端口记忆保留（下次 on 缺省沿用）。
@@ -256,7 +299,21 @@ func (m *SocksManager) startListener(e *socksEntryRT) error {
 		Logf:          m.logf,
 		ResolveBudget: socksResolveBudget,
 	})
-	go func() { _ = srv.Serve(ln) }()
+	go func() {
+		err := srv.Serve(ln)
+		// L6（exec-r1）：非「监听器被关」的 Serve 退出（accept 瞬态错误烧尽退避——
+		// 见 pkg/socks.Serve）= 无人再受理的僵尸监听——按 off 语义收口 + err 如实
+		// 呈现（status 面 Err 字段），防「状态说在听、实际没人 accept」。
+		if err != nil && !errors.Is(err, net.ErrClosed) {
+			m.mu.Lock()
+			if e.ln == ln { // 仍是在役监听（off/级联路径已自行收口）
+				m.stopListener(e)
+				e.err = fmt.Sprintf("监听 accept 失败（%v）——重试 socks on 可恢复", err)
+				m.warnf("socks: %s 监听 accept 失败（%v）——按 off 收口", shortHost(e.rec.Host), err)
+			}
+			m.mu.Unlock()
+		}
+	}()
 	e.ln, e.srv, e.cache = ln, srv, cache
 	e.rec.On = true
 	return nil

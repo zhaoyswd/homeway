@@ -63,15 +63,16 @@ type speedHostRun struct {
 	cancel    context.CancelFunc
 	waitUntil time.Time
 	waiting   bool              // start 已返回、引擎未真正开跑（link_down 重试窗）
+	starting  bool              // start 已受理、runLoop 未收场（封 setWaiting↔engine.Start 的窄窗口，exec-r1 L8）
 	result    *speedtest.Result // 终态（runner 收场时写回；nil = 未到终态）
 	mu        sync.Mutex
 }
 
 func (r *speedHostRun) busy() bool {
 	r.mu.Lock()
-	w := r.waiting
+	w, s := r.waiting, r.starting
 	r.mu.Unlock()
-	return w || r.engine.Running()
+	return w || s || r.engine.Running()
 }
 
 // SpeedtestManager 守护侧测速运行面（Carriers 持有；拨号缝 = carrierDial）。
@@ -100,7 +101,7 @@ func (m *SpeedtestManager) Start(host string, p SpeedtestStart) SpeedtestStartAc
 	}
 	engine := speedtest.NewEngine(m.logf)
 	ctx, cancel := context.WithCancel(context.Background())
-	r := &speedHostRun{engine: engine, cancel: cancel, waiting: true}
+	r := &speedHostRun{engine: engine, cancel: cancel, waiting: true, starting: true}
 	if p.WaitMs > 0 {
 		r.waitUntil = time.Now().Add(time.Duration(p.WaitMs) * time.Millisecond)
 	} else {
@@ -117,6 +118,10 @@ func (m *SpeedtestManager) Start(host string, p SpeedtestStart) SpeedtestStartAc
 // 写回 result（CLI 轮询的终态数据源——等待期被取消也合成 cancelled 终态，不留给
 // 轮询方一个永远 idle 的歧义快照）。
 func (m *SpeedtestManager) runLoop(ctx context.Context, host string, r *speedHostRun, p SpeedtestStart) {
+	// starting 旗标覆盖整个 runLoop 生命周期（exec-r1 L8：setWaiting(false) 与
+	// engine.Start 置 running 之间——以及每轮重试的间隙——busy() 恒真，第二个 start
+	// 插不进来；收场让位）。
+	defer r.setStarting(false)
 	params := speedtest.Params{Down: p.Down, Up: p.Up, Warmup: p.Warmup, Streams: p.Streams}
 	for {
 		// 开跑即离开 waiting（Start 同步跑整轮，期间状态面由引擎快照承载）；
@@ -194,7 +199,14 @@ func (m *SpeedtestManager) Status(host string) *SpeedtestStatus {
 		return &SpeedtestStatus{Host: host, Waiting: true, WaitRemainMs: remain,
 			Snap: speedtest.Snapshot{Phase: "waiting", ElapsedMs: -1}}
 	}
-	return &SpeedtestStatus{Host: host, Snap: r.engine.Snapshot(), Result: result}
+	snap := r.engine.Snapshot()
+	// run 在册但引擎快照还在 idle（starting 窗口/重试间隙的瞬态）：不回 idle——CLI 的
+	// 「运行面丢失」判据（idle+非 waiting+无终态，exec-r1 L5）以 idle 为准，这里把
+	// 在册 run 的瞬态 idle 归一到 connecting，免得轮询撞上微秒级窗口误判。
+	if snap.Phase == string(speedtest.PhaseIdle) && result == nil {
+		snap.Phase = string(speedtest.PhaseConnecting)
+	}
+	return &SpeedtestStatus{Host: host, Snap: snap, Result: result}
 }
 
 // RemoveHost 级联（host.remove）：取消该主机在跑的测速。
@@ -219,6 +231,12 @@ func (m *SpeedtestManager) Close() {
 func (r *speedHostRun) setWaiting(v bool) {
 	r.mu.Lock()
 	r.waiting = v
+	r.mu.Unlock()
+}
+
+func (r *speedHostRun) setStarting(v bool) {
+	r.mu.Lock()
+	r.starting = v
 	r.mu.Unlock()
 }
 

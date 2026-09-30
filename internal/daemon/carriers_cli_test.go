@@ -44,6 +44,7 @@ type carrierStubBackend struct {
 	startArgs  map[string]control.SpeedtestStartArgs
 	termRes    map[string]*control.SpeedtestResultBrief // host -> 终态（nil = 永远 waiting）
 	startedC   chan string                              // start 到达信号（Ctrl-C 用例同步）
+	cancelC    chan string                              // cancel 到达信号（exec-r1 B2：同步等待判据）
 	cancels    []string
 }
 
@@ -58,6 +59,7 @@ func newCarrierStub() *carrierStubBackend {
 		startArgs:         map[string]control.SpeedtestStartArgs{},
 		termRes:           map[string]*control.SpeedtestResultBrief{},
 		startedC:          make(chan string, 16),
+		cancelC:           make(chan string, 16),
 	}
 }
 
@@ -110,12 +112,12 @@ func (b *carrierStubBackend) ForwardList(host string) control.ForwardListResult 
 func (b *carrierStubBackend) SocksOn(host string, listen uint16) (control.SocksOnResult, error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
+	// exec-r1 B1「桩掩盖」整改：on 缺省的**记忆端口解析语义不在桩里复制**（此前桩自带
+	// 解析，CLI 面测试反而掩盖了真实现的缺口）——桩只按「0 = 1080」回显；真语义的
+	// 判据在 facade 层（TestSocksOnOffStatus / TestSocksOnDefaultMemoryWins）与 e2e
+	//（TestCarriersE2ESocksOnDefaultMemory，真 Carriers 全链）。
 	if listen == 0 {
-		if mem, ok := b.socksMem[host]; ok {
-			listen = mem
-		} else {
-			listen = 1080
-		}
+		listen = 1080
 	}
 	if listen < 1024 {
 		return control.SocksOnResult{}, errors.New("监听端口须在 1024–65535")
@@ -183,10 +185,14 @@ func (b *carrierStubBackend) SpeedtestStatus(host string) (control.SpeedtestStat
 
 func (b *carrierStubBackend) SpeedtestCancel(host string) error {
 	b.mu.Lock()
-	defer b.mu.Unlock()
 	b.cancels = append(b.cancels, host)
 	// 取消后注入 cancelled 终态（真实 runner 同款：cancel → 终态可轮询）。
 	b.termRes[host] = &control.SpeedtestResultBrief{OK: false, Reason: "cancelled"}
+	b.mu.Unlock()
+	select {
+	case b.cancelC <- host: // exec-r1 B2：cancel 到达的同步信号（用例锁判据用）
+	default:
+	}
 	return nil
 }
 
@@ -551,6 +557,17 @@ func TestSpeedtestCLICtrlCStopsRotation(t *testing.T) {
 	if err := syscall.Kill(os.Getpid(), syscall.SIGINT); err != nil {
 		t.Fatal(err)
 	}
+	// 「cancel 已到达」做成同步等待（exec-r1 B2：此前断言在 CLI 退出后立刻做，start
+	// 在途窗口的竞态让用例 flaky 且锁不住判据；同步化后修完代码既确定通过、又能真正
+	// 锁死「先 cancel 当前主机」）。
+	select {
+	case h := <-stub.cancelC:
+		if h != ali {
+			t.Fatalf("应先 cancel 当前主机 ali，got %s", h)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Ctrl-C 后未在窗口内发出 speedtest.cancel（start 在途窗口缺口的红路）")
+	}
 	select {
 	case err := <-done:
 		if err == nil || !strings.Contains(err.Error(), "Ctrl-C") {
@@ -565,7 +582,7 @@ func TestSpeedtestCLICtrlCStopsRotation(t *testing.T) {
 		t.Fatalf("Ctrl-C 后 mac 不应被测量：%v", stub.startOrder)
 	}
 	if len(stub.cancels) != 1 || stub.cancels[0] != ali {
-		t.Fatalf("应先 cancel 当前主机 ali：%v", stub.cancels)
+		t.Fatalf("应先 cancel 当前主机 ali（恰一次）：%v", stub.cancels)
 	}
 }
 

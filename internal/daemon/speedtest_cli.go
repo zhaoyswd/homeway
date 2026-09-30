@@ -115,6 +115,10 @@ func speedtestCLI(args []string, version string, w, errW io.Writer) error {
 	results := make([]speedHostResult, 0, len(targets))
 	interrupted := false
 	for _, h := range targets {
+		if ctx.Err() != nil { // Ctrl-C 落在两台之间的边界：不再起下一轮（exec-r1 B2）
+			interrupted = true
+			break
+		}
 		res, err := runSpeedHost(ctx, c, h, speedtest.Params{Down: *down, Up: *up, Warmup: *warmup, Streams: *streams}, *wait, errW, *quiet, *timeout)
 		if err != nil {
 			if ctx.Err() != nil { // Ctrl-C：先 cancel 当前 host（runSpeedHost 内已发）再退出
@@ -216,7 +220,19 @@ func runSpeedHost(ctx context.Context, c *control.Client, h control.HostState, p
 	if h.Link != nil {
 		via, rtt = h.Link.Via, h.Link.RttMs
 	}
+	// Ctrl-C 收尾的单一出口（exec-r1 B2）：start 请求**已发出**后 ctx 取消（含 start
+	// 在途窗口——请求帧先写后等，很可能已送达 daemon 并开跑；含轮询期间的任何取消）
+	// 统一在收尾 defer 补发 speedtest.cancel（best-effort、独立预算；daemon 侧 Cancel
+	// 幂等）。此前只有轮询循环两处显式调用，在途窗口直接返回 = 该轮测速无人取消跑
+	// 满预算。
+	startSent := false
+	defer func() {
+		if startSent && ctx.Err() != nil {
+			cancelSpeedHost(c, h.ID, timeout)
+		}
+	}()
 	reqCtx, reqCancel := context.WithTimeout(ctx, timeout)
+	startSent = true
 	raw, err := c.Request(reqCtx, facade.OpSpeedtestStart, control.SpeedtestStartArgs{
 		Host:     h.ID,
 		DownMs:   p.Down.Milliseconds(),
@@ -228,7 +244,7 @@ func runSpeedHost(ctx context.Context, c *control.Client, h control.HostState, p
 	reqCancel()
 	if err != nil {
 		if ctx.Err() != nil {
-			return speedHostResult{}, ctx.Err()
+			return speedHostResult{}, ctx.Err() // 收尾 cancel 由上方 defer 补发
 		}
 		// no_host/unknown_op 等控制面错误：直接成为该台失败短因（轮转继续）。
 		return speedHostResult{name: name, hex: h.ID, ok: false, reason: "control_error", msg: carrierOpErr("speedtest.start", err).Error(), via: via, rttMs: rtt}, nil
@@ -253,9 +269,9 @@ func runSpeedHost(ctx context.Context, c *control.Client, h control.HostState, p
 	pollBudget := wait + time.Minute + p.Down + p.Up + p.Warmup + 10*time.Second
 	deadline := time.Now().Add(pollBudget)
 	lastHint := time.Time{}
+	failStreak := 0
 	for {
-		if ctx.Err() != nil { // Ctrl-C：先 cancel 当前 host 再退出
-			cancelSpeedHost(c, h.ID, timeout)
+		if ctx.Err() != nil { // Ctrl-C：先 cancel 当前 host 再退出（defer 统一补发）
 			return speedHostResult{}, ctx.Err()
 		}
 		if time.Now().After(deadline) {
@@ -265,12 +281,19 @@ func runSpeedHost(ctx context.Context, c *control.Client, h control.HostState, p
 		st, err := fetchSpeedStatus(ctx, c, h.ID, timeout)
 		if err != nil {
 			if ctx.Err() != nil {
-				cancelSpeedHost(c, h.ID, timeout)
-				return speedHostResult{}, ctx.Err()
+				return speedHostResult{}, ctx.Err() // defer 补发 cancel
+			}
+			// L5（exec-r1）：status 连续失败如实报错（此前静默烧满整个轮询预算）；
+			// 瞬时抖动仍给短窗重试（250ms × 8 = 2s）。
+			failStreak++
+			if failStreak >= statusFailStreak {
+				return speedHostResult{name: name, hex: h.ID, ok: false, reason: "control_error",
+					msg: fmt.Sprintf("status 连续 %d 次失败：%v", failStreak, err), via: via, rttMs: rtt}, nil
 			}
 			time.Sleep(250 * time.Millisecond)
 			continue
 		}
+		failStreak = 0
 		if st.Result != nil { // 终态
 			return speedHostResult{
 				name: name, hex: h.ID, ok: st.Result.OK, reason: st.Result.Reason, msg: st.Result.Msg,
@@ -278,6 +301,12 @@ func runSpeedHost(ctx context.Context, c *control.Client, h control.HostState, p
 				usageDown: st.Result.UsageDown, usageUp: st.Result.UsageUp, wallMs: st.Result.WallMs,
 				via: via, rttMs: rtt,
 			}, nil
+		}
+		// L5（exec-r1）：本台已 start 过——phase=idle 且无终态 = 运行面丢失（daemon
+		// 重启等）：快速失败，不烧满轮询预算。
+		if !st.Waiting && st.Result == nil && st.Phase == string(speedtest.PhaseIdle) {
+			return speedHostResult{name: name, hex: h.ID, ok: false, reason: "interrupted",
+				msg: "运行面丢失（守护进程重启？）——本轮测速已不在，请重试", via: via, rttMs: rtt}, nil
 		}
 		if !quiet && time.Since(lastHint) >= time.Second {
 			lastHint = time.Now()
@@ -292,6 +321,9 @@ func runSpeedHost(ctx context.Context, c *control.Client, h control.HostState, p
 		time.Sleep(250 * time.Millisecond)
 	}
 }
+
+// statusFailStreak status 轮询连续失败上限（超出 = 如实报错；250ms 拍 × 8 = 2s 短窗）。
+const statusFailStreak = 8
 
 // fetchSpeedStatus 一次 status 轮询（独立小预算——轮询不占长请求）。
 func fetchSpeedStatus(ctx context.Context, c *control.Client, host string, timeout time.Duration) (control.SpeedtestStatusResult, error) {

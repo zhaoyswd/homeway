@@ -262,7 +262,7 @@ func forwardBriefOf(st facade.ForwardState) control.ForwardRuleBrief {
 	return control.ForwardRuleBrief{
 		Host: st.Rule.Host, Listen: st.Rule.Listen,
 		TargetIP: st.Rule.TargetIP, TargetPort: st.Rule.TargetPort,
-		State: st.State, Err: st.Err, Conns: st.Conns,
+		State: st.State, Err: st.Err, Conns: st.Conns, Rejected: st.Rejected,
 	}
 }
 

@@ -307,3 +307,36 @@ func TestCarriersE2ESpeedtestWaitingAndCancel(t *testing.T) {
 func stateDirOf(sock string) string {
 	return strings.TrimSuffix(sock, "/"+control.ControlSockName)
 }
+
+// TestCarriersE2ESocksOnDefaultMemory exec-r1 B1：真 Carriers + 控制面全链的
+// 「socks on 缺省沿用记忆端口」——CLI 桩不复制该语义（B1「桩掩盖」整改），真实现
+// 的判据在此（on --listen P → off → on 缺省 → 回到 P 而非 1080）。
+func TestCarriersE2ESocksOnDefaultMemory(t *testing.T) {
+	_, sock := startDaemonForTest(t, fakeProbeDirect)
+	ali := e2eAddHost(t, sock, "ali", 0x25)
+	dir := stateDirOf(sock)
+	sport := freeTCPPort(t)
+
+	var out bytes.Buffer
+	if err := socksCLI([]string{"on", "--host", "ali", "--listen", fmt.Sprint(sport), "--state", dir}, "t", &out); err != nil {
+		t.Fatal(err)
+	}
+	if err := socksCLI([]string{"off", "--host", "ali", "--state", dir}, "t", &out); err != nil {
+		t.Fatal(err)
+	}
+	// 缺省 on：沿用记忆端口 sport（修复前恒落 1080）。
+	out.Reset()
+	if err := socksCLI([]string{"on", "--host", "ali", "--state", dir}, "t", &out); err != nil {
+		t.Fatalf("缺省 on 应沿用记忆端口：%v", err)
+	}
+	if !strings.Contains(out.String(), fmt.Sprintf("127.0.0.1:%d", sport)) {
+		t.Fatalf("缺省 on 应回到记忆端口 %d：%s", sport, out.String())
+	}
+	// 监听真的在记忆端口上。
+	if conn, err := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", sport), time.Second); err != nil {
+		t.Fatalf("记忆端口应可连：%v", err)
+	} else {
+		_ = conn.Close()
+	}
+	_ = ali
+}
