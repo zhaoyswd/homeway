@@ -74,7 +74,7 @@ const (
 	KindSessionStateChanged = "session.state_changed"
 	KindSessionLadder       = "session.ladder"
 	KindSessionRebuild      = "session.rebuild"
-	KindSessionDiag         = "session.diag" // 词表冻结但本期不发射（spec「诊因事件词表」）
+	KindSessionDiag         = "session.diag" // 词表冻结；自 4a §6.3 起发射（spec「诊因事件词表」）
 	KindTransferSample      = "transfer.sample"
 	KindLogLine             = "log.line"
 	KindTermSessionUpdated  = "term.session_updated" // kind 值冻结；载荷字段初始集为空（后续 delta 增补）
@@ -147,7 +147,7 @@ type SessionRebuildPayload struct {
 	Reason string `json:"reason"`
 }
 
-// SessionDiagPayload session.diag 载荷（词表冻结、本期不发射；reason 值初始集
+// SessionDiagPayload session.diag 载荷（词表冻结；自 4a §6.3 起发射；reason 值初始集
 // gated/budget/probe_window——只增不改）。
 type SessionDiagPayload struct {
 	Host   string `json:"host"`

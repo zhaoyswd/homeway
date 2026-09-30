@@ -9,6 +9,8 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"io"
+	"net"
 	"strings"
 	"testing"
 	"time"
@@ -58,28 +60,28 @@ func TestParseViewGrammar(t *testing.T) {
 }
 
 // TestDemandSynthesisThreeSources 三源合成（§6.2 用例：三源单真 / 全假 / 退订后
-// 贡献消失）。sess = nil（构造期失败形态——流量源缺省，其余源照常）。
+// 贡献消失）。
 func TestDemandSynthesisThreeSources(t *testing.T) {
 	id, hexID := demandTestID()
 	bus := NewBus(NewGeneration(), BusConfig{})
 	h := &hostDemand{}
 
 	// 首拍（无源）：false "无"。
-	if a, why := h.evaluate(nil, bus, id); a || why != "无" {
+	if a, why := h.evaluate(bus, id); a || why != "无" {
 		t.Fatalf("全假应 (false,\"无\")，得 (%v,%q)", a, why)
 	}
 	// 源①拨号尝试：单真。
 	h.dials.Add(1)
-	if a, why := h.evaluate(nil, bus, id); !a || why != "拨号尝试" {
+	if a, why := h.evaluate(bus, id); !a || why != "拨号尝试" {
 		t.Fatalf("拨号尝试应单真，得 (%v,%q)", a, why)
 	}
 	// 计数被消费：再评估无此源。
-	if a, why := h.evaluate(nil, bus, id); a || why != "无" {
+	if a, why := h.evaluate(bus, id); a || why != "无" {
 		t.Fatalf("拨号计数应单拍消费，得 (%v,%q)", a, why)
 	}
 	// 源②在场腿：单真。
 	h.activeNx.Add(1)
-	if a, why := h.evaluate(nil, bus, id); !a || why != "在场腿" {
+	if a, why := h.evaluate(bus, id); !a || why != "在场腿" {
 		t.Fatalf("在场腿应单真，得 (%v,%q)", a, why)
 	}
 	h.activeNx.Add(-1)
@@ -88,13 +90,26 @@ func TestDemandSynthesisThreeSources(t *testing.T) {
 	if err := bus.Subscribe(sub, []string{DomainSession}, nil, "", "host="+hexID); err != nil {
 		t.Fatal(err)
 	}
-	if a, why := h.evaluate(nil, bus, id); !a || why != "订阅视图" {
+	if a, why := h.evaluate(bus, id); !a || why != "订阅视图" {
 		t.Fatalf("订阅视图应单真，得 (%v,%q)", a, why)
 	}
 	// 退订后贡献消失（§7.1 场景的 facade 侧前置：全摘域 = 订阅者离开 b.subs）。
 	bus.UnsubscribeDomains(sub, []string{DomainSession})
-	if a, why := h.evaluate(nil, bus, id); a || why != "无" {
+	if a, why := h.evaluate(bus, id); a || why != "无" {
 		t.Fatalf("退订后需求贡献应消失，得 (%v,%q)", a, why)
+	}
+	// 断连入口（exec-r1 低-6）：wire 断开走 Bus.Unsubscribe(c.sub)（server.go
+	// close() 段——与 UnsubscribeDomains 等价但非同一入口）；同入口下 view 聚合
+	// 回落的直接断言（此前只有代码阅读证据）。
+	if err := bus.Subscribe(sub, []string{DomainSession}, nil, "", "host="+hexID); err != nil {
+		t.Fatal(err)
+	}
+	if a, _ := h.evaluate(bus, id); !a {
+		t.Fatal("重订阅（view）后源③应单真")
+	}
+	bus.Unsubscribe(sub)
+	if a, why := h.evaluate(bus, id); a || why != "无" {
+		t.Fatalf("断连入口（Bus.Unsubscribe）后 view 聚合应回落，得 (%v,%q)", a, why)
 	}
 }
 
@@ -269,6 +284,145 @@ func TestDemandTruthTableAlignment(t *testing.T) {
 			t.Errorf("【%s】桌面门得 (%d,%v)，期望 (%d,%v)——与手机门真值表对齐断", v.name, n, counted, v.wantN, v.wantCounted)
 		}
 	}
+}
+
+// TestDemandTrafficSourceUserConnOnly 源①字节口径（exec-r1 中-2 整改回归）：
+// 需求字节源 = countedConn.Write 的**用户连接出站**——探针（PathProbe/punchTo 拨
+// 出口 1 号端口）与 WG 握手/保活不经 Host.DialPort，无路径进入计数面 ⇒ 探针失败
+// 期无用户流量时 demand=false（门控 !demand 分支可达）；用户写出 ⇒ true（出站包）；
+// 连接关闭且无新字节 ⇒ 回落「无」。旧口径（StatsSnapshot.TxBytes 差分）把探针自身
+// 出站重试也算作需求（后端死时恒真），已弃。
+func TestDemandTrafficSourceUserConnOnly(t *testing.T) {
+	c1, c2 := net.Pipe()
+	defer c1.Close()
+	defer c2.Close()
+	go func() { _, _ = io.Copy(io.Discard, c2) }() // pipe 同步写需要读者排空对端
+	restore := injectDialPort(func(s *hostsession.Session, ctx context.Context, port uint16) (net.Conn, error) {
+		return c1, nil
+	})
+	defer restore()
+
+	id, _ := demandTestID()
+	bus := NewBus(NewGeneration(), BusConfig{})
+	dm := &hostDemand{}
+	h := &Host{rec: HostRecord{ID: "probe-excluded"}, sess: &hostsession.Session{}, dm: dm}
+
+	// 首拍采样：无任何用户面动作——探针流量（不经 Host.DialPort）不可能进入计数面。
+	if a, why := dm.evaluate(bus, id); a || why != "无" {
+		t.Fatalf("探针失败期无用户流量应 (false,\"无\")，得 (%v,%q)", a, why)
+	}
+	// 用户拨号：本拍拨号尝试（源①的拨号腿）。
+	conn, err := h.DialPort(context.Background(), 7724)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if a, why := dm.evaluate(bus, id); !a || why != "拨号尝试" {
+		t.Fatalf("拨号拍应 (true,\"拨号尝试\")，得 (%v,%q)", a, why)
+	}
+	// 无新字节、连接在场：在场腿（源②）。
+	if a, why := dm.evaluate(bus, id); !a || why != "在场腿" {
+		t.Fatalf("在场无字节应 (true,\"在场腿\")，得 (%v,%q)", a, why)
+	}
+	// 用户写出：出站包（源①的字节腿——countedConn.Write 记账）。
+	if _, err := conn.Write([]byte("hello")); err != nil {
+		t.Fatal(err)
+	}
+	if a, why := dm.evaluate(bus, id); !a || why != "出站包" {
+		t.Fatalf("用户写出应 (true,\"出站包\")，得 (%v,%q)", a, why)
+	}
+	// 连接关闭、无新字节：全源回落。
+	if err := conn.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if a, why := dm.evaluate(bus, id); a || why != "无" {
+		t.Fatalf("关流后无新字节应 (false,\"无\")，得 (%v,%q)", a, why)
+	}
+}
+
+// TestDemandRefreshKeepsSingleState exec-r1 中-1 整改回归：同 peerID 换 token
+// 刷新后 demand 状态不分叉——会话侧钩子、观测面（Daemon.DemandStatus）、计数器
+// 三面同一 hostDemand（刷新复用原表条目，新会话装回 e）。改前：刷新路径
+// startEntryLocked 造新 entry，钩子绑孤儿 dm、观测面读旧 dm，demand 段对刷新
+// 主机永久冻结在刷新前值。
+func TestDemandRefreshKeepsSingleState(t *testing.T) {
+	dir := t.TempDir()
+	d := New(Options{
+		StrictIdentity: true,
+		Probe: func(ctx context.Context, token string) (*probe.ReachReport, error) {
+			id, _ := demandTestID()
+			return &probe.ReachReport{
+				Peer:    hex.EncodeToString(id[:2]),
+				Results: []probe.ReachResult{{EP: "203.0.113.9:41641", RTT: 9 * time.Millisecond}},
+			}, nil
+		},
+	})
+	t.Cleanup(d.Close)
+	if err := d.Attach(dir); err != nil {
+		t.Fatal(err)
+	}
+	// 注入 newSession：捕获 Options、返回错误（条目仍入表——不起生命周期；
+	// 钩子接线与刷新路径的条目归属无关）。
+	var captured []hostsession.Options
+	oldNew := newSession
+	newSession = func(cfg hostsession.Config, opts hostsession.Options) (*hostsession.Session, error) {
+		captured = append(captured, opts)
+		return nil, errors.New("注入：只捕钩子")
+	}
+	t.Cleanup(func() { newSession = oldNew })
+
+	_, hexID := demandTestID()
+	tok1, tok2 := refreshTestToken(t, 1), refreshTestToken(t, 2) // 同 peerID、不同 secret = 刷新
+	if _, err := d.AddHost(context.Background(), "刷新机", tok1, false); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := d.AddHost(context.Background(), "", tok2, false); err != nil {
+		t.Fatalf("同 peerID 换 token 应走刷新：%v", err)
+	}
+	if len(captured) != 2 {
+		t.Fatalf("应恰捕获两次 Options（入表 + 刷新），实得 %d", len(captured))
+	}
+	// view 需求为真 → 新会话的钩子判定（会话侧写）。
+	sub := d.Bus().NewSubscriber()
+	if err := d.Bus().Subscribe(sub, []string{DomainSession}, nil, "", "host="+hexID); err != nil {
+		t.Fatal(err)
+	}
+	if a, why := captured[1].Demand(); !a || why != "订阅视图" {
+		t.Fatalf("刷新后钩子应判 (true,\"订阅视图\")，得 (%v,%q)", a, why)
+	}
+	// 观测面与钩子判定一致（改前这里读旧 dm：Active=false 冻结）。
+	brief := d.DemandStatus()
+	if len(brief) != 1 || brief[0].Host != hexID {
+		t.Fatalf("demand 观测面应恰一条（%s）：%+v", hexID, brief)
+	}
+	if !brief[0].Active || brief[0].Reason != "订阅视图" || brief[0].At == 0 {
+		t.Fatalf("观测面应与钩子判定一致（true/订阅视图），得 %+v——刷新后状态分叉", brief[0])
+	}
+	// 退订后两面同步回落（同一 dm 的 sticky 写点）。
+	d.Bus().UnsubscribeDomains(sub, []string{DomainSession})
+	if a, why := captured[1].Demand(); a || why != "无" {
+		t.Fatalf("退订后钩子应回落 (false,\"无\")，得 (%v,%q)", a, why)
+	}
+	if brief = d.DemandStatus(); brief[0].Active || brief[0].Reason != "无" {
+		t.Fatalf("退订后观测面应同步回落，得 %+v", brief[0])
+	}
+}
+
+// refreshTestToken 同 peerID、不同 secret 的 token 对（刷新路径驱动件：同后端
+// 重签发形态）。
+func refreshTestToken(t *testing.T, secret byte) string {
+	t.Helper()
+	id, _ := demandTestID()
+	var sec [32]byte
+	sec[0] = secret
+	tok, err := proto.EncodeToken(proto.Token{
+		PeerID:    id,
+		Secret:    sec,
+		Endpoints: []proto.Endpoint{{Addr: "203.0.113.9:41641"}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return tok
 }
 
 // mustPeerID 见 table_isolation_test.go（同包既有助手）。

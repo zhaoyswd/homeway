@@ -182,9 +182,25 @@ func openTable(stateDir string, opts tableOptions) (*hostTable, error) {
 	return r, nil
 }
 
-// startEntryLocked 为一条记录构造并启动会话（调用方持锁或单线程装配期）。
+// startEntryLocked 为一条记录构造条目并起会话（装载/新键入表两路；调用方持锁或
+// 单线程装配期）。
 func (r *hostTable) startEntryLocked(rec HostRecord) *hostEntry {
-	e := &hostEntry{rec: rec, dm: &hostDemand{}}
+	e := newHostEntry(rec)
+	r.startSessionLocked(e)
+	return e
+}
+
+// newHostEntry 条目骨架：登记记录 + 需求合成状态（会话字段留空——起会话见
+// startSessionLocked）。
+func newHostEntry(rec HostRecord) *hostEntry {
+	return &hostEntry{rec: rec, dm: &hostDemand{}}
+}
+
+// startSessionLocked 为条目构造并启动会话（exec-r1 中-1：**装回原条目 e**——刷新路径
+// 与新键入表共用本段，hooks 绑 e、观测面/计数器读 e.dm，三面同一份状态，不再随刷新
+// 裂成孤儿 dm；调用方持锁）。
+func (r *hostTable) startSessionLocked(e *hostEntry) {
+	rec := e.rec
 	cfg := hostsession.Config{
 		Token:            rec.Token,
 		IdentityDir:      filepath.Join(r.stateDir, "identity"),  // 复用 wtransport 机制
@@ -201,18 +217,17 @@ func (r *hostTable) startEntryLocked(rec HostRecord) *hostEntry {
 	}
 	sopts := hostsession.Options{StrictIdentity: r.strict, Observer: obs}
 	if r.hooks != nil {
-		sopts.Demand, sopts.Diag = r.hooks(rec, e) // §6：桌面门 + 诊因发射接线
+		sopts.Demand, sopts.Diag = r.hooks(rec, e) // §6：桌面门 + 诊因发射接线（绑 e）
 	}
 	sess, err := newSession(cfg, sopts)
 	if err != nil {
 		// 构造期唯一错误源 = 日志文件打不开：条目仍入表（记录在案、状态面 failed），
 		// 不因日志问题丢主机登记。
 		r.logf("hosts: %s（%s）会话构造失败：%v", rec.ID, rec.Name, err)
-		return e
+		return
 	}
+	e.sess = sess // 先装回再 Start（低-1）：会话 goroutine 经 hooks 闭包读 e.sess 需要 happens-before
 	sess.Start()
-	e.sess = sess
-	return e
 }
 
 // Add 添加/刷新一台主机：同 token 重复添加 → ErrHostExists；同 peerID 新 token
@@ -260,8 +275,8 @@ func (r *hostTable) Add(name, token string) (HostRecord, error) {
 			return HostRecord{}, errStopTimeout
 		}
 		e.rec = newRec
-		ne := r.startEntryLocked(newRec)
-		e.sess = ne.sess
+		e.sess = nil            // 旧会话已停：先摘引用（新会话构造失败时条目呈「会话对象不在」而非挂尸体）
+		r.startSessionLocked(e) // 新会话装回原条目：hooks/观测面/计数器同读 e.dm（中-1）
 		r.logf("hosts: %s（%s）token 已刷新（同后端重签发）", e.rec.ID, e.rec.Name)
 		return e.rec, nil
 	}
@@ -515,8 +530,14 @@ func (d *Daemon) tableRef() *hostTable {
 // = 先收工当前表（等价 Detach，逐台 session.removed 照发）再按新 stateDir 重新
 // 挂载，不报错、不留双表（supervisor 重建是常规来源）；② 半途失败收尾——装载
 // 出错时已起的会话全部 Stop、表回未 attach 态再返回错误（不留半挂表，下一次
-// Attach 从盘上状态重来）；stateDir 单一来源 = 只经本方法携带。
+// Attach 从盘上状态重来）；③ Attach 装载完成后为每台主机补发 session.added
+// （exec-r1 低-3，与 Detach 的逐台 session.removed 对称——control 与 client 角色
+// 相互独立，client 角色重建时控制面连接不断，在途订阅者靠这批 added 恢复视图，
+// 不静默空表）；stateDir 单一来源 = 只经本方法携带。低-2：attachMu 串行化
+// Attach/Detach（并发 Attach 互相覆盖会留孤儿表）。
 func (d *Daemon) Attach(stateDir string) error {
+	d.attachMu.Lock()
+	defer d.attachMu.Unlock()
 	// 契约①：先收工当前表（等价 Detach——先摘指针再收工，窗口内 NotReady 与
 	// Detach 同款；session.removed 照发）。
 	d.mu.Lock()
@@ -540,12 +561,22 @@ func (d *Daemon) Attach(stateDir string) error {
 	d.mu.Lock()
 	d.table = tbl
 	d.mu.Unlock()
+	// 契约③（added 方向）：装载完成的每台主机补发 session.added（锁外 emit；表已
+	// 挂载 = 前端据 added 重取视图时 NotReady 已为假）。首次 Attach（空总线）天然
+	// 无人在途，照发无害。
+	ev := &busEvents{bus: d.bus}
+	for _, rec := range tbl.Hosts() {
+		ev.HostAdded(rec.ID, rec.Name, rec.AddedAt.UnixMilli())
+	}
 	return nil
 }
 
 // Detach 收工当前主机表（= 迁移前 Registry.Close + 契约③ 逐台 session.removed
-// 照发——在途订阅前端可见收工；未 attach = 无操作）。
+// 照发——在途订阅前端可见收工；未 attach = 无操作）。低-2：与 Attach 同把
+// attachMu 串行化。
 func (d *Daemon) Detach() {
+	d.attachMu.Lock()
+	defer d.attachMu.Unlock()
 	d.mu.Lock()
 	tbl := d.table
 	d.table = nil

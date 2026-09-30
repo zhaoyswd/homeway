@@ -207,6 +207,9 @@ func (c *conn) lookupStream(id uint32) *stream {
 // ——「慢流 MUST NOT 阻塞控制帧/事件推送/其它流」在上行方向同样成立）；双界
 // （32 帧 / 512KiB）取先到，超界 = 每流有效缓冲（upC 8 + 工位 32 = 40 帧）已尽
 // → 收流（gone——如实边界，非无限缓速排空；发送端仍义务分片节流）。
+// 边界注记（exec-r1 低-7）：「永不阻塞」限定**转投路径**（select default）；缓冲
+// 耗尽路径的内联 finish 会阻塞在 dataC <- end（前端不读下行时）——该阻塞受写停滞
+// 看门狗兜底（UpStallTimeout 30s 量级，非无界）。
 func (c *conn) handleStreamData(body []byte) {
 	id, payload, err := DecodeStreamBody(body)
 	if err != nil {

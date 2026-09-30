@@ -115,7 +115,7 @@ func (h *Host) DialPort(ctx context.Context, port uint16) (net.Conn, error) {
 	}
 	if h.dm != nil {
 		h.dm.activeNx.Add(1) // 源②：在场腿（连接关闭时递减——countedConn）
-		return countedConn{Conn: conn, onClose: func() { h.dm.activeNx.Add(-1) }}, nil
+		return countedConn{Conn: conn, dm: h.dm, onClose: func() { h.dm.activeNx.Add(-1) }}, nil
 	}
 	return conn, nil
 }

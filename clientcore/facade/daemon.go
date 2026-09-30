@@ -43,6 +43,11 @@ type Daemon struct {
 
 	mu    sync.Mutex
 	table *hostTable
+	// attachMu Attach/Detach 串行化（低-2：导出 API 防并发——两个并发 Attach 互相
+	// 覆盖时输者的表不会被 Close〔会话不 Stop、无 session.removed〕且同 stateDir 下
+	// 互踩 hosts.json.tmp；当前装配不可达〔client 角色单 goroutine〕，导出面自守）。
+	// 锁序单向：attachMu → d.mu / 表锁，反向不存在（tableRef 等只碰 d.mu）。
+	attachMu sync.Mutex
 }
 
 // New 建进程级 Daemon：总线 + 代际（每次进程启动生成一次，Bus 与绑定层共用）。
@@ -85,8 +90,9 @@ func NewGeneration() string {
 func (d *Daemon) Close() { d.Detach() }
 
 // sessionHooks 每主机会话的 Demand/Diag 钩子装配（§6.2/§6.3，D5/D6）：
-//   - Demand = hostDemand.evaluate（三源合成：出站增量/拨号尝试/在场腿/订阅视图
-//     ——闭包惰性读条目会话，重建换会话自动落到新对象上）；
+//   - Demand = hostDemand.evaluate（三源合成：用户连接出站增量/拨号尝试/在场腿/
+//     订阅视图——字节源在 countedConn 记账面、不读会话对象〔exec-r1 中-2〕，
+//     重建换会话计数天然延续）；
 //   - Diag = 发 session.diag 到进程级总线（gated/budget/probe_window——边沿与
 //     单飞在 hostsession 侧；词表/载荷同源 vocab.go）。
 func (d *Daemon) sessionHooks(rec HostRecord, e *hostEntry) (demand func() (bool, string), diag func(reason string)) {
@@ -96,7 +102,7 @@ func (d *Daemon) sessionHooks(rec HostRecord, e *hostEntry) (demand func() (bool
 	}
 	bus, dm, id := d.bus, e.dm, rec.ID
 	demand = func() (bool, string) {
-		return dm.evaluate(e.sess, bus, pid)
+		return dm.evaluate(bus, pid)
 	}
 	diag = func(reason string) {
 		_, _ = bus.Publish(DomainSession, KindSessionDiag, SessionDiagPayload{Host: id, Reason: reason})

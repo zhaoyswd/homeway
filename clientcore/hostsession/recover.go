@@ -304,10 +304,15 @@ func (g *recoverGate) merge(from recoverLevel, cause string, run func(from recov
 	g.cur = nil
 	r.rc = rc
 	close(r.done)
-	g.mu.Unlock()
 	if g.onRoundEnd != nil {
-		g.onRoundEnd() // 轮结束：probe_window 态离开（锁外调用）
+		// 轮结束：probe_window 态离开。**在临界区内**调用（exec-r1 低-8）：锁外窗口
+		// 曾有窄竞态——新一轮在 Unlock→onRoundEnd 之间起跑时，新轮 waiter 的 onWait
+		// 被旧轮仍置位的 diagActive 去重（漏沿）、旧轮清位落在新轮开始之后（陈旧
+		// 清位）；纳入临界区后清位与 cur=nil 对外原子可见。锁序 g.mu → s.mu 单向
+		// （onRoundEnd = clearDiag 只碰 s.mu；merge 调用方不持 s.mu）。
+		g.onRoundEnd()
 	}
+	g.mu.Unlock()
 	return rc
 }
 

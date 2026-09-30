@@ -222,8 +222,10 @@ func startWatchableDaemon(t *testing.T) (*facade.Daemon, string, func()) {
 // 消费语义由 facade 侧 TestDemandSynthesisThreeSources〔含「退订后贡献消失」段〕/
 // TestDemandViewAtomicReplace 承载）+ 订阅事件真实投递（渲染供给端）。
 // 断开后贡献消失的机制行 = conn close → Bus.Unsubscribe(c.sub)（server.go close()
-// 段）——订阅者出 b.subs 即不再被 viewDemand 聚合；本用例锁「断开后总线对新
-// 前端照常」与游标续播的完整性。
+// 段）——订阅者出 b.subs 即不再被 viewDemand 聚合；该入口（Bus.Unsubscribe）的
+// 聚合回落断言在 facade 侧 TestDemandSynthesisThreeSources 的「断连入口」段
+// （exec-r1 低-6 收口——此前只有代码阅读证据）；本用例锁「断开后总线对新前端
+// 照常」与游标续播的完整性。
 func TestDaemonStatusWatchViewOverWire(t *testing.T) {
 	d, dir, _ := startWatchableDaemon(t)
 	sock := filepath.Join(dir, control.ControlSockName)

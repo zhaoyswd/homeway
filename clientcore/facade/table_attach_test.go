@@ -171,6 +171,47 @@ func TestDetachEmitsSessionRemoved(t *testing.T) {
 	}
 }
 
+// TestAttachReEmitsSessionAdded exec-r1 低-3：Attach 装载完成后为每台主机补发
+// session.added（与 Detach 的逐台 session.removed 对称）——control 与 client 角色
+// 相互独立，client 角色重建时控制面连接不断，在途订阅者看到 removed→added 对、
+// 视图不静默空表（除非前端自行重快照）。
+func TestAttachReEmitsSessionAdded(t *testing.T) {
+	dir := t.TempDir()
+	d := newTestDaemon(t)
+	if err := d.Attach(dir); err != nil {
+		t.Fatal(err)
+	}
+	attachTestHosts(t, d, dir, 27)
+	// 在途订阅者（控制面连接不断形态）：Detach → removed(detach)；重 Attach
+	// （角色重建形态）→ 装载补发 added。
+	sub := d.Bus().NewSubscriber()
+	if err := d.Bus().Subscribe(sub, []string{DomainSession}, nil, "", ""); err != nil {
+		t.Fatal(err)
+	}
+	d.Detach()
+	waitEvent(t, sub, KindSessionRemoved, func(p json.RawMessage) {
+		var sp SessionRemovedPayload
+		if err := json.Unmarshal(p, &sp); err != nil {
+			t.Fatal(err)
+		}
+		if sp.Reason != "detach" {
+			t.Fatalf("Detach 的 removed reason 应 detach，实得 %q", sp.Reason)
+		}
+	})
+	if err := d.Attach(dir); err != nil {
+		t.Fatal(err)
+	}
+	waitEvent(t, sub, KindSessionAdded, func(p json.RawMessage) {
+		var sp SessionAddedPayload
+		if err := json.Unmarshal(p, &sp); err != nil {
+			t.Fatal(err)
+		}
+		if sp.Name != "机27" {
+			t.Fatalf("装载补发 added 应带登记名，载荷：%+v", sp)
+		}
+	})
+}
+
 // TestTableEventsPublishToBus §3.2 事件源直发：表事件（added/removed/
 // state_changed 三 kind）经 Attach 的默认接线直发总线（session 域、载荷同源）。
 func TestTableEventsPublishToBus(t *testing.T) {

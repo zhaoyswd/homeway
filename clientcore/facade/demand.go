@@ -4,11 +4,16 @@ package facade
 // 需求为真），经 hostsession Options.Demand 钩子接入巡检证据门（§6.1 桌面门）。
 // 判定结果与依据 sticky 落 demand 观测面（daemon.status 的 demand 段——词表只增）。
 //
-// 三源（D5）：
-//   ① 真实流量：本拍 WG 出站字节增量（StatsSnapshot.TxBytes 差分 > 0，采样窗 =
-//      巡检拍——「用户在等数据」的本地证据，对端死时出站握手重试仍在涨，不会
-//      误判无需求）或本拍内发生隧道拨号尝试（DialPort 计数；hostsession 内部的
-//      healingDial 无导出缝、不进合成源——r2 新-18）；
+// 三源（D5；源①口径 = exec-r1 中-2 整改）：
+//   ① 真实流量：本拍**经 Host.DialPort 的用户连接出站字节增量**（countedConn.Write
+//      记账差分 > 0，采样窗 = 巡检拍）或本拍内发生隧道拨号尝试（DialPort 计数；
+//      hostsession 内部的 healingDial 无导出缝、不进合成源——r2 新-18）。
+//      连接级过滤：桌面无 App TUN，daemon 拨的隧道连接就是「用户面」，而探针
+//      （PathProbe/punchTo 拨出口 1 号端口）与 WG 握手/保活不经 Host.DialPort——
+//      计数面天然排除探针自身流量，对齐手机口径（手机只算 App TUN 出站，「栈 B
+//      核心自连与巡检/探测自身流量不算需求」，hub.go）；旧口径（StatsSnapshot.
+//      TxBytes 差分）把探针自身的出站握手重试也算作需求，后端死/静默时恒真，
+//      门控「无需求清零」分支实质不可达（exec-r1 中-2），已弃；
 //   ② 在场腿：经 DialPort 的活跃消费连接数 > 0（term 流/未来 files/forward 连接）；
 //   ③ 订阅视图：控制面前端 events.subscribe 的 view 声明聚合到主机集合，该主机
 //      在集合内（文法见 ParseView；空/未知保守忽略——不算需求也不报错）。
@@ -22,17 +27,17 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
-
-	"github.com/zhaoyswd/homeway/clientcore/hostsession"
 )
 
 // hostDemand 一台主机的需求合成状态（挂在表条目上，随条目生命周期）。
 type hostDemand struct {
-	// ① 采样状态（仅 evaluate 调用串行——hostsession 巡检拍每拍恰一次；读写无锁）。
-	lastTx   int64
-	sampled  bool
-	dials    atomic.Int64 // 本拍拨号尝试（Host.DialPort 计数；evaluate Swap 清零）
-	activeNx atomic.Int64 // 在场的 DialPort 消费连接数（countedConn 关闭时递减）
+	// ① 用户连接字节采样状态（仅 evaluate 调用串行——hostsession 巡检拍每拍恰
+	// 一次；读写无锁；userTx 为原子——countedConn.Write 在连接 goroutine 上递增）。
+	userTx     atomic.Int64 // 用户连接累计出站字节（countedConn.Write）
+	lastUserTx int64
+	sampled    bool
+	dials      atomic.Int64 // 本拍拨号尝试（Host.DialPort 计数；evaluate Swap 清零）
+	activeNx   atomic.Int64 // 在场的 DialPort 消费连接数（countedConn 关闭时递减）
 
 	// 最近一拍判定（sticky，daemon.status 面）。
 	mu         sync.Mutex
@@ -41,24 +46,19 @@ type hostDemand struct {
 	lastAt     time.Time
 }
 
-// evaluate 一拍的需求合成（巡检拍调用；sess 为该主机当前会话，nil = 构造期失败
-// 形态——流量源缺省、其余源照常）。
-func (h *hostDemand) evaluate(sess *hostsession.Session, bus *Bus, id [32]byte) (bool, string) {
-	// ① 流量源：TxBytes 差分（世代切换清零 → 负差按 0 处理）。
-	tx := int64(0)
-	if sess != nil {
-		if snap := sess.StatusSnapshot(); snap.Stats != nil {
-			tx = snap.Stats.TxBytes
-		}
-	}
+// evaluate 一拍的需求合成（巡检拍调用；exec-r1 中-2 后不再读会话对象——字节源在
+// countedConn 记账面，探针/握手流量无路径进入）。
+func (h *hostDemand) evaluate(bus *Bus, id [32]byte) (bool, string) {
+	// ① 流量源：用户连接出站字节差分（防御性负差按 0——userTx 单调，不随世代清零）。
+	tx := h.userTx.Load()
 	delta := int64(0)
 	if h.sampled {
-		delta = tx - h.lastTx
+		delta = tx - h.lastUserTx
 		if delta < 0 {
 			delta = 0
 		}
 	}
-	h.lastTx, h.sampled = tx, true
+	h.lastUserTx, h.sampled = tx, true
 	switch {
 	case h.dials.Swap(0) > 0:
 		return h.record(true, "拨号尝试")
@@ -125,12 +125,22 @@ func ParseView(view string) [][32]byte {
 	return out
 }
 
-// countedConn DialPort 消费连接的在场计数包装（Close 递减在场腿——term 流生命周期
-// 必经 Close〔finish/teardown 统一 backend.Close〕；消费方不 Close 则保守多算一次
-// 需求拍，无害）。
+// countedConn DialPort 消费连接的需求计数包装：Close 递减在场腿（源②——term 流
+// 生命周期必经 Close〔finish/teardown 统一 backend.Close〕；消费方不 Close 则保守
+// 多算一次需求拍，无害）；Write 递增用户出站字节（源①——连接级记账面，探针不经
+// 此处，exec-r1 中-2 口径）。
 type countedConn struct {
 	net.Conn
+	dm      *hostDemand
 	onClose func()
+}
+
+func (c countedConn) Write(b []byte) (int, error) {
+	n, err := c.Conn.Write(b)
+	if n > 0 {
+		c.dm.userTx.Add(int64(n)) // 源①：用户连接出站字节（只算出站方向，对齐手机 App TUN 口径）
+	}
+	return n, err
 }
 
 func (c countedConn) Close() error {
