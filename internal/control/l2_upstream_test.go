@@ -183,7 +183,7 @@ func TestServerL2StreamOpenDialIndependent(t *testing.T) {
 
 	openErr := make(chan error, 1)
 	go func() {
-		_, err := c.OpenStream(ctx, "aa")
+		_, err := c.OpenStream(ctx, facade.StreamKindTerm, "aa")
 		openErr <- err
 	}()
 	select {
@@ -215,12 +215,12 @@ func TestStreamUpWorkerTotalLimit(t *testing.T) {
 	ts := startTestServerCfg(t, func(cfg *ServerConfig) { cfg.MaxUpWorkers = 1 })
 	c, _ := dialTest(t, ts)
 	ctx := context.Background()
-	st1, err := c.OpenStream(ctx, "aa")
+	st1, err := c.OpenStream(ctx, facade.StreamKindTerm, "aa")
 	if err != nil {
 		t.Fatal(err)
 	}
 	// 第二条流（同连接）：工位总量已满 → stream_refused。
-	if _, err := c.OpenStream(ctx, "aa"); !errors.Is(err, CodeError(facade.CodeStreamRefused)) {
+	if _, err := c.OpenStream(ctx, facade.StreamKindTerm, "aa"); !errors.Is(err, CodeError(facade.CodeStreamRefused)) {
 		t.Fatalf("工位总量超限应 stream_refused，得到 %v", err)
 	}
 	// 关掉第一条（工位释放）→ 可再开。
@@ -231,7 +231,7 @@ func TestStreamUpWorkerTotalLimit(t *testing.T) {
 	}
 	deadline := time.Now().Add(3 * time.Second)
 	for time.Now().Before(deadline) {
-		_, err := c.OpenStream(ctx, "aa")
+		_, err := c.OpenStream(ctx, facade.StreamKindTerm, "aa")
 		if err == nil {
 			return // 工位已释放、再开成功
 		}
@@ -320,7 +320,7 @@ func TestStreamUpstreamBurstWithinToleranceSurvives(t *testing.T) {
 	ts.backend.pipeDrainEvery = 10 * time.Millisecond
 	ts.backend.mu.Unlock()
 	c, _ := dialTest(t, ts)
-	st, err := c.OpenStream(context.Background(), "aa")
+	st, err := c.OpenStream(context.Background(), facade.StreamKindTerm, "aa")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -357,7 +357,7 @@ func TestStreamUpstreamOverToleranceStillGone(t *testing.T) {
 	ts.backend.dialAddr = pipeDialAddr
 	ts.backend.mu.Unlock()
 	c, _ := dialTest(t, ts)
-	st, err := c.OpenStream(context.Background(), "aa")
+	st, err := c.OpenStream(context.Background(), facade.StreamKindTerm, "aa")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -390,7 +390,7 @@ func TestStreamUpstreamStallTimeoutGone(t *testing.T) {
 	ts.backend.dialAddr = pipeDialAddr
 	ts.backend.mu.Unlock()
 	c, _ := dialTest(t, ts)
-	st, err := c.OpenStream(context.Background(), "aa")
+	st, err := c.OpenStream(context.Background(), facade.StreamKindTerm, "aa")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -429,14 +429,14 @@ func TestStreamUpstreamStallDoesNotPropagate(t *testing.T) {
 	ts.backend.mu.Unlock()
 	c, _ := dialTest(t, ts)
 	ctx := context.Background()
-	stalled, err := c.OpenStream(ctx, "aa")
+	stalled, err := c.OpenStream(ctx, facade.StreamKindTerm, "aa")
 	if err != nil {
 		t.Fatal(err)
 	}
 	ts.backend.mu.Lock()
 	ts.backend.dialAddr = echo.ln.Addr().String()
 	ts.backend.mu.Unlock()
-	healthy, err := c.OpenStream(ctx, "bb")
+	healthy, err := c.OpenStream(ctx, facade.StreamKindTerm, "bb")
 	if err != nil {
 		t.Fatal(err)
 	}

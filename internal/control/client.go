@@ -106,6 +106,20 @@ func (s *ClientStream) EndedErr() error {
 	return fmt.Errorf("%w（%s）", ErrStreamEnded, endReasonText(s.endReason))
 }
 
+// EndReason 终结原因的**类型化导出**（files-cli 2.1 计划外最小扩展，r2 新-2）：
+// 流已终结时返回 reason 值（closed|gone|conn——conn 为连接级断开的本地值，见
+// endReasonConn）；未终结返回空串。写路径消费者（daemon 的 streamConn.Write 翻译
+// streamend.Error）经它取原因——此前原因只进 EndedErr 的中文文案，换文案即静默
+// 失效。markEnded 幂等且首因生效 ⇒ 非 nil 终结错误 ⇒ 原因已定，读此值无竞态
+// （加锁读取）。
+func (s *ClientStream) EndReason() string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.endReason
+}
+
+// endReasonText 终结原因 → 中文描述（EndReason/EndedErr 的文案面；EndReason 给
+// 调用方的是裸原因值，不进这里）。
 func endReasonText(r string) string {
 	switch r {
 	case facade.StreamEndClosed:
@@ -232,9 +246,11 @@ func (c *Client) Notify() <-chan ResponseBody { return c.notifyC }
 // Closed 连接关闭信号。
 func (c *Client) Closed() <-chan struct{} { return c.closed }
 
-// OpenStream stream.open{kind:"term", host} → 流句柄。流对象在请求发出前经
-// pendingStreams 预登记、由 reader 在响应帧上同步注册（见 pendingStreams 注释）。
-func (c *Client) OpenStream(ctx context.Context, host string) (*ClientStream, error) {
+// OpenStream stream.open{kind, host} → 流句柄。kind ∈ term|files（daemon-control-plane
+// 值域只增；files 自 files-cli 期起）——载荷由调用方携带，本客户端不设值域闸（服务端
+// 是值域真源）。流对象在请求发出前经 pendingStreams 预登记、由 reader 在响应帧上同步
+// 注册（见 pendingStreams 注释）。
+func (c *Client) OpenStream(ctx context.Context, kind, host string) (*ClientStream, error) {
 	corr := c.corr.Add(1)
 	st := &ClientStream{c: c, recv: make(chan []byte, 64), end: make(chan string, 1)}
 	c.pendingStreams.Store(corr, st)
@@ -243,7 +259,7 @@ func (c *Client) OpenStream(ctx context.Context, host string) (*ClientStream, er
 	ch := make(chan ResponseBody, 1)
 	c.pending.Store(corr, ch)
 	defer c.pending.Delete(corr)
-	if err := c.writeFrame(encodeJSONFrame(OpReq, RequestBody{Corr: corr, Op: facade.OpStreamOpen, Args: mustMarshal(t_streamArgs(host))})); err != nil {
+	if err := c.writeFrame(encodeJSONFrame(OpReq, RequestBody{Corr: corr, Op: facade.OpStreamOpen, Args: mustMarshal(StreamOpenArgs{Kind: kind, Host: host})})); err != nil {
 		return nil, err
 	}
 	select {
@@ -267,11 +283,6 @@ func (c *Client) OpenStream(ctx context.Context, host string) (*ClientStream, er
 		c.streams.Store(r.StreamID, st)
 	}
 	return st, nil
-}
-
-// t_streamArgs 仅收敛 OpenStream 的载荷构造（避免内联闭包）。
-func t_streamArgs(host string) StreamOpenArgs {
-	return StreamOpenArgs{Kind: facade.StreamKindTerm, Host: host}
 }
 
 func mustMarshal(v any) []byte {

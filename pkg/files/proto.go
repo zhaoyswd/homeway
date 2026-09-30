@@ -84,13 +84,28 @@ type Response struct {
 type Error struct {
 	Code string
 	Msg  string
+	// wrapped 被包错误（Errw 构造；nil = Errf 产的纯文案错误）。**不出 wire**：
+	// response() 序列化面只含 Code/Msg，恒不变。
+	wrapped error
 }
 
 func (e *Error) Error() string { return e.Code + ": " + e.Msg }
 
-// Errf 构造带码错误。
+// Unwrap 暴露被包错误（Go 侧错误链——files-cli 1.2 新增；wire 零改动）。
+// 用途：读方向（下载中断/读响应失败等）的底层终结错误（如 streamend.Error）经链
+// 可达——CLI 的 errors.As(err, &streamend.Error) 由此命中（r2 新-1）。
+func (e *Error) Unwrap() error { return e.wrapped }
+
+// Errf 构造带码错误（纯文案——内部 Sprintf 产不出 %w 链，实测 %w 只打出
+// %!w(...)；要保留被包错误用 Errw）。
 func Errf(code, format string, args ...any) *Error {
 	return &Error{Code: code, Msg: fmt.Sprintf(format, args...)}
+}
+
+// Errw 构造带码且**保留被包错误**的错误（files-cli 1.2 新增；Msg 文案与 Errf 同形——
+// format 仍经 Sprintf，被包错误只进链不进文案——Response 序列化面与既有逐字相同）。
+func Errw(code string, err error, format string, args ...any) *Error {
+	return &Error{Code: code, Msg: fmt.Sprintf(format, args...), wrapped: err}
 }
 
 func (e *Error) response() Response {

@@ -240,7 +240,7 @@ func (b *noopBackend) AddHost(name, token string, force bool) (control.HostAddRe
 }
 func (b *noopBackend) RemoveHost(id string) error      { return control.ErrBackendNoHost }
 func (b *noopBackend) HostStates() []control.HostState { return nil }
-func (b *noopBackend) DialTerm(ctx context.Context, host string) (net.Conn, error) {
+func (b *noopBackend) DialStream(ctx context.Context, kind, host string) (net.Conn, error) {
 	return nil, control.ErrBackendNoSession
 }
 func (b *noopBackend) NotReady() bool { return true }

@@ -43,9 +43,11 @@ type Backend interface {
 	RemoveHost(id string) error
 	// HostStates 各主机动态面（state/reason/link/stats——各会话无锁快照汇成）。
 	HostStates() []HostState
-	// DialTerm 打开一条到目标主机 term 服务（核内约定端口 7724）的隧道连接。
-	// 控制面对 term 协议纯字节透传（spec「流式通道」）。
-	DialTerm(ctx context.Context, host string) (net.Conn, error)
+	// DialStream 打开一条到目标主机指定 kind 服务（term=核内约定端口 7724、
+	// files=7802——端口映射在 daemon 绑定层，kind 值域真源在 facade vocab）的隧道
+	// 连接。控制面对上层协议纯字节透传（spec「流式通道」）。绑定层进程内接口
+	//（非 facade 语义、无 wire 面）；全部方法必须可并发调用。
+	DialStream(ctx context.Context, kind, host string) (net.Conn, error)
 	// NotReady 宿主未就绪（如 client 角色未运行/注册表未挂）——host.*/snapshot
 	// 类操作报 not_ready。
 	NotReady() bool

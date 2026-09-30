@@ -191,7 +191,7 @@ func TestReattachKeepsGenerationAndCursor(t *testing.T) {
 	if _, err := c.Request(rctx, facade.OpSnapshotGet, nil); !errors.Is(err, control.CodeError(facade.CodeNotReady)) {
 		t.Fatalf("重建窗口 snapshot.get 应 not_ready：%v", err)
 	}
-	if _, err := c.OpenStream(rctx, added.ID); !errors.Is(err, control.CodeError(facade.CodeNotReady)) {
+	if _, err := c.OpenStream(rctx, facade.StreamKindTerm, added.ID); !errors.Is(err, control.CodeError(facade.CodeNotReady)) {
 		t.Fatalf("重建窗口 stream.open 应 not_ready：%v", err)
 	}
 	raw, err = c.Request(rctx, facade.OpDaemonStatus, nil)

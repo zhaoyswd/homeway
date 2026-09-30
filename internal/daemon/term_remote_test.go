@@ -32,12 +32,14 @@ import (
 // ---- 假宿主（control.Backend 最小实现：两台主机 + DialTerm 记账）----
 
 type remoteTestBackend struct {
-	mu       sync.Mutex
-	hosts    []control.HostState
-	dialAddr string           // DialTerm 实际拨的假 term 后端
-	dialErr  map[string]error // host -> 拨号错误
-	dialed   []string         // DialTerm 收到的 host
-	notReady bool
+	mu            sync.Mutex
+	hosts         []control.HostState
+	dialAddr      string           // DialStream(kind=term) 实际拨的假 term 后端
+	filesDialAddr string           // DialStream(kind=files) 实际拨的假 files 后端（files-cli 2.2）
+	dialErr       map[string]error // host -> 拨号错误
+	dialed        []string         // DialStream 收到的 host
+	dialKinds     []string         // DialStream 收到的 kind（files-cli 2.1 断言）
+	notReady      bool
 }
 
 func (b *remoteTestBackend) ServerVersion() string { return "test-1.0" }
@@ -62,11 +64,15 @@ func (b *remoteTestBackend) HostStates() []control.HostState {
 	defer b.mu.Unlock()
 	return append([]control.HostState(nil), b.hosts...)
 }
-func (b *remoteTestBackend) DialTerm(ctx context.Context, host string) (net.Conn, error) {
+func (b *remoteTestBackend) DialStream(ctx context.Context, kind, host string) (net.Conn, error) {
 	b.mu.Lock()
 	b.dialed = append(b.dialed, host)
+	b.dialKinds = append(b.dialKinds, kind)
 	err := b.dialErr[host]
 	addr := b.dialAddr
+	if kind == facade.StreamKindFiles && b.filesDialAddr != "" {
+		addr = b.filesDialAddr
+	}
 	known := false
 	for _, h := range b.hosts {
 		if h.ID == host {

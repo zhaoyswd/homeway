@@ -93,7 +93,7 @@ func TestLiveStreamTermEndToEnd(t *testing.T) {
 
 	// 多流并发：两条 term 流各自 GREETING → LIST → LIST-REPLY（term 协议最小往返）。
 	termRoundTrip := func(tag string) {
-		st, err := c.OpenStream(ctx, added.ID)
+		st, err := c.OpenStream(ctx, facade.StreamKindTerm, added.ID)
 		if err != nil {
 			t.Fatalf("[%s] stream.open：%v", tag, err)
 		}

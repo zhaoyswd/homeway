@@ -320,7 +320,7 @@ func (b *skewBackend) RemoveHost(id string) error              { return nil }
 func (b *skewBackend) HostStates() []control.HostState         { return nil }
 func (b *skewBackend) NotReady() bool                          { return false }
 func (b *skewBackend) DemandStatus() []control.HostDemandBrief { return nil }
-func (b *skewBackend) DialTerm(ctx context.Context, host string) (net.Conn, error) {
+func (b *skewBackend) DialStream(ctx context.Context, kind, host string) (net.Conn, error) {
 	return nil, control.ErrBackendNoHost
 }
 func (b *skewBackend) AddHost(name, token string, force bool) (control.HostAddResult, error) {

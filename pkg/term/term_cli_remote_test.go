@@ -16,6 +16,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/zhaoyswd/homeway/pkg/streamend"
 )
 
 // fakeRemoteTerm 测试注入的假远程缝：记录 Resolve/Dial 收到的参数；Dial 返回直连
@@ -275,5 +277,32 @@ func TestRemoteEndMessage(t *testing.T) {
 	var as *RemoteEndError
 	if !errors.As(error(re), &as) || as.Reason != RemoteEndGone {
 		t.Fatal("errors.As 应可取 Reason")
+	}
+}
+
+// TestRemoteEndAliasEquivalenceWithStreamend files-cli 2.2 用例：适配器本体已改产
+// pkg/streamend.Error——attach 主循环的 errors.As(*RemoteEndError)（类型别名）必须
+// 命中 streamend 面产的终结错误（别名等价；防 errors.As 失配静默退化）且三态
+// closed/gone/conn 各归各文案。
+func TestRemoteEndAliasEquivalenceWithStreamend(t *testing.T) {
+	for _, c := range []struct{ reason, want string }{
+		{streamend.Gone, "收尾"},
+		{streamend.Closed, "对端已关闭"},
+		{streamend.Conn, "与守护进程的连接断开"},
+	} {
+		// daemon 适配器（streamConn.Read/Write）现在的产出形态。
+		raw := error(&streamend.Error{Reason: c.reason})
+		// attach 主循环同款判型 + 文案选择（cliAttachRun 的读失败分支）。
+		var re *RemoteEndError
+		if !errors.As(raw, &re) {
+			t.Fatalf("streamend 面 %q 终结应被 attach 判型（别名等价）命中：%v", c.reason, raw)
+		}
+		got := remoteEndMessage("s1", re.Reason)
+		if !strings.Contains(got, c.want) {
+			t.Fatalf("reason=%q 文案缺 %q：%q", c.reason, c.want, got)
+		}
+		if !errors.Is(raw, io.EOF) {
+			t.Fatalf("streamend 面 %q 应 errors.Is io.EOF（Unwrap 链随别名保留）", c.reason)
+		}
 	}
 }

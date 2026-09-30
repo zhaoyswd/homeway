@@ -33,8 +33,9 @@ type fakeBackend struct {
 	roles    []RoleBrief
 	added    map[string]string // id -> token
 	dialErr  map[string]error
-	dialAddr string // DialTerm 实际拨的地址（假 term 后端）
+	dialAddr string // DialStream 实际拨的地址（假后端）
 	dials    int
+	kinds    []string // DialStream 收到的 kind（files-cli 2.1 用例）
 	// L2 用例的慢请求注入（4a §5.1）：blockAddEntered 非 nil 时 AddHost 进入即
 	// 向其发信号并阻塞到 blockAddRelease 关闭（假 Backend 的 entered 同步点）。
 	blockAddEntered chan struct{}
@@ -144,9 +145,10 @@ func (f *fakeBackend) HostStates() []HostState {
 	defer f.mu.Unlock()
 	return append([]HostState(nil), f.states...)
 }
-func (f *fakeBackend) DialTerm(ctx context.Context, host string) (net.Conn, error) {
+func (f *fakeBackend) DialStream(ctx context.Context, kind, host string) (net.Conn, error) {
 	f.mu.Lock()
 	f.dials++
+	f.kinds = append(f.kinds, kind)
 	err := f.dialErr[host]
 	addr := f.dialAddr
 	entered, release := f.dialEntered, f.dialRelease
@@ -498,7 +500,8 @@ func TestErrorCodeMappingNegativeCases(t *testing.T) {
 	if _, err := c.Request(ctx, facade.OpHostAdd, map[string]any{"token": 123}); !errors.Is(err, CodeError(facade.CodeBadRequest)) {
 		t.Fatalf("类型不符应 bad_request：%v", err)
 	}
-	if _, err := c.Request(ctx, facade.OpStreamOpen, StreamOpenArgs{Kind: "files", Host: "aa"}); !errors.Is(err, CodeError(facade.CodeBadRequest)) {
+	// kind 值域外（原示例值 "files" 自 files-cli 2.1 起入值域——值域只增，换仍非法值）。
+	if _, err := c.Request(ctx, facade.OpStreamOpen, StreamOpenArgs{Kind: "nope", Host: "aa"}); !errors.Is(err, CodeError(facade.CodeBadRequest)) {
 		t.Fatalf("kind 值域外应 bad_request：%v", err)
 	}
 	// host_exists。

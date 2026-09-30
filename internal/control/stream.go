@@ -93,19 +93,20 @@ func (c *conn) wake() {
 	}
 }
 
-// opStreamOpen stream.open{kind, host}：kind 初始集仅 term；拨号经 Backend.DialTerm
-// （hostsession 的 DialPort 过隧道，term 端口为核内约定、不进控制面词表）。本函数
-// 运行在独立拨号执行体（runStreamOpen，4a §5.1 r2 新-6）——30s 级拨号不占请求
-// 工位串行位。工位配额（4a §5.3）：全连接上行工位总量超上限 → 拒开（复用既有
-// stream_refused）。
+// opStreamOpen stream.open{kind, host}：kind 值域 = term|files（facade vocab 只增——
+// files 自 files-cli 期起；值域外回 bad_request 不断连，既有语义）；拨号经
+// Backend.DialStream（kind 透传，端口映射在绑定层——hostsession 的 DialPort 过隧道，
+// 端口为核内约定、不进控制面词表）。本函数运行在独立拨号执行体（runStreamOpen，
+// 4a §5.1 r2 新-6）——30s 级拨号不占请求工位串行位。工位配额（4a §5.3）：全连接
+// 上行工位总量超上限 → 拒开（复用既有 stream_refused）。
 func (c *conn) opStreamOpen(corr uint64, args json.RawMessage) {
 	var a StreamOpenArgs
 	if err := parseArgs(args, &a); err != nil {
 		c.reply(corr, nil, err)
 		return
 	}
-	if a.Kind != facade.StreamKindTerm {
-		c.reply(corr, nil, errCode(facade.CodeBadRequest)) // kind 值域外（初始集仅 term）
+	if a.Kind != facade.StreamKindTerm && a.Kind != facade.StreamKindFiles {
+		c.reply(corr, nil, errCode(facade.CodeBadRequest)) // kind 值域外（新 CLI + 旧 daemon 的锁步断点）
 		return
 	}
 	if a.Host == "" {
@@ -126,7 +127,7 @@ func (c *conn) opStreamOpen(corr uint64, args json.RawMessage) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), dialTimeout)
 	defer cancel()
-	backend, err := c.s.cfg.Backend.DialTerm(ctx, a.Host)
+	backend, err := c.s.cfg.Backend.DialStream(ctx, a.Kind, a.Host)
 	if err != nil {
 		switch {
 		case errors.Is(err, ErrBackendNoHost):
@@ -134,7 +135,7 @@ func (c *conn) opStreamOpen(corr uint64, args json.RawMessage) {
 		case errors.Is(err, ErrBackendNoSession):
 			c.reply(corr, nil, errCode(facade.CodeStreamRefused))
 		default:
-			c.s.cfg.Logf("control: stream.open(%s) 拨号失败：%v", a.Host, err)
+			c.s.cfg.Logf("control: stream.open(%s/%s) 拨号失败：%v", a.Kind, a.Host, err)
 			c.reply(corr, nil, errCode(facade.CodeStreamRefused)) // 主机不可达等 = 被拒
 		}
 		return

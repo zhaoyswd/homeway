@@ -176,8 +176,12 @@ type LogLinePayload struct {
 
 // ---------- 流式通道词汇 ----------
 
-// 流 kind 初始集（spec「流式通道」：kind 初始集仅 term）。
-const StreamKindTerm = "term"
+// 流 kind 值域（spec「流式通道」：受控枚举只增——term 为初始集，files 自 files-cli
+// 期起〔files 命令面的远程取放〕；值域外的 kind 由控制面按既有 bad_request 处理）。
+const (
+	StreamKindTerm  = "term"
+	StreamKindFiles = "files"
+)
 
 // stream.end 的 reason 受控枚举（spec：closed = 对端/前端主动关闭；gone = 目标
 // 主机不可达或主机会话收工——控制面层的本地原因。term 协议的 ENDED 词表由 term

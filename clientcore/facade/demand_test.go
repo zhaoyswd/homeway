@@ -426,3 +426,66 @@ func refreshTestToken(t *testing.T, secret byte) string {
 }
 
 // mustPeerID 见 table_isolation_test.go（同包既有助手）。
+
+// TestDemandFilesStreamPresenceLeg files-cli 2.3 用例（files 流腿的 DialPort 记账）：
+// 经注入桩拨 DialPort(ctx, 7802)（files 服务端口）——桩收到 7802（kind→端口→DialPort
+// 唯一路径的 facade 侧端点断言）且连接在途 = 需求源②在场腿 > 0（长传输期间巡检失败
+// 照常计证据、不被「无需求期」门控压制）；连接关闭 → 在场腿归零。
+func TestDemandFilesStreamPresenceLeg(t *testing.T) {
+	var gotPort uint16
+	portCh := make(chan uint16, 1)
+	c1, c2 := net.Pipe()
+	defer c1.Close()
+	defer c2.Close()
+	go func() { _, _ = io.Copy(io.Discard, c2) }() // pipe 同步写需要读者排空对端
+	restore := injectDialPort(func(s *hostsession.Session, ctx context.Context, port uint16) (net.Conn, error) {
+		gotPort = port
+		select {
+		case portCh <- port:
+		default:
+		}
+		return c1, nil
+	})
+	defer restore()
+
+	id, _ := demandTestID()
+	bus := NewBus(NewGeneration(), BusConfig{})
+	dm := &hostDemand{}
+	h := &Host{rec: HostRecord{ID: "files-leg"}, sess: &hostsession.Session{}, dm: dm}
+
+	// files 流腿拨号（7802 = filesServicePort 的核内约定值）。
+	conn, err := h.DialPort(context.Background(), 7802)
+	if err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case p := <-portCh:
+		if p != 7802 {
+			t.Fatalf("DialPort 应携带 files 端口 7802，得到 %d", p)
+		}
+	case <-time.After(time.Second):
+		t.Fatalf("注入桩未收到端口（gotPort=%d）", gotPort)
+	}
+	// 拨号拍先落源①（单拍消费）；下一拍起连接在途 = 在场腿（源②）——files 长传输
+	// 期间需求恒真。
+	if a, why := dm.evaluate(bus, id); !a || why != "拨号尝试" {
+		t.Fatalf("拨号拍应 (true,\"拨号尝试\")，得 (%v,%q)", a, why)
+	}
+	if a, why := dm.evaluate(bus, id); !a || why != "在场腿" {
+		t.Fatalf("files 流在途应 (true,\"在场腿\")，得 (%v,%q)", a, why)
+	}
+	// 连接关闭 → 在场腿归零（全源回落）。
+	if err := conn.Close(); err != nil {
+		t.Fatal(err)
+	}
+	// countedConn 的关闭钩子同步执行（Close 里解注册）；给一个短窗口防调度抖动。
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		if a, why := dm.evaluate(bus, id); !a && why == "无" {
+			return
+		} else if time.Now().After(deadline) {
+			t.Fatalf("关流后在场腿应归零，得 (%v,%q)", a, why)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}

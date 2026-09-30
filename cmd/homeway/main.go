@@ -4,6 +4,7 @@
 //	homeway exit [flags]       # 出口（显式）
 //	homeway relay [flags]      # 中继
 //	homeway term <子命令> …    # 终端命令面：list / new / attach / delete / explain
+//	homeway files <子命令> …   # 文件命令面（类 sftp）：list / stat / mkdir / read / get / put
 //	homeway daemon [--state D] # 桌面守护进程（多主机会话注册表；host-registry-daemon）
 //	homeway daemon status …    # 守护进程状态（控制面读面；--json 机器可读快照）
 //	homeway host <子命令> …    # 主机表管理命令面：add / list / status / delete
@@ -21,6 +22,7 @@ import (
 	"github.com/zhaoyswd/homeway/internal/daemon"
 	"github.com/zhaoyswd/homeway/internal/relay"
 	"github.com/zhaoyswd/homeway/internal/server"
+	"github.com/zhaoyswd/homeway/pkg/files"
 	"github.com/zhaoyswd/homeway/pkg/term"
 )
 
@@ -58,12 +60,16 @@ func run(args []string) int {
 		// 远程接入缝注入（term-remote D1）：`term … --host <ref>` 经 daemon 控制面
 		// 转发；nil = 仅本地面（此处恒注入）。
 		err = term.CLI(rest, daemon.TermRemote(version))
+	case "files":
+		// 远程接入缝注入（files-cli D1/D3，同款形态）：`files … --host <ref>` 经
+		// daemon 控制面 stream.open{kind:files} 转发；nil = 仅本地面（此处恒注入）。
+		err = files.CLI(rest, daemon.FilesRemote(version))
 	case "daemon":
 		err = daemon.CLI(rest, version)
 	case "host":
 		err = daemon.CLI(append([]string{"host"}, rest...), version)
 	default:
-		fmt.Fprintf(os.Stderr, "homeway: 不认识的子命令 %q（可用：exit、relay、term、daemon、host）\n", role)
+		fmt.Fprintf(os.Stderr, "homeway: 不认识的子命令 %q（可用：exit、relay、term、files、daemon、host）\n", role)
 		usage(os.Stderr)
 		return 2
 	}
@@ -115,6 +121,8 @@ func resolveRole(args []string) (role string, rest []string) {
 		return "relay", args[1:]
 	case "term":
 		return "term", args[1:]
+	case "files":
+		return "files", args[1:]
 	case "daemon":
 		return "daemon", args[1:]
 	case "host":
@@ -136,6 +144,10 @@ func usage(w *os.File) {
   homeway relay [flags]        启动中继
   homeway term <子命令> …      终端命令面（list / new / attach / delete / explain；
                                与 App 同一份会话注册表，经 <state>/term.sock 本地直连）
+  homeway files <子命令> …     文件命令面（类 sftp：list / stat / mkdir / read / get /
+                               put；无 --host 直连 <state>/files.sock、--host <ref> 经
+                               daemon 控制面转发到指定后端主机——--state 双面指代差异
+                               见 homeway files --help）
   homeway daemon [--state DIR] 桌面守护进程（多主机会话注册表；默认 state
                                ~/.config/homeway/daemon——与出口 state 禁止同目录）
   homeway daemon status [--json] [--state DIR]

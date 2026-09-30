@@ -23,6 +23,7 @@ import (
 	"time"
 
 	"github.com/zhaoyswd/homeway/internal/control"
+	"github.com/zhaoyswd/homeway/pkg/streamend"
 	"github.com/zhaoyswd/homeway/pkg/term"
 )
 
@@ -74,7 +75,7 @@ func (r *termRemote) DialTerm(ctx context.Context, stateDir, hexID string) (io.R
 	if err != nil {
 		return nil, err
 	}
-	st, err := c.OpenStream(ctx, hexID)
+	st, err := c.OpenStream(ctx, facade.StreamKindTerm, hexID)
 	if err != nil {
 		c.Close()
 		return nil, streamOpenErr(err)
@@ -98,9 +99,14 @@ func dialControl(ctx context.Context, stateDir, version string) (*control.Client
 func controlDialErr(stateDir, sock string, err error) error {
 	switch {
 	case errors.Is(err, fs.ErrNotExist):
+		// 反向提示同时看 term.sock 与 files.sock（files-cli 1.3：term/files 两面共用
+		// 本文案——出口 state 目录里两者都是出口服务的 UDS）。
 		hint := ""
-		if _, terr := os.Stat(filepath.Join(stateDir, "term.sock")); terr == nil {
-			hint = "；该目录有 term.sock 无 control.sock——像是把 --state 指到了出口 state 目录"
+		for _, svcSock := range []string{"term.sock", "files.sock"} {
+			if _, terr := os.Stat(filepath.Join(stateDir, svcSock)); terr == nil {
+				hint = "；该目录有 " + svcSock + " 无 control.sock——像是把 --state 指到了出口 state 目录"
+				break
+			}
 		}
 		return fmt.Errorf("homeway daemon 未在运行（%s 不存在%s）\n"+
 			"--host 模式下 --state 指守护进程 state 目录（默认 ~/.config/homeway/daemon，control.sock 所在）；先启动：homeway daemon --state %s", sock, hint, stateDir)
@@ -154,10 +160,14 @@ func fetchHostsForTerm(ctx context.Context, stateDir, version string) ([]control
 }
 
 // ---- streamConn：ClientStream → io.ReadWriteCloser（design D2）----
+//
+// term 与 files 远程面共用（files-cli 2.2）。终结错误 = pkg/streamend.Error
+//（中立公共包：pkg/term 留类型别名，term 面既有断言零改；files CLI 直接 errors.As
+// 同一类型——读写两方向同一判型路径）。
 
 // streamConn 适配器。不实现 net.Conn 的 deadline 族（半语义不装——满足
 // io.ReadWriteCloser 即可，CLI 从不设 deadline，D1 已核）。Read 内部缓冲跨帧重组；
-// 流终结（stream.end 已收 / 连接级断开）先记原因、排干余量后以 *term.RemoteEndError
+// 流终结（stream.end 已收 / 连接级断开）先记原因、排干余量后以 *streamend.Error
 // 终结（errors.Is(err, io.EOF) 成立；Reason ∈ closed|gone|conn 供 CLI 三态文案，D5）。
 type streamConn struct {
 	c  *control.Client
@@ -184,7 +194,7 @@ func (sc *streamConn) Read(p []byte) (int, error) {
 			sc.mu.Unlock()
 			// reason 只在锁内读（exec-r1 L5）：锁内先拷局部再解锁返回，守住「锁内
 			// 读写」约定——单 reader 调用下无实害，但并发 Read 一旦出现就是数据竞争。
-			return 0, &term.RemoteEndError{Reason: reason}
+			return 0, &streamend.Error{Reason: reason}
 		}
 		sc.mu.Unlock()
 		select {
@@ -205,7 +215,7 @@ func (sc *streamConn) Read(p []byte) (int, error) {
 			// 连接级断开（无 end）：recv 不再进新数据，排干余量后以 conn 终结。
 			sc.mu.Lock()
 			if sc.reason == "" {
-				sc.reason = term.RemoteEndConn
+				sc.reason = streamend.Conn
 			}
 			sc.drainLocked()
 			sc.mu.Unlock()
@@ -227,9 +237,18 @@ func (sc *streamConn) drainLocked() {
 
 // Write 走 Send（流终结即报错——L4 上行显式化；≤16KiB 分片由 Send 内建）。
 // 返回值口径：错误时返回 0（流已死，字节数无意义——调用方按错误收流）。
+//
+// 终结错误翻译（files-cli 2.2，r2 新-2）：Send 的终结错误（ErrStreamEnded——原因
+// 只进中文文案）翻成 streamend.Error{Reason}（经 EndReason() 类型化取因；socket 级
+// 错误 = conn 态）——写方向（put 上行）终结与 Read 方向同类型，CLI 一份 errors.As
+// 覆盖读写两方向。daemon 同时 import internal/control 与 pkg/streamend 两侧，
+// pkg/files 保持零 internal/ 依赖（分层不破）。
 func (sc *streamConn) Write(p []byte) (int, error) {
 	if err := sc.st.Send(p); err != nil {
-		return 0, err
+		if errors.Is(err, control.ErrStreamEnded) {
+			return 0, &streamend.Error{Reason: sc.st.EndReason()}
+		}
+		return 0, &streamend.Error{Reason: streamend.Conn} // socket 级错误 = 连接级断开态
 	}
 	return len(p), nil
 }

@@ -8,6 +8,8 @@ package term
 import (
 	"context"
 	"io"
+
+	"github.com/zhaoyswd/homeway/pkg/streamend"
 )
 
 // RemoteTerm —— `--host` 模式的远程接入缝。
@@ -25,29 +27,19 @@ type RemoteTerm interface {
 
 // 远程流终结原因（attach 的三态归因，design D5；closed/gone 与控制面 stream.end
 // 的 reason 词表一致，conn = 连接级断开——不发 end 的那条）。
+// files-cli 2.1 起本体迁中立公共包 pkg/streamend（files CLI 同一终结类型）；此处
+// 保留常量与类型别名（值不变）——既有 errors.As 消费与单测零改（r2 新-5）。
 const (
-	RemoteEndClosed = "closed"
-	RemoteEndGone   = "gone"
-	RemoteEndConn   = "conn"
+	RemoteEndClosed = streamend.Closed
+	RemoteEndGone   = streamend.Gone
+	RemoteEndConn   = streamend.Conn
 )
 
-// RemoteEndError 远程流的终结错误（适配器 Read 排干余量后的终结返回）。包装
-// io.EOF——errors.Is(err, io.EOF) 成立；errors.As 取 Reason 出三态文案。
-type RemoteEndError struct{ Reason string }
-
-func (e *RemoteEndError) Error() string {
-	switch e.Reason {
-	case RemoteEndClosed:
-		return "对端已关闭流（closed）"
-	case RemoteEndGone:
-		return "与主机的流被收尾（gone）"
-	case RemoteEndConn:
-		return "与守护进程的连接断开"
-	}
-	return "流已终结（" + e.Reason + "）"
-}
-
-func (e *RemoteEndError) Unwrap() error { return io.EOF }
+// RemoteEndError 远程流的终结错误（适配器 Read 排干余量后的终结返回 / Write 路径
+// 翻译后的归一类型）。包装 io.EOF——errors.Is(err, io.EOF) 成立；errors.As 取
+// Reason 出三态文案。**类型别名**（非定义类型）：与 streamend.Error 同一类型，既有
+// 断言（errors.As / 具体类型比较）零改。
+type RemoteEndError = streamend.Error
 
 // remoteEndMessage 远程 attach 的流终结三态文案（design D5 表；与本地面「断链」
 // 单一文案区分——这是控制面层的归因，term 层 ENDED 优先先到先解释）。closed 的

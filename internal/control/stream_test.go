@@ -69,7 +69,7 @@ func TestStreamPassthroughBinaryBytes(t *testing.T) {
 	ts.backend.mu.Unlock()
 	c, _ := dialTest(t, ts)
 
-	st, err := c.OpenStream(context.Background(), "aa")
+	st, err := c.OpenStream(context.Background(), facade.StreamKindTerm, "aa")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -180,7 +180,7 @@ func TestStreamSendShardingLargePayload(t *testing.T) {
 	ts.backend.mu.Unlock()
 	c, _ := dialTest(t, ts)
 
-	st, err := c.OpenStream(context.Background(), "aa")
+	st, err := c.OpenStream(context.Background(), facade.StreamKindTerm, "aa")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -267,7 +267,7 @@ func TestStreamEndOrderBackendClose(t *testing.T) {
 		_ = bc.Close() // 后端主动关（EOF → end(closed)）
 	}()
 	c, _ := dialTest(t, ts)
-	st, err := c.OpenStream(context.Background(), "aa")
+	st, err := c.OpenStream(context.Background(), facade.StreamKindTerm, "aa")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -308,11 +308,11 @@ func TestStreamGoneWhenDialFails(t *testing.T) {
 	ts.backend.dialErr["nobody"] = ErrBackendNoHost
 	ts.backend.mu.Unlock()
 	c, _ := dialTest(t, ts)
-	if _, err := c.OpenStream(context.Background(), "aa"); !errors.Is(err, CodeError(facade.CodeStreamRefused)) {
+	if _, err := c.OpenStream(context.Background(), facade.StreamKindTerm, "aa"); !errors.Is(err, CodeError(facade.CodeStreamRefused)) {
 		t.Fatalf("不可达应 stream_refused：%v", err)
 	}
 	// host 不在表：no_host。
-	if _, err := c.OpenStream(context.Background(), "nobody"); !errors.Is(err, CodeError(facade.CodeNoHost)) {
+	if _, err := c.OpenStream(context.Background(), facade.StreamKindTerm, "nobody"); !errors.Is(err, CodeError(facade.CodeNoHost)) {
 		t.Fatalf("主机不存在应 no_host：%v", err)
 	}
 }
@@ -332,7 +332,7 @@ func TestStreamNoStreamOnClosedAndData(t *testing.T) {
 		t.Fatalf("未知流 close 应 no_stream：%v", err)
 	}
 	// 开一条流、正常关闭，再对它 close。
-	st, err := c.OpenStream(ctx, "aa")
+	st, err := c.OpenStream(ctx, facade.StreamKindTerm, "aa")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -381,7 +381,7 @@ func TestStreamSendAfterLocalClose(t *testing.T) {
 	ts.backend.mu.Unlock()
 	c, _ := dialTest(t, ts)
 	ctx := context.Background()
-	st, err := c.OpenStream(ctx, "aa")
+	st, err := c.OpenStream(ctx, facade.StreamKindTerm, "aa")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -407,13 +407,13 @@ func TestStreamLimitPerConnection(t *testing.T) {
 	ctx := context.Background()
 	var last *ClientStream
 	for i := 0; i < DefaultMaxStreams; i++ {
-		st, err := c.OpenStream(ctx, "aa")
+		st, err := c.OpenStream(ctx, facade.StreamKindTerm, "aa")
 		if err != nil {
 			t.Fatalf("第 %d 条应成功：%v", i+1, err)
 		}
 		last = st
 	}
-	if _, err := c.OpenStream(ctx, "aa"); !errors.Is(err, CodeError(facade.CodeStreamRefused)) {
+	if _, err := c.OpenStream(ctx, facade.StreamKindTerm, "aa"); !errors.Is(err, CodeError(facade.CodeStreamRefused)) {
 		t.Fatalf("超上限应 stream_refused：%v", err)
 	}
 	if last != nil {
@@ -422,7 +422,7 @@ func TestStreamLimitPerConnection(t *testing.T) {
 		}
 		<-last.End()
 		// 关闭释放名额后可再开。
-		if _, err := c.OpenStream(ctx, "aa"); err != nil {
+		if _, err := c.OpenStream(ctx, facade.StreamKindTerm, "aa"); err != nil {
 			t.Fatalf("释放名额后应可再开：%v", err)
 		}
 	}
@@ -585,7 +585,7 @@ func TestStreamBackpressureNoLoss(t *testing.T) {
 		_ = bc.Close() // 写完全部后关 ⇒ end(closed) 必在全部数据之后
 	}()
 	c, _ := dialTest(t, ts)
-	st, err := c.OpenStream(context.Background(), "aa")
+	st, err := c.OpenStream(context.Background(), facade.StreamKindTerm, "aa")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -727,7 +727,7 @@ func TestStreamSendErrorsAfterEnd(t *testing.T) {
 		backendConn <- bc
 	}()
 	c, _ := dialTest(t, ts)
-	st, err := c.OpenStream(context.Background(), "aa")
+	st, err := c.OpenStream(context.Background(), facade.StreamKindTerm, "aa")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -797,7 +797,7 @@ func TestStreamSendErrorsAfterConnClose(t *testing.T) {
 	ts.backend.dialAddr = echo.ln.Addr().String()
 	ts.backend.mu.Unlock()
 	c, _ := dialTest(t, ts)
-	st, err := c.OpenStream(context.Background(), "aa")
+	st, err := c.OpenStream(context.Background(), facade.StreamKindTerm, "aa")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -826,5 +826,45 @@ func TestStreamSendErrorsAfterConnClose(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "连接") {
 		t.Fatalf("错误文案应含连接断开归因：%v", err)
+	}
+}
+
+// TestStreamOpenKindFilesAndUnknown files-cli 2.1 用例：kind=files 经值域闸到达
+// Backend.DialStream（kind 透传——端口映射在 daemon 绑定层，此处断言 kind 到达）；
+// 值域外 kind 回 bad_request **不断连**（同连接后续请求照常应答——锁步语义，新 CLI +
+// 旧 daemon 的兼容断点面）。
+func TestStreamOpenKindFilesAndUnknown(t *testing.T) {
+	ts := startTestServer(t, facade.BusConfig{})
+	echo := startEchoBackend(t)
+	ts.backend.mu.Lock()
+	ts.backend.dialAddr = echo.ln.Addr().String()
+	ts.backend.mu.Unlock()
+	c, _ := dialTest(t, ts)
+	ctx := context.Background()
+
+	// kind=files：照常开流、kind 原样到达 Backend。
+	st, err := c.OpenStream(ctx, facade.StreamKindFiles, "aa")
+	if err != nil {
+		t.Fatalf("kind=files 应照常开流：%v", err)
+	}
+	ts.backend.mu.Lock()
+	kinds := append([]string(nil), ts.backend.kinds...)
+	ts.backend.mu.Unlock()
+	if len(kinds) == 0 || kinds[len(kinds)-1] != facade.StreamKindFiles {
+		t.Fatalf("Backend 应收到 kind=files：%v", kinds)
+	}
+	if err := st.Close(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	// 值域外 kind：bad_request、连接不断。
+	for _, bad := range []string{"unknown", "", "FILES"} {
+		if _, err := c.OpenStream(ctx, bad, "aa"); !errors.Is(err, CodeError(facade.CodeBadRequest)) {
+			t.Fatalf("kind=%q 应 bad_request（值域外），得到 %v", bad, err)
+		}
+	}
+	// 同连接后续请求照常应答（不断连判据）。
+	if _, err := c.Request(ctx, facade.OpDaemonStatus, nil); err != nil {
+		t.Fatalf("bad_request 后连接应仍可用：%v", err)
 	}
 }

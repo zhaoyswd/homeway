@@ -57,12 +57,12 @@ func (c *Client) Open(ctx context.Context) (*Session, error) {
 	line, err := br.ReadBytes('\n')
 	if err != nil {
 		conn.Close()
-		return nil, Errf(CodeStreamOpen, "读问候帧失败：%v", err)
+		return nil, Errw(CodeStreamOpen, err, "读问候帧失败：%v", err)
 	}
 	var g Greeting
 	if err := unmarshalLine(line, &g); err != nil {
 		conn.Close()
-		return nil, Errf(CodeStreamOpen, "问候帧不是 JSON：%v", err)
+		return nil, Errw(CodeStreamOpen, err, "问候帧不是 JSON：%v", err)
 	}
 	if !g.Ok {
 		conn.Close()
@@ -75,17 +75,26 @@ func (c *Client) Open(ctx context.Context) (*Session, error) {
 func (s *Session) Close() error { return s.conn.Close() }
 
 // call 发一条命令并读响应；ok=false ⇒ *Error（带稳定 code）。
-func (s *Session) call(req Request) (Response, error) {
+// 读写两侧的传输错误经 Errw 保留被包错误链（files-cli 1.2：远程面的流终结
+// streamend.Error 经 errors.As 可达）；ctx 取消在两次读之间可观察（阻塞中的读由
+// CLI 侧看门 Close 打断——传输不设 deadline 与取消可观察两口径分开，design D1）。
+func (s *Session) call(ctx context.Context, req Request) (Response, error) {
+	if err := ctx.Err(); err != nil {
+		return Response{}, Errw("canceled", err, "已取消")
+	}
 	if err := WriteLine(s.conn, req); err != nil {
-		return Response{}, Errf("op_failed", "发请求失败：%v", err)
+		return Response{}, Errw("op_failed", err, "发请求失败：%v", err)
+	}
+	if err := ctx.Err(); err != nil {
+		return Response{}, Errw("canceled", err, "已取消")
 	}
 	line, err := s.br.ReadBytes('\n')
 	if err != nil {
-		return Response{}, Errf("op_failed", "读响应失败：%v", err)
+		return Response{}, Errw("op_failed", err, "读响应失败：%v", err)
 	}
 	var resp Response
 	if err := unmarshalLine(line, &resp); err != nil {
-		return Response{}, Errf("op_failed", "响应不是 JSON：%v", err)
+		return Response{}, Errw("op_failed", err, "响应不是 JSON：%v", err)
 	}
 	if !resp.Ok {
 		code := resp.Code
@@ -104,7 +113,7 @@ func (c *Client) List(ctx context.Context, path string) ([]Entry, error) {
 		return nil, err
 	}
 	defer s.Close()
-	resp, err := s.call(Request{Op: "list", Path: path})
+	resp, err := s.call(ctx, Request{Op: "list", Path: path})
 	if err != nil {
 		return nil, err
 	}
@@ -118,7 +127,7 @@ func (c *Client) Stat(ctx context.Context, path string) (Entry, error) {
 		return Entry{}, err
 	}
 	defer s.Close()
-	resp, err := s.call(Request{Op: "stat", Path: path})
+	resp, err := s.call(ctx, Request{Op: "stat", Path: path})
 	if err != nil {
 		return Entry{}, err
 	}
@@ -135,7 +144,7 @@ func (c *Client) Mkdir(ctx context.Context, path string) error {
 		return err
 	}
 	defer s.Close()
-	_, err = s.call(Request{Op: "mkdir", Path: path})
+	_, err = s.call(ctx, Request{Op: "mkdir", Path: path})
 	return err
 }
 
@@ -146,32 +155,47 @@ func (c *Client) Read(ctx context.Context, path, mode string, maxBytes int64) (R
 		return Response{}, err
 	}
 	defer s.Close()
-	return s.call(Request{Op: "read", Path: path, Mode: mode, MaxBytes: maxBytes})
+	return s.call(ctx, Request{Op: "read", Path: path, Mode: mode, MaxBytes: maxBytes})
 }
 
 // Download 大文件下载：把载荷帧原样写进 w，返回总字节数。
 // 取消 = 关流（调用方 cancel ctx 或 Close），服务端无需清理。
+// **签名冻结**（files-cli 1.2，r2 新-6）：App 调用点与集成测试零改——CLI 的 size
+// 回调走 DownloadTo。
 func (c *Client) Download(ctx context.Context, path string, w io.Writer) (int64, error) {
+	return c.DownloadTo(ctx, path, w, nil)
+}
+
+// DownloadTo 大文件下载（files-cli 1.2 新增）：响应行的 size 经 onSize 交付一次
+// （进度分母——不再多打一次 Stat）；onSize 可为 nil。其余语义与 Download 同。
+func (c *Client) DownloadTo(ctx context.Context, path string, w io.Writer, onSize func(int64)) (int64, error) {
 	s, err := c.Open(ctx)
 	if err != nil {
 		return 0, err
 	}
 	defer s.Close()
-	if _, err := s.call(Request{Op: "download", Path: path}); err != nil {
+	resp, err := s.call(ctx, Request{Op: "download", Path: path})
+	if err != nil {
 		return 0, err
+	}
+	if onSize != nil {
+		onSize(resp.Size)
 	}
 	buf := make([]byte, MaxChunk)
 	var total int64
 	for {
+		if cerr := ctx.Err(); cerr != nil {
+			return total, Errw("canceled", cerr, "已取消")
+		}
 		n, err := ReadFrame(s.br, buf)
 		if err != nil {
-			return total, Errf("op_failed", "下载中断：%v", err)
+			return total, Errw("op_failed", err, "下载中断：%v", err)
 		}
 		if n == 0 {
 			return total, nil
 		}
 		if _, err := w.Write(buf[:n]); err != nil {
-			return total, Errf("op_failed", "写本地失败：%v", err)
+			return total, Errw("op_failed", err, "写本地失败：%v", err)
 		}
 		total += int64(n)
 	}
@@ -179,25 +203,42 @@ func (c *Client) Download(ctx context.Context, path string, w io.Writer) (int64,
 
 // Upload 大文件上传：请求 → 服务端 ready → 帧 → 终止帧（提交）。
 // **返回前若发生错误/ctx 取消，会关流但不发终止帧 ⇒ 服务端删 .tierpart，目标不变。**
+// 读发循环的传输错误经 Errw 保留被包错误链（files-cli 1.2：写方向的流终结经
+// daemon 适配层已归一 streamend.Error——errors.As 与读方向同判型）。
 func (c *Client) Upload(ctx context.Context, path string, r io.Reader, size int64, onProgress func(int64)) (int64, error) {
+	return c.upload(ctx, path, r, size, onProgress, nil)
+}
+
+// UploadLimiter 发送端限速缝（files-cli 1.4：CLI 注入令牌桶；nil = 不限）。上传
+// 读发循环在每帧发送前 Await——「上行速率不超过标定安全值」的发送端速率义务
+// （协议无 ack/credit、守护进程每流缓冲满即收流——无回压信号下的盲节流是发送端
+// 唯一可用手段）。
+type UploadLimiter interface {
+	Await(n int)
+}
+
+func (c *Client) upload(ctx context.Context, path string, r io.Reader, size int64, onProgress func(int64), rate UploadLimiter) (int64, error) {
 	s, err := c.Open(ctx)
 	if err != nil {
 		return 0, err
 	}
 	defer s.Close()
-	if _, err := s.call(Request{Op: "write", Path: path, Size: size}); err != nil {
+	if _, err := s.call(ctx, Request{Op: "write", Path: path, Size: size}); err != nil {
 		return 0, err
 	}
 	buf := make([]byte, MaxChunk)
 	var total int64
 	for {
 		if err := ctx.Err(); err != nil {
-			return total, Errf("canceled", "已取消")
+			return total, Errw("canceled", err, "已取消")
 		}
 		n, rerr := r.Read(buf)
 		if n > 0 {
+			if rate != nil {
+				rate.Await(n)
+			}
 			if err := WriteFrame(s.conn, buf[:n]); err != nil {
-				return total, Errf("op_failed", "上传中断：%v", err)
+				return total, Errw("op_failed", err, "上传中断：%v", err)
 			}
 			total += int64(n)
 			if onProgress != nil {
@@ -208,22 +249,28 @@ func (c *Client) Upload(ctx context.Context, path string, r io.Reader, size int6
 			if errors.Is(rerr, io.EOF) {
 				break
 			}
-			return total, Errf("op_failed", "读本地失败：%v", rerr)
+			return total, Errw("op_failed", rerr, "读本地失败：%v", rerr)
 		}
 	}
 	if err := WriteFrame(s.conn, nil); err != nil { // 终止帧 = 提交
-		return total, Errf("op_failed", "提交失败：%v", err)
+		return total, Errw("op_failed", err, "提交失败：%v", err)
 	}
 	line, err := s.br.ReadBytes('\n')
 	if err != nil {
-		return total, Errf("op_failed", "读提交结果失败：%v", err)
+		return total, Errw("op_failed", err, "读提交结果失败：%v", err)
 	}
 	var resp Response
 	if err := unmarshalLine(line, &resp); err != nil {
-		return total, Errf("op_failed", "提交结果不是 JSON：%v", err)
+		return total, Errw("op_failed", err, "提交结果不是 JSON：%v", err)
 	}
 	if !resp.Ok {
 		return total, &Error{Code: resp.Code, Msg: resp.Msg}
 	}
 	return total, nil
+}
+
+// UploadRated 带发送端限速的上传（files-cli 1.4：CLI 的 put 注入令牌桶——rate 为
+// nil 时与 Upload 等价）。App 调用点继续走 Upload（不限速，行为不变）。
+func (c *Client) UploadRated(ctx context.Context, path string, r io.Reader, size int64, onProgress func(int64), rate UploadLimiter) (int64, error) {
+	return c.upload(ctx, path, r, size, onProgress, rate)
 }

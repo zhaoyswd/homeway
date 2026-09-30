@@ -187,7 +187,7 @@ func TestControlPlaneAssemblyEndToEnd(t *testing.T) {
 	}
 
 	// 流腿寻址（真主机表）：不存在的主机 → no_host（term 拨号路径的入口校验）。
-	if _, err := c.OpenStream(ctx, "0102"); !errors.Is(err, control.CodeError(facade.CodeNoHost)) {
+	if _, err := c.OpenStream(ctx, facade.StreamKindTerm, "0102"); !errors.Is(err, control.CodeError(facade.CodeNoHost)) {
 		t.Fatalf("不存在主机流打开应 no_host：%v", err)
 	}
 

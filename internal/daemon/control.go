@@ -17,11 +17,27 @@ import (
 	"github.com/zhaoyswd/homeway/internal/control"
 )
 
-// termServicePort term 服务端口 = 客户端会话的核内约定（spec「流式通道」：
-// 端口 MUST NOT 出现在控制面词表；真源 = internal/server DefaultTermPort 7724，
-// 此处独立常量避免把出口服务大包拉进 daemon 依赖面——一处定源：绑定点经
-// Host.DialPort 携带，facade 不持有端口词表）。
-const termServicePort = 7724
+// 流腿的服务端口 = 客户端会话的核内约定（spec「流式通道」：端口 MUST NOT 出现在
+// 控制面词表；真源 = internal/server 的 DefaultTermPort 7724 / DefaultFilesPort
+// 7802，此处独立常量避免把出口服务大包拉进 daemon 依赖面——一处定源：绑定点经
+// Host.DialPort 携带，facade 不持有端口词表）。files-cli 2.1 起 kind→端口映射
+// 收拢在本文件（DialStream 唯一路径：kind → 端口 → facade.Host.DialPort）。
+const (
+	termServicePort  = 7724
+	filesServicePort = 7802
+)
+
+// streamServicePort kind → 核内约定端口（files-cli 2.1：DialStream 的唯一映射处；
+// 值域外 = 值域闸前移的可判定错误——控制面层同值回 bad_request）。
+func streamServicePort(kind string) (uint16, error) {
+	switch kind {
+	case facade.StreamKindTerm:
+		return termServicePort, nil
+	case facade.StreamKindFiles:
+		return filesServicePort, nil
+	}
+	return 0, fmt.Errorf("未知流 kind %q", kind)
+}
 
 // controlBackend control.Backend 的 daemon 实现（纯绑定：逐方法委托 facade）。
 type controlBackend struct {
@@ -137,10 +153,15 @@ func mapStats(s *facade.HostRxTx) *control.HostRxTx {
 	return &control.HostRxTx{RxBytes: s.RxBytes, TxBytes: s.TxBytes}
 }
 
-// DialTerm 流腿：host hex → facade.Host.DialPort(termServicePort)（重建感知的
-// 隧道端口拨号）。ErrSessionNotCurrent 映射在 facade 哨兵上（§3.3）；「登记在册
-// 但会话对象不在」沿 no_host 族——保持既有 wire 行为。
-func (b *controlBackend) DialTerm(ctx context.Context, host string) (net.Conn, error) {
+// DialStream 流腿（files-cli 2.1 起 DialTerm 泛化）：kind → 核内约定端口 →
+// host hex → facade.Host.DialPort（重建感知的隧道端口拨号——**唯一路径**，无旁路
+// 直拨；term/files 同缝同映射处）。ErrSessionNotCurrent 映射在 facade 哨兵上
+// （§3.3）；「登记在册但会话对象不在」沿 no_host 族——保持既有 wire 行为。
+func (b *controlBackend) DialStream(ctx context.Context, kind, host string) (net.Conn, error) {
+	port, err := streamServicePort(kind)
+	if err != nil {
+		return nil, err // 控制面值域闸前置，理论不可达；防御同款
+	}
 	var pid [32]byte
 	raw, err := hex.DecodeString(host)
 	if err != nil || len(raw) != 32 {
@@ -151,7 +172,7 @@ func (b *controlBackend) DialTerm(ctx context.Context, host string) (net.Conn, e
 	if h == nil {
 		return nil, control.ErrBackendNoHost
 	}
-	conn, err := h.DialPort(ctx, termServicePort)
+	conn, err := h.DialPort(ctx, port)
 	if err != nil {
 		switch {
 		case errors.Is(err, facade.ErrNoHost):
