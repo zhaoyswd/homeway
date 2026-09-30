@@ -153,6 +153,47 @@ state 目录开放给不可信用户/进程。
 f610f3f 起、**自 v0.10.0 起已生效**——v0.9.0 及更早出口重启后 files.sock 会回到 umask 值，
 但 state 目录 700 下实际暴露面为零。）
 
+### 文件命令面（`homeway files`，类 sftp）
+
+与 App **同一份** files 协议（线格式零改动复用），六子命令与协议动词 1:1
+（get↔download / put↔write；无 delete/rename——协议没有不发明）：
+
+```bash
+homeway files list [path] [--json]   # 列目录（--json = 单行 JSON 数组：name/isDir/size/mtimeMs）
+homeway files stat <path> [--json]   # 单条目信息（--json = 单行 JSON）
+homeway files mkdir <path>           # 新建目录（已存在报 already_exists）
+homeway files read <path> [--max N]  # 文本预览（默认 512KiB=协议文本默认；截断提示走 stderr；
+                                     #   --max 超协议内联上限 16MiB 时报错而非静默截断）
+homeway files get <远端> [-o 本地] [--force] [--quiet]
+                                     # 下载（目标缺省 = basename；已存在默认拒、--force 覆盖；
+                                     #   本地原子落盘——写 <目标>.tierpart、成功 rename、
+                                     #   中断即删 ⇒ 无半截残留、可直接重试不需 --force）
+homeway files put <本地> <远端> [--rate-limit N] [--quiet]
+                                     # 上传（远端原子替换；Ctrl-C = 取消，远端清理 .tierpart、
+                                     #   目标不变）；--rate-limit <bytes/s> 上行限速，默认保守值
+                                     #   2MiB/s，0 = 不限、风险自担——协议无 ack/credit，守护
+                                     #   进程每流缓冲（40 帧/640KiB）满即收流，限速是发送端义务
+homeway files list --host mac        # --host <ref>：与 host delete/status / term 同一寻址规则
+```
+
+- **远程模式（`--host`）**：命令经本机 daemon 控制面（`stream.open{kind:files}` 纯透传）
+  过隧道到达目标主机的 files 服务。daemon 未运行 = 可行动错误（提示先启动
+  `homeway daemon`）；守护进程代际过旧不识 files 流时按 `bad_request` 给出
+  「请同批升级 daemon」提示（锁步哲学：同批发版同二进制天然同升）。
+- ⚠️ **`--state` 的指代随 `--host` 切换**（term 面同款重载语义，非互斥）：无 `--host`
+  = 本地面，一次性直连 `<state>/files.sock`（默认**出口 state** `~/.config/homeway`，
+  不要求 daemon 在位）；`--host <ref>` = 远程面，`--state` 指**守护进程 state 目录**
+  （control.sock 所在，默认 `~/.config/homeway/daemon`）。
+- **`--timeout`**：解析 / 连接+打开 / 首响应（问候帧）三段各一次的预算（默认各 10s、
+  最坏相加 30s；**两面均可用**——term 面本地面不接受）；传输本身不设 deadline，
+  超预算/取消的文案按 CLI 自己的阶段归因，不呈现成连接态。
+- **流终结与取消归因**（get/put 中途）：`gone` = 流被守护进程收流（主机不可达或上行
+  持续过快）；`closed` = 对端已关闭（files 服务收工）；连接级断开 = 与守护进程的连接
+  断了，重试即可。get 断流提示已收字节与「可直接重试」；put 断流提示「远端已按取消
+  语义清理」；Ctrl-C/SIGTERM = 关流不发终止帧，远端删 `.tierpart`。
+- **退出码**：成功 = 0；连接 / 协议 / 超时 / 取消 = 1；未知 files 子命令 = 1、
+  顶层未知角色 = 2。
+
 ### 桌面守护进程（`homeway daemon`，多主机客户端常驻）
 
 除手机 App 外的第二种客户端形态：桌面（Mac/Linux）上常驻一个守护进程，把**多台出口
