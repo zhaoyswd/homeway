@@ -79,6 +79,8 @@ type HostAddResult struct {
 type Host struct {
 	rec  HostRecord
 	sess *hostsession.Session
+	// dm 需求合成状态（§6.2：拨号尝试/在场腿计数落点——DialPort 计数入 demand 源）。
+	dm *hostDemand
 }
 
 // Record 登记面（含 carried 不在此面——寻址面不含 carried 的既有口径不变）。
@@ -96,10 +98,13 @@ var dialPort = func(s *hostsession.Session, ctx context.Context, port uint16) (n
 // DialPort 重建感知的隧道端口拨号（hostsession D1 导出面）：会话不在（收工/
 // 重建窗口）→ ErrSessionNotCurrent（facade 哨兵，vocab.go）；登记在册但会话
 // 对象不在（构造期失败）→ ErrNoHost（绑定点沿 no_host 族映射——保持既有 wire
-// 行为）。
+// 行为）。§6.2：拨号尝试与在场连接计入该主机的需求合成（DemandSignal 源①②）。
 func (h *Host) DialPort(ctx context.Context, port uint16) (net.Conn, error) {
 	if h.sess == nil {
 		return nil, ErrNoHost
+	}
+	if h.dm != nil {
+		h.dm.dials.Add(1) // 源①：本拍拨号尝试
 	}
 	conn, err := dialPort(h.sess, ctx, port)
 	if err != nil {
@@ -107,6 +112,10 @@ func (h *Host) DialPort(ctx context.Context, port uint16) (net.Conn, error) {
 			return nil, ErrSessionNotCurrent
 		}
 		return nil, err
+	}
+	if h.dm != nil {
+		h.dm.activeNx.Add(1) // 源②：在场腿（连接关闭时递减——countedConn）
+		return countedConn{Conn: conn, onClose: func() { h.dm.activeNx.Add(-1) }}, nil
 	}
 	return conn, nil
 }

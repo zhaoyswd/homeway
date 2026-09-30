@@ -16,6 +16,7 @@ package facade
 //	| GREETING features 位 | FeatList/Replay/Modes/Agent/Title/Surface | pkg/term feat* | 客户端不认识的位忽略；只增 |
 //	| agent 状态词表 stateV2 | StateV2Unknown/Working/Blocked/Idle | pkg/term stateV2* | 值域只增不改（与 App 侧一一对应） |
 //	| 事件 kind / 错误码 / 订阅域词表 | （无单一数值——受控枚举） | facade vocab.go | 只增不改（本身就是一种版本空间：新增走 spec delta，不改既有值） |
+//	| 订阅视图 view 文法 | host=<id>[,host=<id>]* | facade demand.go ParseView（4a §6.2 登记） | 条目格式只增不改；未知条目保守忽略（不算需求不报错） |
 //
 // 对拍机制（r1 中-2）：term 侧真源常量未导出，pkg/term 增只读访问器
 // （SurfaceVersion/FrameCaps/HelloFlags/GreetingFeatures/StateV2Values/

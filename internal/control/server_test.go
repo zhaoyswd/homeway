@@ -19,6 +19,7 @@ import (
 	"runtime"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -34,10 +35,51 @@ type fakeBackend struct {
 	dialErr  map[string]error
 	dialAddr string // DialTerm 实际拨的地址（假 term 后端）
 	dials    int
+	// L2 用例的慢请求注入（4a §5.1）：blockAddEntered 非 nil 时 AddHost 进入即
+	// 向其发信号并阻塞到 blockAddRelease 关闭（假 Backend 的 entered 同步点）。
+	blockAddEntered chan struct{}
+	blockAddRelease chan struct{}
+	// L2 用例的慢拨号注入（4a §5.1 r2 新-6）：dialEntered 非 nil 时 DialTerm
+	// 进入即发信号并阻塞到 dialRelease 关闭（stream.open 独立执行体判据）。
+	dialEntered chan struct{}
+	dialRelease chan struct{}
+	// pipe 模式的对端持有（从不读；防 GC 关闭 pipe 使写立即失败）。
+	pipePeers []net.Conn
+	// pipe 模式的对端慢排空节拍（>0 = 对端按此间隔慢慢读——「慢读但活着」形态；
+	// 0 = 永不读）。pipeDrained = 慢排空累计收到的字节数（「数据完整到达后端」判据）。
+	pipeDrainEvery time.Duration
+	pipeDrained    atomic.Int64
+	// demand 段注入（4a §6.2 用例）。
+	demand []HostDemandBrief
 }
 
 func newFakeBackend() *fakeBackend {
 	return &fakeBackend{added: map[string]string{}, dialErr: map[string]error{}}
+}
+
+// pipeDialAddr 特殊 dialAddr：DialTerm 返回无缓冲 net.Pipe（对端存 pipePeers、
+// 从不读——「后端不读」形态的**确定性**载体，规避 TCP 内核缓冲/自调优在 localhost
+// 上仍快速排空的不确定窗口，4a §5.3 用例）。
+const pipeDialAddr = "\x00pipe"
+
+// blockAdd 注入 AddHost 阻塞（entered 同步点 + release 放行）。
+func (f *fakeBackend) blockAdd() (entered, release chan struct{}) {
+	entered = make(chan struct{}, 64)
+	release = make(chan struct{})
+	f.mu.Lock()
+	f.blockAddEntered, f.blockAddRelease = entered, release
+	f.mu.Unlock()
+	return
+}
+
+// blockDial 注入 DialTerm 阻塞（entered 同步点 + release 放行）。
+func (f *fakeBackend) blockDial() (entered, release chan struct{}) {
+	entered = make(chan struct{}, 64)
+	release = make(chan struct{})
+	f.mu.Lock()
+	f.dialEntered, f.dialRelease = entered, release
+	f.mu.Unlock()
+	return
 }
 
 func (f *fakeBackend) ServerVersion() string { return "test-1.0" }
@@ -52,6 +94,13 @@ func (f *fakeBackend) HostBriefs() []HostBrief {
 	return append([]HostBrief(nil), f.briefs...)
 }
 func (f *fakeBackend) AddHost(name, token string, force bool) (HostAddResult, error) {
+	f.mu.Lock()
+	entered, release := f.blockAddEntered, f.blockAddRelease
+	f.mu.Unlock()
+	if entered != nil {
+		entered <- struct{}{}
+		<-release
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if strings.HasPrefix(token, "BAD") {
@@ -100,9 +149,37 @@ func (f *fakeBackend) DialTerm(ctx context.Context, host string) (net.Conn, erro
 	f.dials++
 	err := f.dialErr[host]
 	addr := f.dialAddr
+	entered, release := f.dialEntered, f.dialRelease
 	f.mu.Unlock()
+	if entered != nil {
+		entered <- struct{}{}
+		<-release
+	}
 	if err != nil {
 		return nil, err
+	}
+	if addr == pipeDialAddr {
+		c1, c2 := net.Pipe()
+		f.mu.Lock()
+		f.pipePeers = append(f.pipePeers, c2)
+		every := f.pipeDrainEvery
+		f.mu.Unlock()
+		if every > 0 {
+			go func() { // 慢排空：按节拍读（读到的字节即「已到达后端」；EOF 即止）
+				buf := make([]byte, 64<<10)
+				for {
+					n, err := c2.Read(buf)
+					if n > 0 {
+						f.pipeDrained.Add(int64(n))
+					}
+					if err != nil {
+						return
+					}
+					time.Sleep(every)
+				}
+			}()
+		}
+		return c1, nil
 	}
 	if addr == "" {
 		return nil, ErrBackendNoSession
@@ -114,6 +191,12 @@ func (f *fakeBackend) NotReady() bool {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return f.notReady
+}
+
+func (f *fakeBackend) DemandStatus() []HostDemandBrief {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]HostDemandBrief(nil), f.demand...)
 }
 
 // testServer 一套装配好的服务器（临时 state + bus + backend + 假 term 后端）。

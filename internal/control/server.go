@@ -3,9 +3,11 @@ package control
 // server.go — 控制面服务器（§3.2/§3.3）：握手与代际、请求/响应与错误码映射、
 // 事件推送泵；流式通道见 stream.go；socket 监听与权限见 listen.go。
 //
-// 连接模型：一连接两 goroutine（reader 分发 / writer 唯一写 socket）+ 每请求一个
-// handler goroutine（慢操作如 stream.open 的隧道拨号不阻塞读循环）+ 每流两个泵
-//（backend→前端 / 前端→backend，见 stream.go）。writer 的输入按优先级排空：
+// 连接模型：一连接两 goroutine（reader 分发 / writer 唯一写 socket）+ **每连接
+// 有界请求队列 + 固定请求工位**（L2，4a §5.1：在途〔含工位执行中〕≤ 32、超界
+// goodbye(overrun) 断连；「有界在途 = 契约、串行不是契约」——30s 级 stream.open
+// 拨号走独立但有界执行体〔同样计入在途〕，同连接其它请求照常应答）+ 每流上行
+// 工位（见 stream.go）。writer 的输入按优先级排空：
 //
 //	highC（welcome/rsp/goodbye/reload 等控制类；订阅确认帧携带门闩标记——
 //	写出后清位并按序补写回放）> 事件（bus 订阅者 channel；订阅确认在途门闩
@@ -26,6 +28,7 @@ import (
 	"net"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 )
 
@@ -39,6 +42,14 @@ const (
 	highQueue = 64
 	// dialTimeout stream.open 的隧道拨号预算（healingDial 首段试探 + 剩余重试）。
 	dialTimeout = 30 * time.Second
+	// maxInflight 每连接在途请求上限（L2，4a §5.1）：在途（含工位执行中）≤ 32——
+	// 判据只认该口径（队列 31 + 工位 1 或统一计数均可；实现 = 统一计数，容量
+	// maxInflight 的队列 + 1 个分发工位 + stream.open 的拨号执行体各占一计）。
+	// 超界 = 前端失控流水线（32 条慢 host.add 已是极端）→ goodbye(overrun) 断连
+	//（复用既有原因词、零新错误码；前端自辨：断连时有未完成 corr = 请求面溢出
+	// → 重连后按需重发；事件面 overrun〔订阅被总线终止〕则 resubscribe + 全量
+	// 重快照，r1 中-9）。
+	maxInflight = 32
 )
 
 // Server 控制面服务器。
@@ -49,6 +60,13 @@ type Server struct {
 	conns map[*conn]struct{}
 	clos  atomic.Bool
 	wg    sync.WaitGroup
+
+	// 上行工位总量（4a §5.3）：全连接（server 汇总）在役工位数（超总量拒开新流，
+	// 复用 stream_refused）+ 停滞观测计数（停滞等待次数 / 超时收流次数——日志
+	// 计数行携带，发版前可按实测调小 DefaultUpStallTimeout）。
+	upWorkers    atomic.Int64
+	upStallWaits atomic.Int64
+	upStallKills atomic.Int64
 }
 
 // ServerConfig 服务器装配项。
@@ -58,6 +76,11 @@ type ServerConfig struct {
 	Backend       Backend
 	Logf          func(format string, args ...any) // nil = 丢弃
 	MaxStreams    int                              // <=0 = DefaultMaxStreams
+	// UpStallTimeout 每流上行工位等待 upC 空位的上限（<=0 = DefaultUpStallTimeout；
+	// 测试注入缩短）。
+	UpStallTimeout time.Duration
+	// MaxUpWorkers 全连接（server 汇总）上行工位总量上限（<=0 = DefaultMaxUpWorkers）。
+	MaxUpWorkers int
 }
 
 // NewServer 建服务器（代际 = facade.Bus 的 generation）。
@@ -68,23 +91,54 @@ func NewServer(cfg ServerConfig) *Server {
 	if cfg.MaxStreams <= 0 {
 		cfg.MaxStreams = DefaultMaxStreams
 	}
+	if cfg.UpStallTimeout <= 0 {
+		cfg.UpStallTimeout = DefaultUpStallTimeout
+	}
+	if cfg.MaxUpWorkers <= 0 {
+		cfg.MaxUpWorkers = DefaultMaxUpWorkers
+	}
 	return &Server{cfg: cfg, conns: make(map[*conn]struct{})}
 }
 
 // Generation 当前代际。
 func (s *Server) Generation() string { return s.cfg.Bus.Generation() }
 
-// Serve 接入循环（阻塞；listener 由 listen.go 提供，Close 后返回）。
+// Serve 接入循环（阻塞；listener 由 listen.go 提供，Close 后返回）。accept 错误
+// 按瞬态/永久二分（L3，4a §5.2，对齐 net/http 的 Accept 错误处理）：瞬态（连接
+// 中断类/fd 短缺类）→ 同一 listener 有界退避重试（不打断在途用户面、不触发角色
+// 重建）；永久（listener 失效类）→ 返回错误，由 control 角色上抛走 supervisor
+// 既有退避重建（重新 Listen+Serve）。正常 Close 路径零噪声（clos 先行检查）。
 func (s *Server) Serve(ln net.Listener) error {
+	// s.ln 与 Close 的读写同锁（race 修复：Close 与 Serve 并发时不再裸碰字段）。
+	s.mu.Lock()
 	s.ln = ln
+	s.mu.Unlock()
+	if s.clos.Load() {
+		return nil // Close 先于 Serve 接入（control 角色瞬收窗口）：listener 由调用方收口
+	}
+	var retryDelay time.Duration // 瞬态退避（5ms 起翻倍、上限 1s）
 	for {
 		nc, err := ln.Accept()
 		if err != nil {
 			if s.clos.Load() {
-				return nil
+				return nil // 正常收工（Close 先置位再关 listener——零噪声）
 			}
-			return err
+			if transientAcceptError(err) {
+				if retryDelay == 0 {
+					retryDelay = 5 * time.Millisecond
+				} else {
+					retryDelay *= 2
+					if retryDelay > time.Second {
+						retryDelay = time.Second
+					}
+				}
+				s.cfg.Logf("control: accept 瞬态错误（%v）——退避 %v 后同 listener 重试（不重建）", err, retryDelay)
+				time.Sleep(retryDelay)
+				continue
+			}
+			return err // 永久错误：上抛 → control 角色失败 → supervisor 退避重建
 		}
+		retryDelay = 0
 		c := newConn(s, nc)
 		s.mu.Lock()
 		s.conns[c] = struct{}{}
@@ -100,12 +154,34 @@ func (s *Server) Serve(ln net.Listener) error {
 	}
 }
 
+// transientAcceptError accept 错误的瞬态/永久二分（对齐 net/http）：瞬态 = 连接
+// 中断类（ECONNABORTED/ECONNRESET/EINTR）+ fd/内存短缺类（EMFILE/ENFILE/ENOMEM）
+// + 超时类 net.Error；其余（listener 已关闭/失效类）= 永久。
+func transientAcceptError(err error) bool {
+	if errors.Is(err, syscall.ECONNABORTED) ||
+		errors.Is(err, syscall.ECONNRESET) ||
+		errors.Is(err, syscall.EINTR) ||
+		errors.Is(err, syscall.EMFILE) ||
+		errors.Is(err, syscall.ENFILE) ||
+		errors.Is(err, syscall.ENOMEM) {
+		return true
+	}
+	var ne net.Error
+	if errors.As(err, &ne) && ne.Timeout() {
+		return true
+	}
+	return false
+}
+
 // Close 收工：停接入、断开全部连接（在途请求由 shutting_down 错误码路径承接；
 // goodbye(shutting_down) 对还写得出的连接尽力送达）。
 func (s *Server) Close() {
 	s.clos.Store(true)
-	if s.ln != nil {
-		_ = s.ln.Close()
+	s.mu.Lock()
+	ln := s.ln
+	s.mu.Unlock()
+	if ln != nil {
+		_ = ln.Close()
 	}
 	s.mu.Lock()
 	conns := make([]*conn, 0, len(s.conns))
@@ -145,6 +221,14 @@ type conn struct {
 	streamsMu  sync.Mutex
 	nextStream uint32
 
+	// reqC 每连接请求队列（L2，4a §5.1）+ inflight 在途计数（含工位执行中与
+	// stream.open 拨号执行体——统一计数口径：队列 + 工位 + 拨号各占一计）。
+	// dispatcher = 固定请求工位（1 个分发 goroutine，工位内串行只限无长阻塞
+	// 操作——30s 级 stream.open 拨号经 runStreamOpen 走独立执行体，不占工位
+	// 串行位）。在途超界（> maxInflight）→ goodbye(overrun) 断连。
+	reqC     chan RequestBody
+	inflight atomic.Int32
+
 	wakeC  chan struct{} // 有流数据待写（唤醒 writer 轮询）
 	closed chan struct{}
 	once   sync.Once
@@ -164,26 +248,80 @@ func newConn(s *Server, nc net.Conn) *conn {
 		highC:      make(chan highItem, highQueue),
 		subConfirm: make(map[uint64]bool),
 		streams:    make(map[uint32]*stream),
+		reqC:       make(chan RequestBody, maxInflight),
 		wakeC:      make(chan struct{}, 1),
 		closed:     make(chan struct{}),
 	}
 }
 
-// run 连接主循环：writer 先起，reader 阻塞驱动（两者随 close 退出）。
+// run 连接主循环：writer 与请求工位（dispatcher）先起，reader 阻塞驱动（三者随
+// close 退出）。
 func (c *conn) run() {
 	writerDone := make(chan struct{})
 	go func() {
 		defer close(writerDone)
 		c.writer()
 	}()
+	go c.dispatcher() // 请求工位（自终止：close 后经 closed 分支退出，不进 run 等待列）
 	defer c.close("")
 	c.reader()
 	// reader 已退（EOF/IO 错误/对端直接关 socket——CLI 形态不发 goodbye）：立即收工
-	// 唤醒 writer（close 关闭 closed + nc.Close），再等 writer 退出。若等到
-	// `<-writerDone` 之后才走 defer 的 close，writer 会永远停在 step() 的 select
-	// 里等 closed——连接 goroutine 与 fd 全部泄漏（exec-r1 B1）。
+	// 唤醒 writer/dispatcher（close 关闭 closed + nc.Close），再等 writer 退出。若
+	// 等到 `<-writerDone` 之后才走 defer 的 close，writer 会永远停在 step() 的
+	// select 里等 closed——连接 goroutine 与 fd 全部泄漏（exec-r1 B1）。dispatcher
+	// **不在等待列**：工位可能仍在执行在途请求（host.add 探测等有界慢操作），
+	// close 后经 closed 分支自终止——不等它，免得 Server.Close 被一条慢请求绑架。
 	c.close("")
 	<-writerDone
+}
+
+// dispatcher 固定请求工位（L2，4a §5.1）：逐条从 reqC 取请求执行。工位内串行只
+// 限无长阻塞操作——stream.open 的 30s 级拨号经 runStreamOpen 移交独立执行体
+// （在途记账随工位原子转移，净恰 1 计——不因移交瞬时虚高导致边界假拒）。
+func (c *conn) dispatcher() {
+	for {
+		select {
+		case <-c.closed:
+			return
+		case req := <-c.reqC:
+			c.dispatch(req)
+		}
+	}
+}
+
+// dispatch 工位执行一条请求。非 stream.open：在工位内联执行（完成后释放在途
+// 计）；stream.open：整条移交拨号执行体（goroutine），工位立即空出——同连接的
+// daemon.status/host.list/另一个 open 照常应答（r2 新-6：「有界在途 = 契约，
+// 串行不是契约」）。
+func (c *conn) dispatch(req RequestBody) {
+	if req.Op == facade.OpStreamOpen {
+		go c.runStreamOpen(req) // 在途计数随本调用原子转移（dispatch 不减、拨号收尾减）
+		return
+	}
+	defer c.inflight.Add(-1)
+	if c.s.shuttingDown() {
+		c.reply(req.Corr, nil, errCode(facade.CodeShuttingDown))
+		return
+	}
+	h := c.handlerFor(req.Op)
+	if h == nil {
+		// 未知操作名：稳定错误码、连接不中断（spec 场景「未知操作报稳定错误码」）。
+		c.reply(req.Corr, nil, errCode(facade.CodeUnknownOp))
+		return
+	}
+	h(req.Corr, req.Args)
+}
+
+// runStreamOpen stream.open 的独立但有界执行体（同样计入在途 32——「不无界
+// spawn」的立目的不因拨号豁免而退化）：30s 级内联拨号（DialTerm）在这里发生，
+// 不占工位串行位。
+func (c *conn) runStreamOpen(req RequestBody) {
+	defer c.inflight.Add(-1)
+	if c.s.shuttingDown() {
+		c.reply(req.Corr, nil, errCode(facade.CodeShuttingDown))
+		return
+	}
+	c.opStreamOpen(req.Corr, req.Args)
 }
 
 // close 收工连接（幂等）。reason 非空时尽力先发 goodbye（服务端主动收工）：
@@ -356,26 +494,31 @@ func (e *opError) Error() string { return e.code }
 func errCode(code string) error { return &opError{code: code} }
 
 // handleRequestFrame 解请求帧：控制类 body 非法 JSON → bad_json 断连；合法 →
-// 异步分发（慢操作不阻塞读循环——spec「三类流量同连接交错」）。
+// 入每连接有界请求队列（非阻塞；慢操作不阻塞读循环——spec「三类流量同连接
+// 交错」）。在途（含工位执行中）超 maxInflight = 前端失控流水线 →
+// goodbye(overrun) 断连（L2，4a §5.1）。
 func (c *conn) handleRequestFrame(body []byte) {
 	var req RequestBody
 	if err := json.Unmarshal(body, &req); err != nil {
 		c.fatal(facade.CodeBadJSON)
 		return
 	}
-	go func() {
-		if c.s.shuttingDown() {
-			c.reply(req.Corr, nil, errCode(facade.CodeShuttingDown))
-			return
-		}
-		h := c.handlerFor(req.Op)
-		if h == nil {
-			// 未知操作名：稳定错误码、连接不中断（spec 场景「未知操作报稳定错误码」）。
-			c.reply(req.Corr, nil, errCode(facade.CodeUnknownOp))
-			return
-		}
-		h(req.Corr, req.Args)
-	}()
+	if c.inflight.Add(1) > maxInflight {
+		c.inflight.Add(-1)
+		c.fatal(GoodbyeOverrun) // 请求面 overrun：告别帧经 highC 由 writer 串行写出（无并发写竞态）
+		return
+	}
+	select {
+	case c.reqC <- req:
+	case <-c.closed:
+		c.inflight.Add(-1)
+		return
+	default:
+		// 防御性：计数已界 32、队列容量 32，不应触达（触达 = 计数/容量漂移，按
+		// overrun 断连自保）。
+		c.inflight.Add(-1)
+		c.fatal(GoodbyeOverrun)
+	}
 }
 
 // reply 帧化响应（corr 关联回送；err 非 nil 时为错误码）。
@@ -480,6 +623,7 @@ func (c *conn) opDaemonStatus(corr uint64, _ json.RawMessage) {
 		Seq:           c.s.cfg.Bus.CurrentSeq(),
 		Roles:         c.s.cfg.Backend.RolesStatus(),
 		Hosts:         c.s.cfg.Backend.HostStates(),
+		Demand:        c.s.cfg.Backend.DemandStatus(),
 	}, nil)
 }
 
@@ -587,7 +731,7 @@ func (c *conn) opSubscribe(corr uint64, args json.RawMessage) {
 	}
 	// 门闩置位在 Bus.Subscribe 之前（B3 复检暂存的覆盖窗口从 Subscribe 前开始）。
 	c.subConfirm[corr] = true
-	if err := c.s.cfg.Bus.Subscribe(c.sub, a.Domains, a.Cursor, a.Generation); err != nil {
+	if err := c.s.cfg.Bus.Subscribe(c.sub, a.Domains, a.Cursor, a.Generation, a.View); err != nil {
 		// 错误应答同样清位（r2 新-1）——经 sendConfirm 携带 corr，writer 写出后清。
 		switch {
 		case errors.Is(err, facade.ErrCursorStale):

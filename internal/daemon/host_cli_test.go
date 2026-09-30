@@ -313,12 +313,13 @@ func cleanHost(t *testing.T, sock string) {
 // 与旧形态逐字节同构——用假 Backend + 真控制面服务器复现「新 CLI + 旧常驻 daemon」。
 type skewBackend struct{}
 
-func (b *skewBackend) ServerVersion() string            { return "0.9.0-old" }
-func (b *skewBackend) RolesStatus() []control.RoleBrief { return nil }
-func (b *skewBackend) HostBriefs() []control.HostBrief  { return nil }
-func (b *skewBackend) RemoveHost(id string) error       { return nil }
-func (b *skewBackend) HostStates() []control.HostState  { return nil }
-func (b *skewBackend) NotReady() bool                   { return false }
+func (b *skewBackend) ServerVersion() string                   { return "0.9.0-old" }
+func (b *skewBackend) RolesStatus() []control.RoleBrief        { return nil }
+func (b *skewBackend) HostBriefs() []control.HostBrief         { return nil }
+func (b *skewBackend) RemoveHost(id string) error              { return nil }
+func (b *skewBackend) HostStates() []control.HostState         { return nil }
+func (b *skewBackend) NotReady() bool                          { return false }
+func (b *skewBackend) DemandStatus() []control.HostDemandBrief { return nil }
 func (b *skewBackend) DialTerm(ctx context.Context, host string) (net.Conn, error) {
 	return nil, control.ErrBackendNoHost
 }

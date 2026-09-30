@@ -131,19 +131,16 @@ func (b *Bus) CurrentSeq() uint64 {
 	return b.seq
 }
 
-// Publish 发布一条事件（词表外 domain/kind 报错；session.diag 本期不发射；term 域
-// 载荷字段初始集为空——只接受 nil/空载荷）。返回发出序号。
+// Publish 发布一条事件（词表外 domain/kind 报错；term 域载荷字段初始集为空——
+// 只接受 nil/空载荷）。返回发出序号。session.diag 的「本期不发射」硬闸已随 4a
+// §6.3 拆除（词表与载荷字段不动：host, reason——reason 值域 gated/budget/
+// probe_window 只增不改；老前端不识该 kind 按未知值忽略的既有纪律不变）。
 func (b *Bus) Publish(domain, kind string, payload any) (uint64, error) {
 	if kindDomains[kind] == "" {
 		return 0, fmt.Errorf("词表外事件 kind %q", kind)
 	}
 	if kindDomains[kind] != domain {
 		return 0, fmt.Errorf("kind %q 不属于域 %q（归属 %q）", kind, domain, kindDomains[kind])
-	}
-	if kind == KindSessionDiag {
-		// spec「诊因事件词表」：本期守护进程 MUST NOT 发射该 kind（发射点归
-		// facade 期）。词表已冻结，facade 期接入时删掉本闸。
-		return 0, errors.New("session.diag 词表已冻结但本期不发射（发射点归 facade 期）")
 	}
 	var raw json.RawMessage
 	if payload != nil {
@@ -290,6 +287,9 @@ type Subscriber struct {
 	// 替换订阅时 = **覆盖**（新回放段取代旧段——前端按 seq 幂等去重无损，
 	// r3 低-2）。
 	pending []Event
+	// view 订阅视图声明原文（D5 源③：文法 host=<id>[,host=<id>]*，ParseView 解析；
+	// 随 Subscribe 原子替换——与 domains 同一注册点）。
+	view    string
 	ch      chan Event
 	stop    chan struct{}
 	overrun bool
@@ -334,7 +334,9 @@ func (s *Subscriber) matches(domain string) bool { return s.domains[domain] }
 //     只受环窗 4096 界），不新增「回放超余量退 stale」触发条件。
 //
 // domains 为空数组 = 合法（订阅确认回显空集，不推任何域——前端可用它只取回放）。
-func (b *Bus) Subscribe(sub *Subscriber, domains []string, cursor *uint64, generation string) error {
+// view = 前端订阅视图声明（D5：原文登记在订阅者上、viewDemand 聚合消费；空串/
+// 未知格式保守忽略——不算需求也不报错；替换订阅时随 domains 一并整体替换）。
+func (b *Bus) Subscribe(sub *Subscriber, domains []string, cursor *uint64, generation, view string) error {
 	dm := make(map[string]bool, len(domains))
 	for _, d := range domains {
 		if !validDomains[d] {
@@ -369,8 +371,24 @@ func (b *Bus) Subscribe(sub *Subscriber, domains []string, cursor *uint64, gener
 	}
 	sub.pending = replay
 	sub.domains = dm
+	sub.view = view
 	b.subs[sub] = struct{}{}
 	return nil
+}
+
+// viewDemand 某主机是否被任一在途订阅的 view 声明（D5 源③：订阅视图聚合到主机
+// 集合）。退订/断连（订阅者从 b.subs 摘除）后贡献消失。
+func (b *Bus) viewDemand(host [32]byte) bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	for sub := range b.subs {
+		for _, id := range ParseView(sub.view) {
+			if id == host {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // DrainPending 原子取走 pending 回放段（换出为 nil）。调用方 = 绑定层 writer：

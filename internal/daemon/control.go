@@ -168,14 +168,91 @@ func (b *controlBackend) DialTerm(ctx context.Context, host string) (net.Conn, e
 // NotReady 表未 attach（角色未跑/重建窗口——facade 化的「holder 为 nil」判定）。
 func (b *controlBackend) NotReady() bool { return b.d.NotReady() }
 
+// DemandStatus daemon.status 的 demand 段（4a §6.2：各主机最近一拍需求判定——
+// facade hostDemand 的 sticky 快照；表未 attach = nil）。
+func (b *controlBackend) DemandStatus() []control.HostDemandBrief {
+	briefs := b.d.DemandStatus()
+	out := make([]control.HostDemandBrief, 0, len(briefs))
+	for _, d := range briefs {
+		out = append(out, control.HostDemandBrief{Host: d.Host, Active: d.Active, Reason: d.Reason, At: d.At})
+	}
+	return out
+}
+
 var _ control.Backend = (*controlBackend)(nil)
 
-// startControlPlane 装配控制面（cli.go ⑤）：listen → server → accept 循环。
-// 监听失败（活实例占用/state 异常）= 报错退出——控制面是 daemon 的用户面，
-// 静默缺失会让 CLI 全部 not_ready 且无从排查（**首启 fail-fast**：装配期 Listen
-// 语义保留；§5.2 control 角色化只改运行中失败的恢复路径——装配期 listener 注入
-// 角色、角色 Run 内的 Listen 只服务重建，r3 低-3）。
-func startControlPlane(version string, stateDir string, sup *supervisor, d *facade.Daemon, eventf func(string, ...any)) (*control.Server, func(), error) {
+// controlRole control 角色（4a §5.2，D4/L3——r1 高-3）：控制面监听与 Serve 循环
+// 的角色化。**首启 fail-fast（r3 低-3）**：装配期 Listen 在 startControlPlane
+// 完成（监听失败 = 报错退出——控制面是 daemon 的用户面，静默缺失无从排查）、
+// 装配期 listener/server 注入本角色；Run 内的 Listen 只服务**重建路径**。accept
+// 瞬态错误由 control.Serve 内部有界退避重试（不重建、用户面不断）；永久错误
+// （listener 失效类）→ 角色失败 → supervisor 既有退避重建 = 重新 Listen+Serve
+// （无需新增外部重建 API）；重建窗口 = 控制面暂不可达（CLI 既有「守护进程未运行」
+// 类可行动文案覆盖，恢复后自动续）。总线/代际进程级不受角色重建影响。
+type controlRole struct {
+	version  string
+	stateDir string
+	sup      *supervisor
+	d        *facade.Daemon
+	eventf   func(format string, args ...any)
+
+	// 首启注入（一次性——Run 取走后置 nil；重建轮次走 Run 内重 Listen）。
+	srv  *control.Server
+	ln   net.Listener
+	sock string
+}
+
+func (r *controlRole) Name() string { return "control" }
+
+func (r *controlRole) Run(ctx context.Context) error {
+	srv, ln, sock := r.srv, r.ln, r.sock
+	r.srv, r.ln, r.sock = nil, nil, ""
+	if ln == nil {
+		// 重建路径：重新 Listen（上一轮 Run 已 defer srv.Close() 收工旧
+		// Server/listener——否则重听被 ListenControl 的 connect 探测命中旧
+		// socket、误判「已被另一活实例占用」，重建永远失败，r2 新-4）。
+		var err error
+		sock, ln, err = control.ListenControl(r.stateDir)
+		if err != nil {
+			return fmt.Errorf("控制面重听失败：%w", err)
+		}
+		r.eventf("control: 角色重建——控制面重听（sock=%s，0600）", sock)
+	}
+	if srv == nil {
+		srv = control.NewServer(control.ServerConfig{
+			ServerVersion: r.version,
+			Bus:           r.d.Bus(),
+			Backend:       &controlBackend{d: r.d, sup: r.sup, version: r.version},
+		})
+	}
+	// r2 新-4：角色失败上抛前先收工旧 Server/listener（关 listener + 断在途
+	// 连接）——重建收尾判据（新-4）：重听成功 = 旧 listener 已被这里收工。
+	// listener 由角色显式再关一次（srv.Close 先于 Serve 接入的瞬收窗口拿不到
+	// s.ln——双关幂等，net.Listener 第二次 Close 只回错误）。
+	defer func() {
+		_ = ln.Close()
+		srv.Close()
+	}()
+	serveErr := make(chan error, 1)
+	go func() { serveErr <- srv.Serve(ln) }()
+	select {
+	case <-ctx.Done():
+		srv.Close()
+		<-serveErr
+		return ctx.Err() // ctx 取消族 = 正常收工
+	case err := <-serveErr:
+		// Serve 只在永久错误/收工时返回（瞬态已在 Serve 内退避重试）。
+		return err
+	}
+}
+
+// startControlPlane 装配控制面（cli.go ⑤）：装配期 Listen（**首启 fail-fast**：
+// 监听失败 = 报错退出——控制面是 daemon 的用户面，静默缺失会让 CLI 全部
+// not_ready 且无从排查；本机 daemon 为 nohup 非托管形态，进程活着而无控制面比
+// 退出更糟）→ server + listener 注入 control 角色交 supervisor 托管（角色化只改
+// **运行中失败**的恢复路径：瞬态 accept 错误 Serve 内重试、永久错误退避重建 =
+// 重新 Listen+Serve）。总线与代际随进程唯一不变（4.4 同判据）。
+func startControlPlane(ctx context.Context, version string, stateDir string, sup *supervisor, d *facade.Daemon, eventf func(string, ...any)) error {
 	srv := control.NewServer(control.ServerConfig{
 		ServerVersion: version,
 		Bus:           d.Bus(),
@@ -183,10 +260,17 @@ func startControlPlane(version string, stateDir string, sup *supervisor, d *faca
 	})
 	sock, ln, err := control.ListenControl(stateDir)
 	if err != nil {
-		return nil, nil, fmt.Errorf("控制面监听失败：%w", err)
+		return fmt.Errorf("控制面监听失败：%w", err)
 	}
-	go func() { _ = srv.Serve(ln) }()
-	stop := func() { srv.Close() }
+	first := &controlRole{version: version, stateDir: stateDir, sup: sup, d: d, eventf: eventf, srv: srv, ln: ln, sock: sock}
+	sup.Start(ctx, func() Role {
+		r := first
+		if r != nil {
+			first = nil // 首启注入只此一次；重建轮次走 Run 内重 Listen
+			return r
+		}
+		return &controlRole{version: version, stateDir: stateDir, sup: sup, d: d, eventf: eventf}
+	}, nil)
 	eventf("control: 控制面就绪（sock=%s，0600）", sock)
-	return srv, stop, nil
+	return nil
 }

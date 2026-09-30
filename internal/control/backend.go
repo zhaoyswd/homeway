@@ -49,4 +49,7 @@ type Backend interface {
 	// NotReady 宿主未就绪（如 client 角色未运行/注册表未挂）——host.*/snapshot
 	// 类操作报 not_ready。
 	NotReady() bool
+	// DemandStatus 各主机最近一拍的需求判定（daemon.status 的 demand 段，4a
+	// §6.2——词表只增；宿主无需求面时返回 nil）。
+	DemandStatus() []HostDemandBrief
 }

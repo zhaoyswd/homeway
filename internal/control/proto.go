@@ -209,12 +209,24 @@ type StreamEndBody struct {
 // ---------- daemon.status / snapshot.get 载荷 ----------
 
 // DaemonStatusResult daemon.status 成功载荷（版本/代际/角色/主机摘要+链路态）。
+// Demand = 各主机最近一拍的需求判定（4a §6.2：DemandSignal 的观测面，词表只增——
+// 旧前端按未知字段忽略）。
 type DaemonStatusResult struct {
-	ServerVersion string      `json:"serverVersion"`
-	Generation    string      `json:"generation"`
-	Seq           uint64      `json:"seq"`
-	Roles         []RoleBrief `json:"roles"`
-	Hosts         []HostState `json:"hosts"`
+	ServerVersion string            `json:"serverVersion"`
+	Generation    string            `json:"generation"`
+	Seq           uint64            `json:"seq"`
+	Roles         []RoleBrief       `json:"roles"`
+	Hosts         []HostState       `json:"hosts"`
+	Demand        []HostDemandBrief `json:"demand,omitempty"`
+}
+
+// HostDemandBrief daemon.status demand 段单条（host + 最近一拍判定 active/reason/at；
+// at = UnixMilli，0 = 从未判定）。
+type HostDemandBrief struct {
+	Host   string `json:"host"`
+	Active bool   `json:"active"`
+	Reason string `json:"reason"`
+	At     int64  `json:"at"`
 }
 
 // RoleBrief 角色状态摘要。Reason = 最近一次失败原因（running 态为空；spec

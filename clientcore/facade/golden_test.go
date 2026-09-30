@@ -67,7 +67,7 @@ func TestGoldenResumeSetProperties(t *testing.T) {
 
 	// 第一段：消费者 A 在线订阅，收 10 条后中途杀（关订阅、弃通道）。
 	a := b.NewSubscriber()
-	if err := b.Subscribe(a, []string{DomainSession}, nil, "gen-golden"); err != nil {
+	if err := b.Subscribe(a, []string{DomainSession}, nil, "gen-golden", ""); err != nil {
 		t.Fatal(err)
 	}
 	pubN(t, b, 1, 10)
@@ -82,7 +82,7 @@ func TestGoldenResumeSetProperties(t *testing.T) {
 	// 第二段：持游标重连（B），回放 (10, 40] + 在线收尾。发布者并发双 goroutine
 	//（段内乱序/重复不假设单调——集合性质口径）。
 	bl := b.NewSubscriber()
-	if err := b.Subscribe(bl, []string{DomainSession}, &cursor, "gen-golden"); err != nil {
+	if err := b.Subscribe(bl, []string{DomainSession}, &cursor, "gen-golden", ""); err != nil {
 		t.Fatalf("持游标重连失败：%v", err)
 	}
 	replay := bl.DrainPending()
@@ -128,7 +128,7 @@ func TestGoldenResumeSetProperties(t *testing.T) {
 	// 性质 (3)：允许重复——刻意再订一次同游标（重复回放段 11..40 全量重投），
 	// 幂等覆盖不受影响。
 	bl2 := b.NewSubscriber()
-	if err := b.Subscribe(bl2, []string{DomainSession}, &cursor, "gen-golden"); err != nil {
+	if err := b.Subscribe(bl2, []string{DomainSession}, &cursor, "gen-golden", ""); err != nil {
 		t.Fatal(err)
 	}
 	dup := bl2.DrainPending()
@@ -152,12 +152,12 @@ func TestGoldenStaleRingEviction(t *testing.T) {
 	pubN(t, b, 1, 20) // 环只保最近 8 条（seq 13..20）
 	s := b.NewSubscriber()
 	stale := uint64(5)
-	if err := b.Subscribe(s, []string{DomainSession}, &stale, "gen-evict"); !errors.Is(err, ErrCursorStale) {
+	if err := b.Subscribe(s, []string{DomainSession}, &stale, "gen-evict", ""); !errors.Is(err, ErrCursorStale) {
 		t.Fatalf("环淘汰游标应 ErrCursorStale，得到 %v", err)
 	}
 	// 全量重快照（快照本体归消费方；总线面 = 纯在线订阅从当前续播）+ 续播无洞：
 	fresh := b.NewSubscriber()
-	if err := b.Subscribe(fresh, []string{DomainSession}, nil, "gen-evict"); err != nil {
+	if err := b.Subscribe(fresh, []string{DomainSession}, nil, "gen-evict", ""); err != nil {
 		t.Fatal(err)
 	}
 	if p := fresh.DrainPending(); len(p) != 0 {
@@ -175,11 +175,11 @@ func TestGoldenStaleGenerationMismatch(t *testing.T) {
 	pubN(t, b, 1, 5)
 	s := b.NewSubscriber()
 	cur := uint64(0)
-	if err := b.Subscribe(s, []string{DomainSession}, &cur, "gen-old"); !errors.Is(err, ErrCursorStale) {
+	if err := b.Subscribe(s, []string{DomainSession}, &cur, "gen-old", ""); !errors.Is(err, ErrCursorStale) {
 		t.Fatalf("代际失配应 ErrCursorStale，得到 %v", err)
 	}
 	fresh := b.NewSubscriber()
-	if err := b.Subscribe(fresh, []string{DomainSession}, nil, "gen-new"); err != nil {
+	if err := b.Subscribe(fresh, []string{DomainSession}, nil, "gen-new", ""); err != nil {
 		t.Fatal(err)
 	}
 	pubN(t, b, 6, 5)
@@ -194,7 +194,7 @@ func TestBusLargeReplayCompleteDelivery(t *testing.T) {
 	pubN(t, b, 1, 600)
 	s := b.NewSubscriber()
 	cur := uint64(0)
-	if err := b.Subscribe(s, []string{DomainSession}, &cur, "gen-large"); err != nil {
+	if err := b.Subscribe(s, []string{DomainSession}, &cur, "gen-large", ""); err != nil {
 		t.Fatalf(">512 条回放不应报错（更不应 cursor_stale）：%v", err)
 	}
 	replay := s.DrainPending()

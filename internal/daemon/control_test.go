@@ -54,11 +54,10 @@ func startDaemonForTest(t *testing.T, probe func(ctx context.Context, token stri
 	t.Cleanup(cancel)
 	role := newClientRole(dir, st, d)
 	sup.Start(ctx, func() Role { return role }, nil)
-	_, stop, err := startControlPlane("test-daemon", dir, sup, d, st.Eventf)
-	if err != nil {
+	if err := startControlPlane(ctx, "test-daemon", dir, sup, d, st.Eventf); err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(stop)
+	t.Cleanup(func() { cancel(); sup.Close() }) // 控制面随角色收口（conn 收尾）后停角色
 	// 等主机表挂上（角色 goroutine 异步 attach）。
 	deadline := time.Now().Add(3 * time.Second)
 	for time.Now().Before(deadline) {
@@ -115,8 +114,17 @@ func TestControlPlaneAssemblyEndToEnd(t *testing.T) {
 	if st.ServerVersion != "test-daemon" || st.Generation == "" {
 		t.Fatalf("daemon.status：%+v", st)
 	}
-	if len(st.Roles) == 0 || st.Roles[0].Name != "client" {
-		t.Fatalf("角色面应含 client：%+v", st.Roles)
+	// 4a §5.2 起 roles 面 = client + control 两角色（map 序不稳定——按名查）。
+	hasRole := func(name string) bool {
+		for _, r := range st.Roles {
+			if r.Name == name {
+				return true
+			}
+		}
+		return false
+	}
+	if !hasRole("client") || !hasRole("control") {
+		t.Fatalf("角色面应含 client 与 control：%+v", st.Roles)
 	}
 
 	// 订阅 session 域 → host.add（本地签发 token）→ session.added 事件到达。
@@ -213,11 +221,11 @@ func TestControlPlaneNotReadyWhenRoleDisabled(t *testing.T) {
 	d := facade.New(facade.Options{StrictIdentity: true, Logf: st.Debugf, Eventf: st.Eventf})
 	t.Cleanup(d.Close) // 不挂角色（表未 attach = NotReady）
 	sup := newSupervisor(st.Eventf, st.Debugf)
-	_, stop, err := startControlPlane("test-daemon", dir, sup, d, st.Eventf)
-	if err != nil {
+	ctlCtx, ctlCancel := context.WithCancel(context.Background())
+	if err := startControlPlane(ctlCtx, "test-daemon", dir, sup, d, st.Eventf); err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(stop)
+	t.Cleanup(func() { ctlCancel(); sup.Close() })
 	c := dialDaemon(t, filepath.Join(dir, control.ControlSockName))
 	ctx := context.Background()
 	if _, err := c.Request(ctx, facade.OpHostAdd, control.HostAddArgs{Token: "anything"}); !errors.Is(err, control.CodeError(facade.CodeNotReady)) {

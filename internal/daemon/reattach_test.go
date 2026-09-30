@@ -99,11 +99,10 @@ func TestReattachKeepsGenerationAndCursor(t *testing.T) {
 	t.Cleanup(cancel)
 	sup.Start(ctx, func() Role { return role }, []time.Duration{50 * time.Millisecond})
 
-	_, stop, err := startControlPlane("reattach-test", dir, sup, d, st.Eventf)
-	if err != nil {
+	if err := startControlPlane(ctx, "reattach-test", dir, sup, d, st.Eventf); err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(stop)
+	t.Cleanup(func() { cancel(); sup.Close() })
 	sock := dir + "/" + control.ControlSockName
 
 	// ① 首轮 attach 完成 → 前端接入 + 订阅 + 加一台主机（持 seq 游标）。
@@ -209,7 +208,13 @@ func TestReattachKeepsGenerationAndCursor(t *testing.T) {
 	if len(ds.Hosts) != 0 {
 		t.Fatalf("重建窗口 hosts 面应为空（表已 detach）：%d 台", len(ds.Hosts))
 	}
-	if len(ds.Roles) == 0 || ds.Roles[0].Name != "client" {
+	sawClientRole := false
+	for _, r := range ds.Roles {
+		if r.Name == "client" {
+			sawClientRole = true
+		}
+	}
+	if !sawClientRole {
 		t.Fatalf("roles 面应可见 client（failed/重建中）：%+v", ds.Roles)
 	}
 

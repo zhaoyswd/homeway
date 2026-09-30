@@ -100,12 +100,12 @@ func TestBusRingEvictionAndCursorStale(t *testing.T) {
 	}
 	sub := b.NewSubscriber()
 	stale := uint64(1) // seq 2..3 已被淘汰
-	if err := b.Subscribe(sub, []string{DomainSession}, &stale, "gen-1"); !errors.Is(err, ErrCursorStale) {
+	if err := b.Subscribe(sub, []string{DomainSession}, &stale, "gen-1", ""); !errors.Is(err, ErrCursorStale) {
 		t.Fatalf("游标过旧应 ErrCursorStale，得到 %v", err)
 	}
 	// 游标恰在窗起点（cursor+1 == oldest=3）→ 回放 4..6。
 	cur := uint64(2)
-	err := b.Subscribe(sub, []string{DomainSession}, &cur, "gen-1")
+	err := b.Subscribe(sub, []string{DomainSession}, &cur, "gen-1", "")
 	replay := sub.DrainPending()
 	if err != nil || len(replay) != 4 {
 		t.Fatalf("窗起点回放应 4 条：err=%v n=%d", err, len(replay))
@@ -122,7 +122,7 @@ func TestBusCursorFutureRejected(t *testing.T) {
 	pubState(t, b, "h", "ready")
 	sub := b.NewSubscriber()
 	future := uint64(99)
-	if err := b.Subscribe(sub, []string{DomainSession}, &future, "gen-1"); !errors.Is(err, ErrCursorFuture) {
+	if err := b.Subscribe(sub, []string{DomainSession}, &future, "gen-1", ""); !errors.Is(err, ErrCursorFuture) {
 		t.Fatalf("超前游标应 ErrCursorFuture，得到 %v", err)
 	}
 }
@@ -132,7 +132,7 @@ func TestBusGenerationMismatchCursorStale(t *testing.T) {
 	pubState(t, b, "h", "ready")
 	sub := b.NewSubscriber()
 	cur := uint64(0)
-	if err := b.Subscribe(sub, []string{DomainSession}, &cur, "gen-old"); !errors.Is(err, ErrCursorStale) {
+	if err := b.Subscribe(sub, []string{DomainSession}, &cur, "gen-old", ""); !errors.Is(err, ErrCursorStale) {
 		t.Fatalf("代际失配应 ErrCursorStale，得到 %v", err)
 	}
 }
@@ -146,7 +146,7 @@ func TestBusReplayNoDuplicateNoLoss(t *testing.T) {
 	}
 	sub := b.NewSubscriber()
 	cur := uint64(0)
-	err := b.Subscribe(sub, []string{DomainSession}, &cur, "gen-1")
+	err := b.Subscribe(sub, []string{DomainSession}, &cur, "gen-1", "")
 	if err != nil {
 		t.Fatalf("订阅失败：%v", err)
 	}
@@ -180,7 +180,7 @@ func TestBusSnapshotPlusSubscribeEquivalence(t *testing.T) {
 	// 量回放、再在线收尾）——前端见到的 seq 集合 = 全程在线订阅者。
 	b := NewBus("gen-1", BusConfig{})
 	full := b.NewSubscriber()
-	if err := b.Subscribe(full, []string{DomainSession}, nil, "gen-1"); err != nil {
+	if err := b.Subscribe(full, []string{DomainSession}, nil, "gen-1", ""); err != nil {
 		t.Fatalf("全程订阅失败：%v", err)
 	}
 	for i := 0; i < 3; i++ {
@@ -188,7 +188,7 @@ func TestBusSnapshotPlusSubscribeEquivalence(t *testing.T) {
 	}
 	late := b.NewSubscriber()
 	cur := uint64(0) // = 快照带出的序号（这里以 0 模拟「从启动起」）
-	err := b.Subscribe(late, []string{DomainSession}, &cur, "gen-1")
+	err := b.Subscribe(late, []string{DomainSession}, &cur, "gen-1", "")
 	replay := late.DrainPending()
 	if err != nil || len(replay) != 3 {
 		t.Fatalf("晚到订阅回放失败：err=%v n=%d", err, len(replay))
@@ -219,7 +219,7 @@ func TestBusSnapshotPlusSubscribeEquivalence(t *testing.T) {
 func TestBusDomainFilter(t *testing.T) {
 	b := NewBus("gen-1", BusConfig{})
 	sub := b.NewSubscriber()
-	if err := b.Subscribe(sub, []string{DomainLink}, nil, "gen-1"); err != nil {
+	if err := b.Subscribe(sub, []string{DomainLink}, nil, "gen-1", ""); err != nil {
 		t.Fatalf("订阅 link 域失败：%v", err)
 	}
 	pubState(t, b, "h", "ready") // session 域：不投
@@ -240,7 +240,7 @@ func TestBusDomainFilter(t *testing.T) {
 	default:
 	}
 	// 词表外域。
-	if err := b.Subscribe(sub, []string{"nope"}, nil, "gen-1"); err == nil {
+	if err := b.Subscribe(sub, []string{"nope"}, nil, "gen-1", ""); err == nil {
 		t.Fatal("词表外订阅域应报错")
 	}
 }
@@ -251,10 +251,10 @@ func TestBusOverrunMarksStopsAndDoesNotSilentlyDrop(t *testing.T) {
 	b := NewBus("gen-1", BusConfig{SubQueue: 2})
 	slow := b.NewSubscriber()
 	fast := b.NewSubscriber()
-	if err := b.Subscribe(slow, []string{DomainSession}, nil, "gen-1"); err != nil {
+	if err := b.Subscribe(slow, []string{DomainSession}, nil, "gen-1", ""); err != nil {
 		t.Fatal(err)
 	}
-	if err := b.Subscribe(fast, []string{DomainSession}, nil, "gen-1"); err != nil {
+	if err := b.Subscribe(fast, []string{DomainSession}, nil, "gen-1", ""); err != nil {
 		t.Fatal(err)
 	}
 	for i := 0; i < 10; i++ {
@@ -303,8 +303,10 @@ func TestBusKindVocabularyGates(t *testing.T) {
 	if _, err := b.Publish(DomainLog, KindSessionStateChanged, nil); err == nil {
 		t.Fatal("kind/域 不匹配应拒绝")
 	}
-	if _, err := b.Publish(DomainSession, KindSessionDiag, SessionDiagPayload{Host: "h", Reason: DiagGated}); err == nil {
-		t.Fatal("session.diag 本期 MUST NOT 发射")
+	// session.diag：4a §6.3 起真发射（「本期不发射」硬闸已拆——词表/载荷不动：
+	// host, reason；reason 值域 gated/budget/probe_window 只增不改）。
+	if _, err := b.Publish(DomainSession, KindSessionDiag, SessionDiagPayload{Host: "h", Reason: DiagGated}); err != nil {
+		t.Fatalf("session.diag 应可发射（闸已拆）：%v", err)
 	}
 	// term 域：kind 冻结、载荷初始集为空。
 	if _, err := b.Publish(DomainTerm, KindTermEnded, nil); err != nil {
@@ -347,7 +349,7 @@ func TestBusRingByteBudgetEvicts(t *testing.T) {
 func TestBusConcurrentUnsubscribeDomainsVsPublish(t *testing.T) {
 	b := NewBus("gen-1", BusConfig{SubQueue: 512})
 	sub := b.NewSubscriber()
-	if err := b.Subscribe(sub, []string{DomainSession, DomainLink}, nil, ""); err != nil {
+	if err := b.Subscribe(sub, []string{DomainSession, DomainLink}, nil, "", ""); err != nil {
 		t.Fatal(err)
 	}
 	var wg sync.WaitGroup
@@ -361,7 +363,7 @@ func TestBusConcurrentUnsubscribeDomainsVsPublish(t *testing.T) {
 	go func() { // 并发订阅/退订域（写 sub.domains——只在 b.mu 内）
 		defer wg.Done()
 		for i := 0; i < 200; i++ {
-			_ = b.Subscribe(sub, []string{DomainSession, DomainLink}, nil, "")
+			_ = b.Subscribe(sub, []string{DomainSession, DomainLink}, nil, "", "")
 			b.UnsubscribeDomains(sub, []string{DomainSession})
 		}
 	}()
@@ -383,10 +385,10 @@ func TestBusConcurrentUnsubscribeDomainsVsPublish(t *testing.T) {
 func TestSubscribeReplacementNotUnion(t *testing.T) {
 	b := NewBus("gen-b4", BusConfig{SubQueue: 64})
 	sub := b.NewSubscriber()
-	if err := b.Subscribe(sub, []string{DomainLink}, nil, ""); err != nil {
+	if err := b.Subscribe(sub, []string{DomainLink}, nil, "", ""); err != nil {
 		t.Fatal(err)
 	}
-	if err := b.Subscribe(sub, []string{DomainSession}, nil, ""); err != nil {
+	if err := b.Subscribe(sub, []string{DomainSession}, nil, "", ""); err != nil {
 		t.Fatal(err)
 	}
 	// 生效域集合 = {session}（matches 为包内可见的过滤真源）。

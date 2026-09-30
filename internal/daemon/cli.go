@@ -96,17 +96,22 @@ func CLI(args []string, version string) error {
 		st.Eventf("daemon: client 角色未启用（roles.json）——控制面只读骨架")
 	}
 
-	// ⑤ 控制面（§3）：server（control.sock 0600；监听失败 = 报错退出——控制面
-	// 是 daemon 的用户面，静默缺失无从排查）。
-	srv, stopControl, err := startControlPlane(version, *stateDir, sup, d, st.Eventf)
-	if err != nil {
-		cancel()
-		return err
+	// ⑤ 控制面（§5.2 control 角色）：装配期 Listen fail-fast 保留（监听失败 =
+	// 报错退出），listener/server 注入 control 角色交 supervisor 托管——瞬态
+	// accept 错误 Serve 内退避重试、永久错误角色退避重建（重新 Listen+Serve）。
+	// 未登记角色默认 on（v1 兼容，r2 新-2）：仅含 client 的既有 roles.json
+	// 升级后 control 自动在位；显式 enabled:false 才关（无控制面 = CLI 不可达）。
+	if desired.roleEnabled("control") {
+		if err := startControlPlane(ctx, version, *stateDir, sup, d, st.Eventf); err != nil {
+			cancel()
+			return err
+		}
+	} else {
+		st.Eventf("daemon: control 角色未启用（roles.json）——无控制面（CLI 将不可达）")
 	}
-	defer stopControl()
-	_ = srv // srv 生命周期由 stopControl 收口（引用保留供后续扩展）
 
-	st.Eventf("daemon: 就绪（state=%s，client=%v，version=%s）", *stateDir, desired.roleEnabled("client"), version)
+	st.Eventf("daemon: 就绪（state=%s，client=%v，control=%v，version=%s）",
+		*stateDir, desired.roleEnabled("client"), desired.roleEnabled("control"), version)
 
 	// ⑥ 等信号收工。
 	sig := make(chan os.Signal, 1)
@@ -114,6 +119,9 @@ func CLI(args []string, version string) error {
 	got := <-sig
 	st.Eventf("daemon: 收到 %v，收工", got)
 	cancel()
+	// 等角色循环退出（control：连接收尾 goodbye(shutting_down)；client：Detach
+	// 落盘）再走 defer 面（d.Close/st.Close）——顺序即「进程退出前 state 已落盘」。
+	sup.Close()
 	return nil
 }
 

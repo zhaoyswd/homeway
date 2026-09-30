@@ -63,6 +63,15 @@ const (
 	// serviceRebuildCooldown 整会话重建的限频：出口真宕机时重建后的会话同样失败，
 	// 限频把拆建节拍压到最慢一次/冷却期（而非每两级耗尽拆一次）。
 	serviceRebuildCooldown = 10 * time.Minute
+	// servicePatrolFailWindow 「巡检连败」时间窗（4a §6.1，D5——与手机 10 分钟窗
+	// 同源）：相邻两次**计入证据**的失败间隔超过它 ⇒ 计数作废重来，不跨长时间
+	// 挂起拼凑。**只在 Demand 钩子非 nil 的桌面路径生效**（nil = 旧语义，零行为
+	// 变化——手机路径不经过）。
+	servicePatrolFailWindow = 10 * time.Minute
+	// serviceNoiseWindow 巡检失败拍的本地噪声回看窗（r2 新-18：手机同款
+	// perTry+5s——探测预算 10s + 5s 尾窗，覆盖「探测期间有本地发送错误」的采样
+	// 滞后）。nil 传输实例兜底 = 无噪声（localSendErrWithin）。
+	serviceNoiseWindow = serviceProbeTimeout + 5*time.Second
 )
 
 // 服务会话状态（状态面的 state 值）。
@@ -74,6 +83,18 @@ const (
 	// stopping：Stop 在途（review A4）。此前 Stop 收工期间 state 仍是 ready，
 	// Start 会返回 0「已在跑」——与注释「旧实例未退出前 Start 一律 -1」不符。
 	svcStateStopping = "stopping"
+)
+
+// 诊因原因值（4a §6.3，D6）：session.diag 载荷 reason 的值域 = gated/budget/
+// probe_window（词表冻结、只增不改；真源在 facade/vocab.go 的 Diag*——本包与
+// facade 单向依赖〔facade → hostsession〕不 import facade，值按字面镜像，两侧
+// 测试以同值断言对齐）。三点落位：gated = 巡检证据门丢弃分支（notePatrolResult）、
+// budget = rebuildSession 的限频拦截分支、probe_window = recoverGate.merge 的
+// 「有轮在跑 → 等待共享结果」分支（recover.go）。
+const (
+	diagGated       = "gated"
+	diagBudget      = "budget"
+	diagProbeWindow = "probe_window"
 )
 
 // Session：一个服务会话实例（手机经 Default() 单例持有；daemon 经 Registry 每主机一个）。
@@ -118,6 +139,17 @@ type Session struct {
 	linkEP    string // 采纳路径端点
 	linkRttMs int64
 	linkAt    int64 // unix **毫秒**（0 = 还没探过；单位口径与隧道侧一致）
+
+	// demand 巡检拍需求钩子（4a §6.1，D5；nil = 手机/未接线——零行为变化）与
+	// diag 诊因发射钩子（§6.3，D6；nil = 不发射）。均为 NewSession 从 Options 接线。
+	demand func() (bool, string)
+	diag   func(reason string)
+	// diagActive 诊因边沿状态（D6：同因单飞——状态离开〔clearDiag〕前不发第二条）。
+	diagActive map[string]bool
+	// 桌面门状态（§6.1；仅 patrol goroutine 读写——无锁）：
+	patrolStreak      int       // 巡检连败计数（证据门推进后的值）
+	patrolLastCounted time.Time // 上次计入证据的失败时刻（时间窗基线）
+	patrolGated       bool      // 门控态边沿（进入一行 + gated 诊因单飞）
 
 	logf    Logf
 	logFile *os.File
@@ -187,9 +219,18 @@ func NewSession(cfg Config, opts Options) (*Session, error) {
 		build:         build,
 		bridgeFactory: opts.BridgeFactory,
 		observer:      opts.Observer,
+		demand:        opts.Demand,
+		diag:          opts.Diag,
 		cfg:           cfg,
 		logf:          logf,
 		logFile:       logFile,
+	}
+	if opts.Diag != nil {
+		// probe_window 诊因接缝（§6.3 ③）：recoverGate.merge 的「有轮在跑 →
+		// 等待共享结果」分支。隧道域（cshared）的 gate 零值构造 = nil 钩子零行为。
+		s.diagActive = make(map[string]bool)
+		s.recGate.onWait = func() { s.noteDiag(diagProbeWindow) }
+		s.recGate.onRoundEnd = func() { s.clearDiag(diagProbeWindow) }
 	}
 	if s.bridgeFactory != nil {
 		s.logf("启动（无 TUN 服务会话，App 进程内承载 files/term）")
@@ -497,11 +538,11 @@ func (s *Session) recoverStaleSession(sess ExitSession, why string) int {
 
 // patrol 轻量巡检：60s 一发保活探测；连续失败重绑 socket + 丢会话重握手 + 补注册；
 // **恢复阶梯连续走完仍失败 → 整会话重建**（计数在 recoverStaleSession 的 run 回调里，
-// 巡检/拨号两入口同权；patrol 只负责探测与触发）。
+// 巡检/拨号两入口同权；patrol 只负责探测与触发）。失败证据经桌面门推进
+// （notePatrolResult，§6.1——Demand 钩子 nil 时 = 旧语义，手机路径零行为变化）。
 func (s *Session) patrol() {
 	ticker := time.NewTicker(servicePatrolInterval)
 	defer ticker.Stop()
-	failStreak := 0
 	last := time.Now()
 	for {
 		select {
@@ -538,32 +579,144 @@ func (s *Session) patrol() {
 		cancel()
 		rtt := time.Since(started)
 		tr := NewTransport(sess)
+		// 需求判定每拍恰一次（§6.1，D5：桌面三源合成经钩子——结果 sticky 落 facade
+		// 的 demand 观测面〔daemon.status〕，失败拍由证据门消费同一判定；nil = 恒真，
+		// 门不生效——手机路径不经过）。
+		demand, demandWhy := true, ""
+		if s.demand != nil {
+			demand, demandWhy = s.demand()
+		}
 		if err == nil {
-			failStreak = 0
 			s.markLadderHealthy() // 巡检确认健康：耗尽计数归零
 			s.noteLink(sess, rtt)
 			if tr != nil {
 				st := tr.Status()
 				s.logf("link: via=%s ep=%s rtt=%dms（服务会话巡检）", st.Via, st.Ep, rtt.Milliseconds())
 			}
+			s.notePatrolResult(sess, nil, demand, demandWhy, now)
 			continue
 		}
-		failStreak++
-		s.logf("巡检失败（连续 %d）：%v", failStreak, err)
-		if failStreak >= serviceFailStreakReset {
+		s.notePatrolResult(sess, err, demand, demandWhy, now)
+		if s.patrolStreak >= serviceFailStreakReset {
 			s.recoverStaleSession(sess, "巡检连续失败")
-			s.logf("连续 %d 次失败：已重绑本地 socket 并补注册（下一发探测全新握手）", failStreak)
-			failStreak = 0
+			s.logf("连续 %d 次失败：已重绑本地 socket 并补注册（下一发探测全新握手）", s.patrolStreak)
+			s.patrolStreak = 0
 			// 重建若已触发（maybeRebuildIfExhausted），刷新本 tick 的会话引用，
 			// 下一 tick 起用新会话（新会话首个出站包自带注册+赛跑，通常一拍内恢复）。
 			if cur := s.curSession(); cur != sess {
 				if cur == nil {
 					return
 				}
-				sess = cur
 			}
 		}
 	}
+}
+
+// PatrolEvidenceGate 巡检拍的证据推进（纯函数，4a §6.1/§6.4——手机门
+// cmd/clientcore/demand.go patrolEvidenceGate 的**全量镜像**：五分支真值表
+// 「成功拍清零 / localNoise 清零 / 无需求清零 / 窗口作废 / 正常计数」两侧共享
+// 向量，对齐审计的桌面侧真源；窗口常量两侧同源 10 分钟）：
+//   - 探测成功 ⇒ 计数清零（counted=false——成功拍不计失败证据；F,S,F,F 停在 2，
+//     不拼出 3 连败）；
+//   - localNoise（探测窗内有采纳路径本地发送错误）或 !demand ⇒ 计数清零、不计证据；
+//   - 计数拍之间间隔超过窗口（servicePatrolFailWindow）⇒ 计数作废重来；
+//   - 正常计数拍 ⇒ +1。
+//
+// 返回推进后的计数与「本拍是否计入失败证据」。
+func PatrolEvidenceGate(localNoise, demand bool, failStreak int, lastCountedFail, now time.Time, probeErr error) (int, bool) {
+	if probeErr == nil {
+		return 0, false // 成功拍清零（「连败」的连续语义）
+	}
+	if localNoise || !demand {
+		return 0, false
+	}
+	if failStreak > 0 && !lastCountedFail.IsZero() && now.Sub(lastCountedFail) > servicePatrolFailWindow {
+		failStreak = 0
+	}
+	return failStreak + 1, true
+}
+
+// localSendErrWithin 本地噪声源接缝（r2 新-18：NewTransport(sess).
+// LocalSendErrWithin(window)；会话无传输实例时 nil 兜底 = 无噪声）。同包测试
+// 注入驱动 localNoise 分支。
+var localSendErrWithin = func(sess ExitSession, window time.Duration) bool {
+	if tr := NewTransport(sess); tr != nil {
+		return tr.LocalSendErrWithin(window)
+	}
+	return false
+}
+
+// notePatrolResult 一拍巡检结果的证据推进（桌面门接线点，§6.1）。Demand 钩子
+// nil = 旧语义（失败 +1 / 成功清零；localNoise/时间窗/需求分支都不经过——
+// 「钩子 nil = 零行为变化」的前提，手机路径不受影响）；非 nil = 门全量镜像
+// 五分支 + gated 诊因边沿（§6.3 ①：无需求/localNoise 清零均归 gated，进入
+// 拦下态发一条、期间静默、离开时清态）。
+func (s *Session) notePatrolResult(sess ExitSession, err error, demand bool, demandWhy string, now time.Time) {
+	if err == nil {
+		s.patrolStreak = 0
+		if s.patrolGated {
+			s.patrolGated = false
+			s.clearDiag(diagGated)
+			s.logf("巡检恢复：门控态结束（成功拍清零）")
+		}
+		return
+	}
+	if s.demand == nil {
+		s.patrolStreak++
+		s.logf("巡检失败（连续 %d）：%v", s.patrolStreak, err)
+		return
+	}
+	noise := localSendErrWithin(sess, serviceNoiseWindow)
+	n, counted := PatrolEvidenceGate(noise, demand, s.patrolStreak, s.patrolLastCounted, now, err)
+	s.patrolStreak = n
+	if !counted {
+		if !s.patrolGated {
+			s.patrolGated = true
+			why := demandWhy
+			if noise {
+				why = "本地发送错误（环境噪声）"
+			}
+			s.noteDiag(diagGated)
+			s.logf("巡检失败被门控拦下（%s）→ 计数清零仅记录", why)
+		}
+		return
+	}
+	if s.patrolGated {
+		s.patrolGated = false
+		s.clearDiag(diagGated)
+		s.logf("需求恢复（%s）：巡检失败重新计入证据", demandWhy)
+	}
+	s.patrolLastCounted = now
+	s.logf("巡检失败（连续 %d）：%v", n, err)
+}
+
+// noteDiag 诊因边沿发射（§6.3，D6：状态进入才发一条、每主机单飞——同因不发
+// 第二条直至状态离开〔clearDiag〕；Diag 钩子 nil = 零行为）。
+func (s *Session) noteDiag(reason string) {
+	if s.diag == nil {
+		return
+	}
+	s.mu.Lock()
+	if s.diagActive[reason] {
+		s.mu.Unlock()
+		return
+	}
+	if s.diagActive == nil {
+		s.diagActive = make(map[string]bool)
+	}
+	s.diagActive[reason] = true
+	s.mu.Unlock()
+	s.diag(reason)
+}
+
+// clearDiag 诊因状态离开（同因的下一次进入可再发）。
+func (s *Session) clearDiag(reason string) {
+	if s.diag == nil {
+		return
+	}
+	s.mu.Lock()
+	delete(s.diagActive, reason)
+	s.mu.Unlock()
 }
 
 // rebuildSession 恢复阶梯连续耗尽后的**整套重建**（真机 2026-09-22 立项）：App 冻结
@@ -580,11 +733,13 @@ func (s *Session) rebuildSession(reason string) {
 	if time.Since(s.rebuildAt) < serviceRebuildCooldown {
 		s.mu.Unlock()
 		s.logf("REBUILD 整会话重建被限频（%v 内已重建过，继续观察）：原因=%s", serviceRebuildCooldown, reason)
+		s.noteDiag(diagBudget) // §6.3 ②：budget = 限频拦截分支（边沿——实际重建时清态）
 		return
 	}
 	old, oldCache, cfg := s.sess, s.cache, s.cfg
 	s.rebuildAt = time.Now()
 	s.mu.Unlock()
+	s.clearDiag(diagBudget) // 实际重建执行 = 离开 budget 态（下一次拦截可再发）
 
 	s.logf("REBUILD 整会话重建（%s）：拆旧会话换新（force-stop 同机理，进程内完成）", reason)
 	if oldCache != nil {

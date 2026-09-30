@@ -123,7 +123,7 @@ func TestDetachEmitsSessionRemoved(t *testing.T) {
 	}
 	// 先订阅（nil 游标 = 纯在线），再入两台——added/removed 都走在线面。
 	sub := d.Bus().NewSubscriber()
-	if err := d.Bus().Subscribe(sub, []string{DomainSession}, nil, ""); err != nil {
+	if err := d.Bus().Subscribe(sub, []string{DomainSession}, nil, "", ""); err != nil {
 		t.Fatal(err)
 	}
 	attachTestHosts(t, d, dir, 22, 23)
@@ -180,7 +180,7 @@ func TestTableEventsPublishToBus(t *testing.T) {
 		t.Fatal(err)
 	}
 	sub := d.Bus().NewSubscriber()
-	if err := d.Bus().Subscribe(sub, []string{DomainSession}, nil, ""); err != nil {
+	if err := d.Bus().Subscribe(sub, []string{DomainSession}, nil, "", ""); err != nil {
 		t.Fatal(err)
 	}
 

@@ -90,6 +90,8 @@ func (b *remoteTestBackend) NotReady() bool {
 	return b.notReady
 }
 
+func (b *remoteTestBackend) DemandStatus() []control.HostDemandBrief { return nil }
+
 // ---- term 帧最小编解码（pkg/term 帧格式：[op:1][len:2 LE][payload]）----
 
 func encTermFrame(op byte, payload []byte) []byte {

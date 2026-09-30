@@ -48,4 +48,14 @@ type Options struct {
 	Observer       Observer
 	BridgeFactory  BridgeFactory
 	StrictIdentity bool
+	// Demand 巡检拍需求判定钩子（4a §6.1，D5：桌面 DemandSignal 的接入缝）。
+	// **nil = 现行为**（巡检证据门不生效——手机路径不设置，cshared 面零行为
+	// 漂移）；非 nil 时巡检失败拍按手机 patrolEvidenceGate 的全量镜像门语义计
+	// 证据（五分支真值表见 PatrolEvidenceGate）。每巡检拍恰调用一次（判定
+	// 结果 sticky 落需求观测面）。
+	Demand func() (active bool, reason string)
+	// Diag 诊因回调（4a §6.3，D6：gated/budget/probe_window 三 reason 的发射
+	// 点接缝）。nil = 不发射；非 nil 时按**边沿触发 + 每主机单飞**（同因不发
+	// 第二条直至状态离开）由状态机驱动。
+	Diag func(reason string)
 }

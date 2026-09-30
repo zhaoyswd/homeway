@@ -83,3 +83,33 @@ func NewGeneration() string {
 // Close 进程收工：先 Detach 再总线收尾（保「进程退出前 state 已落盘」）；总线
 // 当前无收尾面（进程内对象随进程消亡），即 Detach。
 func (d *Daemon) Close() { d.Detach() }
+
+// sessionHooks 每主机会话的 Demand/Diag 钩子装配（§6.2/§6.3，D5/D6）：
+//   - Demand = hostDemand.evaluate（三源合成：出站增量/拨号尝试/在场腿/订阅视图
+//     ——闭包惰性读条目会话，重建换会话自动落到新对象上）；
+//   - Diag = 发 session.diag 到进程级总线（gated/budget/probe_window——边沿与
+//     单飞在 hostsession 侧；词表/载荷同源 vocab.go）。
+func (d *Daemon) sessionHooks(rec HostRecord, e *hostEntry) (demand func() (bool, string), diag func(reason string)) {
+	var pid [32]byte
+	if b, err := hex.DecodeString(rec.ID); err == nil && len(b) == 32 {
+		copy(pid[:], b)
+	}
+	bus, dm, id := d.bus, e.dm, rec.ID
+	demand = func() (bool, string) {
+		return dm.evaluate(e.sess, bus, pid)
+	}
+	diag = func(reason string) {
+		_, _ = bus.Publish(DomainSession, KindSessionDiag, SessionDiagPayload{Host: id, Reason: reason})
+	}
+	return demand, diag
+}
+
+// DemandStatus demand 观测面（§6.2：daemon.status 的 demand 段——各主机最近一拍
+// 判定；未 attach = nil）。
+func (d *Daemon) DemandStatus() []HostDemandBrief {
+	tbl := d.tableRef()
+	if tbl == nil {
+		return nil
+	}
+	return tbl.demandBriefs()
+}

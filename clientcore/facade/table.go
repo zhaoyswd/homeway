@@ -96,10 +96,12 @@ type HostRecord struct {
 }
 
 // hostEntry 一台主机的运行时：登记记录 + 自持会话（recGate/巡检/重建限频全在
-// hostsession.Session 内——按记录天然隔离，「每记录自持」）。
+// hostsession.Session 内——按记录天然隔离，「每记录自持」）+ 需求合成状态
+// （§6.2 hostDemand：三源采样/在场腿/拨号计数，随条目生命周期）。
 type hostEntry struct {
 	rec  HostRecord
 	sess *hostsession.Session
+	dm   *hostDemand
 }
 
 // hostTable 多主机会话注册表（自 internal/daemon/registry.go 迁入；键 = peerID，
@@ -112,6 +114,7 @@ type hostTable struct {
 	logf     func(format string, args ...any)
 	eventf   func(format string, args ...any)
 	events   TableEvents
+	hooks    tableHooks
 	// carried 装载时 id 非法条目的原样携带：不启动会话、不进寻址面（Hosts/
 	// Sessions 均不含），但**落盘时随有效记录一并写回**——「条目保留」由
 	// recordsLocked 兑现（改前装载日志声称保留、下次落盘却把它写掉）。
@@ -126,7 +129,13 @@ type tableOptions struct {
 	logf   func(format string, args ...any)
 	eventf func(format string, args ...any)
 	events TableEvents
+	// hooks 每主机会话的 Demand/Diag 钩子装配缝（§6.1/§6.3：注入 hostsession
+	// Options——桌面门与诊因发射的接线点；nil = 不接线）。
+	hooks tableHooks
 }
+
+// tableHooks 每主机会话钩子装配缝的类型（tableOptions.hooks 的字段形态）。
+type tableHooks func(rec HostRecord, e *hostEntry) (demand func() (bool, string), diag func(reason string))
 
 // openTable 打开主机表（= 迁移前 OpenRegistry）：读 hosts.json（缺失 = 空表；
 // 损坏 = 备份后空表 + 事件级告警，见 loadHosts）并按表逐后端拉会话（「重启按表
@@ -143,6 +152,7 @@ func openTable(stateDir string, opts tableOptions) (*hostTable, error) {
 		logf:     opts.logf,
 		eventf:   opts.eventf,
 		events:   opts.events,
+		hooks:    opts.hooks,
 	}
 	if r.logf == nil {
 		r.logf = func(string, ...any) {}
@@ -174,7 +184,7 @@ func openTable(stateDir string, opts tableOptions) (*hostTable, error) {
 
 // startEntryLocked 为一条记录构造并启动会话（调用方持锁或单线程装配期）。
 func (r *hostTable) startEntryLocked(rec HostRecord) *hostEntry {
-	e := &hostEntry{rec: rec}
+	e := &hostEntry{rec: rec, dm: &hostDemand{}}
 	cfg := hostsession.Config{
 		Token:            rec.Token,
 		IdentityDir:      filepath.Join(r.stateDir, "identity"),  // 复用 wtransport 机制
@@ -189,7 +199,11 @@ func (r *hostTable) startEntryLocked(rec HostRecord) *hostEntry {
 			ev.HostStateChanged(hostID, from, to, reason)
 		})
 	}
-	sess, err := newSession(cfg, hostsession.Options{StrictIdentity: r.strict, Observer: obs})
+	sopts := hostsession.Options{StrictIdentity: r.strict, Observer: obs}
+	if r.hooks != nil {
+		sopts.Demand, sopts.Diag = r.hooks(rec, e) // §6：桌面门 + 诊因发射接线
+	}
+	sess, err := newSession(cfg, sopts)
 	if err != nil {
 		// 构造期唯一错误源 = 日志文件打不开：条目仍入表（记录在案、状态面 failed），
 		// 不因日志问题丢主机登记。
@@ -374,6 +388,27 @@ func (r *hostTable) Close() {
 	}
 }
 
+// demandBriefs demand 观测面快照（§6.2：daemon.status 的 demand 段数据源）。
+func (r *hostTable) demandBriefs() []HostDemandBrief {
+	r.mu.Lock()
+	out := make([]HostDemandBrief, 0, len(r.hosts))
+	type pair struct {
+		id string
+		dm *hostDemand
+	}
+	ps := make([]pair, 0, len(r.hosts))
+	for _, e := range r.hosts {
+		ps = append(ps, pair{id: e.rec.ID, dm: e.dm})
+	}
+	r.mu.Unlock()
+	for _, p := range ps {
+		if p.dm != nil {
+			out = append(out, p.dm.brief(p.id))
+		}
+	}
+	return out
+}
+
 // recordsLocked 当前表记录快照（调用方持锁）。**含 carried**：非法 id 条目随每次
 // 落盘原样写回（「条目保留」由这里兑现——carried 与有效记录**同集落盘，相对
 // 顺序不承诺**：有效记录在前但其间顺序不承诺（hosts 是 map，每次迭代序随机，
@@ -496,6 +531,7 @@ func (d *Daemon) Attach(stateDir string) error {
 		logf:   d.opts.Logf,
 		eventf: d.opts.Eventf,
 		events: &busEvents{bus: d.bus}, // §3.2 事件源直发总线
+		hooks:  d.sessionHooks,         // §6：桌面门 + 诊因发射接线（Demand/Diag → hostsession Options）
 	})
 	if err != nil {
 		// 契约②：表未挂载（d.table 保持 nil = 未 attach 态）。
@@ -618,7 +654,7 @@ func (d *Daemon) Host(id [32]byte) *Host {
 	tbl.mu.Lock()
 	defer tbl.mu.Unlock()
 	if e, ok := tbl.hosts[id]; ok {
-		return &Host{rec: e.rec, sess: e.sess}
+		return &Host{rec: e.rec, sess: e.sess, dm: e.dm}
 	}
 	return nil
 }

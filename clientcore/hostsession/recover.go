@@ -271,6 +271,12 @@ type recoverRound struct {
 type recoverGate struct {
 	mu  sync.Mutex
 	cur *recoverRound // 非 nil = 有轮在执行
+	// 诊因接缝（4a §6.3，D6：merge 的「有轮在跑 → 等待共享结果」分支 =
+	// probe_window；onRoundEnd = 轮结束、该态离开）。nil = 零行为——隧道域
+	//（cshared）与未接线会话的零值 gate 不经过。单飞：同因每轮至多一条
+	//（diagActive 边沿在 Session 侧）。
+	onWait     func()
+	onRoundEnd func()
 }
 
 // RecoverGate 是 recoverGate 的导出别名（cshared tunRun 字段类型经壳引用同一类型）。
@@ -282,6 +288,9 @@ func (g *recoverGate) merge(from recoverLevel, cause string, run func(from recov
 	if g.cur != nil {
 		r := g.cur
 		g.mu.Unlock()
+		if g.onWait != nil {
+			g.onWait() // §6.3 ③：probe_window（等待在途轮的共享结果；锁外调用）
+		}
 		<-r.done
 		return r.rc
 	}
@@ -296,6 +305,9 @@ func (g *recoverGate) merge(from recoverLevel, cause string, run func(from recov
 	r.rc = rc
 	close(r.done)
 	g.mu.Unlock()
+	if g.onRoundEnd != nil {
+		g.onRoundEnd() // 轮结束：probe_window 态离开（锁外调用）
+	}
 	return rc
 }
 
