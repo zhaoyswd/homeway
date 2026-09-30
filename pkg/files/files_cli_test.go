@@ -820,7 +820,9 @@ func TestFilesCLITokenBucketPacing(t *testing.T) {
 		if chunk > n {
 			chunk = n
 		}
-		tb.Await(chunk)
+		if err := tb.Await(context.Background(), chunk); err != nil {
+			t.Fatalf("无取消 ctx 下 Await 不应报错：%v", err)
+		}
 		n -= chunk
 	}
 	el := time.Since(start)
@@ -843,15 +845,75 @@ func TestFilesCLITokenBucketNoInitialBurst(t *testing.T) {
 	const rate = 2 << 20 // DefaultRateLimit
 	tb := newTokenBucket(rate)
 	start := time.Now()
-	tb.Await(16 * 1024) // 第一帧（16KiB = 协议帧宽）
+	if err := tb.Await(context.Background(), 16*1024); err != nil {
+		t.Fatalf("无取消 ctx 下 Await 不应报错：%v", err)
+	} // 第一帧（16KiB = 协议帧宽）
 	el := time.Since(start)
 	if el < 4*time.Millisecond {
 		t.Fatalf("首帧直通 = 满桶突刺复燃（应在 ~16KiB/rate≈8ms 处等待，实际 %v）", el)
 	}
 	// 令牌已花掉：紧接着的第二帧还要再等（连续两帧不应比两帧配额时间快）。
-	tb.Await(16 * 1024)
+	if err := tb.Await(context.Background(), 16*1024); err != nil {
+		t.Fatalf("无取消 ctx 下 Await 不应报错：%v", err)
+	}
 	if time.Since(start) < 12*time.Millisecond {
 		t.Fatalf("第二帧仍在吃初始配额——桶初始令牌非零（%v 内两帧直通）", time.Since(start))
+	}
+}
+
+// 停顿后补充上限 = burstCap（exec-r1 F2 用例）：>0.3s 停顿（本地盘/慢 stderr/调度
+// 都会造成）后，桶内可立即灌入的增量必须 ≤ min(rate, 256KiB)——旧口径「上限 =
+// rate」会在停顿后重新攒出 >640KiB 窗口的突刺（v0.12.1 修掉的失效模式的复活路径）。
+// 判据走桶内状态（确定性，不依赖时钟精度）：把 last 拨回 1s 前（Await 只在调用时
+// 按 elapsed 补充），触发一次补充后断言余额不超上限。
+func TestFilesCLITokenBucketBurstCapAfterPause(t *testing.T) {
+	// 常量关系：burstCap 必须压在守护进程窗口 640KiB 的一半以下。
+	if tokenBurstCap >= 320<<10 {
+		t.Fatalf("tokenBurstCap=%d 必须小于每流窗口 640KiB 的一半", tokenBurstCap)
+	}
+	for _, rate := range []int64{4 << 20, 128 << 10} { // rate > burstCap 与 rate < burstCap 两支
+		tb := newTokenBucket(rate).(*tokenBucket)
+		tb.mu.Lock()
+		tb.last = time.Now().Add(-time.Second) // 模拟 1s 停顿（>0.3s 即足以击穿窗口）
+		tb.mu.Unlock()
+		if err := tb.Await(context.Background(), 1); err != nil {
+			t.Fatalf("无取消 ctx 下 Await 不应报错：%v", err)
+		}
+		tb.mu.Lock()
+		tokens := tb.tokens
+		tb.mu.Unlock()
+		want := rate
+		if want > tokenBurstCap {
+			want = tokenBurstCap
+		}
+		if tokens > float64(want) {
+			t.Fatalf("rate=%d：停顿 1s 后桶余额 %v 超过补充上限 %d——停顿后突刺未削峰（可立即灌入增量超 640KiB 窗口余量）",
+				rate, tokens, want)
+		}
+	}
+}
+
+// Await 吃 ctx（exec-r1 F5 用例）：小速率下单帧等待可达秒级（16KiB @1024B/s =
+// 16s），ctx 取消必须即时打断等待并返回 ctx.Err()——退出时间有界，不被拖到
+// 「一帧/速率」烧尽。
+func TestFilesCLITokenBucketAwaitCancelBounded(t *testing.T) {
+	tb := newTokenBucket(1024) // --rate-limit 1024（合法值域下界附近）
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() {
+		time.Sleep(150 * time.Millisecond)
+		cancel()
+	}()
+	start := time.Now()
+	err := tb.Await(ctx, 16*1024) // 需 ~16s 的等待——取消应 ~150ms 内打断
+	el := time.Since(start)
+	if err == nil {
+		t.Fatal("取消后 Await 必须返回错误（ctx.Err）")
+	}
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("应返回 ctx 的取消错误，得到 %v", err)
+	}
+	if el > 3*time.Second {
+		t.Fatalf("取消后退出被拖到 %v——sleep 不可打断（F5 未生效，应 ~150ms）", el)
 	}
 }
 

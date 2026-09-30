@@ -623,12 +623,13 @@ type termClient struct {
 // stateForLeg 已随状态单轨化退役（term-remote 3.3，D6）：surface 与 raw 腿的
 // STATE/ATTACHED state 字节统一 stateV2 枚举，不再按腿类折价。
 
+// frame 握手/一锤子帧的写路径（GREETING/LIST/KILL/CREATE/HELLO 应答等——写者
+// goroutine 尚未启动，由 serving goroutine 直发）。exec-r1 F7 起统一走 writeFrameOnce：
+// 部分写（deadline 过期时 net.Conn.Write 可返回 n>0+timeout）会留断尾记录，后续帧
+// （含 HELLO 成腿后写者 goroutine 的帧——同一 termClient 同一把 wmu 天然串行）先续
+// 完旧尾再写新帧，消除「半帧之后拼新帧」的帧界失步；调用方语义不动（错误照旧上抛）。
 func (c *termClient) frame(op byte, payload []byte) error {
-	c.wmu.Lock()
-	defer c.wmu.Unlock()
-	_ = c.conn.SetWriteDeadline(time.Now().Add(termWriteTimeout))
-	_, err := c.conn.Write(encodeTermFrame(op, payload))
-	return err
+	return c.writeFrameOnce(op, payload, termWriteTimeout)
 }
 
 func (c *termClient) close() { _ = c.conn.Close() }

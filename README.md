@@ -159,8 +159,9 @@ f610f3f 起、**自 v0.10.0 起已生效**——v0.9.0 及更早出口重启后 
 （get↔download / put↔write；无 delete/rename——协议没有不发明）：
 
 ```bash
-homeway files list [path] [--json]   # 列目录（--json = 单行 JSON 数组：name/isDir/size/mtimeMs）
-homeway files stat <path> [--json]   # 单条目信息（--json = 单行 JSON）
+homeway files list [path] [--json]   # 列目录（--json = 单行 JSON 数组：name/isDir/size/mtimeMs
+                                     #   + mode〔权限位，八进制，诊断用〕）
+homeway files stat <path> [--json]   # 单条目信息（--json = 单行 JSON，键同 list）
 homeway files mkdir <path>           # 新建目录（已存在报 already_exists）
 homeway files read <path> [--max N]  # 文本预览（默认 512KiB=协议文本默认；截断提示走 stderr；
                                      #   --max 超协议内联上限 16MiB 时报错而非静默截断）

@@ -212,9 +212,10 @@ func (c *Client) Upload(ctx context.Context, path string, r io.Reader, size int6
 // UploadLimiter 发送端限速缝（files-cli 1.4：CLI 注入令牌桶；nil = 不限）。上传
 // 读发循环在每帧发送前 Await——「上行速率不超过标定安全值」的发送端速率义务
 // （协议无 ack/credit、守护进程每流缓冲满即收流——无回压信号下的盲节流是发送端
-// 唯一可用手段）。
+// 唯一可用手段）。Await 吃 ctx（exec-r1 F5）：取消即时打断等待，返回非 nil 由
+// 上传循环直接收流（小速率下单帧等待可达秒级，Ctrl-C 不被拖到等待烧尽）。
 type UploadLimiter interface {
-	Await(n int)
+	Await(ctx context.Context, n int) error
 }
 
 func (c *Client) upload(ctx context.Context, path string, r io.Reader, size int64, onProgress func(int64), rate UploadLimiter) (int64, error) {
@@ -235,7 +236,9 @@ func (c *Client) upload(ctx context.Context, path string, r io.Reader, size int6
 		n, rerr := r.Read(buf)
 		if n > 0 {
 			if rate != nil {
-				rate.Await(n)
+				if aerr := rate.Await(ctx, n); aerr != nil {
+					return total, Errw("canceled", aerr, "已取消")
+				}
 			}
 			if err := WriteFrame(s.conn, buf[:n]); err != nil {
 				return total, Errw("op_failed", err, "上传中断：%v", err)

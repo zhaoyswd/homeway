@@ -113,9 +113,10 @@ func filesUsage(w io.Writer) {
 
 用法：
   homeway files list [path] [--json] [--host <ref>] [--state <dir>] [--timeout <T>]
-        列目录（--json = 单行 JSON 数组：name/isDir/size/mtimeMs，可作脚本契约）
+        列目录（--json = 单行 JSON 数组：name/isDir/size/mtimeMs + mode〔权限位，
+        八进制，诊断用〕，可作脚本契约）
   homeway files stat <path> [--json] [--host <ref>] [--state <dir>] [--timeout <T>]
-        单条目信息（--json = 单行 JSON）
+        单条目信息（--json = 单行 JSON，键同 list）
   homeway files mkdir <path> [--host <ref>] [--state <dir>] [--timeout <T>]
         新建目录（已存在报 already_exists）
   homeway files read <path> [--max N] [--host <ref>] …
@@ -940,49 +941,87 @@ func resolveRateLimit(flag int64) int64 {
 	return flag
 }
 
+// tokenBurstCap 桶的**停顿后补充上限**（exec-r1 F2，2026-09-30）：独立于 rate 的
+// 常量，取守护进程每流窗口 640KiB（40 帧×16KiB）的一半以下。旧口径「补充上限 =
+// rate（1 秒的量）」只对空桶起步成立——稳态背靠背发送 tokens≈0（每帧恰花光），但
+// 读发循环一旦出现 >0.3s 停顿（本地盘/慢 stderr/调度），桶会按 rate 补满，随后一次
+// 性灌出 >640KiB 突刺——正是 v0.12.1 空桶起步修掉的失效模式的复活路径。压到窗口
+// 一半以下后「任意时刻可立即灌入的增量 ≤ burstCap」恒真，稳态吞吐不受影响（稳态
+// tokens≈0，只在停顿后削峰）。
+const tokenBurstCap = 256 << 10 // 256KiB < 640KiB/2
+
 // newTokenBucket 构造令牌桶。rate ≤ 0 = 不限（返回 nil 接口值等价处理——await 直通）。
 // **初始令牌 = 0（纯节拍起步，2026-09-30 v0.12.1 修正）**：首版「桶满起步
 // （burst = rate）」在慢腿上自毁——默认 2MiB/s 的首秒 2MiB 全速突刺远超守护进程
 // 每流 640KiB 窗口 ⇒ WAN 腿 0.04s 内被收流（真机实测：100MiB put 对阿里云腿 gone、
 // 桶 512KiB 同链路反而 63s 全程通过）。盲节流的安全条件 = 任意时刻的在途增量不超
 // 窗口余量，突刺与匀速同受此约束；空桶起步的第一帧只多等 16KiB/rate（默认 8ms），
-// 吞吐代价可忽略。
+// 吞吐代价可忽略。补充上限 = min(rate, tokenBurstCap)（见 tokenBurstCap 注释）。
 func newTokenBucket(rate int64) UploadLimiter {
 	if rate <= 0 {
 		return nil
 	}
-	return &tokenBucket{rate: rate, tokens: 0, last: time.Now()}
+	burst := int64(tokenBurstCap)
+	if rate < burst {
+		burst = rate // 小速率下补充上限不超过 rate 本身（否则节拍失真）
+	}
+	return &tokenBucket{rate: rate, burst: burst, tokens: 0, last: time.Now()}
 }
 
 // tokenBucket 发送端速率义务的载体：**无 ack/credit 下的盲节流**（协议 write 方向
 // 无回压信号；守护进程每流缓冲 = upC 8 + 工位 32 = 40 帧（16KiB 帧）= 640KiB，越界
 // **即时**收流〔finish(gone)——非停滞上限超时〕。安全条件 = 发送速率 ≤ 隧道+远端
 // 写入的排空速率；固定默认值必须取最慢预期腿之下（快腿绿不能当安全速率证据）。
-// 桶容量 = 1 秒的量（稳态补充上限），但**起步恒为空桶**（见 newTokenBucket 注释）。
+// **补充上限 = burst（= min(rate, 256KiB)，窗口一半以下；exec-r1 F2），起步恒为
+// 空桶**（见 newTokenBucket/tokenBurstCap 注释）。
 type tokenBucket struct {
 	rate   int64 // bytes/s
+	burst  int64 // 停顿后补充上限（tokens 高水位；≤ min(rate, tokenBurstCap)）
 	mu     sync.Mutex
 	tokens float64
 	last   time.Time
 }
 
 // Await 为 n 字节的发送配额等待（每帧发送前调用；sleep 粒度 = 攒够本帧的差额）。
-func (b *tokenBucket) Await(n int) {
+// ctx 取消即时打断等待并返回 ctx.Err()（exec-r1 F5，2026-09-30）：time.Sleep 不可
+// 打断，小速率下单帧等待可达秒级（--rate-limit 1024 下 16KiB 帧 = 16s），Ctrl-C
+// 退出不应被拖到单帧等待烧尽——由上传循环收流取消。
+func (b *tokenBucket) Await(ctx context.Context, n int) error {
 	for {
 		b.mu.Lock()
 		now := time.Now()
 		b.tokens += now.Sub(b.last).Seconds() * float64(b.rate)
-		if b.tokens > float64(b.rate) {
-			b.tokens = float64(b.rate)
+		if b.tokens > float64(b.burst) {
+			b.tokens = float64(b.burst)
 		}
 		b.last = now
 		if float64(n) <= b.tokens {
 			b.tokens -= float64(n)
 			b.mu.Unlock()
-			return
+			return nil
 		}
 		need := (float64(n) - b.tokens) / float64(b.rate)
 		b.mu.Unlock()
-		time.Sleep(time.Duration(need * float64(time.Second)))
+		if err := sleepCtx(ctx, time.Duration(need*float64(time.Second))); err != nil {
+			return err
+		}
+	}
+}
+
+// sleepCtx 可被 ctx 取消打断的 sleep（F5）；d ≤ 0 时只查一次 ctx。
+func sleepCtx(ctx context.Context, d time.Duration) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if d <= 0 {
+		return nil
+	}
+	t := time.NewTimer(d)
+	defer t.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-t.C:
+		return nil
 	}
 }

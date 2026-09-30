@@ -248,6 +248,11 @@ func (sc *streamConn) Write(p []byte) (int, error) {
 		if errors.Is(err, control.ErrStreamEnded) {
 			return 0, &streamend.Error{Reason: sc.st.EndReason()}
 		}
+		// socket 级错误翻译成 conn 态前先留一行原始错误（exec-r1 F6）：streamend.Error
+		// 形状被 r2 新-5 冻结（不带 cause 字段）、CLI 文案不变，但 broken pipe/连接重置
+		// 之类的根因既不进 CLI 输出也不进日志就彻底丢了——stderr 记一行保排障线索
+		//（本适配器跑在 CLI 进程内，stderr 即用户终端；每流至多死一次，无刷屏面）。
+		fmt.Fprintf(os.Stderr, "homeway: 远程流写失败（原始错误，供排障）：%v\n", err)
 		return 0, &streamend.Error{Reason: streamend.Conn} // socket 级错误 = 连接级断开态
 	}
 	return len(p), nil
