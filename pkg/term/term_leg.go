@@ -14,6 +14,7 @@
 package term
 
 import (
+	"bytes"
 	"sync"
 	"time"
 
@@ -224,11 +225,45 @@ func (s *termSession) runLegWriter(c *termClient) {
 
 // writeFrameOnce 写一帧（带写超时——raw 腿传会话级 writeTimeout，surface 腿沿用全局
 // termWriteTimeout，既有语义不动）。只在写者 goroutine 里调用。
+//
+// 进度感知续写（2026-09-30，linux CI「意外帧 op 0x6e」根因修复）：net.Conn.Write 在
+// deadline 过期时可返回 **n>0 + timeout**——帧的前半已进内核；调用方停滞语义下重试
+// 的是「同一帧」，整帧重发会把已写部分重复一遍 ⇒ 对端帧界失步。断尾挂在 c.torn 上
+// **跨调用续完**：本帧重试（编码与断尾原帧逐字节相等——续完即整帧已交付）与换帧
+// （控制帧超时后写者继续处理后续帧——先续旧尾、再写新帧，wire 上没有「跳过半帧」
+// 的选项）两种来路都归一到先续尾。调用方语义不动：超时（含部分进展后的那次返回）
+// 照旧上抛给停滞判定/退避。
 func (c *termClient) writeFrameOnce(op byte, payload []byte, timeout time.Duration) error {
 	c.wmu.Lock()
 	defer c.wmu.Unlock()
+	enc := encodeTermFrame(op, payload)
+	sameFrame := len(c.torn) > 0 && bytes.Equal(c.tornWhole, enc)
+	for len(c.torn) > 0 {
+		_ = c.conn.SetWriteDeadline(time.Now().Add(timeout))
+		n, err := c.conn.Write(c.torn)
+		c.torn = c.torn[n:]
+		if len(c.torn) == 0 {
+			c.tornWhole = nil
+		}
+		if err == nil {
+			continue
+		}
+		if isWriteTimeout(err) && n > 0 {
+			continue // 部分进展：立刻续写剩余（deadline 已续期）
+		}
+		return err // 零进展超时（交调用方退避）/硬错误：断尾留在 torn，下次调用续写
+	}
+	if sameFrame {
+		return nil // 调用方重试的就是断尾所属帧：续完 = 整帧已交付
+	}
 	_ = c.conn.SetWriteDeadline(time.Now().Add(timeout))
-	_, err := c.conn.Write(encodeTermFrame(op, payload))
+	n, err := c.conn.Write(enc)
+	if err == nil {
+		return nil
+	}
+	if n < len(enc) {
+		c.torn, c.tornWhole = enc[n:], enc // 断尾（零进展时 = 整帧，下次仍从这里续）
+	}
 	return err
 }
 
@@ -347,7 +382,7 @@ func (s *termSession) runRawWriter(c *termClient) {
 			if !s.drainRingBeforeEnd(c) {
 				return
 			}
-			_ = s.rawWriteFrame(c, ended.op, ended.payload)
+			s.sendEndedStalled(c, ended)
 			_ = c.conn.Close()
 			return
 		}
@@ -376,7 +411,7 @@ func (s *termSession) runRawWriter(c *termClient) {
 				if !s.drainRingBeforeEnd(c) {
 					return
 				}
-				_ = s.rawWriteFrame(c, ended.op, ended.payload)
+				s.sendEndedStalled(c, ended)
 			}
 			_ = c.conn.Close()
 			return
@@ -474,6 +509,30 @@ func (s *termSession) drainRingBeforeEnd(c *termClient) bool {
 			continue
 		}
 		return false // 硬错误：对端已不可达，强发 ENDED 无意义
+	}
+}
+
+// sendEndedStalled ENDED 帧的停滞感知续投（2026-09-30，linux CI 实测修复）：语义与
+// drainRingBeforeEnd 同款——写超时 = 退避重试、连续停滞超 rawStallLimit 断腿、硬错误
+// 放弃。修前形态：ENDED 写错误被 `_ =` 吞掉后立即 Close——收尾恰逢对端短暂不读
+// （测试注入 300ms 写超时的窗口里必现）时客户端收完全部数据却拿不到 ENDED
+// （TestRawEndedAfterRingDrain「unexpected EOF：ENDED 未送达」一轮红）。「ENDED 先于
+// close」是任务 4.1 的硬要求，吞错违背它。
+func (s *termSession) sendEndedStalled(c *termClient, ended *writeItem) {
+	for {
+		err := c.writeFrameOnce(ended.op, ended.payload, s.writeTimeout)
+		if err == nil {
+			return
+		}
+		if isWriteTimeout(err) {
+			if c.out.noteStall(true, s.rawStallLimit) {
+				s.breakLeg(c, "stalled_over_limit")
+				return
+			}
+			time.Sleep(s.stallRetryBackoff())
+			continue
+		}
+		return // 硬错误：对端已不可达
 	}
 }
 

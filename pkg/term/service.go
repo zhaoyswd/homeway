@@ -582,6 +582,10 @@ type termClient struct {
 	conn net.Conn
 	wmu  sync.Mutex // 单帧不撕裂（写者唯一后基本只剩防御意义；一锤子连接 LIST/KILL 仍直用）
 	off  int64      // raw 腿的字节环偏移（**只由本腿写者推进**，D10-2）
+	// torn/tornWhole 是写超时留下的断尾（帧前半已进内核；writeFrameOnce 跨调用
+	// 续完——2026-09-30 进度感知续写，见 term_leg.go）。只写者 goroutine 读写、
+	// wmu 内；tornWhole 供「调用方重试的是否同一帧」的逐字节判等。
+	torn, tornWhole []byte
 	// out 是本腿的出站队列与写者唤醒（见 term_leg.go）。
 	out legOut
 	// handshake 是 raw 腿的握手计划（写者执行；surface 腿为 nil）。
