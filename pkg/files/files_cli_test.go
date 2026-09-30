@@ -804,8 +804,9 @@ func TestFilesCLIRateLimitParse(t *testing.T) {
 	}
 }
 
-// 令牌桶节拍与配额：rate=1MiB/s、桶容量 = 1s 的量——首 MiB 起步直放、其后按速率
-// 匀速；3MiB 总量至少耗时 ~2s（无回压下的盲节流语义）。
+// 令牌桶节拍与配额：rate=1MiB/s、**空桶起步（纯节拍）**——3MiB 总量按速率匀速至少
+// ~3s（无回压下的盲节流语义；v0.12.1 起 burst 语义废除——满桶突刺会击穿守护进程
+// 640KiB 每流窗口，见 newTokenBucket 注释）。
 func TestFilesCLITokenBucketPacing(t *testing.T) {
 	if testing.Short() {
 		t.Skip("节拍用例需要真实时间")
@@ -823,12 +824,34 @@ func TestFilesCLITokenBucketPacing(t *testing.T) {
 		n -= chunk
 	}
 	el := time.Since(start)
-	// 首秒桶全放（1MiB 直通）+ 余 2MiB 按速率 → 下界 1.9s（留调度余量）、上界 8s。
-	if el < 1900*time.Millisecond {
+	// 空桶起步：3MiB @1MiB/s ≈ 3s；下界 2.9s（留调度余量）、上界 8s。
+	if el < 2900*time.Millisecond {
 		t.Fatalf("限速失守（3MiB @1MiB/s 仅 %v）——盲节流义务", el)
 	}
 	if el > 8*time.Second {
 		t.Fatalf("节拍过慢（%v）——桶补充逻辑异常", el)
+	}
+}
+
+// 空桶起步回归（v0.12.1 修正的判据面）：构造即取配额**不得**直通——首帧也要等
+// 攒够令牌。首版满桶起步（tokens=rate）在慢腿上 0.04s 内突刺 2MiB 击穿 640KiB
+// 窗口被收流（真机实测形态），空桶起步把首帧延迟压到 16KiB/rate（默认 8ms）。
+func TestFilesCLITokenBucketNoInitialBurst(t *testing.T) {
+	if testing.Short() {
+		t.Skip("节拍用例需要真实时间")
+	}
+	const rate = 2 << 20 // DefaultRateLimit
+	tb := newTokenBucket(rate)
+	start := time.Now()
+	tb.Await(16 * 1024) // 第一帧（16KiB = 协议帧宽）
+	el := time.Since(start)
+	if el < 4*time.Millisecond {
+		t.Fatalf("首帧直通 = 满桶突刺复燃（应在 ~16KiB/rate≈8ms 处等待，实际 %v）", el)
+	}
+	// 令牌已花掉：紧接着的第二帧还要再等（连续两帧不应比两帧配额时间快）。
+	tb.Await(16 * 1024)
+	if time.Since(start) < 12*time.Millisecond {
+		t.Fatalf("第二帧仍在吃初始配额——桶初始令牌非零（%v 内两帧直通）", time.Since(start))
 	}
 }
 
