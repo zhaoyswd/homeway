@@ -170,7 +170,7 @@ type run struct {
 	abort     func()      // 轮内 ctx 的取消（Cancel/看门狗同步打断在途拨号；Start 装配）
 
 	connMu sync.Mutex
-	conns  map[net.Conn]struct{}
+	conns  []*connEntry
 
 	mu          sync.Mutex
 	liveBytes   int64
@@ -180,31 +180,45 @@ type run struct {
 	usageUp     int64
 }
 
-func newRun(gen uint64) *run { return &run{gen: gen, conns: map[net.Conn]struct{}{}} }
+// connEntry 当轮连接表条目：挂表键 = 指针，**不假设 net.Conn 可比**——daemon runner
+// 的注入缝（facade Host.DialPort）回的是 countedConn 值类型结构体（含 func 字段，
+// 不可哈希不可 ==），以 conn 本身做 map 键或相等比较会在「真拨通」路径立即 panic
+// （2026-10-01 v0.13.1 修：v0.13.0 发版窗口内 daemon speedtest 首拨即崩——单测/桩
+// 的 conn 全是指针型故漏网；手机路径 UDS conn 为指针型不受影响）。
+type connEntry struct{ c net.Conn }
 
-func (r *run) track(c net.Conn) {
+func newRun(gen uint64) *run { return &run{gen: gen} }
+
+func (r *run) track(c net.Conn) *connEntry {
+	e := &connEntry{c: c}
 	r.connMu.Lock()
-	r.conns[c] = struct{}{}
+	r.conns = append(r.conns, e)
 	r.connMu.Unlock()
+	return e
 }
 
-func (r *run) untrack(c net.Conn) {
+func (r *run) untrack(e *connEntry) {
+	if e == nil {
+		return
+	}
 	r.connMu.Lock()
-	delete(r.conns, c)
+	for i, x := range r.conns {
+		if x == e {
+			r.conns = append(r.conns[:i], r.conns[i+1:]...)
+			break
+		}
+	}
 	r.connMu.Unlock()
 }
 
 // closeAll 关掉当轮全部连接（先摘表出锁再关——锁内不做 IO）。
 func (r *run) closeAll() {
 	r.connMu.Lock()
-	cs := make([]net.Conn, 0, len(r.conns))
-	for c := range r.conns {
-		cs = append(cs, c)
-	}
-	r.conns = map[net.Conn]struct{}{}
+	cs := r.conns
+	r.conns = nil
 	r.connMu.Unlock()
-	for _, c := range cs {
-		_ = c.Close()
+	for _, e := range cs {
+		_ = e.c.Close()
 	}
 }
 
@@ -421,6 +435,7 @@ func (e *Engine) runRound(ctx context.Context, dial DialFunc, r *run, p Params) 
 	// 各流窗口彼此对齐、也与下面的 t0 对齐（design D3）。
 	type dialResult struct {
 		conn net.Conn
+		ent  *connEntry // track 句柄（untrack 用——conn 本身不可比较，见 connEntry 注释）
 		br   *bufio.Reader
 	}
 	downRaw := make([]dialResult, 0, p.Streams)
@@ -430,8 +445,8 @@ func (e *Engine) runRound(ctx context.Context, dial DialFunc, r *run, p Params) 
 			r.closeAll()
 			return e.dialFailure(r, err)
 		}
-		r.track(conn)
-		downRaw = append(downRaw, dialResult{conn, bufio.NewReader(conn)})
+		ent := r.track(conn)
+		downRaw = append(downRaw, dialResult{conn, ent, bufio.NewReader(conn)})
 	}
 	for _, d := range downRaw {
 		if ae := e.sendRequest(r, d.conn, d.br, RoleRecv, p.Warmup, p.Down); ae != nil {
@@ -457,7 +472,7 @@ func (e *Engine) runRound(ctx context.Context, dial DialFunc, r *run, p Params) 
 		wg.Add(1)
 		go func(i int, d dialResult) {
 			defer wg.Done()
-			defer r.untrack(d.conn)
+			defer r.untrack(d.ent)
 			defer func() { _ = d.conn.Close() }()
 			got, used, sb, sw, ae := e.readDownStream(r, d.br)
 			downGot[i] = got
@@ -495,8 +510,8 @@ func (e *Engine) runRound(ctx context.Context, dial DialFunc, r *run, p Params) 
 			r.closeAll()
 			return e.dialFailure(r, err)
 		}
-		r.track(conn)
-		upStreams[i] = dialResult{conn, bufio.NewReader(conn)}
+		ent := r.track(conn)
+		upStreams[i] = dialResult{conn, ent, bufio.NewReader(conn)}
 	}
 	r.setWindow(time.Now().Add(p.Warmup+phaseSlack), p.Up)
 	e.setPhase(PhaseUp, "")
@@ -505,7 +520,7 @@ func (e *Engine) runRound(ctx context.Context, dial DialFunc, r *run, p Params) 
 		upWg.Add(1)
 		go func(i int) {
 			defer upWg.Done()
-			defer r.untrack(upStreams[i].conn)
+			defer r.untrack(upStreams[i].ent)
 			defer func() { _ = upStreams[i].conn.Close() }()
 			got, used, wallMs, ae := e.runUpStream(r, upStreams[i].conn, upStreams[i].br, p.Warmup, p.Up)
 			upResults[i] = got

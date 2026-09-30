@@ -7,6 +7,7 @@ import (
 	"context"
 	"fmt"
 	"net"
+	"reflect"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -335,5 +336,37 @@ func TestEngineSnapshotShape(t *testing.T) {
 	}
 	if res := <-done; !res.OK {
 		t.Fatalf("成功终态：%+v", res)
+	}
+}
+
+// uncomparableConn 复刻 facade.countedConn 的失效形态：**值类型**结构体 + func 字段
+// ⇒ 动态类型不可哈希不可 ==。v0.13.0 的 run.conns 以 net.Conn 做 map 键，daemon
+// runner 经 Host.DialPort 拿到这种 conn、首次真拨通即 panic（发版窗口实测）；本用例
+// 在修复前的形态下跑全轮会直接炸（hash of unhashable type）。
+type uncomparableConn struct {
+	net.Conn
+	onClose func()
+}
+
+func TestEngineUncomparableConn(t *testing.T) {
+	addr := startEngineServer(t, Limits{ConnTimeout: 20 * time.Second})
+	e := NewEngine(func(format string, args ...any) { t.Logf(format, args...) })
+	// 先证伪测试自身：值结构体确实不可比较（否则用例退化成普通全轮）。
+	if reflect.TypeOf(uncomparableConn{}).Comparable() {
+		t.Fatal("uncomparableConn 形态漂移（应保持含 func 字段的值结构体——不可比较）")
+	}
+
+	dial := func(ctx context.Context) (net.Conn, error) {
+		c, err := tcpDial(addr)(ctx)
+		if err != nil {
+			return nil, err
+		}
+		return uncomparableConn{Conn: c, onClose: func() { _ = c.Close() }}, nil
+	}
+	res := e.Start(context.Background(), dial, Params{
+		Down: 300 * time.Millisecond, Up: 300 * time.Millisecond, Warmup: 100 * time.Millisecond, Streams: 2,
+	})
+	if !res.OK {
+		t.Fatalf("不可比较 conn 的全轮应成功（修复前 = panic hash of unhashable type）：reason=%s msg=%s", res.Reason, res.Msg)
 	}
 }
