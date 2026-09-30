@@ -336,21 +336,31 @@ func (s *Server) resolveTargets(conn net.Conn, atyp byte, host string) ([]netip.
 
 // dialAny 按序拨候选（多 A 回退，r2 新-1）：首个拨不通换下一个，全部不通才回错误。
 // L7/exec-r1：总预算 = 一份 DialBudget（N 候选共享——最坏不再 N×15s 悬挂）且挂在
-// 服务端生命周期 ctx 上（Server.Close / socks off 即断）；预算耗尽/服务已关不再试
-// 下一候选。
+// 服务端生命周期 ctx 上（Server.Close / socks off 即断）。
+// N2/exec-r2：每候选子预算 = min(DialBudget, 剩余总预算按剩余候选数均分)——单候选
+// 超时（黑洞目标）只烧掉自己的份额，总预算有余仍回退下一候选（超时形态恢复回退
+// 能力、总上界不破）；总预算耗尽/服务已关不再试下一候选。
 func (s *Server) dialAny(addrs []netip.Addr, port uint16) (net.Conn, error) {
-	ctx, cancel := context.WithTimeout(s.base, s.cfg.DialBudget)
+	total, cancel := context.WithTimeout(s.base, s.cfg.DialBudget)
 	defer cancel()
 	var lastErr error
-	for _, ip := range addrs {
-		upstream, err := s.cfg.Dialer(ctx, netip.AddrPortFrom(ip, port))
+	for i, ip := range addrs {
+		if total.Err() != nil {
+			break // 总预算耗尽 / 服务端已关
+		}
+		deadline, _ := total.Deadline()
+		remain := time.Until(deadline)
+		if remain <= 0 {
+			break
+		}
+		share := remain / time.Duration(len(addrs)-i) // 剩余候选均分（末候选 = 全部剩余）
+		subCtx, subCancel := context.WithTimeout(total, min(s.cfg.DialBudget, share))
+		upstream, err := s.cfg.Dialer(subCtx, netip.AddrPortFrom(ip, port))
+		subCancel()
 		if err == nil {
 			return upstream, nil
 		}
 		lastErr = err
-		if ctx.Err() != nil {
-			break // 总预算耗尽 / 服务端已关
-		}
 		s.cfg.Logf("socks: 候选 %s 拨不通，换下一个：%v", ip, err)
 	}
 	if lastErr == nil {

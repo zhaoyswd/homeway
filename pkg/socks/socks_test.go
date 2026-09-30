@@ -371,6 +371,44 @@ func TestMultiAFallback(t *testing.T) {
 	}
 }
 
+// TestMultiATimeoutFallback 首候选黑洞超时仍回退第二候选（N2/exec-r2）：单份总预算
+// 下每候选吃自己的子预算——首候选超时只烧份额、剩余预算供后续候选（多 A 回退在
+// 超时形态恢复；旧共享预算形态首候选吃满总预算即 break，第二候选不再尝试）。
+func TestMultiATimeoutFallback(t *testing.T) {
+	up := echoUpstream(t)
+	goodAP := netip.MustParseAddrPort(up)
+	good, goodPort := goodAP.Addr(), goodAP.Port()
+	bad1 := netip.MustParseAddr("198.51.100.1") // TEST-NET-2：桩黑洞，不真拨
+	var order []string
+	dialer := func(ctx context.Context, dst netip.AddrPort) (net.Conn, error) {
+		order = append(order, dst.Addr().String())
+		if dst.Addr() == good {
+			var d net.Dialer
+			return d.DialContext(ctx, "tcp", dst.String())
+		}
+		<-ctx.Done() // 黑洞形态：等到拨号 ctx 耗尽（超时归因形态）
+		return nil, ctx.Err()
+	}
+	addr := startSocks(t, ServerConfig{
+		Resolver:   fixedResolver(bad1, good),
+		Dialer:     dialer,
+		DialBudget: 400 * time.Millisecond, // 首候选子预算 = 200ms——用例秒级收口
+	})
+	begin := time.Now()
+	cl := dialSocks(t, addr)
+	cl.negotiate(0x00)
+	if rep := cl.connect("blackhole.example", netip.Addr{}, goodPort); rep != repSucceeded {
+		t.Fatalf("首候选超时应回退第二候选成功，rep = %#x", rep)
+	}
+	if len(order) != 2 || order[0] != bad1.String() || order[1] != good.String() {
+		t.Fatalf("超时回退顺序不符：%v", order)
+	}
+	// 总上界：整轮拨号不超过一份 DialBudget（+调度余量）。
+	if el := time.Since(begin); el > 600*time.Millisecond {
+		t.Fatalf("总预算上界被破：整轮 %v", el)
+	}
+}
+
 // TestResolveFailureRep 解析否定（NXDOMAIN 类错误）→ rep=0x04。
 func TestResolveFailureRep(t *testing.T) {
 	resolver := func(ctx context.Context, host string) ([]netip.Addr, error) {

@@ -350,6 +350,9 @@ func forwardListCLI(args []string, version string, w io.Writer) error {
 	fmt.Fprintf(w, "%-12s %-7s %-24s %-10s %-6s %s\n", "主机", "监听", "目标", "状态", "连接", "错误")
 	for _, r := range res.Forwards {
 		st, conns, e := r.State, strconv.Itoa(r.Conns), ""
+		if r.Rejected > 0 { // N5（exec-r2）：超限拒绝计数附注（精确值恒在 --json）
+			conns = fmt.Sprintf("%d(+%d拒)", r.Conns, r.Rejected)
+		}
 		if r.Err != "" {
 			e = truncRunes(r.Err, 40)
 		}

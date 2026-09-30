@@ -223,11 +223,14 @@ func runSpeedHost(ctx context.Context, c *control.Client, h control.HostState, p
 	// Ctrl-C 收尾的单一出口（exec-r1 B2）：start 请求**已发出**后 ctx 取消（含 start
 	// 在途窗口——请求帧先写后等，很可能已送达 daemon 并开跑；含轮询期间的任何取消）
 	// 统一在收尾 defer 补发 speedtest.cancel（best-effort、独立预算；daemon 侧 Cancel
-	// 幂等）。此前只有轮询循环两处显式调用，在途窗口直接返回 = 该轮测速无人取消跑
-	// 满预算。
-	startSent := false
+	// 幂等）。N3（exec-r2）：条件由「ctx 已取消」放宽为「已 start 且未到终态」——
+	// status 连续失败等中途返回路径同样清掉 daemon 侧可能在跑的轮（用户立刻重试
+	// 不再撞 busy）；终态/busy/已显式 cancel 的路径置 settled 不补发（busy = 另一
+	// 会话的轮在跑，cancel 会误伤）。此前只有轮询循环两处显式调用，在途窗口直接
+	// 返回 = 该轮测速无人取消跑满预算。
+	startSent, settled := false, false
 	defer func() {
-		if startSent && ctx.Err() != nil {
+		if startSent && !settled {
 			cancelSpeedHost(c, h.ID, timeout)
 		}
 	}()
@@ -254,6 +257,7 @@ func runSpeedHost(ctx context.Context, c *control.Client, h control.HostState, p
 		return speedHostResult{name: name, hex: h.ID, ok: false, reason: "interrupted", msg: "start 载荷解析失败：" + err.Error(), via: via, rttMs: rtt}, nil
 	}
 	if ack.Phase == "busy" {
+		settled = true // 未起我们自己的轮（busy = 另一会话在跑）——不得补发 cancel 误伤
 		return speedHostResult{name: name, hex: h.ID, ok: false, reason: "busy", msg: "并发满员（同主机已有测速在跑或与手机撞出口上限），稍后再试", via: via, rttMs: rtt}, nil
 	}
 
@@ -276,6 +280,7 @@ func runSpeedHost(ctx context.Context, c *control.Client, h control.HostState, p
 		}
 		if time.Now().After(deadline) {
 			cancelSpeedHost(c, h.ID, timeout)
+			settled = true // 已显式 cancel——defer 不再补发（用例断死「恰一次」）
 			return speedHostResult{}, errors.New("status 轮询超预算（MUST NOT 无限转圈）——已取消该主机")
 		}
 		st, err := fetchSpeedStatus(ctx, c, h.ID, timeout)
@@ -295,6 +300,7 @@ func runSpeedHost(ctx context.Context, c *control.Client, h control.HostState, p
 		}
 		failStreak = 0
 		if st.Result != nil { // 终态
+			settled = true // 终态正常返回——daemon 侧已收场，不动
 			return speedHostResult{
 				name: name, hex: h.ID, ok: st.Result.OK, reason: st.Result.Reason, msg: st.Result.Msg,
 				downBps: st.Result.DownBps, upBps: st.Result.UpBps,

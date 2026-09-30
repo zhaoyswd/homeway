@@ -46,6 +46,7 @@ type carrierStubBackend struct {
 	startedC   chan string                              // start 到达信号（Ctrl-C 用例同步）
 	cancelC    chan string                              // cancel 到达信号（exec-r1 B2：同步等待判据）
 	cancels    []string
+	statusFail bool // status 恒失败形态（N3 用例：连续失败收尾须补发 cancel）
 }
 
 func newCarrierStub() *carrierStubBackend {
@@ -177,6 +178,9 @@ func (b *carrierStubBackend) SpeedtestStart(a control.SpeedtestStartArgs) (contr
 func (b *carrierStubBackend) SpeedtestStatus(host string) (control.SpeedtestStatusResult, error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
+	if b.statusFail {
+		return control.SpeedtestStatusResult{}, errors.New("控制面抖动（桩注入）")
+	}
 	if res := b.termRes[host]; res != nil {
 		return control.SpeedtestStatusResult{Host: host, Phase: "done", Result: res}, nil
 	}
@@ -583,6 +587,47 @@ func TestSpeedtestCLICtrlCStopsRotation(t *testing.T) {
 	}
 	if len(stub.cancels) != 1 || stub.cancels[0] != ali {
 		t.Fatalf("应先 cancel 当前主机 ali（恰一次）：%v", stub.cancels)
+	}
+}
+
+// TestSpeedtestCLIStatusFailCancelsRun status 连续失败收尾补发 cancel（N3/exec-r2）：
+// 「已 start 且未到终态 → best-effort cancel」——daemon 侧在跑的轮被清掉，用户立刻
+// 重试不再撞 busy（修前该路径直接返回 control_error、无人取消，轮烧满预算）。
+func TestSpeedtestCLIStatusFailCancelsRun(t *testing.T) {
+	stub := newCarrierStub()
+	ali, _ := stubHosts(t, stub)
+	dir := startCarrierCLIServer(t, stub)
+	stub.mu.Lock()
+	stub.statusFail = true // start 可达、status 恒失败（8×250ms 窗后 control_error 收尾）
+	stub.mu.Unlock()
+	var out, errOut bytes.Buffer
+	done := make(chan error, 1)
+	go func() {
+		done <- speedtestCLI([]string{"--host", "ali", "--state", dir}, "t", &out, &errOut)
+	}()
+	select {
+	case h := <-stub.cancelC:
+		if h != ali {
+			t.Fatalf("应 cancel ali，got %s", h)
+		}
+	case <-time.After(15 * time.Second):
+		t.Fatal("status 连续失败收尾未补发 speedtest.cancel（N3 红路）")
+	}
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("全部失败应非零退出")
+		}
+	case <-time.After(15 * time.Second):
+		t.Fatal("CLI 未在窗口内退出")
+	}
+	stub.mu.Lock()
+	defer stub.mu.Unlock()
+	if len(stub.cancels) != 1 || stub.cancels[0] != ali {
+		t.Fatalf("应恰一次 cancel ali：%v", stub.cancels)
+	}
+	if !strings.Contains(out.String(), "control_error") {
+		t.Fatalf("应呈现 control_error 短因：%s", out.String())
 	}
 }
 
