@@ -6,7 +6,12 @@
 做有界连通性验证——探测核 `pkg/probe.Reach` 与手机 App 同调一份）、
 `term … --host <name|id>` = 远程终端命令面（term-remote 起：经 daemon 控制面
 `stream.open{kind:term}` 过隧道接指定后端主机的 term 服务，寻址与 host 面同源；v0.11.0 起
-LIST/CLI 状态单轨 stateV2，旧 `state` 键退役）；`clientcore/` = 手机核
+LIST/CLI 状态单轨 stateV2，旧 `state` 键退役）、
+`files …` = 文件命令面（files-cli 起，v0.12.0：六子命令 list/stat/mkdir/read/get/put——
+本地面直连 `<state>/files.sock`〔默认出口 state〕、`--host <ref>` 远程面经控制面
+`stream.open{kind:files}` 纯透传，寻址与 host/term 面同源；`--state` 指代随 `--host` 切换、
+`--rate-limit` 上行限速〔默认 2MiB/s 发送端义务〕，详见 README「文件命令面」节）；
+`clientcore/` = 手机核
 （tier App 经其仓库的 submodule 钉定检出消费，产物 `libclientcore.so`）。本文件只放跨会话
 都要知道的硬规则；工程细节看本仓 `README.md` 与 tier 仓（`github.com/zhaoyswd/tier`）的
 `AGENTS.md` + `docs/agents/` 分册。
