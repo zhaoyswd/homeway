@@ -12,6 +12,7 @@ import (
 	"context"
 	"encoding/binary"
 	"encoding/json"
+	"github.com/zhaoyswd/homeway/clientcore/facade"
 	"os"
 	"strings"
 	"testing"
@@ -51,7 +52,7 @@ func itWaitHostReady(t *testing.T, c *control.Client, host string) control.HostS
 	t.Helper()
 	deadline := time.Now().Add(45 * time.Second)
 	for time.Now().Before(deadline) {
-		raw, err := c.Request(context.Background(), control.OpSnapshotGet, nil)
+		raw, err := c.Request(context.Background(), facade.OpSnapshotGet, nil)
 		if err == nil {
 			var snap control.SnapshotResult
 			if json.Unmarshal(raw, &snap) == nil {
@@ -80,7 +81,7 @@ func TestLiveStreamTermEndToEnd(t *testing.T) {
 	ctx := context.Background()
 
 	// 入表（§3.8 Go 客户端的 host.add——一次性，token 只经内存与环境变量）。
-	raw, err := c.Request(ctx, control.OpHostAdd, control.HostAddArgs{Name: "live-it", Token: token})
+	raw, err := c.Request(ctx, facade.OpHostAdd, control.HostAddArgs{Name: "live-it", Token: token})
 	if err != nil {
 		t.Fatalf("host.add：%v", err)
 	}
@@ -117,7 +118,7 @@ func TestLiveStreamTermEndToEnd(t *testing.T) {
 			if err := st.Close(ctx); err != nil {
 				// term 服务的一锤子命令腿（LIST）回完就收线：服务端先关时流已
 				// end(closed) 出表，这里再关 = no_stream——属正常次序，不算失败。
-				if code, ok := err.(control.CodeError); !ok || string(code) != control.CodeNoStream {
+				if code, ok := err.(control.CodeError); !ok || string(code) != facade.CodeNoStream {
 					t.Fatalf("[%s] stream.close：%v", tag, err)
 				}
 			}
@@ -132,7 +133,7 @@ func TestLiveStreamTermEndToEnd(t *testing.T) {
 	<-done2
 
 	// 流开着的同时控制面仍应答（三类流量同连接并存的最小实证；深度背压归单测）。
-	if _, err := c.Request(ctx, control.OpDaemonStatus, nil); err != nil {
+	if _, err := c.Request(ctx, facade.OpDaemonStatus, nil); err != nil {
 		t.Fatalf("流并发期间 daemon.status：%v", err)
 	}
 	t.Logf("真后端端到端通过（link via=%s ep=%s）", host.Link.Via, host.Link.Ep)
@@ -163,9 +164,9 @@ func TestLiveHostAddAgainstRunningDaemon(t *testing.T) {
 		if parts := strings.SplitN(line, "\t", 2); len(parts) == 2 {
 			name, tok = strings.TrimSpace(parts[0]), strings.TrimSpace(parts[1])
 		}
-		raw, err := c.Request(ctx, control.OpHostAdd, control.HostAddArgs{Name: name, Token: tok})
+		raw, err := c.Request(ctx, facade.OpHostAdd, control.HostAddArgs{Name: name, Token: tok})
 		if err != nil {
-			if code, ok := err.(control.CodeError); ok && string(code) == control.CodeHostExists {
+			if code, ok := err.(control.CodeError); ok && string(code) == facade.CodeHostExists {
 				t.Logf("第 %d 台已在表（幂等跳过）", i+1)
 				continue
 			}

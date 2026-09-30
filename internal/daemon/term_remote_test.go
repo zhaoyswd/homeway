@@ -12,6 +12,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"github.com/zhaoyswd/homeway/clientcore/facade"
 	"io"
 	"io/fs"
 	"net"
@@ -288,7 +289,7 @@ func startRemoteTestRig(t *testing.T, echo, flood, noread bool) *remoteTestRig {
 	}
 	srv := control.NewServer(control.ServerConfig{
 		ServerVersion: "test-1.0",
-		Bus:           control.NewBus(control.NewGeneration(), control.BusConfig{}),
+		Bus:           facade.NewBus(control.NewGeneration(), facade.BusConfig{}),
 		Backend:       backend,
 		Logf:          t.Logf,
 	})
@@ -567,9 +568,9 @@ func TestStreamOpenErrStates(t *testing.T) {
 		err  error
 		want []string
 	}{
-		{"no_host", control.CodeError(control.CodeNoHost), []string{"不在守护进程表中", "host list"}},
-		{"not_ready", control.CodeError(control.CodeNotReady), []string{"未就绪", "稍后重试"}},
-		{"stream_refused", control.CodeError(control.CodeStreamRefused), []string{"主机离线", "host status"}},
+		{"no_host", control.CodeError(facade.CodeNoHost), []string{"不在守护进程表中", "host list"}},
+		{"not_ready", control.CodeError(facade.CodeNotReady), []string{"未就绪", "稍后重试"}},
+		{"stream_refused", control.CodeError(facade.CodeStreamRefused), []string{"主机离线", "host status"}},
 		{"超预算", context.DeadlineExceeded, []string{"超预算", "--timeout"}},
 		{"其它", errors.New("boom"), []string{"stream.open 失败"}},
 	}

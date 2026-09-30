@@ -9,6 +9,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"github.com/zhaoyswd/homeway/clientcore/facade"
 	"net"
 	"sync"
 
@@ -34,10 +35,10 @@ var reachProbe = func(ctx context.Context, token string) (*probe.ReachReport, er
 type registryHolder struct {
 	mu     sync.Mutex
 	cur    *Registry
-	busRef *control.Bus
+	busRef *facade.Bus
 }
 
-func newRegistryHolder(bus *control.Bus) *registryHolder {
+func newRegistryHolder(bus *facade.Bus) *registryHolder {
 	return &registryHolder{busRef: bus}
 }
 
@@ -53,7 +54,7 @@ func (h *registryHolder) get() *Registry {
 	return h.cur
 }
 
-func (h *registryHolder) bus() *control.Bus { return h.busRef }
+func (h *registryHolder) bus() *facade.Bus { return h.busRef }
 
 // controlBackend control.Backend 的 daemon 实现。
 type controlBackend struct {
@@ -97,7 +98,7 @@ func (b *controlBackend) AddHost(name, token string, force bool) (control.HostAd
 	}
 	res := control.HostAddResult{}
 	if force {
-		res.Reach = &control.HostReach{Tier: control.ReachTierSkipped, Tested: []control.ReachTested{}}
+		res.Reach = &control.HostReach{Tier: facade.ReachTierSkipped, Tested: []control.ReachTested{}}
 	} else {
 		rep, err := reachProbe(context.Background(), token)
 		if err != nil {
@@ -107,9 +108,9 @@ func (b *controlBackend) AddHost(name, token string, force bool) (control.HostAd
 		case probe.TierNone:
 			return control.HostAddResult{}, control.ErrBackendHostUnreachable
 		case probe.TierDirect:
-			res.Reach = &control.HostReach{Tier: control.ReachTierDirect, Tested: []control.ReachTested{}}
+			res.Reach = &control.HostReach{Tier: facade.ReachTierDirect, Tested: []control.ReachTested{}}
 		case probe.TierRelay:
-			res.Reach = &control.HostReach{Tier: control.ReachTierRelay, Tested: []control.ReachTested{}}
+			res.Reach = &control.HostReach{Tier: facade.ReachTierRelay, Tested: []control.ReachTested{}}
 		}
 		for _, t := range rep.Results {
 			res.Reach.Tested = append(res.Reach.Tested, control.ReachTested{Ep: t.EP, Relay: t.Relay, RttMs: t.RTT.Milliseconds()})
@@ -216,22 +217,22 @@ func (b *controlBackend) NotReady() bool { return b.holder.get() == nil }
 
 // registryEventsAdaptor RegistryEvents → 控制面总线（session 域）。
 type registryEventsAdaptor struct {
-	bus *control.Bus
+	bus *facade.Bus
 }
 
 func (a *registryEventsAdaptor) HostAdded(id, name string, addedAt int64) {
-	_, _ = a.bus.Publish(control.DomainSession, control.KindSessionAdded,
-		control.SessionAddedPayload{Host: id, Name: name, AddedAt: addedAt})
+	_, _ = a.bus.Publish(facade.DomainSession, facade.KindSessionAdded,
+		facade.SessionAddedPayload{Host: id, Name: name, AddedAt: addedAt})
 }
 
 func (a *registryEventsAdaptor) HostRemoved(id, reason string) {
-	_, _ = a.bus.Publish(control.DomainSession, control.KindSessionRemoved,
-		control.SessionRemovedPayload{Host: id, Reason: reason})
+	_, _ = a.bus.Publish(facade.DomainSession, facade.KindSessionRemoved,
+		facade.SessionRemovedPayload{Host: id, Reason: reason})
 }
 
 func (a *registryEventsAdaptor) HostStateChanged(id, from, to, reason string) {
-	_, _ = a.bus.Publish(control.DomainSession, control.KindSessionStateChanged,
-		control.SessionStateChangedPayload{Host: id, State: to, Reason: reason})
+	_, _ = a.bus.Publish(facade.DomainSession, facade.KindSessionStateChanged,
+		facade.SessionStateChangedPayload{Host: id, State: to, Reason: reason})
 }
 
 // hostsession.Observer 兼容断言（startEntryLocked 的注入形态）。
@@ -241,7 +242,7 @@ var _ control.Backend = (*controlBackend)(nil)
 // startControlPlane 装配控制面（cli.go ⑤）：listen → server → accept 循环。
 // 监听失败（活实例占用/state 异常）= 报错退出——控制面是 daemon 的用户面，
 // 静默缺失会让 CLI 全部 not_ready 且无从排查。
-func startControlPlane(version string, stateDir string, sup *supervisor, holder *registryHolder, bus *control.Bus, eventf func(string, ...any)) (*control.Server, func(), error) {
+func startControlPlane(version string, stateDir string, sup *supervisor, holder *registryHolder, bus *facade.Bus, eventf func(string, ...any)) (*control.Server, func(), error) {
 	srv := control.NewServer(control.ServerConfig{
 		ServerVersion: version,
 		Bus:           bus,

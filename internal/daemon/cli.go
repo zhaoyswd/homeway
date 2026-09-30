@@ -19,6 +19,7 @@ import (
 	"path/filepath"
 	"syscall"
 
+	"github.com/zhaoyswd/homeway/clientcore/facade"
 	"github.com/zhaoyswd/homeway/clientcore/hostsession"
 	"github.com/zhaoyswd/homeway/internal/control"
 )
@@ -80,7 +81,7 @@ func CLI(args []string, version string) error {
 	// ④ 角色子系统：本期仅 client（注册表按 hosts.json 逐后端拉会话）；注册表
 	// 经 holder 与控制面共享（角色重建时换实例，重建窗口 = not_ready）。总线
 	// 先建（holder 引用；代际每次启动随机）。
-	bus := control.NewBus(control.NewGeneration(), control.BusConfig{})
+	bus := facade.NewBus(control.NewGeneration(), facade.BusConfig{})
 	holder := newRegistryHolder(bus)
 	sup := newSupervisor(st.Eventf, st.Debugf)
 	if desired.roleEnabled("client") {

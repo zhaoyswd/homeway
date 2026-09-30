@@ -11,6 +11,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/zhaoyswd/homeway/clientcore/facade"
 	"io"
 	"net"
 	"os"
@@ -68,9 +69,9 @@ func (f *fakeBackend) AddHost(name, token string, force bool) (HostAddResult, er
 	f.briefs = append(f.briefs, b)
 	res := HostAddResult{ID: id, Name: name, AddedAt: 1700000000}
 	if force {
-		res.Reach = &HostReach{Tier: ReachTierSkipped, Tested: []ReachTested{}}
+		res.Reach = &HostReach{Tier: facade.ReachTierSkipped, Tested: []ReachTested{}}
 	} else {
-		res.Reach = &HostReach{Tier: ReachTierDirect, BestEp: "203.0.113.1:41641", RttMs: 12, Tested: []ReachTested{{Ep: "203.0.113.1:41641", RttMs: 12}}}
+		res.Reach = &HostReach{Tier: facade.ReachTierDirect, BestEp: "203.0.113.1:41641", RttMs: 12, Tested: []ReachTested{{Ep: "203.0.113.1:41641", RttMs: 12}}}
 	}
 	return res, nil
 }
@@ -119,7 +120,7 @@ func (f *fakeBackend) NotReady() bool {
 type testServer struct {
 	dir     string
 	sock    string
-	bus     *Bus
+	bus     *facade.Bus
 	backend *fakeBackend
 	srv     *Server
 	termLn  net.Listener
@@ -138,10 +139,10 @@ func shortTempDir(t *testing.T) string {
 	return dir
 }
 
-func startTestServer(t *testing.T, busCfg BusConfig) *testServer {
+func startTestServer(t *testing.T, busCfg facade.BusConfig) *testServer {
 	t.Helper()
 	dir := shortTempDir(t)
-	bus := NewBus(NewGeneration(), busCfg)
+	bus := facade.NewBus(NewGeneration(), busCfg)
 	backend := newFakeBackend()
 	// 假 term 后端：一条 TCP listener（echo 模式由各测试自定）。
 	termLn, err := net.Listen("tcp", "127.0.0.1:0")
@@ -193,7 +194,7 @@ func readFrameRaw(t *testing.T, r *bufio.Reader) (byte, []byte) {
 }
 
 func TestHandshakeWelcomeBytes(t *testing.T) {
-	ts := startTestServer(t, BusConfig{})
+	ts := startTestServer(t, facade.BusConfig{})
 	nc, err := net.Dial("unix", ts.sock)
 	if err != nil {
 		t.Fatal(err)
@@ -225,7 +226,7 @@ func TestHandshakeWelcomeBytes(t *testing.T) {
 }
 
 func TestHandshakeProtoMismatchReloadThenClose(t *testing.T) {
-	ts := startTestServer(t, BusConfig{})
+	ts := startTestServer(t, facade.BusConfig{})
 	nc, err := net.Dial("unix", ts.sock)
 	if err != nil {
 		t.Fatal(err)
@@ -252,19 +253,19 @@ func TestHandshakeProtoMismatchReloadThenClose(t *testing.T) {
 
 func TestHandshakeGenerationCursorStale(t *testing.T) {
 	// 代际失配三场景之三：握手成功（新代际）但订阅带旧代际游标 → cursor_stale。
-	ts := startTestServer(t, BusConfig{})
+	ts := startTestServer(t, facade.BusConfig{})
 	c, _ := dialTest(t, ts)
-	if _, err := c.Subscribe(context.Background(), []string{DomainSession}, nil, "", "gen-old"); !errors.Is(err, CodeError(CodeCursorStale)) {
+	if _, err := c.Subscribe(context.Background(), []string{facade.DomainSession}, nil, "", "gen-old"); !errors.Is(err, CodeError(facade.CodeCursorStale)) {
 		t.Fatalf("旧代际订阅应 cursor_stale，得到 %v", err)
 	}
 	// 连接仍可用（不断连）。
-	if _, err := c.Request(context.Background(), OpHostList, nil); err != nil {
+	if _, err := c.Request(context.Background(), facade.OpHostList, nil); err != nil {
 		t.Fatalf("cursor_stale 后连接应仍可用：%v", err)
 	}
 }
 
 func TestHandshakeBadJSONAndBadFrameDisconnect(t *testing.T) {
-	ts := startTestServer(t, BusConfig{})
+	ts := startTestServer(t, facade.BusConfig{})
 	// hello 帧坏 JSON → goodbye(bad_json) + 断连。
 	nc, err := net.Dial("unix", ts.sock)
 	if err != nil {
@@ -280,7 +281,7 @@ func TestHandshakeBadJSONAndBadFrameDisconnect(t *testing.T) {
 	}
 	var g GoodbyeBody
 	_ = json.Unmarshal(body, &g)
-	if g.Reason != CodeBadJSON {
+	if g.Reason != facade.CodeBadJSON {
 		t.Fatalf("goodbye 原因应为 bad_json：%q", g.Reason)
 	}
 	if _, err := r.ReadByte(); err != io.EOF {
@@ -304,7 +305,7 @@ func TestHandshakeBadJSONAndBadFrameDisconnect(t *testing.T) {
 		t.Fatalf("超限应 goodbye，得到 0x%02x", op)
 	}
 	_ = json.Unmarshal(body, &g)
-	if g.Reason != CodeBadFrame {
+	if g.Reason != facade.CodeBadFrame {
 		t.Fatalf("goodbye 原因应为 bad_frame：%q", g.Reason)
 	}
 	// body（未声明的那部分）留在流里：连接直接被关。
@@ -324,7 +325,7 @@ func TestHandshakeBadJSONAndBadFrameDisconnect(t *testing.T) {
 	r3 := bufio.NewReader(nc3)
 	op, body = readFrameRaw(t, r3)
 	_ = json.Unmarshal(body, &g)
-	if op != OpGoodbye || g.Reason != CodeBadFrame {
+	if op != OpGoodbye || g.Reason != facade.CodeBadFrame {
 		t.Fatalf("非法 op 应 goodbye(bad_frame)：op=0x%02x reason=%q", op, g.Reason)
 	}
 }
@@ -332,7 +333,7 @@ func TestHandshakeBadJSONAndBadFrameDisconnect(t *testing.T) {
 // ---------- §3.3 逐操作 + 错误码映射逐行负例 ----------
 
 func TestOpsHappyPath(t *testing.T) {
-	ts := startTestServer(t, BusConfig{})
+	ts := startTestServer(t, facade.BusConfig{})
 	ts.backend.mu.Lock()
 	ts.backend.states = []HostState{{
 		ID: "aa", Name: "mbp", State: "ready",
@@ -344,7 +345,7 @@ func TestOpsHappyPath(t *testing.T) {
 	c, _ := dialTest(t, ts)
 
 	// daemon.status。
-	raw, err := c.Request(context.Background(), OpDaemonStatus, nil)
+	raw, err := c.Request(context.Background(), facade.OpDaemonStatus, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -356,7 +357,7 @@ func TestOpsHappyPath(t *testing.T) {
 		t.Fatalf("daemon.status 载荷形状：%+v", st)
 	}
 	// host.add（host-cli 3b：响应类型 = HostAddResult，reach 结论字段上 wire）。
-	raw, err = c.Request(context.Background(), OpHostAdd, HostAddArgs{Name: "mbp", Token: "hmw1good"})
+	raw, err = c.Request(context.Background(), facade.OpHostAdd, HostAddArgs{Name: "mbp", Token: "hmw1good"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -364,11 +365,11 @@ func TestOpsHappyPath(t *testing.T) {
 	if err := json.Unmarshal(raw, &add); err != nil || add.ID == "" || add.AddedAt == 0 {
 		t.Fatalf("host.add 载荷：%v（%s）", err, raw)
 	}
-	if add.Reach == nil || add.Reach.Tier != ReachTierDirect || add.Reach.BestEp == "" || len(add.Reach.Tested) == 0 {
+	if add.Reach == nil || add.Reach.Tier != facade.ReachTierDirect || add.Reach.BestEp == "" || len(add.Reach.Tested) == 0 {
 		t.Fatalf("host.add reach 结论缺失：%+v", add.Reach)
 	}
 	// host.list。
-	raw, err = c.Request(context.Background(), OpHostList, nil)
+	raw, err = c.Request(context.Background(), facade.OpHostList, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -377,7 +378,7 @@ func TestOpsHappyPath(t *testing.T) {
 		t.Fatalf("host.list：%v %+v", err, list)
 	}
 	// snapshot.get（seq 与 bus 一致）。
-	raw, err = c.Request(context.Background(), OpSnapshotGet, nil)
+	raw, err = c.Request(context.Background(), facade.OpSnapshotGet, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -386,100 +387,100 @@ func TestOpsHappyPath(t *testing.T) {
 		t.Fatalf("snapshot.get：%v %+v", err, snap)
 	}
 	// host.remove。
-	if _, err := c.Request(context.Background(), OpHostRemove, HostRemoveArgs{Host: add.ID}); err != nil {
+	if _, err := c.Request(context.Background(), facade.OpHostRemove, HostRemoveArgs{Host: add.ID}); err != nil {
 		t.Fatalf("host.remove：%v", err)
 	}
 }
 
 func TestErrorCodeMappingNegativeCases(t *testing.T) {
-	ts := startTestServer(t, BusConfig{})
+	ts := startTestServer(t, facade.BusConfig{})
 	c, _ := dialTest(t, ts)
 	ctx := context.Background()
 
 	// unknown_op：不断连（后续请求照常）。
-	if _, err := c.Request(ctx, "nonsense.op", nil); !errors.Is(err, CodeError(CodeUnknownOp)) {
+	if _, err := c.Request(ctx, "nonsense.op", nil); !errors.Is(err, CodeError(facade.CodeUnknownOp)) {
 		t.Fatalf("未知操作应 unknown_op：%v", err)
 	}
-	if _, err := c.Request(ctx, OpHostList, nil); err != nil {
+	if _, err := c.Request(ctx, facade.OpHostList, nil); err != nil {
 		t.Fatalf("unknown_op 后连接应不断：%v", err)
 	}
 	// bad_token。
-	if _, err := c.Request(ctx, OpHostAdd, HostAddArgs{Token: "BADxxx"}); !errors.Is(err, CodeError(CodeBadToken)) {
+	if _, err := c.Request(ctx, facade.OpHostAdd, HostAddArgs{Token: "BADxxx"}); !errors.Is(err, CodeError(facade.CodeBadToken)) {
 		t.Fatalf("坏 token 应 bad_token：%v", err)
 	}
 	// bad_request：字段缺失/类型不符/值域外。
-	if _, err := c.Request(ctx, OpHostAdd, HostAddArgs{Token: ""}); !errors.Is(err, CodeError(CodeBadRequest)) {
+	if _, err := c.Request(ctx, facade.OpHostAdd, HostAddArgs{Token: ""}); !errors.Is(err, CodeError(facade.CodeBadRequest)) {
 		t.Fatalf("空 token 应 bad_request：%v", err)
 	}
-	if _, err := c.Request(ctx, OpHostAdd, map[string]any{"token": 123}); !errors.Is(err, CodeError(CodeBadRequest)) {
+	if _, err := c.Request(ctx, facade.OpHostAdd, map[string]any{"token": 123}); !errors.Is(err, CodeError(facade.CodeBadRequest)) {
 		t.Fatalf("类型不符应 bad_request：%v", err)
 	}
-	if _, err := c.Request(ctx, OpStreamOpen, StreamOpenArgs{Kind: "files", Host: "aa"}); !errors.Is(err, CodeError(CodeBadRequest)) {
+	if _, err := c.Request(ctx, facade.OpStreamOpen, StreamOpenArgs{Kind: "files", Host: "aa"}); !errors.Is(err, CodeError(facade.CodeBadRequest)) {
 		t.Fatalf("kind 值域外应 bad_request：%v", err)
 	}
 	// host_exists。
-	if _, err := c.Request(ctx, OpHostAdd, HostAddArgs{Token: "T1"}); err != nil {
+	if _, err := c.Request(ctx, facade.OpHostAdd, HostAddArgs{Token: "T1"}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := c.Request(ctx, OpHostAdd, HostAddArgs{Token: "DUP"}); !errors.Is(err, CodeError(CodeHostExists)) {
+	if _, err := c.Request(ctx, facade.OpHostAdd, HostAddArgs{Token: "DUP"}); !errors.Is(err, CodeError(facade.CodeHostExists)) {
 		t.Fatalf("同后端重复添加应 host_exists：%v", err)
 	}
 	// host_unreachable（host-cli 3b 只增错误码）：全不可达且未带 force → 不入表、
 	// 不断连（后续请求照常）；带 force → 添加成功（tier=skipped）。
-	if _, err := c.Request(ctx, OpHostAdd, HostAddArgs{Token: "DEADx"}); !errors.Is(err, CodeError(CodeHostUnreachable)) {
+	if _, err := c.Request(ctx, facade.OpHostAdd, HostAddArgs{Token: "DEADx"}); !errors.Is(err, CodeError(facade.CodeHostUnreachable)) {
 		t.Fatalf("全不可达应 host_unreachable：%v", err)
 	}
-	if _, err := c.Request(ctx, OpHostList, nil); err != nil {
+	if _, err := c.Request(ctx, facade.OpHostList, nil); err != nil {
 		t.Fatalf("host_unreachable 后连接应不断：%v", err)
 	}
-	raw, err := c.Request(ctx, OpHostAdd, HostAddArgs{Token: "DEADx", Force: true})
+	raw, err := c.Request(ctx, facade.OpHostAdd, HostAddArgs{Token: "DEADx", Force: true})
 	if err != nil {
 		t.Fatalf("force 应添加成功：%v", err)
 	}
 	var forced HostAddResult
-	if err := json.Unmarshal(raw, &forced); err != nil || forced.Reach == nil || forced.Reach.Tier != ReachTierSkipped || forced.Reach.Tested == nil || len(forced.Reach.Tested) != 0 {
+	if err := json.Unmarshal(raw, &forced); err != nil || forced.Reach == nil || forced.Reach.Tier != facade.ReachTierSkipped || forced.Reach.Tested == nil || len(forced.Reach.Tested) != 0 {
 		t.Fatalf("force 载荷应为 skipped（端点未实测）：%s", raw)
 	}
-	if _, err := c.Request(ctx, OpHostRemove, HostRemoveArgs{Host: forced.ID}); err != nil {
+	if _, err := c.Request(ctx, facade.OpHostRemove, HostRemoveArgs{Host: forced.ID}); err != nil {
 		t.Fatalf("清理 force 添加的主机：%v", err)
 	}
 	// no_host。
-	if _, err := c.Request(ctx, OpHostRemove, HostRemoveArgs{Host: "ff"}); !errors.Is(err, CodeError(CodeNoHost)) {
+	if _, err := c.Request(ctx, facade.OpHostRemove, HostRemoveArgs{Host: "ff"}); !errors.Is(err, CodeError(facade.CodeNoHost)) {
 		t.Fatalf("主机不存在应 no_host：%v", err)
 	}
 	// 订阅：词表外域 bad_request；同域重复订阅幂等成功；退订未订阅域幂等成功。
-	if _, err := c.Subscribe(ctx, []string{"nope"}, nil, "", ""); !errors.Is(err, CodeError(CodeBadRequest)) {
+	if _, err := c.Subscribe(ctx, []string{"nope"}, nil, "", ""); !errors.Is(err, CodeError(facade.CodeBadRequest)) {
 		t.Fatalf("词表外域应 bad_request：%v", err)
 	}
-	if _, err := c.Subscribe(ctx, []string{DomainSession}, nil, "", ""); err != nil {
+	if _, err := c.Subscribe(ctx, []string{facade.DomainSession}, nil, "", ""); err != nil {
 		t.Fatalf("订阅失败：%v", err)
 	}
-	if _, err := c.Subscribe(ctx, []string{DomainSession}, nil, "", ""); err != nil {
+	if _, err := c.Subscribe(ctx, []string{facade.DomainSession}, nil, "", ""); err != nil {
 		t.Fatalf("同域重复订阅应幂等成功：%v", err)
 	}
-	if err := c.Unsubscribe(ctx, []string{DomainLog}); err != nil {
+	if err := c.Unsubscribe(ctx, []string{facade.DomainLog}); err != nil {
 		t.Fatalf("退订未订阅域应幂等成功：%v", err)
 	}
 	// 游标超前 bad_request；连接仍在（映射类错误全部不断连）。
 	future := uint64(999)
-	if _, err := c.Subscribe(ctx, []string{DomainSession}, &future, "", ""); !errors.Is(err, CodeError(CodeBadRequest)) {
+	if _, err := c.Subscribe(ctx, []string{facade.DomainSession}, &future, "", ""); !errors.Is(err, CodeError(facade.CodeBadRequest)) {
 		t.Fatalf("超前游标应 bad_request：%v", err)
 	}
-	if _, err := c.Request(ctx, OpHostList, nil); err != nil {
+	if _, err := c.Request(ctx, facade.OpHostList, nil); err != nil {
 		t.Fatalf("映射错误后连接应不断：%v", err)
 	}
 	// not_ready（放在最后：置位后宿主面不可用）。
 	ts.backend.mu.Lock()
 	ts.backend.notReady = true
 	ts.backend.mu.Unlock()
-	if _, err := c.Request(ctx, OpHostList, nil); !errors.Is(err, CodeError(CodeNotReady)) {
+	if _, err := c.Request(ctx, facade.OpHostList, nil); !errors.Is(err, CodeError(facade.CodeNotReady)) {
 		t.Fatalf("未就绪应 not_ready：%v", err)
 	}
 }
 
 func TestBadJSONRequestDisconnects(t *testing.T) {
 	// 控制类 body 非法 JSON → bad_json 断连（req 帧）。
-	ts := startTestServer(t, BusConfig{})
+	ts := startTestServer(t, facade.BusConfig{})
 	nc, err := net.Dial("unix", ts.sock)
 	if err != nil {
 		t.Fatal(err)
@@ -496,7 +497,7 @@ func TestBadJSONRequestDisconnects(t *testing.T) {
 	op, body := readFrameRaw(t, r)
 	var g GoodbyeBody
 	_ = json.Unmarshal(body, &g)
-	if op != OpGoodbye || g.Reason != CodeBadJSON {
+	if op != OpGoodbye || g.Reason != facade.CodeBadJSON {
 		t.Fatalf("req 坏 JSON 应 goodbye(bad_json)：0x%02x %q", op, g.Reason)
 	}
 }
@@ -504,34 +505,34 @@ func TestBadJSONRequestDisconnects(t *testing.T) {
 // ---------- 事件推送/回放/overrun（经客户端的端到端） ----------
 
 func TestServerEventSubscribeReplayAndLive(t *testing.T) {
-	ts := startTestServer(t, BusConfig{})
+	ts := startTestServer(t, facade.BusConfig{})
 	for i := 0; i < 3; i++ {
-		if _, err := ts.bus.Publish(DomainSession, KindSessionStateChanged, SessionStateChangedPayload{Host: "aa", State: fmt.Sprintf("s%d", i)}); err != nil {
+		if _, err := ts.bus.Publish(facade.DomainSession, facade.KindSessionStateChanged, facade.SessionStateChangedPayload{Host: "aa", State: fmt.Sprintf("s%d", i)}); err != nil {
 			t.Fatal(err)
 		}
 	}
 	c, _ := dialTest(t, ts)
 	cur := uint64(0)
-	if _, err := c.Subscribe(context.Background(), []string{DomainSession}, &cur, "view-main", ""); err != nil {
+	if _, err := c.Subscribe(context.Background(), []string{facade.DomainSession}, &cur, "view-main", ""); err != nil {
 		t.Fatal(err)
 	}
 	// 回放 3 条 + 在线 1 条。
 	for want := uint64(1); want <= 3; want++ {
 		select {
 		case ev := <-c.Events():
-			if ev.Seq != want || ev.Kind != KindSessionStateChanged {
+			if ev.Seq != want || ev.Kind != facade.KindSessionStateChanged {
 				t.Fatalf("回放事件 %d：%+v", want, ev)
 			}
 		case <-time.After(2 * time.Second):
 			t.Fatalf("回放事件 %d 未到达", want)
 		}
 	}
-	if _, err := ts.bus.Publish(DomainSession, KindSessionRemoved, SessionRemovedPayload{Host: "aa", Reason: "user"}); err != nil {
+	if _, err := ts.bus.Publish(facade.DomainSession, facade.KindSessionRemoved, facade.SessionRemovedPayload{Host: "aa", Reason: "user"}); err != nil {
 		t.Fatal(err)
 	}
 	select {
 	case ev := <-c.Events():
-		if ev.Seq != 4 || ev.Kind != KindSessionRemoved {
+		if ev.Seq != 4 || ev.Kind != facade.KindSessionRemoved {
 			t.Fatalf("在线事件：%+v", ev)
 		}
 	case <-time.After(2 * time.Second):
@@ -541,13 +542,13 @@ func TestServerEventSubscribeReplayAndLive(t *testing.T) {
 
 func TestServerOverrunGoodbyeDisconnect(t *testing.T) {
 	// 慢消费者：订阅队列 2、客户端不读事件 → goodbye(overrun) + 断连。
-	ts := startTestServer(t, BusConfig{SubQueue: 2})
+	ts := startTestServer(t, facade.BusConfig{SubQueue: 2})
 	c, _ := dialTest(t, ts)
-	if _, err := c.Subscribe(context.Background(), []string{DomainSession}, nil, "", ""); err != nil {
+	if _, err := c.Subscribe(context.Background(), []string{facade.DomainSession}, nil, "", ""); err != nil {
 		t.Fatal(err)
 	}
 	for i := 0; i < 30; i++ {
-		if _, err := ts.bus.Publish(DomainSession, KindSessionStateChanged, SessionStateChangedPayload{Host: "aa", State: "x"}); err != nil {
+		if _, err := ts.bus.Publish(facade.DomainSession, facade.KindSessionStateChanged, facade.SessionStateChangedPayload{Host: "aa", State: "x"}); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -567,7 +568,7 @@ func TestServerOverrunGoodbyeDisconnect(t *testing.T) {
 }
 
 func TestServerCloseSendsGoodbyeShuttingDown(t *testing.T) {
-	ts := startTestServer(t, BusConfig{})
+	ts := startTestServer(t, facade.BusConfig{})
 	c, _ := dialTest(t, ts)
 	go func() {
 		time.Sleep(100 * time.Millisecond)
@@ -575,7 +576,7 @@ func TestServerCloseSendsGoodbyeShuttingDown(t *testing.T) {
 	}()
 	select {
 	case g := <-c.Goodbye():
-		if g.Reason != CodeShuttingDown {
+		if g.Reason != facade.CodeShuttingDown {
 			t.Fatalf("收工告别原因应为 shutting_down：%q", g.Reason)
 		}
 	case <-c.Closed():
@@ -593,11 +594,11 @@ func TestServerCloseSendsGoodbyeShuttingDown(t *testing.T) {
 // writer 永远等不到 closed ⇒ 每次断开泄漏 1 conn + 2 goroutine + 1 fd，监控脚本
 // 几小时打爆 fd 上限）。
 func TestClientDisconnectReleasesConnAndGoroutines(t *testing.T) {
-	ts := startTestServer(t, BusConfig{})
+	ts := startTestServer(t, facade.BusConfig{})
 	before := runtime.NumGoroutine()
 	for i := 0; i < 10; i++ {
 		c, _ := dialTest(t, ts)
-		if _, err := c.Request(context.Background(), OpDaemonStatus, nil); err != nil {
+		if _, err := c.Request(context.Background(), facade.OpDaemonStatus, nil); err != nil {
 			t.Fatalf("第 %d 条连接 status 失败：%v", i, err)
 		}
 		c.Close() // 直接关 socket（CLI 正常断开形态）
@@ -631,16 +632,16 @@ func TestClientDisconnectReleasesConnAndGoroutines(t *testing.T) {
 // （exec-r1 M1：此前 close(reason) 先走阻塞 sendHigh，唯一逃生口 closed 又在本
 // 函数更后面才关——互等挂死，Server.Close()（daemon 收工路径）收不了尾）。
 func TestConnCloseBoundedWhenHighQueueFull(t *testing.T) {
-	bus := NewBus(NewGeneration(), BusConfig{})
+	bus := facade.NewBus(NewGeneration(), facade.BusConfig{})
 	srv := NewServer(ServerConfig{Bus: bus, Backend: newFakeBackend()})
 	a, _ := net.Pipe()
 	c := newConn(srv, a)
 	for i := 0; i < highQueue; i++ { // 灌满控制帧队列（前端不读的病态）
-		c.highC <- []byte("x")
+		c.highC <- highItem{frame: []byte("x")}
 	}
 	done := make(chan struct{})
 	go func() {
-		c.fatal(CodeBadFrame) // 帧级错误路径 = close(bad_frame) 携带告别帧
+		c.fatal(facade.CodeBadFrame) // 帧级错误路径 = close(bad_frame) 携带告别帧
 		close(done)
 	}()
 	select {
@@ -661,7 +662,7 @@ func TestConnCloseBoundedWhenHighQueueFull(t *testing.T) {
 // stream.data 被完整读下、只回 no_stream 不断连，spec「帧长上限」对流帧名存实亡）。
 // 只写 5 字节帧头（body 不发）同时证明「超限在读 body 前拒绝」。
 func TestServerRejectsOversizedStreamDataOnReadPath(t *testing.T) {
-	ts := startTestServer(t, BusConfig{})
+	ts := startTestServer(t, facade.BusConfig{})
 	nc, err := net.Dial("unix", ts.sock)
 	if err != nil {
 		t.Fatal(err)
@@ -684,7 +685,7 @@ func TestServerRejectsOversizedStreamDataOnReadPath(t *testing.T) {
 	op, body := readFrameRaw(t, r)
 	var g GoodbyeBody
 	_ = json.Unmarshal(body, &g)
-	if op != OpGoodbye || g.Reason != CodeBadFrame {
+	if op != OpGoodbye || g.Reason != facade.CodeBadFrame {
 		t.Fatalf("超流上限应 goodbye(bad_frame)：op=0x%02x reason=%q", op, g.Reason)
 	}
 	if _, err := r.ReadByte(); err != io.EOF {
@@ -772,12 +773,12 @@ func TestListenControlResidue(t *testing.T) {
 // 此前 opUnsubscribe 在 subMu 下裸 delete(sub.domains)，与 publish 在 b.mu 下经
 // matches 读同一张 map 构成 fatal 级竞态）。`-race` 下旧实现必报
 // concurrent map read and map write；修复 = 域增删收敛进总线锁
-// （Bus.UnsubscribeDomains，server 只调）。
+// （facade.Bus.UnsubscribeDomains，server 只调）。
 func TestServerConcurrentUnsubscribeVsPublish(t *testing.T) {
-	ts := startTestServer(t, BusConfig{SubQueue: 1024})
+	ts := startTestServer(t, facade.BusConfig{SubQueue: 1024})
 	c, _ := dialTest(t, ts)
 	ctx := context.Background()
-	if _, err := c.Subscribe(ctx, []string{DomainSession}, nil, "", ""); err != nil {
+	if _, err := c.Subscribe(ctx, []string{facade.DomainSession}, nil, "", ""); err != nil {
 		t.Fatal(err)
 	}
 	var wg sync.WaitGroup
@@ -785,16 +786,16 @@ func TestServerConcurrentUnsubscribeVsPublish(t *testing.T) {
 	go func() { // 并发发布（publish 在 b.mu 下读 sub.domains）
 		defer wg.Done()
 		for i := 0; i < 500; i++ {
-			_, _ = ts.bus.Publish(DomainSession, KindSessionStateChanged, SessionStateChangedPayload{Host: "aa", State: "x"})
+			_, _ = ts.bus.Publish(facade.DomainSession, facade.KindSessionStateChanged, facade.SessionStateChangedPayload{Host: "aa", State: "x"})
 		}
 	}()
 	go func() { // 并发退订/再订阅（写 sub.domains——只在 b.mu 内）
 		defer wg.Done()
 		for i := 0; i < 100; i++ {
-			if err := c.Unsubscribe(ctx, []string{DomainSession}); err != nil {
+			if err := c.Unsubscribe(ctx, []string{facade.DomainSession}); err != nil {
 				return // 连接被断（overrun 等）：停（竞态窗口已开过）
 			}
-			if _, err := c.Subscribe(ctx, []string{DomainSession}, nil, "", ""); err != nil {
+			if _, err := c.Subscribe(ctx, []string{facade.DomainSession}, nil, "", ""); err != nil {
 				return
 			}
 		}

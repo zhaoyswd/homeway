@@ -17,6 +17,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"github.com/zhaoyswd/homeway/clientcore/facade"
 	"io"
 	"os"
 	"path/filepath"
@@ -96,17 +97,17 @@ func hostAddCLI(args []string, version string, w io.Writer) error {
 		return fmt.Errorf("homeway daemon 未在运行（sock=%s：%v）\n先启动：homeway daemon --state %s", sock, err, *stateDir)
 	}
 	defer c.Close()
-	raw, err := c.Request(ctx, control.OpHostAdd, control.HostAddArgs{Name: *name, Token: token, Force: *force})
+	raw, err := c.Request(ctx, facade.OpHostAdd, control.HostAddArgs{Name: *name, Token: token, Force: *force})
 	if err != nil {
 		var code control.CodeError
 		switch {
-		case errors.As(err, &code) && string(code) == control.CodeHostUnreachable:
+		case errors.As(err, &code) && string(code) == facade.CodeHostUnreachable:
 			return fmt.Errorf("全不可达：token %s 的全部端点（直连与中继）在预算内均无应答，主机未入表\n排查：出口是否在运行 / token 是否为最新（重启出口取新 token）/ 网络与防火墙是否放行 UDP / 受限网络需在出口配置中继后重新粘贴\n仍然添加：homeway host add <token> --force", maskToken(token))
-		case errors.As(err, &code) && string(code) == control.CodeBadToken:
+		case errors.As(err, &code) && string(code) == facade.CodeBadToken:
 			return fmt.Errorf("token 非法（%s）：服务端解码失败，请从出口启动日志重新获取", maskToken(token))
-		case errors.As(err, &code) && string(code) == control.CodeHostExists:
+		case errors.As(err, &code) && string(code) == facade.CodeHostExists:
 			return fmt.Errorf("该后端已在表中（同 token 重复添加；换新 token = 同键刷新，无需先删）")
-		case errors.As(err, &code) && string(code) == control.CodeNotReady:
+		case errors.As(err, &code) && string(code) == facade.CodeNotReady:
 			return fmt.Errorf("守护进程注册表未就绪（client 角色启动中/重建窗口），稍后重试")
 		default:
 			return fmt.Errorf("host.add 失败：%w", err)
@@ -141,12 +142,12 @@ func printHostAdded(w io.Writer, res *control.HostAddResult) {
 		return
 	}
 	switch res.Reach.Tier {
-	case control.ReachTierDirect:
+	case facade.ReachTierDirect:
 		fmt.Fprintf(w, "已添加主机 %s（%s）——直连可达 ep=%s rtt=%dms\n", name, shortHostID(res.ID), res.Reach.BestEp, res.Reach.RttMs)
-	case control.ReachTierRelay:
+	case facade.ReachTierRelay:
 		fmt.Fprintf(w, "已添加主机 %s（%s）——仅中继可达 ep=%s rtt=%dms\n", name, shortHostID(res.ID), res.Reach.BestEp, res.Reach.RttMs)
 		fmt.Fprintln(w, "  提示：直连不可达，连接将走中继；若非预期请检查出口公网端口/UPnP")
-	case control.ReachTierSkipped:
+	case facade.ReachTierSkipped:
 		fmt.Fprintf(w, "已添加主机 %s（%s）——跳过验证（--force，端点未实测，首次连接时补全）\n", name, shortHostID(res.ID))
 	default:
 		fmt.Fprintf(w, "已添加主机 %s（%s）——验证结论未知（tier=%q，词表外值；守护进程版本或高于本 CLI）\n", name, shortHostID(res.ID), res.Reach.Tier)
@@ -196,7 +197,7 @@ func fetchHosts(stateDir string, timeout time.Duration, version string) ([]contr
 		return nil, nil, fmt.Errorf("homeway daemon 未在运行（sock=%s：%v）\n先启动：homeway daemon --state %s", sock, err, stateDir)
 	}
 	closeC := func() { c.Close(); cancel() }
-	raw, err := c.Request(ctx, control.OpDaemonStatus, nil)
+	raw, err := c.Request(ctx, facade.OpDaemonStatus, nil)
 	if err != nil {
 		closeC()
 		return nil, nil, fmt.Errorf("daemon.status 失败：%w", err)
@@ -384,9 +385,9 @@ func hostDeleteCLI(args []string, version string, w io.Writer) error {
 	}
 	defer c.Close()
 	var code control.CodeError
-	if _, err := c.Request(ctx, control.OpHostRemove, control.HostRemoveArgs{Host: id}); err != nil {
+	if _, err := c.Request(ctx, facade.OpHostRemove, control.HostRemoveArgs{Host: id}); err != nil {
 		switch {
-		case errors.As(err, &code) && string(code) == control.CodeNoHost:
+		case errors.As(err, &code) && string(code) == facade.CodeNoHost:
 			return fmt.Errorf("主机 %s 不存在或已被删除（homeway host list 查看）", target)
 		default:
 			return fmt.Errorf("host.remove 失败：%w", err)

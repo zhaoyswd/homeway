@@ -11,6 +11,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/zhaoyswd/homeway/clientcore/facade"
 	"net"
 	"net/netip"
 	"os"
@@ -81,7 +82,7 @@ func TestHostAddFourPaths(t *testing.T) {
 	dead := addDeadPort(t)
 
 	// ① 直连可达：入表 + tier=direct + bestEp=实测直连端点 + rtt 有值。
-	raw, err := c.Request(ctx, control.OpHostAdd, control.HostAddArgs{Name: "直连后端", Token: addToken(t, [32]byte{1}, proto.Endpoint{Addr: direct.pc.LocalAddr().String()})})
+	raw, err := c.Request(ctx, facade.OpHostAdd, control.HostAddArgs{Name: "直连后端", Token: addToken(t, [32]byte{1}, proto.Endpoint{Addr: direct.pc.LocalAddr().String()})})
 	if err != nil {
 		t.Fatalf("直连 host.add：%v", err)
 	}
@@ -89,7 +90,7 @@ func TestHostAddFourPaths(t *testing.T) {
 	if err := json.Unmarshal(raw, &r1); err != nil {
 		t.Fatal(err)
 	}
-	if r1.Reach == nil || r1.Reach.Tier != control.ReachTierDirect || r1.Reach.BestEp != direct.pc.LocalAddr().String() || r1.Reach.RttMs < 0 {
+	if r1.Reach == nil || r1.Reach.Tier != facade.ReachTierDirect || r1.Reach.BestEp != direct.pc.LocalAddr().String() || r1.Reach.RttMs < 0 {
 		t.Fatalf("直连结论不符：%+v", r1.Reach)
 	}
 	if len(r1.Reach.Tested) != 1 || r1.Reach.Tested[0].Relay {
@@ -98,7 +99,7 @@ func TestHostAddFourPaths(t *testing.T) {
 
 	// ② 仅中继：直连死 + 中继活 → 入表 + tier=relay + 提示面数据（relay 档场景
 	// 证据——live 拓扑若两台均直连则以此为准，host-cli 1.7 同款）。
-	raw, err = c.Request(ctx, control.OpHostAdd, control.HostAddArgs{Name: "中继后端", Token: addToken(t, [32]byte{2},
+	raw, err = c.Request(ctx, facade.OpHostAdd, control.HostAddArgs{Name: "中继后端", Token: addToken(t, [32]byte{2},
 		proto.Endpoint{Addr: dead},
 		proto.Endpoint{Addr: relay.pc.LocalAddr().String(), Relay: true},
 	)})
@@ -109,7 +110,7 @@ func TestHostAddFourPaths(t *testing.T) {
 	if err := json.Unmarshal(raw, &r2); err != nil {
 		t.Fatal(err)
 	}
-	if r2.Reach == nil || r2.Reach.Tier != control.ReachTierRelay || r2.Reach.BestEp != relay.pc.LocalAddr().String() {
+	if r2.Reach == nil || r2.Reach.Tier != facade.ReachTierRelay || r2.Reach.BestEp != relay.pc.LocalAddr().String() {
 		t.Fatalf("仅中继结论不符：%+v", r2.Reach)
 	}
 
@@ -118,13 +119,13 @@ func TestHostAddFourPaths(t *testing.T) {
 		proto.Endpoint{Addr: dead},
 		proto.Endpoint{Addr: "203.0.113.50:41641", Relay: true},
 	)
-	if _, err := c.Request(ctx, control.OpHostAdd, control.HostAddArgs{Name: "失联", Token: tok3}); !errors.Is(err, control.CodeError(control.CodeHostUnreachable)) {
+	if _, err := c.Request(ctx, facade.OpHostAdd, control.HostAddArgs{Name: "失联", Token: tok3}); !errors.Is(err, control.CodeError(facade.CodeHostUnreachable)) {
 		t.Fatalf("全不可达应 host_unreachable：%v", err)
 	}
-	if _, err := c.Request(ctx, control.OpHostList, nil); err != nil {
+	if _, err := c.Request(ctx, facade.OpHostList, nil); err != nil {
 		t.Fatalf("host_unreachable 后连接应保持：%v", err)
 	}
-	rawList, err := c.Request(ctx, control.OpHostList, nil)
+	rawList, err := c.Request(ctx, facade.OpHostList, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -137,7 +138,7 @@ func TestHostAddFourPaths(t *testing.T) {
 	}
 
 	// ④ force 跳过：同 token 带 force → 入表成功、tier=skipped、tested 空。
-	raw, err = c.Request(ctx, control.OpHostAdd, control.HostAddArgs{Name: "强制", Token: tok3, Force: true})
+	raw, err = c.Request(ctx, facade.OpHostAdd, control.HostAddArgs{Name: "强制", Token: tok3, Force: true})
 	if err != nil {
 		t.Fatalf("force host.add：%v", err)
 	}
@@ -145,13 +146,13 @@ func TestHostAddFourPaths(t *testing.T) {
 	if err := json.Unmarshal(raw, &r4); err != nil {
 		t.Fatal(err)
 	}
-	if r4.Reach == nil || r4.Reach.Tier != control.ReachTierSkipped || r4.Reach.BestEp != "" || len(r4.Reach.Tested) != 0 {
+	if r4.Reach == nil || r4.Reach.Tier != facade.ReachTierSkipped || r4.Reach.BestEp != "" || len(r4.Reach.Tested) != 0 {
 		t.Fatalf("force 结论应为 skipped（端点未实测）：%+v", r4.Reach)
 	}
 
 	// 清理（会话对回环探测应答器的暖机属异步预期，Remove 走完即可）。
 	for _, id := range []string{r1.ID, r2.ID, r4.ID} {
-		if _, err := c.Request(ctx, control.OpHostRemove, control.HostRemoveArgs{Host: id}); err != nil {
+		if _, err := c.Request(ctx, facade.OpHostRemove, control.HostRemoveArgs{Host: id}); err != nil {
 			t.Fatalf("清理 %s：%v", id, err)
 		}
 	}
@@ -165,10 +166,10 @@ func TestHostAddBadTokenNoProbe(t *testing.T) {
 	ctx := context.Background()
 	fp := addStartProber(t, "exit-n")
 
-	if _, err := c.Request(ctx, control.OpHostAdd, control.HostAddArgs{Token: "hmw1-not-a-token"}); !errors.Is(err, control.CodeError(control.CodeBadToken)) {
+	if _, err := c.Request(ctx, facade.OpHostAdd, control.HostAddArgs{Token: "hmw1-not-a-token"}); !errors.Is(err, control.CodeError(facade.CodeBadToken)) {
 		t.Fatalf("坏 token 应 bad_token：%v", err)
 	}
-	if _, err := c.Request(ctx, control.OpHostAdd, control.HostAddArgs{Token: "hmw1-not-a-token", Force: true}); !errors.Is(err, control.CodeError(control.CodeBadToken)) {
+	if _, err := c.Request(ctx, facade.OpHostAdd, control.HostAddArgs{Token: "hmw1-not-a-token", Force: true}); !errors.Is(err, control.CodeError(facade.CodeBadToken)) {
 		t.Fatalf("force 不得绕过 bad_token：%v", err)
 	}
 	if got := fp.hits.Load(); got != 0 {
@@ -227,7 +228,7 @@ func TestHostAddProbeZeroSideEffect(t *testing.T) {
 
 	// A 先入表并就绪（A 走 force：出口的探测应答器 = WG 端口本身会回参照点应答，
 	// 但此处不依赖——force 保证入表不依赖探测结论，暖机握手才判健康）。
-	raw, err := c.Request(ctx, control.OpHostAdd, control.HostAddArgs{Name: "健康A", Token: tokA, Force: true})
+	raw, err := c.Request(ctx, facade.OpHostAdd, control.HostAddArgs{Name: "健康A", Token: tokA, Force: true})
 	if err != nil {
 		t.Fatalf("A 入表：%v", err)
 	}
@@ -240,7 +241,7 @@ func TestHostAddProbeZeroSideEffect(t *testing.T) {
 
 	// 添加 B（真探测：应答器活端点）——探测期间/之后 A 无扰动。
 	bEp := addStartProber(t, "exit-b")
-	raw, err = c.Request(ctx, control.OpHostAdd, control.HostAddArgs{Name: "后端B", Token: addToken(t, [32]byte{5}, proto.Endpoint{Addr: bEp.pc.LocalAddr().String()})})
+	raw, err = c.Request(ctx, facade.OpHostAdd, control.HostAddArgs{Name: "后端B", Token: addToken(t, [32]byte{5}, proto.Endpoint{Addr: bEp.pc.LocalAddr().String()})})
 	if err != nil {
 		t.Fatalf("B host.add：%v", err)
 	}
@@ -248,7 +249,7 @@ func TestHostAddProbeZeroSideEffect(t *testing.T) {
 	if err := json.Unmarshal(raw, &recB); err != nil {
 		t.Fatal(err)
 	}
-	if recB.Reach == nil || recB.Reach.Tier != control.ReachTierDirect {
+	if recB.Reach == nil || recB.Reach.Tier != facade.ReachTierDirect {
 		t.Fatalf("B 结论应为 direct：%+v", recB.Reach)
 	}
 
@@ -257,7 +258,7 @@ func TestHostAddProbeZeroSideEffect(t *testing.T) {
 	deadline := time.Now().Add(3 * time.Second)
 	found := false
 	for time.Now().Before(deadline) {
-		rawS, err := c.Request(ctx, control.OpSnapshotGet, nil)
+		rawS, err := c.Request(ctx, facade.OpSnapshotGet, nil)
 		if err == nil {
 			var snap control.SnapshotResult
 			if json.Unmarshal(rawS, &snap) == nil {

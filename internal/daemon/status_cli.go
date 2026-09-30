@@ -12,6 +12,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"github.com/zhaoyswd/homeway/clientcore/facade"
 	"io"
 	"path/filepath"
 	"time"
@@ -42,7 +43,7 @@ func statusCLI(args []string, version string, w io.Writer) error {
 		return fmt.Errorf("homeway daemon 未在运行（sock=%s：%v）\n先启动：homeway daemon --state %s", sock, err, *stateDir)
 	}
 	defer c.Close()
-	raw, err := c.Request(ctx, control.OpDaemonStatus, nil)
+	raw, err := c.Request(ctx, facade.OpDaemonStatus, nil)
 	if err != nil {
 		return fmt.Errorf("daemon.status 失败：%w", err)
 	}

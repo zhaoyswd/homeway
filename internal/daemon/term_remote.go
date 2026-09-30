@@ -12,6 +12,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/zhaoyswd/homeway/clientcore/facade"
 	"io"
 	"io/fs"
 	"os"
@@ -117,11 +118,11 @@ func streamOpenErr(err error) error {
 	var code control.CodeError
 	if errors.As(err, &code) {
 		switch string(code) {
-		case control.CodeNoHost:
+		case facade.CodeNoHost:
 			return errors.New("主机不在守护进程表中（no_host）；homeway host list 查看在表主机")
-		case control.CodeNotReady:
+		case facade.CodeNotReady:
 			return errors.New("守护进程注册表未就绪（not_ready；client 角色启动中/重建窗口），稍后重试")
-		case control.CodeStreamRefused:
+		case facade.CodeStreamRefused:
 			return errors.New("与主机的流打开被拒（stream_refused）——主机离线、隧道未通或主机会话不可用；用 homeway host status <name> 核对会话与链路态")
 		}
 	}
@@ -139,7 +140,7 @@ func fetchHostsForTerm(ctx context.Context, stateDir, version string) ([]control
 		return nil, nil, err
 	}
 	closeC := func() { c.Close() }
-	raw, err := c.Request(ctx, control.OpDaemonStatus, nil)
+	raw, err := c.Request(ctx, facade.OpDaemonStatus, nil)
 	if err != nil {
 		closeC()
 		return nil, nil, fmt.Errorf("daemon.status 失败：%w", err)

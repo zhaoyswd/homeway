@@ -12,6 +12,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/zhaoyswd/homeway/clientcore/facade"
 	"io"
 	"net"
 	"strings"
@@ -61,7 +62,7 @@ func startEchoBackend(t *testing.T) *echoTermBackend {
 func TestStreamPassthroughBinaryBytes(t *testing.T) {
 	// 透传字节逐字节对拍：上行脏数据（0x00/0xff/UTF-8 截断段/全 256 值）经
 	// stream.data → 后端 echo → stream.data 回来，字节原样（守护进程不解析不改写）。
-	ts := startTestServer(t, BusConfig{})
+	ts := startTestServer(t, facade.BusConfig{})
 	echo := startEchoBackend(t)
 	ts.backend.mu.Lock()
 	ts.backend.dialAddr = echo.ln.Addr().String()
@@ -105,7 +106,7 @@ func TestStreamPassthroughBinaryBytes(t *testing.T) {
 	}
 	select {
 	case r := <-st.End():
-		if r != StreamEndClosed {
+		if r != facade.StreamEndClosed {
 			t.Fatalf("前端主动关应 end(closed)：%q", r)
 		}
 	case <-time.After(3 * time.Second):
@@ -172,7 +173,7 @@ func TestSendShardFrameBound(t *testing.T) {
 // 在单元层确定性覆盖（2026-09-29 CI 实测：32 帧 e2e 在 ubuntu 共享 runner 红于
 // 「流 1 不在册（已关？），上行 16384 字节被拒」——upC 溢出收流，分片本身无误）。
 func TestStreamSendShardingLargePayload(t *testing.T) {
-	ts := startTestServer(t, BusConfig{})
+	ts := startTestServer(t, facade.BusConfig{})
 	echo := startEchoBackend(t)
 	ts.backend.mu.Lock()
 	ts.backend.dialAddr = echo.ln.Addr().String()
@@ -243,7 +244,7 @@ func TestStreamSendShardingLargePayload(t *testing.T) {
 
 func TestStreamEndOrderBackendClose(t *testing.T) {
 	// 后端发 N 块后主动关闭：客户端收齐 N 块后收 end(closed)，之后无该流数据。
-	ts := startTestServer(t, BusConfig{})
+	ts := startTestServer(t, facade.BusConfig{})
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
@@ -285,7 +286,7 @@ func TestStreamEndOrderBackendClose(t *testing.T) {
 	t.Logf("收到 %q", got)
 	select {
 	case r := <-st.End():
-		if r != StreamEndClosed {
+		if r != facade.StreamEndClosed {
 			t.Fatalf("后端 EOF 应 end(closed)：%q", r)
 		}
 	case <-time.After(3 * time.Second):
@@ -301,24 +302,24 @@ func TestStreamEndOrderBackendClose(t *testing.T) {
 
 func TestStreamGoneWhenDialFails(t *testing.T) {
 	// 目标主机不可达：stream.open 拒（stream_refused，不产生流）。
-	ts := startTestServer(t, BusConfig{})
+	ts := startTestServer(t, facade.BusConfig{})
 	ts.backend.mu.Lock()
 	ts.backend.dialErr["aa"] = errors.New("unreachable")
 	ts.backend.dialErr["nobody"] = ErrBackendNoHost
 	ts.backend.mu.Unlock()
 	c, _ := dialTest(t, ts)
-	if _, err := c.OpenStream(context.Background(), "aa"); !errors.Is(err, CodeError(CodeStreamRefused)) {
+	if _, err := c.OpenStream(context.Background(), "aa"); !errors.Is(err, CodeError(facade.CodeStreamRefused)) {
 		t.Fatalf("不可达应 stream_refused：%v", err)
 	}
 	// host 不在表：no_host。
-	if _, err := c.OpenStream(context.Background(), "nobody"); !errors.Is(err, CodeError(CodeNoHost)) {
+	if _, err := c.OpenStream(context.Background(), "nobody"); !errors.Is(err, CodeError(facade.CodeNoHost)) {
 		t.Fatalf("主机不存在应 no_host：%v", err)
 	}
 }
 
 func TestStreamNoStreamOnClosedAndData(t *testing.T) {
 	// 未知/已关 streamId：close 回 no_stream 不断连；data 帧 → corr=0 回执 no_stream。
-	ts := startTestServer(t, BusConfig{})
+	ts := startTestServer(t, facade.BusConfig{})
 	echo := startEchoBackend(t)
 	ts.backend.mu.Lock()
 	ts.backend.dialAddr = echo.ln.Addr().String()
@@ -327,7 +328,7 @@ func TestStreamNoStreamOnClosedAndData(t *testing.T) {
 	ctx := context.Background()
 
 	// 未知流 close。
-	if _, err := c.Request(ctx, OpStreamClose, StreamCloseArgs{StreamID: 99}); !errors.Is(err, CodeError(CodeNoStream)) {
+	if _, err := c.Request(ctx, facade.OpStreamClose, StreamCloseArgs{StreamID: 99}); !errors.Is(err, CodeError(facade.CodeNoStream)) {
 		t.Fatalf("未知流 close 应 no_stream：%v", err)
 	}
 	// 开一条流、正常关闭，再对它 close。
@@ -339,7 +340,7 @@ func TestStreamNoStreamOnClosedAndData(t *testing.T) {
 		t.Fatal(err)
 	}
 	<-st.End()
-	if _, err := c.Request(ctx, OpStreamClose, StreamCloseArgs{StreamID: st.ID}); !errors.Is(err, CodeError(CodeNoStream)) {
+	if _, err := c.Request(ctx, facade.OpStreamClose, StreamCloseArgs{StreamID: st.ID}); !errors.Is(err, CodeError(facade.CodeNoStream)) {
 		t.Fatalf("已关流 close 应 no_stream：%v", err)
 	}
 	// 对已关流发 data：corr=0 通知回执 no_stream，连接与其它流不受影响。
@@ -354,14 +355,14 @@ func TestStreamNoStreamOnClosedAndData(t *testing.T) {
 	select {
 	case n := <-c.Notify():
 		var m map[string]any
-		if err := json.Unmarshal(n.Result, &m); err != nil || m["error"] != CodeNoStream {
+		if err := json.Unmarshal(n.Result, &m); err != nil || m["error"] != facade.CodeNoStream {
 			t.Fatalf("data 回执应为 no_stream：%s", n.Result)
 		}
 	case <-time.After(3 * time.Second):
 		t.Fatal("no_stream 回执未到达")
 	}
 	// 连接仍可用（不断连）。
-	if _, err := c.Request(ctx, OpHostList, nil); err != nil {
+	if _, err := c.Request(ctx, facade.OpHostList, nil); err != nil {
 		t.Fatalf("no_stream 后连接应不断：%v", err)
 	}
 }
@@ -373,7 +374,7 @@ func TestStreamNoStreamOnClosedAndData(t *testing.T) {
 // 红绿判别与 end 帧存在竞速——删掉 markEnded 后本用例可能仍绿（end 先到），该行的
 // 保障意义在「end 未到/永不到的窗口内不再静默成功」。
 func TestStreamSendAfterLocalClose(t *testing.T) {
-	ts := startTestServer(t, BusConfig{})
+	ts := startTestServer(t, facade.BusConfig{})
 	echo := startEchoBackend(t)
 	ts.backend.mu.Lock()
 	ts.backend.dialAddr = echo.ln.Addr().String()
@@ -397,7 +398,7 @@ func TestStreamSendAfterLocalClose(t *testing.T) {
 
 func TestStreamLimitPerConnection(t *testing.T) {
 	// 每连接在册流上限（默认 8）：第 9 条 stream_refused；关闭后可再开。
-	ts := startTestServer(t, BusConfig{})
+	ts := startTestServer(t, facade.BusConfig{})
 	echo := startEchoBackend(t)
 	ts.backend.mu.Lock()
 	ts.backend.dialAddr = echo.ln.Addr().String()
@@ -412,7 +413,7 @@ func TestStreamLimitPerConnection(t *testing.T) {
 		}
 		last = st
 	}
-	if _, err := c.OpenStream(ctx, "aa"); !errors.Is(err, CodeError(CodeStreamRefused)) {
+	if _, err := c.OpenStream(ctx, "aa"); !errors.Is(err, CodeError(facade.CodeStreamRefused)) {
 		t.Fatalf("超上限应 stream_refused：%v", err)
 	}
 	if last != nil {
@@ -432,7 +433,7 @@ func TestSlowStreamDoesNotBlockControlFrames(t *testing.T) {
 	// 前端停读）到流队列与 socket 缓冲上限，随后该连接发 daemon.status——控制
 	// 帧必须在积压流数据**大量送达之前**到达（writer 优先级：控制 > 流——控制
 	// 帧不被慢流队头阻塞）。
-	ts := startTestServer(t, BusConfig{})
+	ts := startTestServer(t, facade.BusConfig{})
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
@@ -474,7 +475,7 @@ func TestSlowStreamDoesNotBlockControlFrames(t *testing.T) {
 	if _, err := nc.Write(EncodeFrame(OpHello, []byte(`{"protoVersion":1,"frontend":{"kind":"cli","name":"slow","version":"0"}}`))); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := nc.Write(EncodeFrame(OpReq, mustJSONBytes(t, RequestBody{Corr: 1, Op: OpStreamOpen, Args: mustJSONBytes(t, StreamOpenArgs{Kind: StreamKindTerm, Host: "aa"})}))); err != nil {
+	if _, err := nc.Write(EncodeFrame(OpReq, mustJSONBytes(t, RequestBody{Corr: 1, Op: facade.OpStreamOpen, Args: mustJSONBytes(t, StreamOpenArgs{Kind: facade.StreamKindTerm, Host: "aa"})}))); err != nil {
 		t.Fatal(err)
 	}
 	// 读到 stream.open 的 rsp 即止（读 deadline 防无限阻塞）。
@@ -501,7 +502,7 @@ func TestSlowStreamDoesNotBlockControlFrames(t *testing.T) {
 	time.Sleep(time.Second)
 	// 恢复读 + 同连接发控制请求。
 	_ = nc.SetReadDeadline(time.Time{})
-	if _, err := nc.Write(EncodeFrame(OpReq, mustJSONBytes(t, RequestBody{Corr: 2, Op: OpDaemonStatus}))); err != nil {
+	if _, err := nc.Write(EncodeFrame(OpReq, mustJSONBytes(t, RequestBody{Corr: 2, Op: facade.OpDaemonStatus}))); err != nil {
 		t.Fatal(err)
 	}
 	_ = nc.SetReadDeadline(time.Now().Add(10 * time.Second))
@@ -552,7 +553,7 @@ func mustJSONBytes(t *testing.T, v any) []byte {
 // 照常应答（单流前端语义：同连接 Request 在停读窗口内不保证，已从判据删除——
 // r1 P0-1）。
 func TestStreamBackpressureNoLoss(t *testing.T) {
-	ts := startTestServer(t, BusConfig{})
+	ts := startTestServer(t, facade.BusConfig{})
 	// 后端：写 N 块（块内字节带序号模式）后主动关——EOF 触发 end(closed)。
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -597,7 +598,7 @@ func TestStreamBackpressureNoLoss(t *testing.T) {
 	c2, _ := dialTest(t, ts)
 	c2ctx, c2cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer c2cancel()
-	if _, err := c2.Request(c2ctx, OpDaemonStatus, nil); err != nil {
+	if _, err := c2.Request(c2ctx, facade.OpDaemonStatus, nil); err != nil {
 		t.Fatalf("停读窗口内另一条连接的请求应照常应答：%v", err)
 	}
 
@@ -646,7 +647,7 @@ func TestStreamBackpressureNoLoss(t *testing.T) {
 			t.Fatal("end 帧未到达")
 		}
 	}
-	if endReason != StreamEndClosed {
+	if endReason != facade.StreamEndClosed {
 		t.Fatalf("后端 EOF 应 end(closed)：%q", endReason)
 	}
 }
@@ -702,7 +703,7 @@ func TestStreamBackpressureOldDeliveryDropsFrames(t *testing.T) {
 // 背靠背 → 服务端上行队列满按背压收流（finish(gone)）→ 流收尾后后续 Send 报
 // ErrStreamEnded（非 nil、errors.Is 可判、含原因）。
 func TestStreamSendErrorsAfterEnd(t *testing.T) {
-	ts := startTestServer(t, BusConfig{})
+	ts := startTestServer(t, facade.BusConfig{})
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
@@ -748,7 +749,7 @@ t2:
 		}
 		select {
 		case r := <-st.End():
-			if r != StreamEndGone {
+			if r != facade.StreamEndGone {
 				t.Fatalf("后端不读应收 end(gone)：%q", r)
 			}
 			break t2
@@ -759,7 +760,7 @@ t2:
 	// end(gone) 必达（若上面经 Send 报错退出，这里非阻塞补收）。
 	select {
 	case r := <-st.End():
-		if r != StreamEndGone {
+		if r != facade.StreamEndGone {
 			t.Fatalf("后端不读应收 end(gone)：%q", r)
 		}
 	default:
@@ -790,7 +791,7 @@ t2:
 // 收工（连接断，无 end 帧）→ 在册流全部标记 ended（reason=conn）→ Send 报
 // ErrStreamEnded（含「连接已断开」文案）。
 func TestStreamSendErrorsAfterConnClose(t *testing.T) {
-	ts := startTestServer(t, BusConfig{})
+	ts := startTestServer(t, facade.BusConfig{})
 	echo := startEchoBackend(t)
 	ts.backend.mu.Lock()
 	ts.backend.dialAddr = echo.ln.Addr().String()

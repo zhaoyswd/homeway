@@ -11,6 +11,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"github.com/zhaoyswd/homeway/clientcore/facade"
 	"net"
 	"os"
 	"path/filepath"
@@ -301,7 +302,7 @@ func cleanHost(t *testing.T, sock string) {
 		return
 	}
 	defer c.Close()
-	raw, err := c.Request(ctx, control.OpHostList, nil)
+	raw, err := c.Request(ctx, facade.OpHostList, nil)
 	if err != nil {
 		return
 	}
@@ -310,7 +311,7 @@ func cleanHost(t *testing.T, sock string) {
 		return
 	}
 	for _, h := range list.Hosts {
-		_, _ = c.Request(ctx, control.OpHostRemove, control.HostRemoveArgs{Host: h.ID})
+		_, _ = c.Request(ctx, facade.OpHostRemove, control.HostRemoveArgs{Host: h.ID})
 	}
 }
 
@@ -339,7 +340,7 @@ func (b *skewBackend) AddHost(name, token string, force bool) (control.HostAddRe
 // daemon 后复核，退出码 0（主机确实已被旧 daemon 入表）。
 func TestHostCLIAddVersionSkewNoReach(t *testing.T) {
 	dir := shortTempDirDaemon(t)
-	bus := control.NewBus(control.NewGeneration(), control.BusConfig{})
+	bus := facade.NewBus(control.NewGeneration(), facade.BusConfig{})
 	srv := control.NewServer(control.ServerConfig{ServerVersion: "0.9.0-old", Bus: bus, Backend: &skewBackend{}})
 	sock, ln, err := control.ListenControl(dir)
 	if err != nil {

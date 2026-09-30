@@ -77,39 +77,8 @@ type ResponseBody struct {
 	Result json.RawMessage `json:"result,omitempty"`
 }
 
-// 错误码表（spec「请求/响应与错误码表」，只增不改；连接列 = 是否断连）。
-// 常量名为错误码字符串（Code* 前缀）；帧/总线层的 error 哨兵（Err* 前缀）另见
-// frame.go / bus.go。
-const (
-	CodeUnknownOp       = "unknown_op"       // 未知操作名（不断连）
-	CodeNoStream        = "no_stream"        // 未知/已关闭的 streamId（不断连）
-	CodeBadJSON         = "bad_json"         // 控制类 body 非法 JSON（断连）
-	CodeBadRequest      = "bad_request"      // 载荷字段缺失/类型不符/值域外（不断连）
-	CodeBadFrame        = "bad_frame"        // 帧长超限/非法 op（断连；超限在读 body 前）
-	CodeNotReady        = "not_ready"        // 守护进程未就绪（不断连）
-	CodeShuttingDown    = "shutting_down"    // 收工中（不断连）
-	CodeHostExists      = "host_exists"      // 重复添加同后端（不断连）
-	CodeNoHost          = "no_host"          // 主机不存在（不断连）
-	CodeBadToken        = "bad_token"        // token 非法（不断连）
-	CodeHostUnreachable = "host_unreachable" // host.add 验证结论为全不可达且未带 force（不入表；不断连；host-cli 3b 只增）
-	CodeStreamRefused   = "stream_refused"   // 流打开被拒（含在册流超上限；不断连）
-	CodeCursorStale     = "cursor_stale"     // 订阅游标过旧/代际失配（resync 语义；不断连）
-)
-
-// ---------- 操作词表与各操作载荷 ----------
-
-// 操作名（spec 初始集，只增不改）。
-const (
-	OpDaemonStatus      = "daemon.status"
-	OpHostAdd           = "host.add"
-	OpHostRemove        = "host.remove"
-	OpHostList          = "host.list"
-	OpSnapshotGet       = "snapshot.get"
-	OpEventsSubscribe   = "events.subscribe"
-	OpEventsUnsubscribe = "events.unsubscribe"
-	OpStreamOpen        = "stream.open"
-	OpStreamClose       = "stream.close"
-)
+// 错误码表（Code*）与操作名词表（Op*）已迁 clientcore/facade/vocab.go（4a 任务
+// 1.1：词汇真源一处定义；本包引用 facade 词汇，不自定义）。
 
 // HostAddArgs host.add 载荷（3b 起含服务端有界连通性验证——验证契约本体见
 // host-management；结论以 HostAddResult.reach 字段只增返回）。
@@ -129,13 +98,7 @@ type HostAddResult struct {
 	Reach   *HostReach `json:"reach,omitempty"` // 3b 只增：验证三档结论（nil 不出现——服务端恒填）
 }
 
-// reach.tier 受控枚举（spec「命令归属规则」：direct|relay|skipped，只增不改）。
-const (
-	ReachTierDirect  = "direct"  // 有直连端点应答
-	ReachTierRelay   = "relay"   // 直连全无应答且中继有应答
-	ReachTierSkipped = "skipped" // force 跳过探测（端点未实测语义）
-)
-
+// （reach.tier 词表 ReachTierDirect/Relay/Skipped 已迁 clientcore/facade/vocab.go。）
 // HostReach host.add 成功载荷的验证结论（tier=none 不出现在成功载荷——全不可达
 // 用错误码 host_unreachable 表达，不入表不断连）。
 type HostReach struct {
@@ -220,50 +183,8 @@ type StreamCloseArgs struct {
 
 // ---------- 事件流（域与 kind 词表、载荷字段表） ----------
 
-// 订阅域词表（spec 初始集，只增不改）。
-const (
-	DomainLink     = "link"
-	DomainSession  = "session"
-	DomainTransfer = "transfer"
-	DomainLog      = "log"
-	DomainTerm     = "term"
-)
-
-// 事件 kind 词表（受控枚举，只增不改）。
-const (
-	KindLinkChanged         = "link.changed"
-	KindSessionAdded        = "session.added"
-	KindSessionRemoved      = "session.removed"
-	KindSessionStateChanged = "session.state_changed"
-	KindSessionLadder       = "session.ladder"
-	KindSessionRebuild      = "session.rebuild"
-	KindSessionDiag         = "session.diag" // 词表冻结但本期不发射（spec「诊因事件词表」）
-	KindTransferSample      = "transfer.sample"
-	KindLogLine             = "log.line"
-	KindTermSessionUpdated  = "term.session_updated" // kind 值冻结；载荷字段初始集为空（后续 delta 增补）
-	KindTermEnded           = "term.ended"           // 同上
-)
-
-// kindDomains kind → 域 的唯一归属表（Publish 校验 + fixtures 对拍真源）。
-var kindDomains = map[string]string{
-	KindLinkChanged:         DomainLink,
-	KindSessionAdded:        DomainSession,
-	KindSessionRemoved:      DomainSession,
-	KindSessionStateChanged: DomainSession,
-	KindSessionLadder:       DomainSession,
-	KindSessionRebuild:      DomainSession,
-	KindSessionDiag:         DomainSession,
-	KindTransferSample:      DomainTransfer,
-	KindLogLine:             DomainLog,
-	KindTermSessionUpdated:  DomainTerm,
-	KindTermEnded:           DomainTerm,
-}
-
-// validDomains 订阅域词表。
-var validDomains = map[string]bool{
-	DomainLink: true, DomainSession: true, DomainTransfer: true, DomainLog: true, DomainTerm: true,
-}
-
+// （订阅域 Domain*/事件 kind Kind* 词表、kindDomains 归属表与 validDomains 已迁
+// clientcore/facade/vocab.go。）
 // EventBody 事件帧 body：seq 自包含（全局单调、随代际唯一化）；payload 为该 kind 的
 // 载荷（字段表见 spec，只增不改）。
 type EventBody struct {
@@ -273,92 +194,12 @@ type EventBody struct {
 	Payload json.RawMessage `json:"payload,omitempty"`
 }
 
-// ---------- 事件载荷字段表（spec「事件流」初始集落实现；字段只增不改） ----------
-
-// LinkChangedPayload link.changed 载荷。
-type LinkChangedPayload struct {
-	Host  string `json:"host"`
-	Via   string `json:"via"`
-	Ep    string `json:"ep"`
-	RttMs int64  `json:"rttMs"`
-	At    int64  `json:"at"`
-}
-
-// SessionAddedPayload session.added 载荷。
-type SessionAddedPayload struct {
-	Host    string `json:"host"`
-	Name    string `json:"name"`
-	AddedAt int64  `json:"addedAt"`
-}
-
-// SessionRemovedPayload session.removed 载荷。
-type SessionRemovedPayload struct {
-	Host   string `json:"host"`
-	Reason string `json:"reason"`
-}
-
-// SessionStateChangedPayload session.state_changed 载荷（state/reason 值域随
-// hostsession 状态机：idle/starting/ready/failed/stopping）。
-type SessionStateChangedPayload struct {
-	Host   string `json:"host"`
-	State  string `json:"state"`
-	Reason string `json:"reason"`
-}
-
-// SessionLadderPayload session.ladder 载荷（发射点归 facade 期，词表先行）。
-type SessionLadderPayload struct {
-	Host    string `json:"host"`
-	Level   string `json:"level"`
-	Outcome string `json:"outcome"`
-	Cause   string `json:"cause"`
-}
-
-// SessionRebuildPayload session.rebuild 载荷。
-type SessionRebuildPayload struct {
-	Host   string `json:"host"`
-	Reason string `json:"reason"`
-}
-
-// SessionDiagPayload session.diag 载荷（词表冻结、本期不发射；reason 值初始集
-// gated/budget/probe_window——只增不改）。
-type SessionDiagPayload struct {
-	Host   string `json:"host"`
-	Reason string `json:"reason"`
-}
-
-// 诊因原因值（spec「诊因事件词表」）。
-const (
-	DiagGated       = "gated"
-	DiagBudget      = "budget"
-	DiagProbeWindow = "probe_window"
-)
-
-// TransferSamplePayload transfer.sample 载荷。
-type TransferSamplePayload struct {
-	Host    string `json:"host"`
-	RxBytes int64  `json:"rxBytes"`
-	TxBytes int64  `json:"txBytes"`
-}
-
-// LogLinePayload log.line 载荷。
-type LogLinePayload struct {
-	Level string `json:"level"`
-	Msg   string `json:"msg"`
-}
+// （事件载荷结构 *Payload 与诊因原因值 Diag* 已迁 clientcore/facade/vocab.go。）
 
 // ---------- 流式通道 ----------
 
-// 流 kind 初始集（spec「流式通道」：kind 初始集仅 term）。
-const StreamKindTerm = "term"
-
-// stream.end 的 reason 受控枚举（spec：closed = 对端/前端主动关闭；gone = 目标
-// 主机不可达或主机会话收工——控制面层的本地原因。term 协议的 ENDED 词表由 term
-// 协议自身承载，控制面不重定义）。
-const (
-	StreamEndClosed = "closed"
-	StreamEndGone   = "gone"
-)
-
+// （流 kind StreamKindTerm 与 stream.end 原因词表 StreamEndClosed/Gone 已迁
+// clientcore/facade/vocab.go。）
 // StreamEndBody stream.end 帧 body（JSON，非流 DATA 二进制 body）。
 type StreamEndBody struct {
 	StreamID uint32 `json:"streamId"`

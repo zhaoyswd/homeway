@@ -21,6 +21,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"github.com/zhaoyswd/homeway/clientcore/facade"
 	"io"
 	"net"
 	"sync"
@@ -70,22 +71,22 @@ func (c *conn) opStreamOpen(corr uint64, args json.RawMessage) {
 		c.reply(corr, nil, err)
 		return
 	}
-	if a.Kind != StreamKindTerm {
-		c.reply(corr, nil, errCode(CodeBadRequest)) // kind 值域外（初始集仅 term）
+	if a.Kind != facade.StreamKindTerm {
+		c.reply(corr, nil, errCode(facade.CodeBadRequest)) // kind 值域外（初始集仅 term）
 		return
 	}
 	if a.Host == "" {
-		c.reply(corr, nil, errCode(CodeBadRequest))
+		c.reply(corr, nil, errCode(facade.CodeBadRequest))
 		return
 	}
 	if c.s.cfg.Backend.NotReady() {
-		c.reply(corr, nil, errCode(CodeNotReady))
+		c.reply(corr, nil, errCode(facade.CodeNotReady))
 		return
 	}
 	c.streamsMu.Lock()
 	if len(c.streams) >= c.s.cfg.MaxStreams {
 		c.streamsMu.Unlock()
-		c.reply(corr, nil, errCode(CodeStreamRefused)) // 在册流超上限
+		c.reply(corr, nil, errCode(facade.CodeStreamRefused)) // 在册流超上限
 		return
 	}
 	c.streamsMu.Unlock()
@@ -96,12 +97,12 @@ func (c *conn) opStreamOpen(corr uint64, args json.RawMessage) {
 	if err != nil {
 		switch {
 		case errors.Is(err, ErrBackendNoHost):
-			c.reply(corr, nil, errCode(CodeNoHost))
+			c.reply(corr, nil, errCode(facade.CodeNoHost))
 		case errors.Is(err, ErrBackendNoSession):
-			c.reply(corr, nil, errCode(CodeStreamRefused))
+			c.reply(corr, nil, errCode(facade.CodeStreamRefused))
 		default:
 			c.s.cfg.Logf("control: stream.open(%s) 拨号失败：%v", a.Host, err)
-			c.reply(corr, nil, errCode(CodeStreamRefused)) // 主机不可达等 = 被拒
+			c.reply(corr, nil, errCode(facade.CodeStreamRefused)) // 主机不可达等 = 被拒
 		}
 		return
 	}
@@ -110,7 +111,7 @@ func (c *conn) opStreamOpen(corr uint64, args json.RawMessage) {
 	if len(c.streams) >= c.s.cfg.MaxStreams { // 并发 open 竞争上限
 		c.streamsMu.Unlock()
 		_ = backend.Close()
-		c.reply(corr, nil, errCode(CodeStreamRefused))
+		c.reply(corr, nil, errCode(facade.CodeStreamRefused))
 		return
 	}
 	c.nextStream++
@@ -141,10 +142,10 @@ func (c *conn) opStreamClose(corr uint64, args json.RawMessage) {
 	}
 	st := c.lookupStream(a.StreamID)
 	if st == nil {
-		c.reply(corr, nil, errCode(CodeNoStream))
+		c.reply(corr, nil, errCode(facade.CodeNoStream))
 		return
 	}
-	st.finish(StreamEndClosed)
+	st.finish(facade.StreamEndClosed)
 	c.reply(corr, map[string]bool{"closed": true}, nil)
 }
 
@@ -162,12 +163,12 @@ func (c *conn) lookupStream(id uint32) *stream {
 func (c *conn) handleStreamData(body []byte) {
 	id, payload, err := DecodeStreamBody(body)
 	if err != nil {
-		c.fatal(CodeBadFrame)
+		c.fatal(facade.CodeBadFrame)
 		return
 	}
 	st := c.lookupStream(id)
 	if st == nil {
-		c.reply(0, map[string]any{"op": OpStreamData, "streamId": id, "error": CodeNoStream}, nil)
+		c.reply(0, map[string]any{"op": OpStreamData, "streamId": id, "error": facade.CodeNoStream}, nil)
 		c.s.cfg.Logf("control: 流 %d 不在册（已关？），上行 %d 字节被拒", id, len(payload))
 		return
 	}
@@ -177,7 +178,7 @@ func (c *conn) handleStreamData(body []byte) {
 	default:
 		// 上行队列满 = 后端持续不读（远超 term 交互的正常形态）：按背压失败收流
 		//（gone——对端消费不可达的本地原因），不阻塞读循环。
-		st.finish(StreamEndGone)
+		st.finish(facade.StreamEndGone)
 	}
 }
 
@@ -200,9 +201,9 @@ func (st *stream) backendPump() {
 		}
 		if err != nil {
 			if errors.Is(err, io.EOF) {
-				st.finish(StreamEndClosed)
+				st.finish(facade.StreamEndClosed)
 			} else {
-				st.finish(StreamEndGone) // 后端连接错误（会话收工会体现为这里）
+				st.finish(facade.StreamEndGone) // 后端连接错误（会话收工会体现为这里）
 			}
 			return
 		}
@@ -221,7 +222,7 @@ func (st *stream) upstreamPump() {
 		case b := <-st.upC:
 			_ = st.backend.SetWriteDeadline(time.Now().Add(streamUpTimeout))
 			if _, err := st.backend.Write(b); err != nil {
-				st.finish(StreamEndGone)
+				st.finish(facade.StreamEndGone)
 				return
 			}
 		case <-st.done:

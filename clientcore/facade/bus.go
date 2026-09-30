@@ -1,4 +1,4 @@
-package control
+package facade
 
 // bus.go — 事件总线（§3.4，spec「事件流」）：全局单调 seq（每次启动从 0 计、随
 // 代际唯一化）+ 环形重放窗（默认 4096 条 / 1MiB，可注入）+ 域过滤分发 + 游标回放。
@@ -23,6 +23,8 @@ package control
 // 投递次序说明：投递在总线锁外，跨发布者的并发事件到达顺序不保证全局 seq 单调；
 // 事件自包含（带 seq），前端按同键比 seq 幂等覆盖（at-least-once 语义）。同一
 // 发布者的同键事件天然串行（hostsession 的 Observer 在会话状态迁移尾部同步调用）。
+// 订阅回放不经投递通道：Subscribe 锁内拷入 pending 回放段，订阅者消费顺序固定
+// **pending → ch**（B3 订阅原子交付——「回放批先于任何在线事件」的总线侧保证）。
 
 import (
 	"encoding/json"
@@ -278,6 +280,16 @@ func (b *Bus) oldestSeqLocked() uint64 {
 type Subscriber struct {
 	bus     *Bus
 	domains map[string]bool
+	// pending 订阅回放段（B3，r2 新-3 拍死唯一形态）：Subscribe 在总线锁内把
+	// 回放拷进本切片（**普通切片，不占订阅队列 ch**——锁内灌 ch 形态被否决：
+	// ch 已满〔慢消费者或门闩期 writer 不消费〕时会在总线锁内阻塞 channel send，
+	// Publish 全线挂起，而 hostsession 的 Observer 在状态迁移尾部同步调 Publish
+	// = 会话面挂死；非阻塞 + overrun 则 terminateOverrun 重入 b.mu 自锁）。
+	// 消费顺序固定 **pending → ch**：绑定层在订阅确认写出且门闩清位后经
+	// DrainPending 取走（先排空 pending、再补写暂存缓冲、再恢复常规消费）。
+	// 替换订阅时 = **覆盖**（新回放段取代旧段——前端按 seq 幂等去重无损，
+	// r3 低-2）。
+	pending []Event
 	ch      chan Event
 	stop    chan struct{}
 	overrun bool
@@ -305,23 +317,28 @@ func (s *Subscriber) OverrunDone() bool { return s.overrun }
 // matches 域过滤（空集合 = 未订阅任何域）。
 func (s *Subscriber) matches(domain string) bool { return s.domains[domain] }
 
-// Subscribe 挂订阅 + 游标回放（原子：锁内检查游标、拷贝回放列表、注册生效——
-// 回放与在线推送之间零缝隙零重叠）。同连接重复订阅 = **替换**（sub.domains
-// 整体换为新载荷集合——daemon-control-plane delta 3b 钉死，B4 澄清：非并集）。
+// Subscribe 挂订阅 + 游标回放（原子：锁内检查游标、回放拷入 pending 段、注册
+// 生效——回放与在线推送之间零缝隙零重叠，B3 订阅原子交付）。同连接重复订阅 =
+// **替换**（sub.domains 整体换为新载荷集合——daemon-control-plane delta 3b 钉死，
+// B4 澄清：非并集）；pending 回放段同样 = 覆盖（新回放段取代旧段，r3 低-2——
+// 前端按 seq 幂等去重无损）。
 //
 //   - generation != 当前代际 → ErrCursorStale（前端全量重快照）；
 //   - cursor 超前于当前序号 → ErrCursorFuture（bad_request）；
 //   - cursor+1 早于环内最老 seq（游标过旧/环已被冲刷）→ ErrCursorStale；
 //   - 域词表外 → ErrUnknownDomain（bad_request）；
-//   - 返回 replay = 窗内 (cursor, 当前] 的订阅域事件（连接层先于在线流写出；
-//     at-least-once 语义下重复/交叠无害，见文件头「投递次序说明」）。
+//   - 回放 = 窗内 (cursor, 当前] 的订阅域事件，拷入 sub.pending（**不占订阅队列
+//     ch**）；绑定层先写订阅确认 rsp、清门闩，再经 DrainPending 取走并先于在线
+//     流写出（at-least-once 语义下重复/交叠无害，见文件头「投递次序说明」）。
+//     窗内游标永远能回放——回放条数不受 subQueue 界（pending 是普通切片，长度
+//     只受环窗 4096 界），不新增「回放超余量退 stale」触发条件。
 //
 // domains 为空数组 = 合法（订阅确认回显空集，不推任何域——前端可用它只取回放）。
-func (b *Bus) Subscribe(sub *Subscriber, domains []string, cursor *uint64, generation string) ([]Event, error) {
+func (b *Bus) Subscribe(sub *Subscriber, domains []string, cursor *uint64, generation string) error {
 	dm := make(map[string]bool, len(domains))
 	for _, d := range domains {
 		if !validDomains[d] {
-			return nil, fmt.Errorf("词表外订阅域 %q", d)
+			return fmt.Errorf("词表外订阅域 %q", d)
 		}
 		dm[d] = true
 	}
@@ -330,18 +347,18 @@ func (b *Bus) Subscribe(sub *Subscriber, domains []string, cursor *uint64, gener
 	if generation != "" && generation != b.gen {
 		// 代际失配（spec「守护进程重启后旧游标失效」）：cursor_stale 引导全量
 		// 重快照。缺省（不带 generation 的旧前端）退化为仅重放窗检查。
-		return nil, fmt.Errorf("%w: 代际失配（订阅带 %q，当前 %q）", ErrCursorStale, generation, b.gen)
+		return fmt.Errorf("%w: 代际失配（订阅带 %q，当前 %q）", ErrCursorStale, generation, b.gen)
 	}
 	var replay []Event
 	if cursor != nil {
 		if *cursor > b.seq {
-			return nil, fmt.Errorf("%w: %d > 当前 %d", ErrCursorFuture, *cursor, b.seq)
+			return fmt.Errorf("%w: %d > 当前 %d", ErrCursorFuture, *cursor, b.seq)
 		}
 		oldest := b.oldestSeqLocked()
 		// 环空（尚无事件）时任何 cursor 都可从当前续播；环非空时要求 cursor+1
 		// 不早于最老（否则窗内已缺段 = cursor_stale 引导重快照，MUST NOT 静默跳段）。
 		if b.ringLen > 0 && *cursor+1 < oldest {
-			return nil, fmt.Errorf("%w: 游标 %d 早于重放窗起点 %d", ErrCursorStale, *cursor, oldest)
+			return fmt.Errorf("%w: 游标 %d 早于重放窗起点 %d", ErrCursorStale, *cursor, oldest)
 		}
 		for i := 0; i < b.ringLen; i++ {
 			ev := b.ring[(b.ringStart+i)%b.ringCap]
@@ -350,9 +367,22 @@ func (b *Bus) Subscribe(sub *Subscriber, domains []string, cursor *uint64, gener
 			}
 		}
 	}
+	sub.pending = replay
 	sub.domains = dm
 	b.subs[sub] = struct{}{}
-	return replay, nil
+	return nil
+}
+
+// DrainPending 原子取走 pending 回放段（换出为 nil）。调用方 = 绑定层 writer：
+// 在订阅确认 rsp 写出且门闩清位后调用，取走后先于暂存缓冲/常规在线消费写出
+// （「确认 → 回放 → 在线」三段次序的总线侧供给端）。锁内交换、锁外由调用方
+// 写出——锁内只做切片换手，零阻塞。
+func (s *Subscriber) DrainPending() []Event {
+	s.bus.mu.Lock()
+	p := s.pending
+	s.pending = nil
+	s.bus.mu.Unlock()
+	return p
 }
 
 // Unsubscribe 摘订阅（幂等；未订阅/已摘均安全）。

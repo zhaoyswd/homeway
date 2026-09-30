@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/zhaoyswd/homeway/clientcore/facade"
 	"net"
 	"sync"
 	"sync/atomic"
@@ -107,9 +108,9 @@ func (s *ClientStream) EndedErr() error {
 
 func endReasonText(r string) string {
 	switch r {
-	case StreamEndClosed:
+	case facade.StreamEndClosed:
 		return "对端已关闭（stream.end=closed）"
-	case StreamEndGone:
+	case facade.StreamEndGone:
 		return "主机不可达或上行过快（stream.end=gone）"
 	case endReasonConn:
 		return "控制面连接已断开"
@@ -199,7 +200,7 @@ func (c *Client) Request(ctx context.Context, op string, args any) (json.RawMess
 // 非空且失配时服务端回 cursor_stale）。订阅确认后回放事件先于在线事件进入
 // Events()（服务端写出次序保证）。
 func (c *Client) Subscribe(ctx context.Context, domains []string, cursor *uint64, view, generation string) (SubscribeResult, error) {
-	raw, err := c.Request(ctx, OpEventsSubscribe, SubscribeArgs{Domains: domains, Cursor: cursor, View: view, Generation: generation})
+	raw, err := c.Request(ctx, facade.OpEventsSubscribe, SubscribeArgs{Domains: domains, Cursor: cursor, View: view, Generation: generation})
 	if err != nil {
 		return SubscribeResult{}, err
 	}
@@ -212,7 +213,7 @@ func (c *Client) Subscribe(ctx context.Context, domains []string, cursor *uint64
 
 // Unsubscribe 退订。
 func (c *Client) Unsubscribe(ctx context.Context, domains []string) error {
-	_, err := c.Request(ctx, OpEventsUnsubscribe, UnsubscribeArgs{Domains: domains})
+	_, err := c.Request(ctx, facade.OpEventsUnsubscribe, UnsubscribeArgs{Domains: domains})
 	return err
 }
 
@@ -242,7 +243,7 @@ func (c *Client) OpenStream(ctx context.Context, host string) (*ClientStream, er
 	ch := make(chan ResponseBody, 1)
 	c.pending.Store(corr, ch)
 	defer c.pending.Delete(corr)
-	if err := c.writeFrame(encodeJSONFrame(OpReq, RequestBody{Corr: corr, Op: OpStreamOpen, Args: mustMarshal(t_streamArgs(host))})); err != nil {
+	if err := c.writeFrame(encodeJSONFrame(OpReq, RequestBody{Corr: corr, Op: facade.OpStreamOpen, Args: mustMarshal(t_streamArgs(host))})); err != nil {
 		return nil, err
 	}
 	select {
@@ -270,7 +271,7 @@ func (c *Client) OpenStream(ctx context.Context, host string) (*ClientStream, er
 
 // t_streamArgs 仅收敛 OpenStream 的载荷构造（避免内联闭包）。
 func t_streamArgs(host string) StreamOpenArgs {
-	return StreamOpenArgs{Kind: StreamKindTerm, Host: host}
+	return StreamOpenArgs{Kind: facade.StreamKindTerm, Host: host}
 }
 
 func mustMarshal(v any) []byte {
@@ -317,16 +318,16 @@ func (s *ClientStream) Recv() <-chan []byte { return s.recv }
 func (s *ClientStream) End() <-chan string { return s.end }
 
 // Close 前端主动关（stream.close 操作，reason=closed）。成功即置终结位
-// （markEnded(StreamEndClosed)，exec-r1 L4）：终结状态化原只覆盖「收到 stream.end /
+// （markEnded(facade.StreamEndClosed)，exec-r1 L4）：终结状态化原只覆盖「收到 stream.end /
 // 连接级断开」，本端主动关流后 Send 同样不再静默成功写进死流（与 2.2 的 proposal
 // 意图对齐；服务端对已关流的 data 另有 no_stream 回执兜底，此处是本端第一道闸）。
 // 归因复用 closed 的近似（exec-r2 N4 登记）：此后 Send 的 EndedErr 文案为「对端已
 // 关闭」，实情是本端主动 stream.close（对端 end 帧可能永不到达）；仓内唯一消费者
 // streamConn.Close 在 Client.Close() 后不再写、无命中路径，不值得为此新开原因枚举。
 func (s *ClientStream) Close(ctx context.Context) error {
-	_, err := s.c.Request(ctx, OpStreamClose, StreamCloseArgs{StreamID: s.ID})
+	_, err := s.c.Request(ctx, facade.OpStreamClose, StreamCloseArgs{StreamID: s.ID})
 	if err == nil {
-		s.markEnded(StreamEndClosed)
+		s.markEnded(facade.StreamEndClosed)
 	}
 	return err
 }

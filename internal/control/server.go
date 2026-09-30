@@ -7,8 +7,9 @@ package control
 // handler goroutine（慢操作如 stream.open 的隧道拨号不阻塞读循环）+ 每流两个泵
 //（backend→前端 / 前端→backend，见 stream.go）。writer 的输入按优先级排空：
 //
-//	highC（welcome/rsp/goodbye/reload 等控制类）> replayC（订阅回放批）
-//	> 事件（bus 订阅者 channel）> 各流 dataC（公平轮询）
+//	highC（welcome/rsp/goodbye/reload 等控制类；订阅确认帧携带门闩标记——
+//	写出后清位并按序补写回放）> 事件（bus 订阅者 channel；订阅确认在途门闩
+//	置位期复检-暂存）> 各流 dataC（公平轮询）
 //
 // 这保证慢流积压、订阅回放大批都不阻塞控制帧（spec「慢流不拖垮控制面」/「三类
 // 流量同连接交错」）。前端整体不读的病态由写停滞看门狗兜底（SetWriteDeadline
@@ -23,6 +24,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"github.com/zhaoyswd/homeway/clientcore/facade"
 	"net"
 	"sync"
 	"sync/atomic"
@@ -54,13 +56,13 @@ type Server struct {
 // ServerConfig 服务器装配项。
 type ServerConfig struct {
 	ServerVersion string
-	Bus           *Bus
+	Bus           *facade.Bus
 	Backend       Backend
 	Logf          func(format string, args ...any) // nil = 丢弃
 	MaxStreams    int                              // <=0 = DefaultMaxStreams
 }
 
-// NewServer 建服务器（代际 = Bus 的 generation）。
+// NewServer 建服务器（代际 = facade.Bus 的 generation）。
 func NewServer(cfg ServerConfig) *Server {
 	if cfg.Logf == nil {
 		cfg.Logf = func(string, ...any) {}
@@ -75,7 +77,7 @@ func NewServer(cfg ServerConfig) *Server {
 func (s *Server) Generation() string { return s.cfg.Bus.Generation() }
 
 // NewGeneration 生成新代际（16 字节随机 hex——每次守护进程启动调用一次，
-// Bus 与 Server 共用同一值）。
+// facade.Bus 与 Server 共用同一值）。
 func NewGeneration() string {
 	var b [16]byte
 	if _, err := rand.Read(b[:]); err != nil {
@@ -144,10 +146,16 @@ type conn struct {
 
 	handshook atomic.Bool
 
-	highC   chan []byte   // 控制帧（已帧化字节）
-	replayC chan [][]byte // 订阅回放批（已帧化字节，按序）
-	sub     *Subscriber   // 事件订阅（nil = 未订阅）
-	subMu   sync.Mutex
+	// highC 控制帧队列（已帧化字节 + 订阅确认的门闩标记）。元素结构见 highItem。
+	highC chan highItem
+	sub   *facade.Subscriber // 事件订阅（nil = 未订阅）
+	subMu sync.Mutex
+	// subConfirm 订阅确认在途门闩（B3，r2 新-1 复检暂存 + r3 低-2 按 corr 标记
+	// 而非裸 bool——两次订阅在途互不误清，writer 只清 rsp 帧携带的 corr）。
+	subConfirm map[uint64]bool
+	// heldFrames 门闩置位期间从 evC 取出的事件帧（复检暂存——已武装的阻塞
+	// receive 无法撤销，只能在取后复检；清位后按序补写）。
+	heldFrames [][]byte
 
 	streams    map[uint32]*stream
 	streamsMu  sync.Mutex
@@ -158,15 +166,22 @@ type conn struct {
 	once   sync.Once
 }
 
+// highItem highC 的元素：控制帧字节；subConfirm 非 0 = 该帧是订阅确认 rsp
+// （成功或错误应答——corr 即门闩标记），writer **写出后**按 corr 清门闩（B3）。
+type highItem struct {
+	frame      []byte
+	subConfirm uint64
+}
+
 func newConn(s *Server, nc net.Conn) *conn {
 	return &conn{
-		s:       s,
-		nc:      nc,
-		highC:   make(chan []byte, highQueue),
-		replayC: make(chan [][]byte, 2),
-		streams: make(map[uint32]*stream),
-		wakeC:   make(chan struct{}, 1),
-		closed:  make(chan struct{}),
+		s:          s,
+		nc:         nc,
+		highC:      make(chan highItem, highQueue),
+		subConfirm: make(map[uint64]bool),
+		streams:    make(map[uint32]*stream),
+		wakeC:      make(chan struct{}, 1),
+		closed:     make(chan struct{}),
 	}
 }
 
@@ -197,7 +212,7 @@ func (c *conn) close(reason string) {
 		if reason != "" {
 			if f := encodeJSONFrame(OpGoodbye, GoodbyeBody{Reason: reason}); f != nil {
 				select {
-				case c.highC <- f:
+				case c.highC <- highItem{frame: f}:
 				default: // 队列满：尽力语义，丢弃告别帧不挂等
 				}
 			}
@@ -216,6 +231,12 @@ func (c *conn) close(reason string) {
 			c.s.cfg.Bus.Unsubscribe(c.sub)
 			c.sub = nil
 		}
+		// 连接关闭兜底清位（B3）：rsp 写失败路径不单独清位（写失败必然走向连接
+		// 收工，靠此处兜底）——门闩与暂存缓冲都是无消费面的纯状态，一并收尾。
+		for corr := range c.subConfirm {
+			delete(c.subConfirm, corr)
+		}
+		c.heldFrames = nil
 		c.subMu.Unlock()
 	})
 }
@@ -227,7 +248,20 @@ func (c *conn) sendHigh(frame []byte) {
 		return
 	}
 	select {
-	case c.highC <- frame:
+	case c.highC <- highItem{frame: frame}:
+	case <-c.closed:
+	}
+}
+
+// sendConfirm 订阅确认 rsp 入 highC，携带门闩标记（B3：成功与错误应答一律经此
+// ——错误 rsp 同样清位，否则订阅队列无人消费、灌满 512 后被总线
+// terminateOverrun，一次 cursor_stale 被放大成 goodbye(overrun) 断连，r2 新-1）。
+func (c *conn) sendConfirm(corr uint64, frame []byte) {
+	if frame == nil {
+		return // 序列化防御性失败（ResponseBody 为结构体，实际不可达）：连接收工兜底
+	}
+	select {
+	case c.highC <- highItem{frame: frame, subConfirm: corr}:
 	case <-c.closed:
 	}
 }
@@ -256,7 +290,7 @@ func (c *conn) reader() {
 		head, err := ReadHeader(c.nc) // 按 op 选上限（流 DATA 256KiB / 控制类 1MiB）
 		if err != nil {
 			if errors.Is(err, ErrBadFrame) {
-				c.fatal(CodeBadFrame) // 长度超限（读 body 前拒绝）
+				c.fatal(facade.CodeBadFrame) // 长度超限（读 body 前拒绝）
 			}
 			return // IO 错误/EOF = 连接结束
 		}
@@ -266,7 +300,7 @@ func (c *conn) reader() {
 		}
 		op := head.Op
 		if !ValidOp(op) {
-			c.fatal(CodeBadFrame) // 非法 op（预留段/未知值）
+			c.fatal(facade.CodeBadFrame) // 非法 op（预留段/未知值）
 			return
 		}
 		switch op {
@@ -304,11 +338,11 @@ func (c *conn) fatal(code string) { c.close(code) }
 func (c *conn) handleHello(body []byte) bool {
 	var hello HelloBody
 	if err := json.Unmarshal(body, &hello); err != nil {
-		c.fatal(CodeBadJSON)
+		c.fatal(facade.CodeBadJSON)
 		return false
 	}
 	if hello.Frontend.Kind == "" || hello.Frontend.Name == "" {
-		c.fatal(CodeBadRequest) // 前端标识缺失（握手无 rsp 通道）
+		c.fatal(facade.CodeBadRequest) // 前端标识缺失（握手无 rsp 通道）
 		return false
 	}
 	if hello.ProtoVersion != ProtoVersion {
@@ -342,18 +376,18 @@ func errCode(code string) error { return &opError{code: code} }
 func (c *conn) handleRequestFrame(body []byte) {
 	var req RequestBody
 	if err := json.Unmarshal(body, &req); err != nil {
-		c.fatal(CodeBadJSON)
+		c.fatal(facade.CodeBadJSON)
 		return
 	}
 	go func() {
 		if c.s.shuttingDown() {
-			c.reply(req.Corr, nil, errCode(CodeShuttingDown))
+			c.reply(req.Corr, nil, errCode(facade.CodeShuttingDown))
 			return
 		}
 		h := c.handlerFor(req.Op)
 		if h == nil {
 			// 未知操作名：稳定错误码、连接不中断（spec 场景「未知操作报稳定错误码」）。
-			c.reply(req.Corr, nil, errCode(CodeUnknownOp))
+			c.reply(req.Corr, nil, errCode(facade.CodeUnknownOp))
 			return
 		}
 		h(req.Corr, req.Args)
@@ -368,7 +402,7 @@ func (c *conn) reply(corr uint64, result any, err error) {
 		if errors.As(err, &oe) {
 			rsp.Error = oe.code
 		} else {
-			rsp.Error = CodeBadRequest // 非映射错误统一落 bad_request（防御）
+			rsp.Error = facade.CodeBadRequest // 非映射错误统一落 bad_request（防御）
 		}
 	} else {
 		rsp.Ok = true
@@ -376,13 +410,40 @@ func (c *conn) reply(corr uint64, result any, err error) {
 			b, merr := json.Marshal(result)
 			if merr != nil {
 				c.s.cfg.Logf("control: 序列化响应失败：%v", merr)
-				rsp.Ok, rsp.Error = false, CodeBadRequest
+				rsp.Ok, rsp.Error = false, facade.CodeBadRequest
 			} else {
 				rsp.Result = b
 			}
 		}
 	}
 	c.sendHigh(encodeJSONFrame(OpRsp, rsp))
+}
+
+// replyConfirm 订阅确认应答（B3）：与 reply 同构，但帧经 sendConfirm 携带
+// 门闩标记（corr）——writer 写出该 rsp 后按 corr 清位、按序补写回放与暂存
+// （clearSubConfirm）。
+func (c *conn) replyConfirm(corr uint64, result any, err error) {
+	rsp := ResponseBody{Corr: corr}
+	if err != nil {
+		var oe *opError
+		if errors.As(err, &oe) {
+			rsp.Error = oe.code
+		} else {
+			rsp.Error = facade.CodeBadRequest
+		}
+	} else {
+		rsp.Ok = true
+		if result != nil {
+			b, merr := json.Marshal(result)
+			if merr != nil {
+				c.s.cfg.Logf("control: 序列化响应失败：%v", merr)
+				rsp.Ok, rsp.Error = false, facade.CodeBadRequest
+			} else {
+				rsp.Result = b
+			}
+		}
+	}
+	c.sendConfirm(corr, encodeJSONFrame(OpRsp, rsp))
 }
 
 // opHandler 操作处理函数（自带 corr 回复——订阅等需要自定义响应次序的操作）。
@@ -393,23 +454,23 @@ type opHandler func(corr uint64, args json.RawMessage)
 // = 守护托管；stream.open(term) = 控制面转发；一次性直跑类命令不经过控制面。
 func (c *conn) handlerFor(op string) opHandler {
 	switch op {
-	case OpDaemonStatus:
+	case facade.OpDaemonStatus:
 		return c.opDaemonStatus
-	case OpHostAdd:
+	case facade.OpHostAdd:
 		return c.opHostAdd
-	case OpHostRemove:
+	case facade.OpHostRemove:
 		return c.opHostRemove
-	case OpHostList:
+	case facade.OpHostList:
 		return c.opHostList
-	case OpSnapshotGet:
+	case facade.OpSnapshotGet:
 		return c.opSnapshotGet
-	case OpEventsSubscribe:
+	case facade.OpEventsSubscribe:
 		return c.opSubscribe
-	case OpEventsUnsubscribe:
+	case facade.OpEventsUnsubscribe:
 		return c.opUnsubscribe
-	case OpStreamOpen:
+	case facade.OpStreamOpen:
 		return c.opStreamOpen
-	case OpStreamClose:
+	case facade.OpStreamClose:
 		return c.opStreamClose
 	}
 	return nil
@@ -421,7 +482,7 @@ func parseArgs(args json.RawMessage, dst any) error {
 		return nil // 无载荷操作（host.list / daemon.status / snapshot.get）
 	}
 	if err := json.Unmarshal(args, dst); err != nil {
-		return errCode(CodeBadRequest)
+		return errCode(facade.CodeBadRequest)
 	}
 	return nil
 }
@@ -445,11 +506,11 @@ func (c *conn) opHostAdd(corr uint64, args json.RawMessage) {
 		return
 	}
 	if a.Token == "" {
-		c.reply(corr, nil, errCode(CodeBadRequest))
+		c.reply(corr, nil, errCode(facade.CodeBadRequest))
 		return
 	}
 	if c.s.cfg.Backend.NotReady() {
-		c.reply(corr, nil, errCode(CodeNotReady))
+		c.reply(corr, nil, errCode(facade.CodeNotReady))
 		return
 	}
 	// 服务端验证路径（host-cli 3b，design D1/D3）：decode（bad_token）→ 探测
@@ -458,13 +519,13 @@ func (c *conn) opHostAdd(corr uint64, args json.RawMessage) {
 	res, err := c.s.cfg.Backend.AddHost(a.Name, a.Token, a.Force)
 	switch {
 	case errors.Is(err, ErrBackendHostExists):
-		c.reply(corr, nil, errCode(CodeHostExists))
+		c.reply(corr, nil, errCode(facade.CodeHostExists))
 	case errors.Is(err, ErrBackendBadToken):
-		c.reply(corr, nil, errCode(CodeBadToken))
+		c.reply(corr, nil, errCode(facade.CodeBadToken))
 	case errors.Is(err, ErrBackendHostUnreachable):
-		c.reply(corr, nil, errCode(CodeHostUnreachable))
+		c.reply(corr, nil, errCode(facade.CodeHostUnreachable))
 	case err != nil:
-		c.reply(corr, nil, errCode(CodeBadRequest))
+		c.reply(corr, nil, errCode(facade.CodeBadRequest))
 	default:
 		c.reply(corr, res, nil)
 	}
@@ -477,17 +538,17 @@ func (c *conn) opHostRemove(corr uint64, args json.RawMessage) {
 		return
 	}
 	if a.Host == "" {
-		c.reply(corr, nil, errCode(CodeBadRequest))
+		c.reply(corr, nil, errCode(facade.CodeBadRequest))
 		return
 	}
 	if c.s.cfg.Backend.NotReady() {
-		c.reply(corr, nil, errCode(CodeNotReady))
+		c.reply(corr, nil, errCode(facade.CodeNotReady))
 		return
 	}
 	if err := c.s.cfg.Backend.RemoveHost(a.Host); errors.Is(err, ErrBackendNoHost) {
-		c.reply(corr, nil, errCode(CodeNoHost))
+		c.reply(corr, nil, errCode(facade.CodeNoHost))
 	} else if err != nil {
-		c.reply(corr, nil, errCode(CodeBadRequest))
+		c.reply(corr, nil, errCode(facade.CodeBadRequest))
 	} else {
 		c.reply(corr, map[string]bool{"removed": true}, nil)
 	}
@@ -495,7 +556,7 @@ func (c *conn) opHostRemove(corr uint64, args json.RawMessage) {
 
 func (c *conn) opHostList(corr uint64, _ json.RawMessage) {
 	if c.s.cfg.Backend.NotReady() {
-		c.reply(corr, nil, errCode(CodeNotReady))
+		c.reply(corr, nil, errCode(facade.CodeNotReady))
 		return
 	}
 	c.reply(corr, HostListResult{Hosts: c.s.cfg.Backend.HostBriefs()}, nil)
@@ -505,7 +566,7 @@ func (c *conn) opHostList(corr uint64, _ json.RawMessage) {
 // 各会话无锁快照），**最后**读总线当前 seq 作为快照序号——设计 A4）。
 func (c *conn) opSnapshotGet(corr uint64, _ json.RawMessage) {
 	if c.s.cfg.Backend.NotReady() {
-		c.reply(corr, nil, errCode(CodeNotReady))
+		c.reply(corr, nil, errCode(facade.CodeNotReady))
 		return
 	}
 	hosts := c.s.cfg.Backend.HostStates()
@@ -519,8 +580,12 @@ func (c *conn) opSnapshotGet(corr uint64, _ json.RawMessage) {
 // opSubscribe 订阅：游标检查（cursor_stale/bad_request）、幂等（同域重复订阅 =
 // 成功，语义 = **替换**：该连接的订阅域集合整体换为新载荷的 domains——
 // daemon-control-plane delta 3b 钉死，非并集；实现 = bus.Subscribe 的
-// sub.domains = dm 整体赋值）、view 回显；确认 rsp 先于回放批（writer 优先级），
-// 回放先于在线事件（seq 次序——锁内原子拷贝+注册，见 bus.Subscribe）。
+// sub.domains = dm 整体赋值）、view 回显。「确认 → 回放 → 在线」三段次序 =
+// B3 订阅原子交付：回放拷入订阅者 pending 段在总线锁内原子完成（见
+// facade.Bus.Subscribe），绑定侧以「订阅确认在途」门闩（复检暂存）保证——门闩
+// 在 Bus.Subscribe **前**置位（注册后投递的在线事件被取到时门闩必已置位），
+// 确认 rsp（成功或错误）写出且清位后，writer 先排空 pending 回放段、再补写
+// 暂存缓冲、再恢复常规消费（clearSubConfirm）。
 func (c *conn) opSubscribe(corr uint64, args json.RawMessage) {
 	var a SubscribeArgs
 	if err := parseArgs(args, &a); err != nil {
@@ -528,7 +593,7 @@ func (c *conn) opSubscribe(corr uint64, args json.RawMessage) {
 		return
 	}
 	if a.Domains == nil {
-		c.reply(corr, nil, errCode(CodeBadRequest))
+		c.reply(corr, nil, errCode(facade.CodeBadRequest))
 		return
 	}
 	c.subMu.Lock()
@@ -536,34 +601,26 @@ func (c *conn) opSubscribe(corr uint64, args json.RawMessage) {
 	if c.sub == nil {
 		c.sub = c.s.cfg.Bus.NewSubscriber()
 	}
-	replay, err := c.s.cfg.Bus.Subscribe(c.sub, a.Domains, a.Cursor, a.Generation)
-	if err != nil {
+	// 门闩置位在 Bus.Subscribe 之前（B3 复检暂存的覆盖窗口从 Subscribe 前开始）。
+	c.subConfirm[corr] = true
+	if err := c.s.cfg.Bus.Subscribe(c.sub, a.Domains, a.Cursor, a.Generation); err != nil {
+		// 错误应答同样清位（r2 新-1）——经 sendConfirm 携带 corr，writer 写出后清。
 		switch {
-		case errors.Is(err, ErrCursorStale):
-			c.reply(corr, nil, errCode(CodeCursorStale))
-		case errors.Is(err, ErrCursorFuture):
-			c.reply(corr, nil, errCode(CodeBadRequest))
+		case errors.Is(err, facade.ErrCursorStale):
+			c.replyConfirm(corr, nil, errCode(facade.CodeCursorStale))
+		case errors.Is(err, facade.ErrCursorFuture):
+			c.replyConfirm(corr, nil, errCode(facade.CodeBadRequest))
 		default:
-			c.reply(corr, nil, errCode(CodeBadRequest)) // 词表外订阅域
+			c.replyConfirm(corr, nil, errCode(facade.CodeBadRequest)) // 词表外订阅域
 		}
 		return
 	}
-	c.reply(corr, SubscribeResult{
+	c.replyConfirm(corr, SubscribeResult{
 		Domains:    a.Domains, // 替换语义下生效集合恰 = 本次声明（回显即生效域集合，spec「重复订阅替换而非并集」）
 		Cursor:     c.s.cfg.Bus.CurrentSeq(),
 		View:       a.View, // 只回显（spec：不参与需求判定——信号源归 facade 期）
 		Generation: c.s.Generation(),
 	}, nil)
-	if len(replay) > 0 {
-		batch := make([][]byte, 0, len(replay))
-		for _, ev := range replay {
-			batch = append(batch, encodeJSONFrame(OpEvt, EventBody{Seq: ev.Seq, Domain: ev.Domain, Kind: ev.Kind, Payload: ev.Payload}))
-		}
-		select {
-		case c.replayC <- batch:
-		case <-c.closed:
-		}
-	}
 }
 
 // opUnsubscribe 退订（未订阅域 = 幂等成功，无错误码——spec 错误码表）。
@@ -574,13 +631,13 @@ func (c *conn) opUnsubscribe(corr uint64, args json.RawMessage) {
 		return
 	}
 	if a.Domains == nil {
-		c.reply(corr, nil, errCode(CodeBadRequest))
+		c.reply(corr, nil, errCode(facade.CodeBadRequest))
 		return
 	}
 	c.subMu.Lock()
 	defer c.subMu.Unlock()
 	if c.sub != nil {
-		// 域增删收敛在总线锁内（Bus.UnsubscribeDomains）——订阅态的写半边不得
+		// 域增删收敛在总线锁内（facade.Bus.UnsubscribeDomains）——订阅态的写半边不得
 		// 留在 server 侧裸改（exec-r1 H1 的竞态源）。
 		c.s.cfg.Bus.UnsubscribeDomains(c.sub, a.Domains)
 	}
@@ -591,13 +648,10 @@ func (c *conn) opUnsubscribe(corr uint64, args json.RawMessage) {
 
 func (c *conn) writer() {
 	for {
-		if !c.drainHigh() { // ① 控制（最高）
+		if !c.drainHigh() { // ① 控制（最高；订阅确认帧写出后清门闩+按序补写）
 			return
 		}
-		if !c.drainReplay() { // ② 订阅回放（先于在线事件）
-			return
-		}
-		if !c.step() { // ③ 一条事件或一条流数据（交替防饿死）→ 回循环头
+		if !c.step() { // ② 一条事件或一条流数据（交替防饿死）→ 回循环头
 			return
 		}
 	}
@@ -618,8 +672,8 @@ func waitHighDrained(c *conn) {
 func (c *conn) drainHigh() bool {
 	for {
 		select {
-		case f := <-c.highC:
-			if !c.writeFrame(f) {
+		case item := <-c.highC:
+			if !c.writeHighItem(item) {
 				return false
 			}
 		default:
@@ -628,37 +682,36 @@ func (c *conn) drainHigh() bool {
 	}
 }
 
-func (c *conn) drainReplay() bool {
-	for {
-		select {
-		case batch := <-c.replayC:
-			for _, f := range batch {
-				if !c.writeFrame(f) {
-					return false
-				}
-			}
-		default:
-			return true
-		}
+// writeHighItem 写一条控制帧；订阅确认帧（subConfirm != 0）写出后按 corr 清门闩
+// （B3）：最后一个门闩清位 = 先排空 pending 回放段、再补写暂存缓冲、再恢复常规
+// 消费——「确认 → 回放 → 在线」三段次序的绑定侧落点（r3 低-1）。
+func (c *conn) writeHighItem(item highItem) bool {
+	if !c.writeFrame(item.frame) {
+		return false
 	}
+	if item.subConfirm == 0 {
+		return true
+	}
+	return c.clearSubConfirm(item.subConfirm)
 }
 
 // step 消费一条在线事件或一条流数据；无消费来源时阻塞等待（wakeC 唤醒后重扫
 // 流集合）。false = 连接收工。
 func (c *conn) step() bool {
 	c.subMu.Lock()
-	var evC <-chan Event
+	var evC <-chan facade.Event
 	var doneC <-chan struct{}
 	if c.sub != nil {
 		evC, doneC = c.sub.Events(), c.sub.Done()
 	}
 	c.subMu.Unlock()
 
-	// 事件非阻塞一条（在流轮询前——事件是慢流 MUST NOT 阻塞的另一类）。
+	// 事件非阻塞一条（在流轮询前——事件是慢流 MUST NOT 阻塞的另一类）。取到后
+	// 复检门闩（B3 复检暂存——见 takeEvent）。
 	if evC != nil {
 		select {
 		case ev := <-evC:
-			return c.writeFrame(encodeJSONFrame(OpEvt, EventBody{Seq: ev.Seq, Domain: ev.Domain, Kind: ev.Kind, Payload: ev.Payload}))
+			return c.takeEvent(ev)
 		default:
 		}
 	}
@@ -674,21 +727,14 @@ func (c *conn) step() bool {
 	if evC != nil {
 		select {
 		case ev := <-evC:
-			return c.writeFrame(encodeJSONFrame(OpEvt, EventBody{Seq: ev.Seq, Domain: ev.Domain, Kind: ev.Kind, Payload: ev.Payload}))
+			return c.takeEvent(ev)
 		case <-doneC:
 			// 订阅 overrun（bus 停投）：goodbye(overrun) 断连（spec「慢消费者被
 			// 断连重同步」——不静默丢事件）。
 			c.fatalFromWriter(GoodbyeOverrun)
 			return false
-		case f := <-c.highC:
-			return c.writeFrame(f)
-		case batch := <-c.replayC:
-			for _, f := range batch {
-				if !c.writeFrame(f) {
-					return false
-				}
-			}
-			return true
+		case item := <-c.highC:
+			return c.writeHighItem(item)
 		case <-c.wakeC:
 			return true
 		case <-c.closed:
@@ -696,20 +742,56 @@ func (c *conn) step() bool {
 		}
 	}
 	select {
-	case f := <-c.highC:
-		return c.writeFrame(f)
-	case batch := <-c.replayC:
-		for _, f := range batch {
-			if !c.writeFrame(f) {
-				return false
-			}
-		}
-		return true
+	case item := <-c.highC:
+		return c.writeHighItem(item)
 	case <-c.wakeC:
 		return true
 	case <-c.closed:
 		return false
 	}
+}
+
+// takeEvent B3 复检暂存（r2 新-1 / r3 低-1）：writer 从 evC 取到事件后**复检**
+// 订阅确认门闩——置位期间 writer 唯一写出源 = highC，evC 事件仍会被取出（已武装
+// 的阻塞 receive 无法撤销——标志位对「下一次进 select」生效，已停在 select 里的
+// writer 只能靠取后复检覆盖），取出即复检-暂存、不写出；pending 回放段与流数据
+// 在门闩期同样不写出（drainHigh 之外无写出路径）。清位后由 clearSubConfirm 按
+// 「pending 回放段 → 暂存缓冲」次序补写。
+func (c *conn) takeEvent(ev facade.Event) bool {
+	f := encodeJSONFrame(OpEvt, EventBody{Seq: ev.Seq, Domain: ev.Domain, Kind: ev.Kind, Payload: ev.Payload})
+	c.subMu.Lock()
+	if len(c.subConfirm) > 0 {
+		c.heldFrames = append(c.heldFrames, f)
+		c.subMu.Unlock()
+		return true // 门闩置位：暂存不写出，回循环头（highC 仍是唯一消费源）
+	}
+	c.subMu.Unlock()
+	return c.writeFrame(f)
+}
+
+// clearSubConfirm 清订阅确认门闩（按 corr 匹配——r3 低-2：两次订阅在途互不
+// 误清）。最后一个门闩清位后：锁内原子取走 pending 回放段与暂存缓冲，锁外按序
+// 写出——先排空 pending 回放段、再补写暂存缓冲、再恢复常规消费。
+func (c *conn) clearSubConfirm(corr uint64) bool {
+	c.subMu.Lock()
+	delete(c.subConfirm, corr)
+	var out [][]byte
+	if len(c.subConfirm) == 0 {
+		if c.sub != nil {
+			for _, ev := range c.sub.DrainPending() {
+				out = append(out, encodeJSONFrame(OpEvt, EventBody{Seq: ev.Seq, Domain: ev.Domain, Kind: ev.Kind, Payload: ev.Payload}))
+			}
+		}
+		out = append(out, c.heldFrames...)
+		c.heldFrames = nil
+	}
+	c.subMu.Unlock()
+	for _, f := range out {
+		if !c.writeFrame(f) {
+			return false
+		}
+	}
+	return true
 }
 
 // streamSnapshot 流集合快照（轮询用）。

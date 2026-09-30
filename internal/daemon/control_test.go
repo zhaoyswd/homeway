@@ -9,6 +9,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"github.com/zhaoyswd/homeway/clientcore/facade"
 	"os"
 	"path/filepath"
 	"testing"
@@ -29,7 +30,7 @@ func startDaemonForTest(t *testing.T) (*DaemonState, string) {
 		t.Fatal(err)
 	}
 	t.Cleanup(st.Close)
-	bus := control.NewBus(control.NewGeneration(), control.BusConfig{})
+	bus := facade.NewBus(control.NewGeneration(), facade.BusConfig{})
 	holder := newRegistryHolder(bus)
 	sup := newSupervisor(st.Eventf, st.Debugf)
 	ctx, cancel := context.WithCancel(context.Background())
@@ -87,7 +88,7 @@ func TestControlPlaneAssemblyEndToEnd(t *testing.T) {
 	ctx := context.Background()
 
 	// daemon.status：角色面可见（client 角色由 supervisor 起来）。
-	raw, err := c.Request(ctx, control.OpDaemonStatus, nil)
+	raw, err := c.Request(ctx, facade.OpDaemonStatus, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -103,7 +104,7 @@ func TestControlPlaneAssemblyEndToEnd(t *testing.T) {
 	}
 
 	// 订阅 session 域 → host.add（本地签发 token）→ session.added 事件到达。
-	if _, err := c.Subscribe(ctx, []string{control.DomainSession}, nil, "", ""); err != nil {
+	if _, err := c.Subscribe(ctx, []string{facade.DomainSession}, nil, "", ""); err != nil {
 		t.Fatal(err)
 	}
 	// host.add 3b 起带服务端探测：本用例端点不可达（TEST-NET），注入假探测（tier
@@ -122,7 +123,7 @@ func TestControlPlaneAssemblyEndToEnd(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	raw, err = c.Request(ctx, control.OpHostAdd, control.HostAddArgs{Name: "测试后端", Token: tokStr})
+	raw, err = c.Request(ctx, facade.OpHostAdd, control.HostAddArgs{Name: "测试后端", Token: tokStr})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -130,15 +131,15 @@ func TestControlPlaneAssemblyEndToEnd(t *testing.T) {
 	if err := json.Unmarshal(raw, &added); err != nil || added.ID == "" {
 		t.Fatalf("host.add：%v（%s）", err, raw)
 	}
-	if added.Reach == nil || added.Reach.Tier != control.ReachTierDirect {
+	if added.Reach == nil || added.Reach.Tier != facade.ReachTierDirect {
 		t.Fatalf("host.add 结论载荷：%+v", added.Reach)
 	}
 	select {
 	case ev := <-c.Events():
-		if ev.Kind != control.KindSessionAdded {
+		if ev.Kind != facade.KindSessionAdded {
 			t.Fatalf("首个事件应为 session.added：%+v", ev)
 		}
-		var p control.SessionAddedPayload
+		var p facade.SessionAddedPayload
 		_ = json.Unmarshal(ev.Payload, &p)
 		if p.Host != added.ID || p.Name != "测试后端" {
 			t.Fatalf("session.added 载荷：%+v", p)
@@ -149,18 +150,18 @@ func TestControlPlaneAssemblyEndToEnd(t *testing.T) {
 
 	// 错误码映射（真 Registry 哨兵路径）：重复添加 → host_exists；坏 token →
 	// bad_token；不存在 → no_host。
-	if _, err := c.Request(ctx, control.OpHostAdd, control.HostAddArgs{Token: tokStr}); !errors.Is(err, control.CodeError(control.CodeHostExists)) {
+	if _, err := c.Request(ctx, facade.OpHostAdd, control.HostAddArgs{Token: tokStr}); !errors.Is(err, control.CodeError(facade.CodeHostExists)) {
 		t.Fatalf("同 token 重复应 host_exists：%v", err)
 	}
-	if _, err := c.Request(ctx, control.OpHostAdd, control.HostAddArgs{Token: "hmw1garbage"}); !errors.Is(err, control.CodeError(control.CodeBadToken)) {
+	if _, err := c.Request(ctx, facade.OpHostAdd, control.HostAddArgs{Token: "hmw1garbage"}); !errors.Is(err, control.CodeError(facade.CodeBadToken)) {
 		t.Fatalf("坏 token 应 bad_token：%v", err)
 	}
-	if _, err := c.Request(ctx, control.OpHostRemove, control.HostRemoveArgs{Host: "ff"}); !errors.Is(err, control.CodeError(control.CodeNoHost)) {
+	if _, err := c.Request(ctx, facade.OpHostRemove, control.HostRemoveArgs{Host: "ff"}); !errors.Is(err, control.CodeError(facade.CodeNoHost)) {
 		t.Fatalf("不存在应 no_host：%v", err)
 	}
 
 	// snapshot.get：主机动态面（会话对不可达端点异步暖机失败属预期，状态面可见）。
-	raw, err = c.Request(ctx, control.OpSnapshotGet, nil)
+	raw, err = c.Request(ctx, facade.OpSnapshotGet, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -173,12 +174,12 @@ func TestControlPlaneAssemblyEndToEnd(t *testing.T) {
 	}
 
 	// 流腿寻址（真 Registry）：不存在的主机 → no_host（term 拨号路径的入口校验）。
-	if _, err := c.OpenStream(ctx, "0102"); !errors.Is(err, control.CodeError(control.CodeNoHost)) {
+	if _, err := c.OpenStream(ctx, "0102"); !errors.Is(err, control.CodeError(facade.CodeNoHost)) {
 		t.Fatalf("不存在主机流打开应 no_host：%v", err)
 	}
 
 	// host.remove → session.removed 事件。
-	if _, err := c.Request(ctx, control.OpHostRemove, control.HostRemoveArgs{Host: added.ID}); err != nil {
+	if _, err := c.Request(ctx, facade.OpHostRemove, control.HostRemoveArgs{Host: added.ID}); err != nil {
 		t.Fatal(err)
 	}
 	found := false
@@ -186,7 +187,7 @@ func TestControlPlaneAssemblyEndToEnd(t *testing.T) {
 	for !found {
 		select {
 		case ev := <-c.Events():
-			if ev.Kind == control.KindSessionRemoved {
+			if ev.Kind == facade.KindSessionRemoved {
 				found = true
 			}
 		case <-deadline:
@@ -204,7 +205,7 @@ func TestControlPlaneNotReadyWhenRoleDisabled(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(st.Close)
-	bus := control.NewBus(control.NewGeneration(), control.BusConfig{})
+	bus := facade.NewBus(control.NewGeneration(), facade.BusConfig{})
 	holder := newRegistryHolder(bus) // 不挂角色
 	sup := newSupervisor(st.Eventf, st.Debugf)
 	_, stop, err := startControlPlane("test-daemon", dir, sup, holder, bus, st.Eventf)
@@ -214,15 +215,15 @@ func TestControlPlaneNotReadyWhenRoleDisabled(t *testing.T) {
 	t.Cleanup(stop)
 	c := dialDaemon(t, filepath.Join(dir, control.ControlSockName))
 	ctx := context.Background()
-	if _, err := c.Request(ctx, control.OpHostAdd, control.HostAddArgs{Token: "anything"}); !errors.Is(err, control.CodeError(control.CodeNotReady)) {
+	if _, err := c.Request(ctx, facade.OpHostAdd, control.HostAddArgs{Token: "anything"}); !errors.Is(err, control.CodeError(facade.CodeNotReady)) {
 		t.Fatalf("注册表未挂应 not_ready：%v", err)
 	}
-	if _, err := c.Request(ctx, control.OpHostList, nil); !errors.Is(err, control.CodeError(control.CodeNotReady)) {
+	if _, err := c.Request(ctx, facade.OpHostList, nil); !errors.Is(err, control.CodeError(facade.CodeNotReady)) {
 		t.Fatalf("host.list 未挂应 not_ready：%v", err)
 	}
 	// 控制面骨架仍应答（daemon.status 不依赖注册表——Backend.NotReady 只挡
 	// host/snapshot 面）。
-	raw, err := c.Request(ctx, control.OpDaemonStatus, nil)
+	raw, err := c.Request(ctx, facade.OpDaemonStatus, nil)
 	if err != nil {
 		t.Fatalf("daemon.status 不应被 not_ready 挡：%v", err)
 	}
