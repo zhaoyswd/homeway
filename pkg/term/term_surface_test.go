@@ -1265,6 +1265,40 @@ func TestSurfaceLegBackpressureFlags(t *testing.T) {
 	}
 }
 
+// TestSurfaceWriterReportsWriteCost FIX-28 接线：surface 写者把每帧写耗时上报给腿
+// （此前 noteWriteCost 无生产调用 ⇒ underPressure 恒 false，背压安全网空转）。
+// 变异红路：删 runSurfaceWriter 里的 noteWriteCost 调用 ⇒ 本用例超时红。
+func TestSurfaceWriterReportsWriteCost(t *testing.T) {
+	leg := newSurfaceLeg()
+	client, server := net.Pipe()
+	defer client.Close()
+	defer server.Close()
+	c := &termClient{conn: server, leg: leg, surface: true, out: newLegOut()}
+	s := &termSession{}
+	go s.runSurfaceWriter(c)
+	// pipe 无缓冲：读端故意延迟超过合并窗，让写阻塞出「链路有压力」的耗时。
+	go func() {
+		time.Sleep(surfaceMergeWindowMax + 30*time.Millisecond)
+		buf := make([]byte, 4096)
+		for i := 0; i < 8; i++ {
+			if _, err := client.Read(buf); err != nil {
+				return
+			}
+		}
+	}()
+	if !c.out.enqueue(writeItem{op: opSnapshot, payload: []byte("frame")}, 0) {
+		t.Fatal("入队失败")
+	}
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if leg.underPressure() {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatal("写耗时未上报：noteWriteCost 未接线（underPressure 恒 false）")
+}
+
 // ---- 上行帧编解码的纯函数 roundtrip（2.10）----
 //
 // 这一组是「便宜但关键」的：上面那些端到端判据一旦因为编解码错位失败，症状会是
@@ -1373,4 +1407,26 @@ func TestSurfaceClipboardWriteForwarded(t *testing.T) {
 		return
 	}
 	t.Fatal("没收到 CLIPBOARD 帧（OSC 52 没被转发）")
+}
+
+// TestEncClipboardLargeTextLengthExact FIX-27：剪贴板内容上限取 termMaxPayload-3，
+// 长度字段（u16）恒精确。旧上限 256KiB 时 uint16(65536)=0 会回绕，且帧编码器按
+// termMaxPayload 截 payload 把文本尾巴切掉 ⇒ 64KiB–256KiB 区间静默写坏。
+// 变异红路：把 clipMaxBytes 改回 256<<10 ⇒ 本用例红（长度回绕 + 载荷超上限）。
+func TestEncClipboardLargeTextLengthExact(t *testing.T) {
+	big := strings.Repeat("x", 100<<10) // 100KiB：旧上限下长度字段回绕
+	p := encClipboard(clipKindWrite, big)
+	if len(p) > termMaxPayload {
+		t.Fatalf("载荷超帧上限：%d > %d", len(p), termMaxPayload)
+	}
+	if got := int(binary.LittleEndian.Uint16(p[1:3])); got != len(p)-3 {
+		t.Fatalf("长度字段应等于文本字节数：字段=%d 实际=%d（回绕即红）", got, len(p)-3)
+	}
+	if len(p)-3 != clipMaxBytes {
+		t.Fatalf("超长文本应截到 clipMaxBytes=%d，实得 %d", clipMaxBytes, len(p)-3)
+	}
+	small := strings.Repeat("y", 1024)
+	if ps := encClipboard(clipKindWrite, small); int(binary.LittleEndian.Uint16(ps[1:3])) != len(small) {
+		t.Fatal("未超限文本不应被截")
+	}
 }

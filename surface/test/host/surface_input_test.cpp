@@ -193,6 +193,16 @@ int main(int argc, char** argv) {
         const uint8_t clipRead[] = {0x01, 0x00, 0x00};  // kind=1 读请求（len=0）
         check(decodeClipboard(clipRead, sizeof(clipRead), kind, text, err) && kind == 1,
               "CLIPBOARD 读请求解码");
+        // FIX-27：读应答的长度字段是 u16——超 65532 的文本必须被截到帧上限内，否则
+        // appendU16 回绕（65536 → 0）写出「声明长度与实际字节不符」的坏帧。
+        {
+            const std::string huge(100 * 1024, 'x');
+            const std::vector<uint8_t> ans = encodeClipboardAnswer(huge);
+            const size_t declared =
+                static_cast<size_t>(ans[1]) | (static_cast<size_t>(ans[2]) << 8);
+            check(ans.size() <= 65535 && declared == ans.size() - 3,
+                  "剪贴板读应答超长文本：长度字段精确且不超帧上限（FIX-27）");
+        }
     }
 
     if (failures > 0) {

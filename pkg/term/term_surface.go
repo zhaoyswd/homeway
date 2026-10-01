@@ -795,8 +795,12 @@ const (
 	clipKindReadAnswer byte = 2 // C→S：客户端对读请求的应答
 )
 
-// clipMaxBytes 是剪贴板内容的长度上限（沿用既有粘贴语义的量级）。
-const clipMaxBytes = 256 << 10
+// clipMaxBytes 是剪贴板内容的长度上限。**FIX-27**：取 termMaxPayload-3 而不是原
+// 256KiB——CLIPBOARD 载荷 = [kind:1][len:2][text]，长度字段是 u16，text 超过 65535
+// 会让 uint16(len(text)) 回绕（65536 → 0），同时帧编码器的 payload 截断（frames.go
+// 按 termMaxPayload 截）会把文本尾巴切掉 ⇒ 客户端拿到「长度与实际字节不符」的坏帧
+// （64KiB–256KiB 区间静默损坏）。取满帧上限减去 3 字节头，长度字段恒精确。
+const clipMaxBytes = termMaxPayload - 3
 
 // encClipboard 组 CLIPBOARD 载荷：[kind:1][len:2][text]。
 func encClipboard(kind byte, text string) []byte {

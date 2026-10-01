@@ -858,10 +858,16 @@ std::vector<uint8_t> encodeTheme(const uint8_t fg[3], const uint8_t bg[3], bool 
 }
 
 std::vector<uint8_t> encodeClipboardAnswer(const std::string& text) {
+    // FIX-27：长度字段是 u16，文本超 65532 会让 appendU16 回绕（65536 → 0），而外层帧
+    // 编码按 kMaxPayload(65535) 截断 ⇒ 服务端读到「声明长度与实际字节不符」的坏帧
+    // （64KiB–256KiB 区间静默写坏）。这里先截到帧上限减去 3 字节头，长度字段恒精确；
+    // 与 Go 侧 clipMaxBytes = termMaxPayload-3 同口径（两端必须同时改）。
+    static constexpr size_t kMaxClipText = 65535u - 3u;
+    const size_t n = text.size() > kMaxClipText ? kMaxClipText : text.size();
     std::vector<uint8_t> out;
     out.push_back(2);  // kClipKindReadAnswer
-    appendU16(out, static_cast<uint16_t>(text.size()));
-    out.insert(out.end(), text.begin(), text.end());
+    appendU16(out, static_cast<uint16_t>(n));
+    out.insert(out.end(), text.begin(), text.begin() + static_cast<std::ptrdiff_t>(n));
     return out;
 }
 

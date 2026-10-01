@@ -273,7 +273,14 @@ func (s *termSession) runSurfaceWriter(c *termClient) {
 	for {
 		items, ended, quit := c.out.take()
 		for _, it := range items {
-			if err := c.writeFrameOnce(it.op, it.payload, termWriteTimeout); err != nil {
+			started := time.Now()
+			err := c.writeFrameOnce(it.op, it.payload, termWriteTimeout)
+			// 写耗时上报（FIX-28 接线）：超过合并窗 ⇒ underPressure ⇒ 下一拍走全量。
+			// 此前 noteWriteCost 无生产调用，这条安全网恒 false（机制空转）。
+			if c.leg != nil {
+				c.leg.noteWriteCost(time.Since(started))
+			}
+			if err != nil {
 				s.legWriteFailed(c, err)
 				return
 			}
