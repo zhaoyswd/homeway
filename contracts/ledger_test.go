@@ -4,7 +4,6 @@
 package contracts
 
 import (
-	"fmt"
 	"sort"
 	"testing"
 )
@@ -240,7 +239,6 @@ func TestLedgerLegacyStatusLegacy(t *testing.T) {
 	if legacy != 10 { // 族⑥ 5 + 族⑦ 4 + via=tunnel 1
 		t.Errorf("legacy 行数 = %d，期望 10（compat-passthrough 初始集如实为空集——双出口在役 v0.10.0 与本仓同 lineage，r2 实测归位；%d 行 compat）", legacy, compat)
 	}
-	_ = fmt.Sprintf("")
 }
 
 func containsStr(s, sub string) bool {

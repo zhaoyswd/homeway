@@ -170,8 +170,9 @@ func ExtractAll(root string) (Extracted, error) {
 						if i >= len(vs.Values) {
 							return nil, fmt.Errorf("contracts: %s：%s 无值（iota 词表需改手写值）", r.Dir, name.Name)
 						}
-						// 同包前序常量可解析（词表聚集体如 termFeatures 不在前缀内，这里只为兜底）。
-						v, err := evalExpr(vs.Values[i], map[string]string{})
+						// 标识符值 fail-closed：词表常量的值须为字面量或源码文本形态
+						// （词表聚集体如 termFeatures 不在前缀内，不在此兜底）。
+						v, err := evalExpr(vs.Values[i])
 						if err != nil {
 							return nil, fmt.Errorf("contracts: %s：%s 值不可求值：%w", r.Dir, name.Name, err)
 						}
@@ -264,8 +265,9 @@ func parseDir(root, dir string, cache map[string]*ast.Package) (*ast.Package, er
 }
 
 // evalExpr 求值词表常量的值表达式：字符串字面量原样、整数字面量十进制文本、
-// 一元负号、移位/按位或组合、选择子表达式（math.MinInt32）按源码文本渲染。
-func evalExpr(e ast.Expr, seen map[string]string) (string, error) {
+// 一元负号、移位/按位或组合、选择子表达式（math.MinInt32）按源码文本渲染；
+// 标识符一律 fail-closed 报错（不支持同包常量引用链）。
+func evalExpr(e ast.Expr) (string, error) {
 	switch v := e.(type) {
 	case *ast.BasicLit:
 		switch v.Kind {
@@ -280,7 +282,7 @@ func evalExpr(e ast.Expr, seen map[string]string) (string, error) {
 		}
 		return "", fmt.Errorf("不支持的字面量 %s", v.Value)
 	case *ast.UnaryExpr:
-		x, err := evalExpr(v.X, seen)
+		x, err := evalExpr(v.X)
 		if err != nil {
 			return "", err
 		}
@@ -289,11 +291,11 @@ func evalExpr(e ast.Expr, seen map[string]string) (string, error) {
 		}
 		return "-" + x, nil
 	case *ast.BinaryExpr:
-		x, err := evalExpr(v.X, seen)
+		x, err := evalExpr(v.X)
 		if err != nil {
 			return "", err
 		}
-		y, err := evalExpr(v.Y, seen)
+		y, err := evalExpr(v.Y)
 		if err != nil {
 			return "", err
 		}
@@ -319,9 +321,6 @@ func evalExpr(e ast.Expr, seen map[string]string) (string, error) {
 		}
 		return "", fmt.Errorf("不支持的选择子形态")
 	case *ast.Ident:
-		if s, ok := seen[v.Name]; ok {
-			return s, nil
-		}
 		return "", fmt.Errorf("未解析的标识符 %s", v.Name)
 	}
 	return "", fmt.Errorf("不支持的表达式形态 %T", e)
