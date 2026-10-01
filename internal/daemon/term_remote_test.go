@@ -602,7 +602,7 @@ func TestControlDialErrStates(t *testing.T) {
 		want []string
 	}{
 		{"ENOENT", &fs.PathError{Op: "dial", Path: sock, Err: syscall.ENOENT},
-			[]string{"daemon 未在运行", "--state 指统一 state 根", "homeway --state"}},
+			[]string{"统一进程未在运行", "--state 指统一 state 根", "homeway --state"}},
 		{"ECONNREFUSED", &net.OpError{Op: "dial", Err: os.NewSyscallError("connect", syscall.ECONNREFUSED)},
 			[]string{"残留 socket"}},
 		{"EACCES", &net.OpError{Op: "dial", Err: os.NewSyscallError("connect", syscall.EACCES)},

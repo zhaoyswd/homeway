@@ -55,7 +55,7 @@ func ListenControl(stateDir string) (string, net.Listener, error) {
 	// 目录 0700（第二层；OpenDaemonState 已建，这里幂等再收紧并作为装配断言）。
 	if err := os.Chmod(stateDir, 0o700); err != nil {
 		// 与出口口径一致：目录收紧失败告警不阻断（socket 0600 那层还兜着）。
-		fmt.Fprintf(os.Stderr, "homeway daemon: ⚠️ state 目录 %s 收紧 0700 失败（%v）——socket 0600 仍是边界\n", stateDir, err)
+		fmt.Fprintf(os.Stderr, "homeway: ⚠️ state 目录 %s 收紧 0700 失败（%v）——socket 0600 仍是边界\n", stateDir, err)
 	}
 	return sock, ln, nil
 }

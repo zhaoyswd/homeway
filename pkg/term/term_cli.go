@@ -101,8 +101,8 @@ func expandFlagEq(args []string) []string {
 
 // termCommon 是各子命令的公共参数（--state/--host/--timeout）。
 //
-// --host 非空 = 远程模式：--state 的指代切换为 daemon state 目录（control.sock
-// 所在；空串 = 实现侧默认 ~/.config/homeway/daemon）——同一 flag 重载、非互斥
+// --host 非空 = 远程模式：--state 的指代切换为统一 state 根（control.sock
+// 所在；空串 = 实现侧默认 ~/.config/homeway）——同一 flag 重载、非互斥
 // 报错（r1 P2-5）；--timeout = 解析与打开**各**用一次的预算（CLI 侧两次独立
 // context.WithTimeout；默认各 10s，最坏相加 20s——exec-r1 L1 校正，原「总预算
 // 10s」措辞不准；attach 流本身不设 deadline——两口径分开，r1 P2-9）。
@@ -376,7 +376,7 @@ func cliList(args []string, remote RemoteTerm) error {
 		}
 	}
 	// 缺省补默认（newTermTarget 内：本地面 --state 沿用 ~/.config/homeway；远程
-	// --state 留空 = daemon 侧默认 ~/.config/homeway/daemon）。
+	// --state 留空 = daemon 侧默认 ~/.config/homeway〔统一 state 根〕）。
 	entries, raw, err := cliListFetch(c.target(remote))
 	if err != nil {
 		return err
@@ -935,11 +935,12 @@ func termUsage(w io.Writer) {
 远程模式（--host，经 daemon 控制面转发；term 帧协议经隧道端到端原样复用）：
   --host <name|id>   目标主机（与 host delete/status 同规则：名称精确 / peerID 全长
                      hex / 无歧义短前缀；homeway host list 查看在表主机）
-  ⚠ --host 模式下 --state 指守护进程 state 目录（control.sock 所在，默认
-     ~/.config/homeway/daemon）——与本地面（出口 state，默认 ~/.config/homeway）
-     指代不同；--timeout 为解析与打开各一次的预算（默认各 10s、最坏相加 20s，
+  ⚠ --host 模式下 --state 指统一 state 根（control.sock 所在，默认
+     `+DefaultStateDir()+`，与本地面同一根——本地面找 term.sock、远程面找
+     control.sock）；--timeout 为解析与打开各一次的预算（默认各 10s、最坏相加 20s，
      如 10s/1500ms），仅 --host 模式可用（本地面给出即报错）；attach 流本身不设
-     deadline（长连接语义）。daemon 未运行时先启动：homeway daemon
+     deadline（长连接语义）。daemon 未运行时远程面自动拉起（--no-spawn / Windows
+     例外报可行动错误——先手动启动：homeway --state <dir>〔零参统一进程〕）
   远程 attach 的流终结归因：gone = 主机不可达或上行过快（会话仍在目标主机运行，可
      重新 attach）；closed = 对端关闭（也可能是本端长时间停止读取、出口侧慢腿自治
      收尾）；连接级断开 = 与守护进程的连接断了，重新执行命令即可。

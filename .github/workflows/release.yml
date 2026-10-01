@@ -138,6 +138,9 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # ⚠️ 已知限制（exec-r1 中-1，登记不自级修复）：linux 产物因 vt 静态库 + cgo
+          # 静态链接跨 runner 不可逐字节复现——同 commit 重跑会产出不同字节的 linux 二进制
+          #（darwin 跨 run 一致）。「在役 = Release 产物」的核验以当次下载对 sidecar 为准。
           # ---- 带 vt 的 cgo 目标（D7）----
           - { os: macos-latest,  goos: darwin,  goarch: arm64, vt: cgo }
           - { os: macos-latest,  goos: darwin,  goarch: amd64, vt: cgo, cc: "clang -arch x86_64" }

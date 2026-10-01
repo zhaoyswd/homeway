@@ -461,3 +461,41 @@ func TestRelayGroupTokenNoKey(t *testing.T) {
 		t.Fatalf("无钥推算应可行动错误：%v", err)
 	}
 }
+
+// TestPrintTokenRevealSourceNotes 来源注记区分（exec-r1 低-5）：ledger（进程未跑/
+// 角色未装配）与 ledger-early（角色已装配、本轮 token 未铸出——启动早期窗口）两句
+// 注记分开，不再合并成与实情不符的一句；未知来源原样透传。
+func TestPrintTokenRevealSourceNotes(t *testing.T) {
+	cases := []struct {
+		source, want string
+	}{
+		{"runtime", "运行态真源（控制面）"},
+		{"ledger", "台账末行（进程未跑/角色未装配"},
+		{"ledger-early", "台账末行（角色已装配、本轮 token 未铸出"},
+		{"derived", "离线推算（relay.key + config）"},
+		{"自定义来源", "自定义来源"},
+	}
+	for _, tc := range cases {
+		var out bytes.Buffer
+		printTokenReveal(&out, "serve", "hmw1FAKE", tc.source, []string{"1.2.3.4:41641"})
+		if !strings.Contains(out.String(), "来源："+tc.want) {
+			t.Fatalf("source=%s 注记应含 %q：\n%s", tc.source, tc.want, out.String())
+		}
+	}
+}
+
+// TestWarnNoEndpoints 无端点 token 的可行动提示（exec-r1 低-5）：台账末行是
+// endpoints=null 预热行时提示「首轮端点尚未铸出 + 稍后重试/看 events.log」；
+// 有端点时不打提示。
+func TestWarnNoEndpoints(t *testing.T) {
+	var out bytes.Buffer
+	warnNoEndpoints(&out, nil)
+	if !strings.Contains(out.String(), "首轮端点尚未铸出") || !strings.Contains(out.String(), "events.log") {
+		t.Fatalf("无端点应打可行动提示：\n%s", out.String())
+	}
+	out.Reset()
+	warnNoEndpoints(&out, []string{"1.2.3.4:41641"})
+	if out.Len() != 0 {
+		t.Fatalf("有端点不应打提示：\n%s", out.String())
+	}
+}

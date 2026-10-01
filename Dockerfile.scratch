@@ -3,9 +3,10 @@
 #   GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -trimpath -ldflags "-s -w" -o build/homeway ./cmd/homeway
 #   docker build -f Dockerfile.scratch -t homeway:<tag> .
 #
-# 单二进制按角色运行：默认（无参数）= 出口；要跑中继就传 `relay`：
-#   docker run -d --name homeway-exit  --network host ... homeway:<tag>
-#   docker run -d --name homeway-relay --network host ... homeway:<tag> relay --advertise 1.2.3.4:41741
+# 单二进制按角色运行（v0.14.0 命令面）：默认（无参数）= 统一进程（serve 角色默认启用；
+# 中继 = config [relay] enabled=true，或前台单角色名词 `relay`）：
+#   docker run -d --name homeway --network host ... homeway:<tag>            # 出口（统一进程）
+#   docker run -d --name relay  --network host ... homeway:<tag> relay --advertise 1.2.3.4:41741
 FROM scratch
 COPY build/homeway /homeway
 # 二进制分发条款要求随附自有许可与第三方声明（生成脚本见 tools/gen-third-party-notices.sh）

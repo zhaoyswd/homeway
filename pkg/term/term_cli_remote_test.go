@@ -102,7 +102,7 @@ func TestCLIListHostViaFakeRemote(t *testing.T) {
 		t.Fatalf("--host 模式 --state 应透传 daemon state 指代：%v", stateSeen)
 	}
 
-	// 不带 --state：stateDir 透传空串（= daemon 侧默认 ~/.config/homeway/daemon）。
+	// 不带 --state：stateDir 透传空串（= daemon 侧默认 ~/.config/homeway〔统一 state 根〕）。
 	if err := cliList([]string{"--host", "mac"}, f); err != nil {
 		t.Fatalf("远程 list（默认 state）：%v", err)
 	}

@@ -272,6 +272,27 @@ func TestOpenFreshState(t *testing.T) {
 	}
 }
 
+// TestOpenTightensLooseSubdirs 既有子目录收紧（exec-r1 低-7）：runbook 手建的
+// relay/ 0755 这类漂移在 OpenNodeState 归一为 0700（MkdirAll 的 mode 只对新建生效）。
+func TestOpenTightensLooseSubdirs(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(dir, "relay"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	st, err := OpenNodeState(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	fi, err := os.Stat(st.RelayDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fi.Mode().Perm() != 0o700 {
+		t.Fatalf("既有子目录应收紧 0700：got %v", fi.Mode().Perm())
+	}
+}
+
 func TestMigrateConfigExistingNotRegenerated(t *testing.T) {
 	// config 已存在时不重写（手编意图不被覆盖）。
 	dir := t.TempDir()

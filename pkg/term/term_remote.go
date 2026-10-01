@@ -15,8 +15,8 @@ import (
 // RemoteTerm —— `--host` 模式的远程接入缝。
 type RemoteTerm interface {
 	// ResolveHostRef 把 --host 的名称/全长 hex/无歧义短前缀解析为 hex id（规则与
-	// host delete/status 同源）。stateDir = daemon state 目录（control.sock 所在；
-	// 空串 = 实现侧默认 ~/.config/homeway/daemon）。
+	// host delete/status 同源）。stateDir = 统一 state 根（control.sock 所在；
+	// 空串 = 实现侧默认 ~/.config/homeway）。
 	ResolveHostRef(ctx context.Context, stateDir, ref string) (hexID, name string, err error)
 	// DialTerm 打开到目标主机 term 服务的字节流（term 帧协议端到端承载、零改写；
 	// 返回的连接已满足「可读 GREETING」的普通流语义）。ctx = 本次拨号（控制面连接 +

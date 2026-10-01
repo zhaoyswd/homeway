@@ -111,7 +111,7 @@ func usageForward(w io.Writer) {
                      规则表 + 运行态（listening/failed/在世连接数）
   homeway forward delete --host <ref> --listen <P>
                      删规则并关监听（在世连接不强关、自然收口）
-全部子命令可加 --state DIR（恒指 daemon state，默认 ~/.config/homeway/daemon）与 --timeout。
+全部子命令可加 --state DIR（指统一 state 根〔control.sock 所在〕，默认 `+DefaultStateDir()+`）与 --timeout。
 监听端口 1024–65535、每主机 ≤8 条、与全部规则及 socks 监听全局唯一。
 `)
 }

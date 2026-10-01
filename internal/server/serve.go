@@ -470,6 +470,7 @@ func Start(ctx context.Context, cfg ServeConfig) (*Server, error) {
 			// 与 files/term 同一取舍：可选服务起不来不影响隧道/转发。
 			logf("⚠️ speedtest 监听 %s 失败（%v）—— 测速功能会报错（state 目录异常/被其它实例占用），其余功能不受影响", ssock, slerr)
 		} else {
+			chmodTighten(ssock, "speedtest.sock") // exec-r1 低-7：files/term 同款收紧（旧路径只覆盖两个 socket）
 			s.speedLn, s.speedSock, s.speedOwn, s.speedSrv = sln, ssock, sown, ssrv
 			go func() {
 				verr := ssrv.Serve(sln)
@@ -511,8 +512,8 @@ func Start(ctx context.Context, cfg ServeConfig) (*Server, error) {
 // 注：Go 的 UnixListener.Close 默认会按路径 unlink（unlinkOnClose=true）——本函数
 // 在 listen 成功后关掉这个默认，删除统一走身份比对路径（见 removeSockOwn）。
 // 路径超过 sockaddr_un 上限时直接报错（重试无意义）。
-// chmodTighten 收紧本地服务 socket 权限到 0600（term/files 共用；r5 F2 + r6 F 抽出——
-// serve 启动路径与测试共用同一实现，测试对「删掉生产 chmod」有真变异敏感度）。
+// chmodTighten 收紧本地服务 socket 权限到 0600（term/files/speedtest 共用；r5 F2 + r6 F
+// 抽出——serve 启动路径与测试共用同一实现，测试对「删掉生产 chmod」有真变异敏感度）。
 func chmodTighten(path, label string) bool {
 	if err := os.Chmod(path, 0o600); err != nil {
 		logf("⚠️ %s chmod 0600 失败（%v）—— 纵深加固未生效，state 目录权限仍是边界", label, err)

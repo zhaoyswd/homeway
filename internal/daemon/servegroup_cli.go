@@ -589,6 +589,7 @@ func serveTokenCLI(args []string, version string, w io.Writer) error {
 			return fmt.Errorf("serve.token 载荷解析失败：%w", err)
 		}
 		printTokenReveal(w, "serve", res.Token, res.Source, res.Eps)
+		warnNoEndpoints(w, res.Eps)
 		return nil
 	}
 	tok, eps, ok, err := server.RevealLastToken(filepath.Join(*g.stateDir, "serve"))
@@ -599,6 +600,7 @@ func serveTokenCLI(args []string, version string, w io.Writer) error {
 		return errors.New("台账为空（serve 从未铸出 token）：先启动 `homeway serve start`，等首轮端点探测后重试")
 	}
 	printTokenReveal(w, "serve", tok, "ledger", eps)
+	warnNoEndpoints(w, eps)
 	return nil
 }
 
@@ -660,12 +662,15 @@ func deriveRelayTokenOffline(stateDir string) (string, []string, error) {
 	return relay.BuildToken(secret, cfg.Relay.Advertise, port)
 }
 
-// printTokenReveal reveal 输出（完整凭证只经本命令族——reveal 纪律）。
+// printTokenReveal reveal 输出（完整凭证只经本命令族——reveal 纪律）。来源注记区分
+// 「角色未装配/进程未跑」（ledger）与「角色已装配、本轮 token 未铸出」（ledger-early，
+// 启动早期窗口——exec-r1 低-5：旧合并注记与实情不符）。
 func printTokenReveal(w io.Writer, role, token, source string, eps []string) {
 	srcNote := map[string]string{
-		"runtime": "运行态真源（控制面）",
-		"ledger":  "台账末行（角色未装配/未铸出——写入纪律下末行 = 最近在用 token）",
-		"derived": "离线推算（relay.key + config）",
+		"runtime":      "运行态真源（控制面）",
+		"ledger":       "台账末行（进程未跑/角色未装配——写入纪律下末行 = 最近在用 token）",
+		"ledger-early": "台账末行（角色已装配、本轮 token 未铸出——等首轮端点探测，约 15s）",
+		"derived":      "离线推算（relay.key + config）",
 	}[source]
 	if srcNote == "" {
 		srcNote = source
@@ -673,6 +678,15 @@ func printTokenReveal(w io.Writer, role, token, source string, eps []string) {
 	fmt.Fprintf(w, "%s token：%s\n来源：%s\n", role, token, srcNote)
 	if len(eps) > 0 {
 		fmt.Fprintf(w, "端点：%s\n", strings.Join(eps, "、"))
+	}
+}
+
+// warnNoEndpoints 无端点 token 的可行动提示（exec-r1 低-5）：台账末行是 endpoints=null
+// 的预热行时，这枚 token 连不上（没有可拨的端点）——提示稍后重试或看 events.log 的
+// 「客户端 token」行（首轮铸出后 token 行自带端点）。
+func warnNoEndpoints(w io.Writer, eps []string) {
+	if len(eps) == 0 {
+		fmt.Fprintln(w, "⚠️ 该 token 无端点（serve 首轮端点尚未铸出——启动后约 15s 完成首轮公网探测）；稍后重试，或看 <state>/cache/events.log 的「客户端 token」行")
 	}
 }
 

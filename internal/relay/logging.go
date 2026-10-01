@@ -18,7 +18,8 @@ import (
 	"github.com/zhaoyswd/homeway/internal/logfile"
 )
 
-const relayLogPrefix = "2006-01-02 15:04:05.000 [homeway-relay] "
+// relayLogPrefix 前缀 [relay]（exec-r1 中-3：旧双二进制名前缀随合并退役）。
+const relayLogPrefix = "2006-01-02 15:04:05.000 [relay] "
 
 var (
 	rlogMu sync.Mutex
@@ -42,7 +43,7 @@ func initRelayLog(stateDir string) {
 	w, err := logfile.Open(stateDir, "relay.log", 2<<20, 3)
 	if err != nil {
 		// 打不开不致命（中继没有必须落盘的状态）：终端提示一句，服务继续。
-		fmt.Fprintln(os.Stderr, "homeway-relay: ⚠️ 文件日志打开失败（", err, "）—— 本轮日志缺失，服务继续")
+		fmt.Fprintln(os.Stderr, "homeway relay: ⚠️ 文件日志打开失败（", err, "）—— 本轮日志缺失，服务继续")
 		return
 	}
 	rlW = w

@@ -58,8 +58,8 @@ func DefaultStateDir() string {
 // 实现落 internal/daemon/files_remote.go，测试注假实现）。
 type RemoteFiles interface {
 	// ResolveHostRef 把 --host 的名称/全长 hex/无歧义短前缀解析为 hex id（规则与
-	// host delete/status 同源）。stateDir = daemon state 目录（control.sock 所在；
-	// 空串 = 实现侧默认 ~/.config/homeway/daemon）。
+	// host delete/status 同源）。stateDir = 统一 state 根（control.sock 所在；
+	// 空串 = 实现侧默认 ~/.config/homeway）。
 	ResolveHostRef(ctx context.Context, stateDir, ref string) (hexID, name string, err error)
 	// DialFiles 打开到目标主机 files 服务的字节流（files 协议端到端承载、零改写；
 	// 返回的连接满足「可读问候帧」的普通流语义）。ctx = 「控制面连接 + stream.open」
@@ -137,10 +137,11 @@ func filesUsage(w io.Writer) {
                `+DefaultStateDir()+`，不要求 daemon 在位）
   --host <ref> = 远程面：经 daemon 控制面 stream.open{kind:files} 转发（ref = 名称
                精确 / peerID hex 全长 / 无歧义短前缀，与 host delete/status 同规则）；
-               ⚠ 该模式下 --state 指守护进程 state 目录（control.sock 所在，默认
-               ~/.config/homeway/daemon）。--timeout = 解析/连接+打开/首响应（问候帧）
-               三段各一次的预算（默认各 10s，最坏相加 30s；传输本身不设 deadline）。
-  daemon 未运行时远程面会报可行动错误（先启动：homeway daemon）。
+               ⚠ 该模式下 --state 指统一 state 根（control.sock 所在，默认
+               `+DefaultStateDir()+`，与本地面同一根）。--timeout = 解析/连接+打开/首响应（问候帧）
+               三段各一次的预算（默认各 10s、最坏相加 30s；传输本身不设 deadline）。
+  daemon 未运行时远程面自动拉起（--no-spawn / Windows 例外报可行动错误——
+  先手动启动：homeway --state <dir>〔零参统一进程〕）。
 
 流终结归因（get/put 中途）：gone = 流被守护进程收流（主机不可达或上行持续过快）；
 closed = 对端已关闭（files 服务收工）；连接级断开 = 与守护进程的连接断了，重试即可。
@@ -347,8 +348,8 @@ func filesDialErr(sock string, err error) error {
 	switch {
 	case errors.Is(err, fs.ErrNotExist):
 		return fmt.Errorf("出口未在跑、或该目录不是出口 state 目录（%s 不存在）。\n"+
-			"本地面 --state 默认 %s（出口 state）；对远程主机取放文件请用 --host <name|id>（该模式下 --state 指守护进程 state 目录，默认 ~/.config/homeway/daemon）",
-			sock, DefaultStateDir())
+			"本地面 --state 默认 %s（出口 state）；对远程主机取放文件请用 --host <name|id>（该模式下 --state 指统一 state 根〔control.sock 所在〕，默认 %s）",
+			sock, DefaultStateDir(), DefaultStateDir())
 	case errors.Is(err, syscall.ECONNREFUSED):
 		return fmt.Errorf("连接被拒：%s 像是残留 socket（出口进程已退出）；确认出口在跑，或删除该文件后重试", sock)
 	case errors.Is(err, syscall.EACCES), errors.Is(err, syscall.EPERM):

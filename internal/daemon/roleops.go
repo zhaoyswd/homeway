@@ -265,8 +265,13 @@ func (ro *roleOps) ServeStatus() control.ServeStatusResult {
 func (ro *roleOps) ServeToken() (control.ServeTokenResult, error) {
 	// 运行态真源优先；未铸出（探测未完成窗口）或角色未装配 → 台账末行（写入纪律下
 	// 末行 = 最近在用 token——两源同源，spec 场景「token 双路径一致」）。
+	// 来源细分（exec-r1 低-5）：ledger-early = 角色已装配、本轮 token 未铸出（启动
+	// 早期窗口）；ledger = 进程在跑但角色未装配（如 serve stop 后）或未跑直读——
+	// 前者的台账末行可能是 endpoints=null 预热行，CLI 侧据此给可行动提示。
+	roleAssembled := false
 	if role := ro.serveRole(); role != nil {
 		if cur := role.Current(); cur != nil {
+			roleAssembled = true
 			if tok := cur.CurrentToken(); tok != "" {
 				return control.ServeTokenResult{Token: tok, Source: "runtime"}, nil
 			}
@@ -279,7 +284,11 @@ func (ro *roleOps) ServeToken() (control.ServeTokenResult, error) {
 	if !ok {
 		return control.ServeTokenResult{}, errors.New("serve 角色未铸出 token 且台账为空（等首轮端点探测后重试，或先 homeway serve start）")
 	}
-	return control.ServeTokenResult{Token: tok, Source: "ledger", Eps: eps}, nil
+	src := "ledger"
+	if roleAssembled {
+		src = "ledger-early"
+	}
+	return control.ServeTokenResult{Token: tok, Source: src, Eps: eps}, nil
 }
 
 func (ro *roleOps) RelayStart() (control.RoleActionResult, error) {

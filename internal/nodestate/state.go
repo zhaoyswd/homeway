@@ -63,8 +63,14 @@ func OpenNodeState(dir string) (*NodeState, error) {
 		fmt.Fprintf(os.Stderr, "homeway: ⚠️ state 目录 %s 收紧 0700 失败（%v）——建议手工 chmod\n", dir, err)
 	}
 	for _, sub := range []string{subServe, subRelay, subClient, subCache} {
-		if err := os.MkdirAll(filepath.Join(dir, sub), 0o700); err != nil {
+		p := filepath.Join(dir, sub)
+		if err := os.MkdirAll(p, 0o700); err != nil {
 			return nil, err
+		}
+		// 既有子目录收紧（MkdirAll 的 mode 只对新建生效；runbook 手建的 relay/ 0755
+		// 这类漂移在此归一——exec-r1 低-7；失败告警不阻断，与顶层目录同口径）。
+		if err := os.Chmod(p, 0o700); err != nil {
+			fmt.Fprintf(os.Stderr, "homeway: ⚠️ state 子目录 %s 收紧 0700 失败（%v）——建议手工 chmod\n", p, err)
 		}
 	}
 	st := &NodeState{Dir: dir}
