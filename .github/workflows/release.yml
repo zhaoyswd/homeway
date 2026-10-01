@@ -64,7 +64,12 @@ jobs:
       # CGO_ENABLED=0 下加 tag 也救不了），由 clientcore job 的 cshared 面守。收窄后 windows
       # 桩门覆盖共享核包（flock/TUN fd 平台拆分，1.1）。
       - run: go vet $(go list ./... | grep -vE '/clientcore/cmd/clientcore$')
-      - run: go test $(go list ./... | grep -vE '/clientcore/cmd/clientcore$')
+      # -p 1（包级串行）：并行包执行时各测试二进制的随机 TCP 监听会撞进彼此的端口号
+      #（v0.12.1 已记同族；3f 发版窗口 dispatch 连三轮各撞不同包〔control 流限额时序 /
+      # daemon files 终结归因 / relay UDP 端口号上重绑 TCP 撞号〕，套件增至 26 包后恶化）
+      # ——串行后跨包端口竞争与 CPU 争用两个 flake 源同时消除，代价 = test 步墙钟翻倍
+      #（分钟级）。本地复跑（整面 + 撞号用例 -count=8 加压）皆绿，判 runner 环境非代码。
+      - run: go test -p 1 $(go list ./... | grep -vE '/clientcore/cmd/clientcore$')
       # off 变体（CGO_ENABLED=0 / armv7）与 windows 桩也必须一直可编：armv7/windows 的发版产物
       # 就编在这条路径上，别等 build job 才发现烂了（term_vt_off 断编 2026-09-27 的教训）。
       - run: CGO_ENABLED=0 go build $(go list ./... | grep -vE '/clientcore/cmd/clientcore$')
@@ -114,7 +119,8 @@ jobs:
       - run: bash tools/build-vt.sh "$(go env GOOS)-$(go env GOARCH)"
       - run: go build -tags cshared ./clientcore/...
       - run: go vet -tags cshared ./clientcore/...
-      - run: go test -tags cshared ./clientcore/...
+      # -p 1 同 test job：跨包端口竞争消除（wtransport 等集成测试也监听随机端口）。
+      - run: go test -p 1 -tags cshared ./clientcore/...
       - name: c-shared 构建冒烟（//export 面完整可见；不发 dylib 产物）
         if: runner.os == 'macOS'
         run: |

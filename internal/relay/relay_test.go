@@ -171,20 +171,37 @@ func startRelay(t *testing.T, cfg Config) *Relay {
 	if cfg.Logf == nil {
 		cfg.Logf = func(f string, a ...any) { t.Logf("[relay] "+f, a...) }
 	}
-	r := New(cfg)
-	ctx, cancel := context.WithCancel(context.Background())
-	done := make(chan struct{})
-	go func() { defer close(done); _ = r.Run(ctx) }()
-	for i := 0; i < 100 && !r.LocalAddr().IsValid(); i++ {
-		time.Sleep(10 * time.Millisecond)
-	}
-	if !r.LocalAddr().IsValid() {
+	// 中继的控制面 TCP 与 UDP **同号**（部署零新增口），UDP :0 由内核在临时口区间
+	// 挑号——同号 TCP 可能恰好被**外部** socket（并行测试包的随机监听/系统进程的
+	// 临时口连接）占住 ⇒ relay 静默退回纯 UDP 中继 ⇒ 需要控制腿的用例红（CI 并行包
+	// 下实测；包内先后用例的串行性已由 Run 收尾关 ctlLn 保证，这里是外部占用面）。
+	// 起后探测控制腿：不在就换口重起（有界重试——每次重起内核重挑 UDP 号）。
+	for attempt := 1; ; attempt++ {
+		r := New(cfg)
+		ctx, cancel := context.WithCancel(context.Background())
+		done := make(chan struct{})
+		go func() { defer close(done); _ = r.Run(ctx) }()
+		for i := 0; i < 100 && !r.LocalAddr().IsValid(); i++ {
+			time.Sleep(10 * time.Millisecond)
+		}
+		if !r.LocalAddr().IsValid() {
+			cancel()
+			t.Fatal("中继没起来")
+		}
+		ctl := net.TCPAddr{IP: net.IPv4(127, 0, 0, 1), Port: int(r.LocalAddr().Port())}
+		if c, derr := net.DialTimeout("tcp", ctl.String(), time.Second); derr == nil {
+			_ = c.Close()
+			// 收工顺序：先 cancel 再等 Run 退出（LIFO 的 cleanup 顺序坑过）
+			t.Cleanup(func() { cancel(); <-done })
+			return r
+		}
 		cancel()
-		t.Fatal("中继没起来")
+		<-done
+		if attempt >= 5 {
+			t.Fatalf("中继控制面 TCP 同号口连续 %d 次被外部占用——环境异常", attempt)
+		}
+		t.Logf("[relay] 控制面 TCP 同号口被外部占用，换口重起（第 %d 次）", attempt)
 	}
-	// 收工顺序：先 cancel 再等 Run 退出（LIFO 的 cleanup 顺序坑过）
-	t.Cleanup(func() { cancel(); <-done })
-	return r
 }
 
 // ---------- 测试 ----------
