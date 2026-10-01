@@ -289,8 +289,8 @@ func Start(ctx context.Context, cfg ServeConfig) (*Server, error) {
 		}
 	}
 	inter, ierr := intercept.Attach(ns, intercept.Config{
-		TunnelIP:      cfg.TunnelIP,
-		DNSPort:       dnsPort,
+		TunnelIP: cfg.TunnelIP,
+		DNSPort:  dnsPort,
 		// 过境 TCP 边界（FIX-63）：原 64/30min 耦合——64 路并发对「手机全量流量」太
 		// 窄（一次页面加载的并行连接就能顶到），而 30min 空闲又让泄漏连接占坑过久。
 		// 现 1024 路 / 5min：上限与 pkg/intercept 的默认（4096）同量级留余量；空闲取
