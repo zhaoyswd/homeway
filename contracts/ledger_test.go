@@ -173,6 +173,11 @@ func TestLedgerExemptionNotes(t *testing.T) {
 		{"bridge-files", "code", "marshal", "App 走 default"},
 		{"bridge-term", "code", "remote", "App 走 default"},
 		{"bridge-term", "code", "marshal", "App 走 default"},
+		// 6.2 补登（App 面对账首跑检出）：③透传里 App 无 case 的 already_exists 与
+		// termEndNone 哨兵同样落 default（design 族⑦「③无 case 值走 default（note 豁免）」
+		// / tasks 1.1「ENDED code −1/哨兵——note『App 走 default』」）。
+		{"bridge-term", "code", "already_exists", "App 走 default"},
+		{"term-frame", "ended-code", "math.MinInt32", "App 走 default"},
 		{"event-payload", "via", "none", "不入豁免减法"},
 		{"event-payload", "via", "tunnel", "本仓零产出者"},
 		{"event-payload", "state", "stopping", "App 走 default"},

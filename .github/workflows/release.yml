@@ -82,6 +82,17 @@ jobs:
           set -euo pipefail
           sudo apt-get update -qq && sudo apt-get install -y -qq zlib1g-dev
           bash tools/surface-host-test.sh
+      # 契约台账对账门（contract-ledger 6.1）：两组包（中-3）——
+      #   ① contracts 包全量（词表对账规则①②④ + fixtures 摘要冻结门③ + 净室对拍；
+      #      不点名 -run 防空绿——r3 N-19）；
+      #   ② 版本治理生产侧（fixtures 版本目录遍历 + GREETING/surface 版本门 + 错配注入红路：
+      #      必须import 生产解码器，落 internal/control 与 pkg/term 的生产侧测试——D5）。
+      # 隐式 `go test -p 1 ./...` 仍兜底；显式 step 保门可见性，并与 8.3 判据③采证命令同形。
+      - name: 契约台账对账门（contracts 对账 + 版本治理生产侧）
+        run: |
+          set -euo pipefail
+          go test ./contracts/... -count=1 -v
+          go test ./internal/control/ ./pkg/term/ -run 'TestVersionGovernance' -count=1 -v
       # 声明文件必须与当前依赖一致（改了依赖没重跑生成脚本 ⇒ 别发版）
       - run: bash tools/gen-third-party-notices.sh --check
 

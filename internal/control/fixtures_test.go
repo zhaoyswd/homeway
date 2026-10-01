@@ -21,6 +21,9 @@ import (
 	"os/exec"
 	"path/filepath"
 	"reflect"
+	"sort"
+	"strconv"
+	"strings"
 	"testing"
 )
 
@@ -31,13 +34,56 @@ type fixtureEntry struct {
 	Op       string          `json:"op"`
 	Hex      string          `json:"hex"`
 	Expect   json.RawMessage `json:"expect"`
+	// Dir 所属版本目录（v1/v2…；加载时填充，不来自 JSON）——目录遍历化后错误信息
+	// 要带版本上下文（contract-ledger tasks 5.1）。
+	Dir string `json:"-"`
 }
 
-func loadFixtures(t *testing.T) []fixtureEntry {
+// fixtureVersionDirs 列 root 下的版本目录（v1、v2…，数值序）。版本治理目录遍历
+// （contract-ledger tasks 5.1）：未来新增 v2/ 目录落盘即自动进对拍回归；空目录
+// 幂等跳过（loadFixtures 对无 frames.jsonl 的目录不报错）。零版本目录 = 异常
+// （v1 是冻结基线，不可能被删——fail-closed）。
+func fixtureVersionDirs(t *testing.T, root string) []string {
 	t.Helper()
-	p := filepath.Join("testdata", "fixtures", "v1", "frames.jsonl")
+	ents, err := os.ReadDir(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	type vn struct {
+		name string
+		n    int
+	}
+	var dirs []vn
+	for _, e := range ents {
+		if !e.IsDir() || !strings.HasPrefix(e.Name(), "v") {
+			continue
+		}
+		n, err := strconv.Atoi(e.Name()[1:])
+		if err != nil || n < 1 {
+			continue
+		}
+		dirs = append(dirs, vn{e.Name(), n})
+	}
+	if len(dirs) == 0 {
+		t.Fatalf("%s 下没有版本目录（v1 是冻结基线，缺席即异常）", root)
+	}
+	sort.Slice(dirs, func(i, j int) bool { return dirs[i].n < dirs[j].n })
+	out := make([]string, len(dirs))
+	for i, d := range dirs {
+		out[i] = d.name
+	}
+	return out
+}
+
+// loadFixturesDir 读单个版本目录的 frames.jsonl（dir 缺文件 = 空目录，返回 nil——幂等）。
+func loadFixturesDir(t *testing.T, root, dir string) []fixtureEntry {
+	t.Helper()
+	p := filepath.Join(root, dir, "frames.jsonl")
 	f, err := os.Open(p)
 	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
 		t.Fatal(err)
 	}
 	defer f.Close()
@@ -51,12 +97,24 @@ func loadFixtures(t *testing.T) []fixtureEntry {
 		}
 		var e fixtureEntry
 		if err := json.Unmarshal(line, &e); err != nil {
-			t.Fatalf("fixtures 行损坏：%v（%s）", err, line)
+			t.Fatalf("%s：行损坏：%v（%s）", dir, err, line)
 		}
+		e.Dir = dir
 		out = append(out, e)
 	}
 	if err := sc.Err(); err != nil {
 		t.Fatal(err)
+	}
+	return out
+}
+
+// loadFixtures 全部版本目录的向量并集（目录遍历化：今天只有 v1，未来 v2… 自动进回归）。
+func loadFixtures(t *testing.T) []fixtureEntry {
+	t.Helper()
+	root := filepath.Join("testdata", "fixtures")
+	var out []fixtureEntry
+	for _, dir := range fixtureVersionDirs(t, root) {
+		out = append(out, loadFixturesDir(t, root, dir)...)
 	}
 	if len(out) == 0 {
 		t.Fatal("fixtures 为空")
@@ -92,23 +150,34 @@ func bodyStructFor(op byte) any {
 func TestFixturesDecodeExactBytes(t *testing.T) {
 	// ①解码向：hex 帧 → op/body；**再编码 = 原 hex 逐字节一致**（帧布局锚定）。
 	for _, fx := range loadFixtures(t) {
-		raw := hexBytes(t, fx.Hex)
-		r := bufio.NewReader(bytes.NewReader(raw))
-		op, body, err := ReadFrame(r, MaxControlBody)
-		if err != nil {
-			t.Fatalf("%s：解码失败：%v", fx.Name, err)
-		}
-		if fmt.Sprintf("0x%02x", op) != fx.Op {
-			t.Fatalf("%s：op=0x%02x 与声明 %s 不符", fx.Name, op, fx.Op)
-		}
-		if got := EncodeFrame(op, body); !bytes.Equal(got, raw) {
-			t.Fatalf("%s：再编码与原字节不一致：%x ≠ %x", fx.Name, got, raw)
-		}
-		if op == OpStreamData {
-			checkStreamFixture(t, fx.Name, body, fx.Expect)
-		} else {
-			checkJSONFixture(t, fx.Name, op, body, fx.Expect)
-		}
+		replayFixtureDecode(t, fx)
+	}
+}
+
+// replayFixtureDecode 单向量对当前生产解码器的解码断言（①逐字节 + ②结构等价）——
+// fixtures_test 与 version_governance_test（按版本目录回归）共用同一判据。
+func replayFixtureDecode(t *testing.T, fx fixtureEntry) {
+	t.Helper()
+	name := fx.Name
+	if fx.Dir != "" {
+		name = fx.Dir + "/" + fx.Name
+	}
+	raw := hexBytes(t, fx.Hex)
+	r := bufio.NewReader(bytes.NewReader(raw))
+	op, body, err := ReadFrame(r, MaxControlBody)
+	if err != nil {
+		t.Fatalf("%s：解码失败：%v", name, err)
+	}
+	if fmt.Sprintf("0x%02x", op) != fx.Op {
+		t.Fatalf("%s：op=0x%02x 与声明 %s 不符", name, op, fx.Op)
+	}
+	if got := EncodeFrame(op, body); !bytes.Equal(got, raw) {
+		t.Fatalf("%s：再编码与原字节不一致：%x ≠ %x", name, got, raw)
+	}
+	if op == OpStreamData {
+		checkStreamFixture(t, name, body, fx.Expect)
+	} else {
+		checkJSONFixture(t, name, op, body, fx.Expect)
 	}
 }
 
