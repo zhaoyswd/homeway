@@ -53,13 +53,6 @@ constexpr uint8_t kCapsSurface = 1u << 0;
 // capability 块里的「后随 1 字节协议版本」声明位（与服务端 pkg/term capsProtoVer 同值）。
 constexpr uint8_t kCapsProtoVer = 1u << 7;
 
-// 双传输开关（任务 3.5）：**模块级**设置（进程内所有页面共用），对之后新建的腿生效。
-//   Auto          = 出口声明了 featSurface 位才走 surface（M3 起的默认值）；
-//   ForceSurface  = 只要有位就协商（出口没有位时静默退 legacy，日志记一行）；
-//   ForceLegacy   = 永不声明能力位（逃生口；M2 阶段的默认值，见 tasks 3.5 的发布阶段口径）。
-// 无论哪个模式，**协商失败都会自动回落 legacy 重试一次**（surface_unavailable / bad_capability）。
-enum class SurfaceMode : uint8_t { Auto = 0, ForceSurface = 1, ForceLegacy = 2 };
-
 constexpr size_t kFragChunk = 60u << 10;   // 单片 gzip 数据上限（与服务端同值）
 constexpr uint8_t kFragMoreBit = 1u << 0;  // 分片头 flags bit0 = 还有后续片
 // surface 载荷版本（**帧体头**：SNAPSHOT / SURFACE-DIFF / FETCH-ROWS 应答；与服务端 surfaceVer
@@ -226,11 +219,12 @@ bool decodeGrid(const std::vector<uint8_t>& blob, uint16_t& cols, uint16_t& rows
 // 与 3.8 的计数都读它），塞进渲染层就只能上设备才能验。
 //
 // **线程契约（任务 3.2 接线上渲染层后新增，别绕过）**：写侧只有一个线程（transport 的 reader /
-// 握手线程：onFrame / applyFetchRows / pollTimeout），读侧是**另一个线程**（渲染线程）。所以
-// 网格数据必须经 `copyGridForRender` / `altScreenNow` 读——它们持内部锁把当前网格拷成一份
-// 独立的快照；`grid()` 这类直读访问器**只给单线程场景**（宿主测试、3.3 的滚动管理在同一线程里
-// 用）。理由：帧间隔 16–33ms 而一次换源重建只要几百微秒，流式输出时两者必然重叠，
-// 裸读 std::vector<Row> 会撞上 onFrame 的 `m_rows = snap.grid`（重分配 ⇒ 读到半截指针）。
+// 握手线程：onFrame / applyFetchRows / pollTimeout），读侧是**另一个线程**（渲染线程）。
+// 渲染桥（tier terminal 的 napi_init.cpp）只走 `viewWindow()` / `cursorForRender()` /
+// `altScreenNow()`——锁内取快照；`grid()` 这类直读访问器**只给单线程场景**（宿主测试、
+// 3.3 的滚动管理在同一线程里用）。理由：帧间隔 16–33ms 而一次换源重建只要几百微秒，
+// 流式输出时两者必然重叠，裸读 std::vector<Row> 会撞上 onFrame 的 `m_rows = snap.grid`
+//（重分配 ⇒ 读到半截指针）。
 class SurfaceSession {
 public:
     struct Stats {
@@ -333,8 +327,10 @@ public:
     // （3.4 的接线曾据此把 plain shell 的每一次触摸都当鼠标事件吞掉，滚动因此失效）。
     bool mouseReporting() const;
 
-    // ---- 跨线程读面（渲染路径只走这两个）----
+    // ---- 跨线程读面 ----
     // 锁内把当前网格整份拷进 out（调用方持有副本，之后随便读）；返回是否有过快照。
+    // FIX-93 复核：渲染桥的真入口是 viewWindow()/cursorForRender()（见上）；本方法当前
+    // 只被宿主 golden 测试用作「锁内拷贝 vs grid() 直读」的一致性接缝——保留为测试面。
     bool copyGridForRender(CellGrid& out) const;
     // 当前是否备用屏（渲染层替掉本地 vt 的答案；锁内读，等价于 copyGridForRender 的轻量版）。
     bool altScreenNow() const;

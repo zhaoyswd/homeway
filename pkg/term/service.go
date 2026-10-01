@@ -636,9 +636,6 @@ type termClient struct {
 	clipCache        string
 }
 
-// stateForLeg 已随状态单轨化退役（term-remote 3.3，D6）：surface 与 raw 腿的
-// STATE/ATTACHED state 字节统一 stateV2 枚举，不再按腿类折价。
-
 // frame 握手/一锤子帧的写路径（GREETING/LIST/KILL/CREATE/HELLO 应答等——写者
 // goroutine 尚未启动，由 serving goroutine 直发）。exec-r1 F7 起统一走 writeFrameOnce：
 // 部分写（deadline 过期时 net.Conn.Write 可返回 n>0+timeout）会留断尾记录，后续帧

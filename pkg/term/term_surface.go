@@ -239,8 +239,9 @@ type SurfaceState struct {
 
 // surfaceCursorOf 把 vt 的光标快照打成 wire 形态。
 //
-// 单独抽出来是为了**单一映射**：会话下发（SurfaceCursor）与 golden 样例生成都用它，
-// 否则「样例里的光标」与「线上发出去的光标」可能各按一套 flag 位映射，golden 就白做了。
+// 单独抽出来是为了**单一映射**：会话帧生成（term_surface_session.go 的
+// SNAPSHOT/DIFF 体）与 golden 样例生成都用它，否则「样例里的光标」与「线上发出去的
+// 光标」可能各按一套 flag 位映射，golden 就白做了。
 func surfaceCursorOf(c vt.Cursor) surfaceCursor {
 	out := surfaceCursor{X: c.X, Y: c.Y, Shape: uint8(c.Shape)}
 	if c.Visible {

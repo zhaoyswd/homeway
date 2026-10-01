@@ -72,7 +72,6 @@ func (s *sessionVT) EncodeInput(ev inputEvent) []byte { _ = ev; return nil }
 
 func (s *sessionVT) SurfaceGrid(cols, rows uint16) []byte           { return nil }
 func (s *sessionVT) SurfaceMirror(cols, rows uint16, vp int) []byte { return nil }
-func (s *sessionVT) SurfaceCursor() surfaceCursor                   { return surfaceCursor{} }
 func (s *sessionVT) SurfaceModes() (uint32, uint8, uint8)           { return 0, 0, 0 }
 func (s *sessionVT) SurfaceAltScreen() bool                         { return false }
 func (s *sessionVT) SurfaceStateNow() SurfaceState                  { return SurfaceState{} }

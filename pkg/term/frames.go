@@ -33,7 +33,6 @@ const (
 	opKill       byte = 0x05
 	opError      byte = 0x06
 	opState      byte = 0x07
-	opReserved08 byte = 0x08 // 保留（旧提案里曾是 LIST-REPLY；不得复用，避免老客户端误读）
 	opAttached   byte = 0x09
 	opReplayDone byte = 0x0A
 	opOK         byte = 0x0B

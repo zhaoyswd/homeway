@@ -188,14 +188,6 @@ func (s *sessionVT) SurfaceMirror(cols, rows uint16, viewports int) []byte {
 	return vt.EncodeGrid(cols, uint16(len(rs)), rs)
 }
 
-// SurfaceCursor 光标快照（含形状与可见性）。差分帧（任务 3.10）与快照帧共用它。
-func (s *sessionVT) SurfaceCursor() surfaceCursor {
-	if !s.Available() {
-		return surfaceCursor{}
-	}
-	return surfaceCursorOf(s.t.Cursor())
-}
-
 // surfaceModesOf 把 vt 的模式位打成 wire 形态（**单一映射**：会话下发与 golden 样例共用，
 // 与 surfaceCursorOf 同款理由——两处各按一套位映射的话 golden 就白做了）。
 func surfaceModesOf(m vt.Modes) (modes uint32, kitty, misc uint8) {
