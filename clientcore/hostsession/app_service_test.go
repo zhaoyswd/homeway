@@ -353,3 +353,57 @@ func TestSessionDialAddr(t *testing.T) {
 		t.Fatalf("会话不在应 ErrSessionNotCurrent，实得 %v", err)
 	}
 }
+
+// TestRebuildSessionDiscardedAfterFinish（FIX-04）：rebuildSession 的构建窗口内会话已
+// 收工（finish 并发落地，如巡检/stop 在窗口内完成）——新会话必须弃用（Close），不得
+// 换入（换入 = 孤儿：无人再 Stop，Manager.Start 视 idle 换新实例 ⇒ 同身份双会话）。
+func TestRebuildSessionDiscardedAfterFinish(t *testing.T) {
+	old := newFakeExitSession()
+	fresh := newFakeExitSession()
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	s := &Session{
+		state:  svcStateReady,
+		since:  time.Now(),
+		stopCh: make(chan struct{}),
+		done:   make(chan struct{}),
+		logf:   Discard,
+	}
+	s.build = func(cfg Config, logf Logf) (ExitSession, *wtransport.EndpointCache, error) {
+		close(entered)
+		<-release
+		return fresh, nil, nil
+	}
+	s.mu.Lock()
+	s.sess = old
+	s.mu.Unlock()
+
+	rebuilt := make(chan struct{})
+	go func() {
+		s.rebuildSession("测试：构建窗口内收工")
+		close(rebuilt)
+	}()
+	select {
+	case <-entered:
+	case <-time.After(3 * time.Second):
+		t.Fatal("重建未进入构建")
+	}
+	s.finish(svcStateIdle, "已收工") // 模拟巡检/stop 收工在构建窗口内完成
+	close(release)
+	select {
+	case <-rebuilt:
+	case <-time.After(3 * time.Second):
+		t.Fatal("rebuildSession 未返回")
+	}
+	if got := s.curSession(); got != nil {
+		t.Fatal("收工后不得换入新会话（孤儿：无人再 Stop，同身份双会话）")
+	}
+	select {
+	case <-fresh.closed:
+	default:
+		t.Fatal("被弃用的新会话应 Close")
+	}
+	if st, _, _ := s.snapshotState(); st != svcStateIdle {
+		t.Fatalf("状态应保持收工态 idle，实得 %s", st)
+	}
+}

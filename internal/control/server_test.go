@@ -82,6 +82,9 @@ type fakeBackend struct {
 	// 进入即发信号并阻塞到 dialRelease 关闭（stream.open 独立执行体判据）。
 	dialEntered chan struct{}
 	dialRelease chan struct{}
+	// onHostStates 非 nil 时 HostStates 返回前调用（FIX-03：快照读取窗口注入点——
+	// 模拟「状态迁移 + 总线发布」落在快照读取期间）。
+	onHostStates func()
 	// pipe 模式的对端持有（从不读；防 GC 关闭 pipe 使写立即失败）。
 	pipePeers []net.Conn
 	// pipe 模式的对端慢排空节拍（>0 = 对端按此间隔慢慢读——「慢读但活着」形态；
@@ -194,8 +197,13 @@ func (f *fakeBackend) RemoveHost(id string) error {
 }
 func (f *fakeBackend) HostStates() []HostState {
 	f.mu.Lock()
-	defer f.mu.Unlock()
-	return append([]HostState(nil), f.states...)
+	hook := f.onHostStates
+	states := append([]HostState(nil), f.states...)
+	f.mu.Unlock()
+	if hook != nil {
+		hook() // FIX-03 用例：快照读取窗口内的注入点（模拟「状态迁移+发布」落在读取期）
+	}
+	return states
 }
 func (f *fakeBackend) DialStream(ctx context.Context, kind, host string) (net.Conn, error) {
 	f.mu.Lock()
@@ -1117,4 +1125,42 @@ func TestServerConcurrentUnsubscribeVsPublish(t *testing.T) {
 		}
 	}()
 	wg.Wait()
+}
+
+// TestSnapshotSeqReadBeforeHosts（FIX-03）：HostStates 执行期间发布的事件必须落在快照
+// 序号**之后**（seq 先读）——seq 后读时该事件「seq ≤ 游标且不在快照里」，订阅回放不
+// 覆盖，前端该行永久陈旧（快照+续播「不漏」契约的真缝隙）。
+func TestSnapshotSeqReadBeforeHosts(t *testing.T) {
+	ts := startTestServer(t, facade.BusConfig{})
+	ts.backend.mu.Lock()
+	ts.backend.states = []HostState{{ID: "aa", Name: "aa", State: "ready"}}
+	ts.backend.mu.Unlock()
+	var eventSeq atomic.Uint64
+	ts.backend.mu.Lock()
+	ts.backend.onHostStates = func() {
+		seq, err := ts.bus.Publish(facade.DomainSession, facade.KindSessionStateChanged,
+			facade.SessionStateChangedPayload{Host: "aa", State: "ready"})
+		if err == nil {
+			eventSeq.Store(seq)
+		}
+	}
+	ts.backend.mu.Unlock()
+	c, _ := dialTest(t, ts)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	raw, err := c.Request(ctx, facade.OpSnapshotGet, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var snap SnapshotResult
+	if err := json.Unmarshal(raw, &snap); err != nil {
+		t.Fatal(err)
+	}
+	es := eventSeq.Load()
+	if es == 0 {
+		t.Fatal("注入事件未发布（假 Backend 钩子未生效）")
+	}
+	if snap.Seq >= es {
+		t.Fatalf("快照序号 %d 未早于快照期发布的事件 %d（seq 后读回归：该事件既不在快照也不回放）", snap.Seq, es)
+	}
 }

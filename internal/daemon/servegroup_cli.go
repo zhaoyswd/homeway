@@ -269,10 +269,15 @@ func roleRestartCLI(role string, args []string, version string, w io.Writer) err
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), *g.timeout)
 	defer cancel()
-	// restart 无重建对象的两态（进程未跑 / 角色未装配）都报可行动错误（r1 中-6）：
-	// 语义 = 先 start。status 预检（纯读，未跑面降级读 config 给出期望态）。
+	// restart 允许 running 与 failed（failed = 跳过剩余退避立即重建）；进程未跑 /
+	// 角色未装配（stopped/absent）报可行动错误（r1 中-6）：语义 = 先 start。
+	// status 预检（纯读，未跑面降级读 config 给出期望态）。
 	raw, running := groupStatus(ctx, role, *g.stateDir, version)
-	if !running || roleRunState(role, raw) != roleStateRunning {
+	state := ""
+	if running {
+		state = roleRunState(role, raw)
+	}
+	if !running || (state != roleStateRunning && state != roleStateFailed) {
 		phrase := "进程未运行"
 		if running {
 			phrase = roleStatePhrase(role, raw)

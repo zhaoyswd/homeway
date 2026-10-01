@@ -142,6 +142,15 @@ func (c *conn) opStreamOpen(corr uint64, args json.RawMessage) {
 	}
 
 	c.streamsMu.Lock()
+	if c.streamsClosed {
+		// 连接在拨号窗口内已收工：不得注册（close 的 teardown 清单已跑完，晚注册的流
+		// 没有回收路径——pump 永挂、上行工位配额不回落）。关后端、弃配额、尽力回执
+		// （连接已断，rsp 发不出属预期）。
+		c.streamsMu.Unlock()
+		_ = backend.Close()
+		c.reply(corr, nil, errCode(facade.CodeStreamRefused))
+		return
+	}
 	if len(c.streams) >= c.s.cfg.MaxStreams { // 并发 open 竞争上限
 		c.streamsMu.Unlock()
 		_ = backend.Close()

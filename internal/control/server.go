@@ -221,6 +221,10 @@ type conn struct {
 	streams    map[uint32]*stream
 	streamsMu  sync.Mutex
 	nextStream uint32
+	// streamsClosed 连接收工置位（streamsMu 保护）：stream.open 拨号窗口内连接关闭时，
+	// 注册前拦下——晚注册的流不在 close 的 teardown 清单里，会成孤儿（pump 永挂、
+	// 工位配额不回落）。
+	streamsClosed bool
 
 	// reqC 每连接请求队列（L2，4a §5.1）+ inflight 在途计数（含工位执行中与
 	// stream.open 拨号执行体——统一计数口径：队列 + 工位 + 拨号各占一计）。
@@ -344,6 +348,7 @@ func (c *conn) close(reason string) {
 		close(c.closed)
 		_ = c.nc.Close()
 		c.streamsMu.Lock()
+		c.streamsClosed = true // 先置位再 teardown：拨号窗口内的并发注册在锁内被拦（FIX-02）
 		for _, st := range c.streams {
 			st.teardown() // 连接级断开：end 帧发不出，不发（与流级 gone 三者可区分）
 		}
@@ -736,16 +741,20 @@ func (c *conn) opHostList(corr uint64, _ json.RawMessage) {
 	c.reply(corr, HostListResult{Hosts: c.s.cfg.Backend.HostBriefs()}, nil)
 }
 
-// opSnapshotGet 快照（锁序三路径之②：先宿主快照（Registry.mu 拷贝会话集合 →
-// 各会话无锁快照），**最后**读总线当前 seq 作为快照序号——设计 A4）。
+// opSnapshotGet 快照（锁序三路径之②：**先读总线当前 seq、后读宿主快照**——FIX-03
+// 修正实现次序。设计 A4 原文写「最后读 seq」，但其论证（「重放可能重复但无害」）恰好
+// 只对 seq 先读成立：seq 后读的失败模式是「状态已迁、seq 未读」窗口内的事件 seq ≤
+// 游标且不在快照里 ⇒ 既不回放也不含于快照 ⇒ 前端该行永久陈旧；seq 先读则该窗口内
+// 事件 seq > 游标 ⇒ 必回放（可能重复，由同键幂等覆盖消化——at-least-once 口径）。）
 func (c *conn) opSnapshotGet(corr uint64, _ json.RawMessage) {
 	if c.s.cfg.Backend.NotReady() {
 		c.reply(corr, nil, errCode(facade.CodeNotReady))
 		return
 	}
+	seq := c.s.cfg.Bus.CurrentSeq() // 先取号（保「不漏」；重复允许，见上）
 	hosts := c.s.cfg.Backend.HostStates()
 	c.reply(corr, SnapshotResult{
-		Seq:        c.s.cfg.Bus.CurrentSeq(),
+		Seq:        seq,
 		Generation: c.s.Generation(),
 		Hosts:      hosts,
 	}, nil)

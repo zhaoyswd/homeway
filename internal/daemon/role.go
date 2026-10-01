@@ -116,7 +116,14 @@ func (s *supervisor) startRole(name string, makeRole func() Role, backoff []time
 			select {
 			case <-m.done: // 旧轮已退出（stopped）：换代——落到下方建新轮
 			default:
-				// stopping（收尾中）：锁外等旧轮 Run 返回（端口/socket 释放净）再启。
+				// 轮在世但不在跑，两义二选：
+				//   failed（退避重建中）= 期望态已满足——幂等**立即返回**。不得等 done：
+				//     退避循环在世且无人 cancel 时永不退出，等它 = start 挂死。
+				//   stopping/收尾窗 = 锁外等旧轮 Run 返回（端口/socket 释放净）再启（r1 中-4）。
+				if st := s.stats[name]; st != nil && st.State == roleStateFailed {
+					s.mu.Unlock()
+					return
+				}
 				done := m.done
 				s.mu.Unlock()
 				select {
@@ -141,6 +148,10 @@ func (s *supervisor) startRole(name string, makeRole func() Role, backoff []time
 // StopRole 动态停一个角色：取消其子 ctx 后**立即返回**（成功应答不等收尾——D5 完成语义
 // r1 中-4：收尾最长 = 10s 宽限 + UPnP 缩租 8s，同步等会烧穿请求预算）；收尾异步进行，
 // 状态面 stopping → stopped。未运行/未装载 = 幂等成功。
+//
+// **failed 态必须真停**：失败退避中的循环若不 cancel，退避到点会自行重建——期望态已写
+// false 却仍在跑。stopping/stopped 幂等（cancel 幂等，同时兜住「终态写入后、done 关闭
+// 前」的窄窗）。
 func (s *supervisor) StopRole(name string) {
 	s.mu.Lock()
 	m, ok := s.roles[name]
@@ -149,9 +160,10 @@ func (s *supervisor) StopRole(name string) {
 		return
 	}
 	st := s.stats[name]
-	if st == nil || st.State != roleStateRunning {
+	if st == nil || (st.State != roleStateRunning && st.State != roleStateFailed) {
 		s.mu.Unlock()
-		return // 已停/停中：幂等
+		m.cancel() // 幂等兜底：stopping/已停无需新动作（cancel 幂等，窄窗补齐）
+		return
 	}
 	s.setStatLocked(name, roleStateStopping, st.LastError)
 	s.mu.Unlock()
@@ -160,12 +172,13 @@ func (s *supervisor) StopRole(name string) {
 }
 
 // RestartRole 动态重启 = 取消子 ctx → **等旧角色 Run 返回**（串行化，r1 中-4）→ 同一条
-// 重建路径再启动（期望态不变；Restarts 计数与失败重建同面累计）。未运行 = 可行动错误
-// （上层映射「先 serve start」提示，r1 中-6）。
+// 重建路径再启动（期望态不变；Restarts 计数与失败重建同面累计）。允许 running 与
+// failed 两态（failed = 跳过剩余退避、立即重建）；stopped/absent = 可行动错误（上层
+// 映射「先 serve start」提示，r1 中-6）。
 func (s *supervisor) RestartRole(name string) error {
 	s.mu.Lock()
 	m, ok := s.roles[name]
-	if !ok || !m.phaseRunning(s.stats[name]) {
+	if !ok || !m.phaseRestartable(s.stats[name]) {
 		s.mu.Unlock()
 		return fmt.Errorf("角色 %s 未在运行（先 start）", name)
 	}
@@ -187,6 +200,11 @@ func (s *supervisor) RestartRole(name string) error {
 // phaseRunning 状态面判运行（stats 由调用方持锁读）。
 func (m *managedRole) phaseRunning(st *RoleStatus) bool {
 	return st != nil && st.State == roleStateRunning
+}
+
+// phaseRestartable 可重启态：running = 常规重建；failed = 退避中立即重建（跳过剩余退避）。
+func (m *managedRole) phaseRestartable(st *RoleStatus) bool {
+	return st != nil && (st.State == roleStateRunning || st.State == roleStateFailed)
 }
 
 // runRoleLoop 一个角色的运行-失败-退避-重建循环（角色 goroutine 本体；动态 stop =

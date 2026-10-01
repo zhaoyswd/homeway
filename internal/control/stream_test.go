@@ -868,3 +868,86 @@ func TestStreamOpenKindFilesAndUnknown(t *testing.T) {
 		t.Fatalf("bad_request 后连接应仍可用：%v", err)
 	}
 }
+
+// TestStreamOpenConnClosedDuringDialNoOrphan（FIX-02）：拨号窗口内连接关闭——流不得
+// 注册进已收工连接（旧行为：close 的 teardown 清单已跑完，晚注册的流成孤儿——pump
+// 永挂、上行工位配额不回落）。判据：放行拨号后（a）后端 pipe 被服务端关闭（对端读到
+// EOF/ClosedPipe，而非超时）；（b）全连接上行工位计数回落 0；（c）新连接照常可开流。
+func TestStreamOpenConnClosedDuringDialNoOrphan(t *testing.T) {
+	ts := startTestServer(t, facade.BusConfig{})
+	ts.backend.mu.Lock()
+	ts.backend.dialAddr = pipeDialAddr // 拨号成功返回 net.Pipe（对端可观察服务端是否 Close）
+	ts.backend.mu.Unlock()
+	entered, release := ts.backend.blockDial()
+	c, _ := dialTest(t, ts)
+	openErr := make(chan error, 1)
+	go func() {
+		_, err := c.OpenStream(context.Background(), facade.StreamKindTerm, "aa")
+		openErr <- err
+	}()
+	select {
+	case <-entered:
+	case <-time.After(3 * time.Second):
+		t.Fatal("stream.open 未进入假拨号")
+	}
+	// 拨号在途：关闭客户端连接，等连接收工落地（conns 清空 ⟹ close 的 teardown 已跑完）。
+	c.Close()
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		ts.srv.mu.Lock()
+		n := len(ts.srv.conns)
+		ts.srv.mu.Unlock()
+		if n == 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("客户端连接未收工")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	close(release) // 放行拨号（此刻连接已收工）
+	select {
+	case <-openErr: // 连接已关：客户端请求早已失败（错误内容不判——rsp 无消费面）
+	case <-time.After(3 * time.Second):
+		t.Fatal("放行后客户端调用未返回")
+	}
+	// 等拨号执行体真返回（pipe 已创建；服务端此后走「连接已收工」拒绝路径）。
+	deadline = time.Now().Add(3 * time.Second)
+	for {
+		ts.backend.mu.Lock()
+		n := len(ts.backend.pipePeers)
+		ts.backend.mu.Unlock()
+		if n > 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("拨号未返回 pipe（执行体未完成）")
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+	// 判据①：后端 pipe 被服务端关闭（EOF/ClosedPipe；读到超时 = 仍活着 = 孤儿）。
+	ts.backend.mu.Lock()
+	peer := ts.backend.pipePeers[len(ts.backend.pipePeers)-1]
+	ts.backend.mu.Unlock()
+	_ = peer.SetReadDeadline(time.Now().Add(2 * time.Second))
+	if _, err := peer.Read(make([]byte, 1)); !errors.Is(err, io.EOF) && !errors.Is(err, io.ErrClosedPipe) {
+		t.Fatalf("后端 pipe 未被关闭（err=%v）：晚注册的孤儿流没有回收路径（FIX-02 回归）", err)
+	}
+	// 判据②：上行工位配额回落 0（未泄漏）。
+	deadline = time.Now().Add(2 * time.Second)
+	for ts.srv.upWorkers.Load() != 0 {
+		if time.Now().After(deadline) {
+			t.Fatalf("上行工位配额泄漏：%d（应为 0）", ts.srv.upWorkers.Load())
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	// 判据③：服务照常——新连接可正常开流。
+	c2, _ := dialTest(t, ts)
+	st, err := c2.OpenStream(context.Background(), facade.StreamKindTerm, "aa")
+	if err != nil {
+		t.Fatalf("后续流应正常开：%v", err)
+	}
+	if err := st.Close(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+}

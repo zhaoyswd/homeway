@@ -108,6 +108,10 @@ type Session struct {
 	stopCh   chan struct{} // close = 收工请求（取消暖机与巡检）
 	stopOnce sync.Once
 	done     chan struct{} // close = start goroutine（含巡检）已完全退出
+	// finishing finish 已启动（终态；mu 保护）：rebuildSession 的换入守卫——构建窗口内
+	// 收工（拨号 goroutine 与巡检 goroutine 并发）时新会话必须弃用，否则成孤儿
+	// （无人再 Stop，Manager.Start 视 idle 换新实例 ⇒ 同身份双会话/僵尸 Bind）。
+	finishing bool
 
 	sess   ExitSession
 	cache  *wtransport.EndpointCache
@@ -774,7 +778,20 @@ func (s *Session) rebuildSession(reason string) {
 		s.finish(svcStateFailed, "重建失败："+err.Error())
 		return
 	}
+	// 终态复检（FIX-04）：本函数可从**拨号 goroutine**（healingDial 耗尽路径，
+	// recoverStaleSession → maybeRebuildIfExhausted）调用，与巡检 goroutine 的 finish
+	// （stopCh 收工）并发——构建窗口内若 finish 已启动（finishing 置位），换入即成孤儿：
+	// 无人再 Stop 它，Manager.Start 视 idle 换新实例 ⇒ 同身份双会话/僵尸 Bind（本文件
+	// 反复防的形态）。守卫只认 finishing（不依赖 state 中间值——覆盖 finish 全程，
+	// 含「已清 sess、终态未置位」的窄窗）；stopCh 已关但 finish 未启动的窗口允许换入，
+	// 随后 finish 会把它正常收掉。
 	s.mu.Lock()
+	if s.finishing {
+		s.mu.Unlock()
+		_ = sess.Close()
+		s.logf("REBUILD 会话已在构建窗口内收工——新会话弃用（防孤儿）")
+		return
+	}
 	s.sess, s.cache = sess, cache
 	s.mu.Unlock()
 	s.logf("REBUILD 新会话已换入（首个出站包将重新注册+赛跑）")
@@ -784,6 +801,7 @@ func (s *Session) rebuildSession(reason string) {
 // idle（正常收工）与 failed（硬失败）共用；failed 保留 reason 供状态面呈现。
 func (s *Session) finish(state, reason string) {
 	s.mu.Lock()
+	s.finishing = true // 终态标志先行（FIX-04）：rebuildSession 的换入守卫在同一锁内读
 	bridge, sess, cache := s.bridge, s.sess, s.cache
 	s.bridge, s.sess, s.cache = nil, nil, nil
 	s.mu.Unlock()

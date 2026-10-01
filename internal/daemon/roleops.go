@@ -192,12 +192,12 @@ func (ro *roleOps) lifecycleStop(name string, setEnabled func(*nodeconfig.Config
 	return control.RoleActionResult{Action: "stopped"}, nil
 }
 
-// lifecycleRestart 角色进程内重建（期望态不变；未在跑 = 可行动错误哨兵——CLI 预检
-// 兜住「先 serve start」提示，wire 理论不可达）。等旧轮 Run 返回（串行化）后走
-// supervisor 同一条重建路径（RestartRole 内部用装配期 makeRole——与本面工厂同源）。
+// lifecycleRestart 角色进程内重建（期望态不变）。running = 常规重建；failed = 跳过剩余
+// 退避立即重建（supervisor.RestartRole 同面语义）；stopped/absent = 可行动错误哨兵
+// （CLI 预检兜住「先 serve start」提示，wire 理论不可达）。
 func (ro *roleOps) lifecycleRestart(name string) (control.RoleActionResult, error) {
 	state, _ := ro.roleStateOf(name)
-	if state != roleStateRunning {
+	if state != roleStateRunning && state != roleStateFailed {
 		return control.RoleActionResult{}, control.ErrBackendRoleStopped
 	}
 	if err := ro.sup.RestartRole(name); err != nil {

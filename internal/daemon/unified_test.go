@@ -8,6 +8,7 @@ package daemon
 
 import (
 	"context"
+	"errors"
 	"net"
 	"os"
 	"path/filepath"
@@ -101,6 +102,73 @@ func TestSupervisorStopImmediateAckAndStoppingPhase(t *testing.T) {
 	}
 	waitRoleState(t, sup, "r", roleStateStopping, 2*time.Second)
 	waitRoleState(t, sup, "r", roleStateStopped, 5*time.Second)
+}
+
+// failRole 立即失败的角色（failed 态矩阵用：每轮 Run 记一次后返回固定错误）。
+type failRole struct {
+	name string
+	runs chan struct{}
+	err  error
+}
+
+func (f *failRole) Name() string { return f.name }
+func (f *failRole) Run(ctx context.Context) error {
+	if f.runs != nil {
+		f.runs <- struct{}{}
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	return f.err
+}
+
+// failed 态矩阵（role-management 修）：start 幂等不挂死 / stop 真停不复活 /
+// restart 跳过剩余退避立即重建 / stop 后再 start 可重来。
+func TestSupervisorFailedStateMatrix(t *testing.T) {
+	_, sup, done := newSupForTest(t)
+	defer done()
+	runs := make(chan struct{}, 16)
+	mk := func() Role { return &failRole{name: "r", runs: runs, err: errors.New("boom")} }
+	longBackoff := []time.Duration{2 * time.Second}
+
+	sup.StartRole("r", mk, longBackoff)
+	<-runs
+	waitRoleState(t, sup, "r", roleStateFailed, 3*time.Second)
+
+	// start（failed 态）= 幂等立即返回（旧实现等永不关闭的 done ⇒ 挂死）。
+	start := time.Now()
+	sup.StartRole("r", mk, nil)
+	if elapsed := time.Since(start); elapsed > 300*time.Millisecond {
+		t.Fatalf("failed 态 start 应立即返回（幂等），实际 %v", elapsed)
+	}
+
+	// restart（failed 态）= 跳过剩余退避立即重建。
+	if err := sup.RestartRole("r"); err != nil {
+		t.Fatalf("failed 态 restart 应允许（跳过退避立即重建）：%v", err)
+	}
+	select {
+	case <-runs:
+	case <-time.After(1 * time.Second):
+		t.Fatal("restart 后新轮未在 1s 内起（应跳过 2s 退避）")
+	}
+	waitRoleState(t, sup, "r", roleStateFailed, 3*time.Second)
+
+	// stop（failed 态）= 真停：stopping → stopped，且退避到点不复活。
+	sup.StopRole("r")
+	waitRoleState(t, sup, "r", roleStateStopped, 2*time.Second)
+	select {
+	case <-runs:
+		t.Fatal("failed 态 stop 后角色自行复活（旧实现静默吞 stop 的回归）")
+	case <-time.After(2500 * time.Millisecond): // > 退避窗
+	}
+
+	// stop 后再 start 可重来（stopped → 换代重建）。
+	sup.StartRole("r", mk, longBackoff)
+	select {
+	case <-runs:
+	case <-time.After(1 * time.Second):
+		t.Fatal("stop 后 start 未起新轮")
+	}
 }
 
 // restart = 等旧 Run 返回再 Start（串行化）+ 计数累计（与失败重建同面）。
