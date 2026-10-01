@@ -17,6 +17,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"github.com/zhaoyswd/homeway/pkg/ifaceutil"
 	"net"
 	"net/netip"
 	"strings"
@@ -24,12 +25,6 @@ import (
 	"syscall"
 	"time"
 )
-
-// 虚拟/隧道网卡的名字黑名单（前缀匹配，大小写不敏感）：这些不是我们的上行网卡。
-var virtualIfacePrefixes = []string{
-	"lo", "utun", "ipsec", "gif", "stf", "awdl", "llw", "anpi", "ap",
-	"bridge", "vmnet", "vmenet", "tap", "tun", "tailscale", "docker", "br-", "veth", "virbr",
-}
 
 // IsPublicAddr：公网单播地址吗（v4/v6 都判）。**token 里只放公网地址**用这个判据：
 // 私网（RFC1918）、CGNAT(100.64/10)、回环、链路本地、ULA(fc00::/7)、未指定、组播一律不算。
@@ -57,16 +52,8 @@ func IsPublicAddr(ip netip.Addr) bool {
 	return true
 }
 
-// IsVirtualIface：名字像隧道/虚拟网卡吗（纯函数，单测覆盖）。
-func IsVirtualIface(name string) bool {
-	l := strings.ToLower(name)
-	for _, p := range virtualIfacePrefixes {
-		if strings.HasPrefix(l, p) {
-			return true
-		}
-	}
-	return false
-}
+// IsVirtualIface：名字像隧道/虚拟网卡吗（单实现在 pkg/ifaceutil，FIX-72）。
+func IsVirtualIface(name string) bool { return ifaceutil.IsVirtual(name) }
 
 // ProbeTargets：探针目标（anycast DNS，**字面 IP**：规则型代理会把域名解析成 fake-IP）。
 func DefaultProbeTargets() []netip.AddrPort {

@@ -3,19 +3,12 @@
 package egress
 
 import (
-	"fmt"
 	"net"
 
-	"golang.org/x/sys/unix"
+	"github.com/zhaoyswd/homeway/pkg/ifaceutil"
 )
 
-// bindSocketToIface：Linux 用 SO_BINDTODEVICE 钉网卡（容器里跑要 --network host + 足够权限）。
+// bindSocketToIface 单实现在 pkg/ifaceutil（FIX-72）。
 func bindSocketToIface(fd int, ifi *net.Interface) error {
-	if ifi == nil {
-		return nil
-	}
-	if err := unix.SetsockoptString(fd, unix.SOL_SOCKET, unix.SO_BINDTODEVICE, ifi.Name); err != nil {
-		return fmt.Errorf("SO_BINDTODEVICE %q: %w", ifi.Name, err)
-	}
-	return nil
+	return ifaceutil.PinSocketToFD(fd, ifi)
 }

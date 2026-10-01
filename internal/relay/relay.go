@@ -596,8 +596,18 @@ func (r *Relay) handleControl(src netip.AddrPort, label [8]byte, lg *leg, payloa
 			_, _ = r.pc.WriteToUDPAddrPort(proto.EncodeFrame(proto.FrameTypeRelayReg, proto.EncodeRelayAgain()), src)
 			return
 		}
-		// 无 UDP 注册（纯控制腿）的 keepalive：addr 无从比对，静默续命即可——
-		// 回 Again 只会让后端无意义地重注册刷屏（review B7③）。
+		if !lg.addr.IsValid() {
+			// 无 UDP 注册（纯控制腿）的保活（FIX-68）：addr 无从比对，但**不能**无条件
+			// 续命——此前任何人知道 label 就能发一个「影子保活」把这条腿永久占住
+			//（占腿额、还把真后端的注册用 Again 挡回）。判据：必须挂着控制连接，且保活
+			// 源 IP 与控制连接同 IP（端口可不同：TCP/UDP 各自随机）。
+			if lg.ctl == nil || !sameIPAsControl(lg.ctl, src) {
+				_, _ = r.pc.WriteToUDPAddrPort(proto.EncodeFrame(proto.FrameTypeRelayReg, proto.EncodeRelayAgain()), src)
+				return
+			}
+			// 有活控制连接且同 IP：静默续命（回 Again 只会让后端无意义地重注册刷屏，
+			// review B7③ 的原意保留）。
+		}
 		r.mu.Lock()
 		lg.last = time.Now()
 		r.mu.Unlock()
@@ -1087,4 +1097,18 @@ func (r *Relay) RegisterLeg(label [8]byte) (netip.AddrPort, bool) {
 		return netip.AddrPort{}, false
 	}
 	return lg.addr, true
+}
+
+// sameIPAsControl 保活源 IP 是否与控制连接同源（FIX-68 的无 addr 腿判据；控制连接
+// 不在/地址取不到 = 不接受该保活）。
+func sameIPAsControl(cc *ctlConn, src netip.AddrPort) bool {
+	ra := cc.c.RemoteAddr()
+	if ra == nil {
+		return false
+	}
+	ap, err := netip.ParseAddrPort(ra.String())
+	if err != nil {
+		return false
+	}
+	return ap.Addr().Unmap() == src.Addr().Unmap()
 }

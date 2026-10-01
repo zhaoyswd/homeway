@@ -474,3 +474,53 @@ func TestKeepaliveOnUnknownLegAsksAgain(t *testing.T) {
 		t.Fatal("收到 Again 后重注册应当成功")
 	}
 }
+
+// TestShadowKeepaliveDoesNotExtendNoAddrLeg（FIX-68）：无 UDP 注册地址的腿（纯控制腿）
+// 只认「有控制连接且同 IP」的保活——否则任何人知道 label 就能发影子保活把腿永久
+// 占住。判据：腿的 last 不被影子保活推后，且回 RelayAgain（要求重走注册）。
+func TestShadowKeepaliveDoesNotExtendNoAddrLeg(t *testing.T) {
+	r := startRelay(t, Config{})
+	// 造一条无 addr 的腿（模拟控制腿；不挂控制连接 = 影子形态）。
+	label := [8]byte{'s', 'h', 'a', 'd', 'o', 'w', '0', '1'}
+	lg := &leg{label: label, last: time.Now()}
+	r.mu.Lock()
+	r.legs[label] = lg
+	lg.verified = true
+	lg.addr = netip.AddrPort{}
+	lg.last = time.Now().Add(-time.Minute)
+	before := lg.last
+	r.mu.Unlock()
+
+	// 影子保活：来自任意源（不同 IP 或干脆没有控制连接）。
+	pc, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pc.Close()
+	msg := proto.EncodeTagged(label, proto.FrameTypeRelayReg, proto.EncodeRelayKeepalive())
+	if _, err := pc.WriteToUDPAddrPort(msg, r.LocalAddr()); err != nil {
+		t.Fatal(err)
+	}
+	// 等一小会：last 不得被推后（影子保活不续命）。
+	time.Sleep(150 * time.Millisecond)
+	r.mu.Lock()
+	after := lg.last
+	r.mu.Unlock()
+	if !after.Equal(before) {
+		t.Fatalf("影子保活不应续命：before=%v after=%v", before, after)
+	}
+	// 回包应为 Again（要求重注册）——读它。
+	_ = pc.SetReadDeadline(time.Now().Add(2 * time.Second))
+	buf := make([]byte, 512)
+	n, _, rerr := pc.ReadFromUDPAddrPort(buf)
+	if rerr != nil {
+		t.Fatalf("应收到 Again 应答：%v", rerr)
+	}
+	typ, payload, derr := proto.DecodeFrame(buf[:n])
+	if derr != nil || typ != proto.FrameTypeRelayReg {
+		t.Fatalf("应答应是 RelayReg 帧：typ=0x%02x err=%v", typ, derr)
+	}
+	if sub, _ := proto.RelaySubtype(payload); sub != proto.RelaySubAgain {
+		t.Fatalf("影子保活应回 RelayAgain（要求重注册），实际 sub=0x%02x", sub)
+	}
+}

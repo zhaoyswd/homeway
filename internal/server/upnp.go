@@ -12,6 +12,9 @@ import (
 	"context"
 	"encoding/xml"
 	"fmt"
+	"github.com/zhaoyswd/homeway/pkg/ifaceutil"
+	"github.com/zhaoyswd/homeway/pkg/servercore"
+	"golang.org/x/net/ipv4"
 	"io"
 	"net"
 	"net/http"
@@ -19,9 +22,6 @@ import (
 	"net/url"
 	"strings"
 	"time"
-
-	"github.com/zhaoyswd/homeway/pkg/servercore"
-	"golang.org/x/net/ipv4"
 )
 
 const (
@@ -697,12 +697,5 @@ func localIPv4Candidates() []netip.Addr {
 	return out
 }
 
-// virtualIface 判据与出口的直连候选过滤共用一份：这些接口上的地址拨不到家用路由器。
-func virtualIface(name string) bool {
-	for _, p := range []string{"lo", "utun", "tun", "tap", "bridge", "docker", "vmenet", "llw", "awdl", "anpi", "gif", "stf"} {
-		if strings.HasPrefix(name, p) {
-			return true
-		}
-	}
-	return false
-}
+// virtualIface 判据单实现在 pkg/ifaceutil（FIX-72：此前两份清单内容不同）。
+func virtualIface(name string) bool { return ifaceutil.IsVirtual(name) }

@@ -5,15 +5,15 @@ import (
 	"crypto/rand"
 	"errors"
 	"fmt"
+	"github.com/zhaoyswd/homeway/pkg/ifaceutil"
+	"github.com/zhaoyswd/homeway/pkg/probe"
+	"github.com/zhaoyswd/homeway/pkg/proto"
+	"golang.zx2c4.com/wireguard/conn"
 	"net"
 	"net/netip"
 	"sync"
 	"sync/atomic"
 	"time"
-
-	"github.com/zhaoyswd/homeway/pkg/probe"
-	"github.com/zhaoyswd/homeway/pkg/proto"
-	"golang.zx2c4.com/wireguard/conn"
 )
 
 // nowTime 可注入时钟（测试用）。
@@ -561,7 +561,7 @@ func (b *ServerBind) Open(port uint16) ([]conn.ReceiveFunc, uint16, error) {
 		// 绑了源地址还要把 socket 钉在该网卡上（见 PinSocketToIface 的注释）：
 		// 否则默认路由被 TUN 型代理抢走时，STUN 观测到的是代理的映射而不是路由器上的真实映射。
 		if ip, ok := netip.AddrFromSlice(laddr.IP); ok {
-			if ifi := ifaceForAddr(ip.Unmap()); ifi != nil {
+			if ifi := ifaceutil.IfaceForAddr(ip.Unmap()); ifi != nil {
 				if err := PinSocketToIface(c, ifi); err != nil {
 					b.logf("⚠️ 钉网卡 %s 失败（%v）—— 继续以未绑卡运行（公网端点公布变保守）", ifi.Name, err)
 				} else {
