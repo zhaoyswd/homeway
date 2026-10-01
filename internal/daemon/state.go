@@ -2,7 +2,7 @@ package daemon
 
 // state.go — 统一进程的守护侧日志面（role-management 2.3，D1/D11）：
 //
-//	state 布局本体（三层 + 同根迁移）在 internal/nodestate；本文件只持有**守护侧
+//	state 布局本体（三层）在 internal/nodestate；本文件只持有**守护侧
 //	自有日志**——cache/daemon-events.log（摘要，终端同显）+ cache/daemon-debug.log
 //	（细节）。落名沿用迁移映射（旧 daemon 自有 events/debug.log → 前缀改名防与
 //	serve 角色的 cache/events.log|debug.log 同名碰撞——nodestate 迁移 1.2 的既定

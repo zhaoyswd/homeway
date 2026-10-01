@@ -3,7 +3,7 @@ package daemon
 // unified.go — 统一进程装配（role-management tasks 2.3，design D1/D3/D9/HD delta）。
 //
 // 装配序（D1）：取锁（统一进程与前台单角色共用 <state>/lock——角色名归一）→
-// OpenNodeState（三层布局 + 同根自动迁移 + config 缺失生成默认）→ 读 config
+// OpenNodeState（三层布局 + config 缺失生成默认）→ 读 config
 // （fail-fast）→ client/control 角色**恒开**（期望态 roles.json 已退役——控制面宿主
 // 与注册表是 daemon 本职，无开关无配置节）→ serve/relay 按期望态（config enabled）
 // 挂 supervisor → 等信号收工（全停进程常驻不退出，D9——client/control 仍开）。
@@ -135,7 +135,7 @@ func assembleUnified(parent context.Context, version, stateDir string, verbose b
 	}
 	proc.release = lock.Release
 
-	// ② 三层 state + 同根自动迁移 + config 缺失生成默认（迁移摘要进 cache/events.log）。
+	// ② 三层 state + config 缺失生成默认（公告行进 cache/events.log）。
 	nst, err := nodestate.OpenNodeState(stateDir)
 	if err != nil {
 		cancel()

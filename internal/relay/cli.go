@@ -30,7 +30,7 @@ var Version string
 // 信号处理；统一进程的唯一信号入口在 daemon 装配层，D3）。
 func CLI(args []string) error {
 	fs := flag.NewFlagSet("homeway relay", flag.ExitOnError)
-	state := fs.String("state", defaultStateDir(), "统一 state 根（L2=<state>/relay、relay.log=<state>/cache；首启自动迁移旧布局）")
+	state := fs.String("state", defaultStateDir(), "统一 state 根（L2=<state>/relay、relay.log=<state>/cache）")
 	listen := fs.String("listen", ":41741", "监听地址（UDP；未显式给 = 用 config）")
 	advertise := fs.String("advertise", "", "token 里公布的中继地址（逗号分隔 host:port；默认用本机网卡地址；未显式给 = 用 config）")
 	fs.Usage = func() {
@@ -54,7 +54,7 @@ func CLI(args []string) error {
 	}
 	defer lock.Release()
 
-	// 三层 state 打开（含同根自动迁移 + config 缺失生成默认）；relay.log 落 cache/。
+	// 三层 state 打开（含 config 缺失生成默认）；relay.log 落 cache/。
 	nst, err := nodestate.OpenNodeState(*state)
 	if err != nil {
 		return fmt.Errorf("打开 state %s：%w", *state, err)

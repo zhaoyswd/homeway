@@ -273,12 +273,9 @@ homeway status --watch         # client 域 live 渲染：快照 + 订阅续播�
 - **状态工件**：`homeway export [--state D] [dest.tar]`（不变量四件 = config.toml +
   serve/ + relay/ + client/，0600 未压缩 tar）/ `homeway import <file>`（布局校验 +
   安全解包 + 落位回滚；目标进程必须在停）/ `homeway reset cache`（清可弃层 cache/）。
-- **旧布局自动迁移**：统一进程首次在旧 state 上启动时自动幂等搬迁（v0.13.x 及更早的
-  exit 布局〔根下 key.bin/tokens.jsonl〕与 daemon 子目录布局）——判据行（`cache/events.log`
-  与终端回显）：每文件一行 `迁移：<旧路径> → <新路径>`、`吸收：daemon/roles.json → 期望态
-  并入 config（client 恒开）`、`迁移备份：<state>/migration-backup-<ts>/`（state 顶层，
-  reset cache 不碰）；目标已存在 = `跳过：…（目标已存在，保留原地）`（幂等）；再次启动
-  零迁移行。初始 `serve.enabled` 按旧形态定（旧 exit 布局 ⇒ true、仅 daemon 布局 ⇒ false）。
+- **旧布局迁移（已退役，FIX-90）**：v0.13.x 及更早的 exit/daemon 布局曾由统一进程首启
+  自动幂等搬迁；现役部署均已迁到三层布局，该一次性迁移代码已删除。历史
+  `migration-backup-<ts>/` 目录（state 顶层）保留不动（`reset cache` 不碰）。
 - **单实例**：state 目录 flock 排他锁（统一进程与前台单角色共用 `<state>/lock`），
   二次启动报「已在运行（pid N）」；进程死亡锁自动释放。
 
@@ -449,7 +446,7 @@ cmd/homeway         单入口：`homeway <谁> <干什么>` 分发（角色 serv
 internal/server     出口角色（WG 端点 + 拦截层 + 本机服务 + 设备表）与前台 CLI
 internal/relay      中继角色（注册腿 + per-client 转发 + hint）与前台 CLI
 internal/nodeconfig config.toml（L1 意图层）读改写内核
-internal/nodestate  三层 state 布局 + 同根自动迁移 + export/import + 单实例锁
+internal/nodestate  三层 state 布局 + export/import + 单实例锁
 internal/daemon     统一进程装配（supervisor + 控制面 + 按需拉起 + 命令组 CLI——经 facade 单入口消费）
 clientcore/facade   客户端会话面的唯一语义真源（词汇/版本台账/事件总线/主机表/Host 对象）
 internal/control    控制面 wire 绑定（UDS/帧/握手；词汇与总线真源在 clientcore/facade）

@@ -27,7 +27,7 @@ import (
 // 自带信号处理——统一进程的唯一信号入口在 daemon 装配层，D3）。
 func CLI(args []string) error {
 	fs := flag.NewFlagSet("homeway serve", flag.ExitOnError)
-	stateDir := fs.String("state", defaultStateDir(), "统一 state 根（L2=<state>/serve、L3=<state>/cache、socket=<state>；首启自动迁移旧布局）")
+	stateDir := fs.String("state", defaultStateDir(), "统一 state 根（L2=<state>/serve、L3=<state>/cache、socket=<state>）")
 	listen := fs.Uint("listen", 41641, "WG 监听端口（被占用自动退让；未显式给 = 用 config）")
 	publicEndpoint := fs.String("public-endpoint", "", "显式公网端点（逗号分隔 ip:port；给了就跳过 UPnP/STUN 推断直接公布，FIX-61）")
 	relayServer := fs.String("relay", "", "中继 token（rl1…，由 `homeway relay` 启动时打印；空 = 不用中继；未显式给 = 用 config）")
@@ -70,7 +70,7 @@ func CLI(args []string) error {
 	}
 	defer lock.Release()
 
-	// 三层 state 打开（含同根自动迁移 + config 缺失生成默认）——迁移摘要行先进
+	// 三层 state 打开（含 config 缺失生成默认）——公告行先进
 	// <state>/cache/events.log；随后关句柄，events/debug 日志交由 serve 角色接管
 	// （append-only，同文件续写；两写者不同时在世）。
 	nst, err := nodestate.OpenNodeState(*stateDir)
