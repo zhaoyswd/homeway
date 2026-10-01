@@ -12,6 +12,8 @@
 set -euo pipefail
 
 cd "$(dirname "$0")/.."   # 仓库根
+ROOT="$PWD"               # 路径基准（FIX-113：不再依赖 $OLDPWD 的 shell 语义——子 shell 里
+                          # 也稳定；$OLDPWD 在「调用者非仓库根 / cd 未更新」时是脆弱依赖）
 
 VENDOR=third_party/libghostty-vt
 OUT_ROOT="$VENDOR/prebuilt"
@@ -64,7 +66,7 @@ for t in "${targets[@]}"; do
       -Dtarget="$zt" -Dversion-string="$VT_VERSION_STRING" \
       -Demit-xcframework=false \
       --cache-dir "$PWD/.zig-cache" \
-      -p "$OLDPWD/$out" )
+      -p "$ROOT/$out" )
   # 硬约束①：删掉 dylib —— -lghostty-vt 在 .a/.dylib 并存时优先选动态库，我们要静态链接。
   rm -f "$out"/lib/*.dylib "$out"/lib/*.so*
   lib="$(ls "$out"/lib/libghostty-vt.a 2>/dev/null || true)"
@@ -78,11 +80,17 @@ for t in "${targets[@]}"; do
     darwin-*)
       # zig ar 解出来的成员是 000 权限（归档里没存模式），不 chmod 会「Permission denied」。
       tmp="$(mktemp -d)"
-      ( cd "$tmp" && "$ZIG_BIN" ar x "$OLDPWD/$lib" \
+      ( cd "$tmp" && "$ZIG_BIN" ar x "$ROOT/$lib" \
         && chmod -R u+rwX . \
-        && rm -f "$OLDPWD/$lib" \
-        && "$ZIG_BIN" ar rcs "$OLDPWD/$lib" ./*.o )
+        && rm -f "$ROOT/$lib" \
+        && "$ZIG_BIN" ar rcs "$ROOT/$lib" ./*.o )
       rm -rf "$tmp"
+      # 复查（FIX-113 fail-closed）：重打包后产物必须非空——ar 链在异常下可能留下
+      # 空档/半档（此前只看命令退出码，fail-open 静默）。
+      if [[ ! -s "$lib" ]]; then
+        echo "build-vt: ${t} 重打包后产物为空/缺失（${lib}）——按失败处理" >&2
+        exit 3
+      fi
       ;;
   esac
   echo "build-vt: ${t} 完成 → ${lib}（$(wc -c <"$lib" | tr -d ' ') 字节）"

@@ -390,6 +390,11 @@ func (s *ClientStream) Close(ctx context.Context) error {
 // Close 关闭客户端连接（幂等）。
 func (c *Client) Close() {
 	c.once.Do(func() {
+		// 顺序契约（FIX-114 实测窗口）：先标在册流 ended，再关 closed——反序时
+		// 「Closed 已关、流还没标」的窗口里 Send 会返回写错误而非 ErrStreamEnded
+		//（测试在 -race 整包负载下 0.00s 偶发红暴露；reader 退出的 readerDone 幂等，
+		// 与本调用重复无害）。
+		c.readerDone()
 		close(c.closed)
 		_ = c.nc.Close()
 	})

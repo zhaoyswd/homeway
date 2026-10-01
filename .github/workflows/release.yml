@@ -68,8 +68,15 @@ jobs:
           arch="$(uname -m | sed 's/^arm64$/aarch64/')"
           os="$(uname -s | sed 's/^Darwin$/macos/;s/^Linux$/linux/')"
           url="$(curl -fsSL https://ziglang.org/download/index.json | jq -r --arg k "${arch}-${os}" '."0.16.0"[$k].tarball')"
+          sha="$(curl -fsSL https://ziglang.org/download/index.json | jq -r --arg k "${arch}-${os}" '."0.16.0"[$k].shasum')"
           echo "zig tarball: ${url}"
           curl -fsSL "$url" -o /tmp/zig.tar.xz
+          # 校验和（FIX-114）：index.json 的 shasum 字段逐字节核对——供应链完整性门。
+          if command -v sha256sum >/dev/null 2>&1; then
+            echo "${sha}  /tmp/zig.tar.xz" | sha256sum -c -
+          else
+            echo "${sha}  /tmp/zig.tar.xz" | shasum -a 256 -c -
+          fi
           mkdir -p "$HOME/zig-0.16.0"
           tar -xJf /tmp/zig.tar.xz -C "$HOME/zig-0.16.0" --strip-components=1
           "$HOME/zig-0.16.0/zig" version | grep -qx '0.16.0'
@@ -110,6 +117,10 @@ jobs:
           set -euo pipefail
           go test ./contracts/... -count=1 -v
           go test ./internal/control/ ./pkg/term/ -run 'TestVersionGovernance' -count=1 -v
+      # 关键包 -race（FIX-114）：并发缝隙的回归网——六包 = 控制面 / 守护 / 中继 / 出口 /
+      # 终端 / 传输（均为并发面密集且已有确定性用例的包；vt 已在上方本目标产出）。
+      - name: 关键包 -race（六包）
+        run: go test -race ./internal/control/ ./internal/daemon/ ./internal/relay/ ./internal/server/ ./pkg/term/ ./clientcore/internal/wtransport/
       # 声明文件必须与当前依赖一致（改了依赖没重跑生成脚本 ⇒ 别发版）
       - run: bash tools/gen-third-party-notices.sh --check
 
@@ -139,8 +150,15 @@ jobs:
           arch="$(uname -m | sed 's/^arm64$/aarch64/')"
           os="$(uname -s | sed 's/^Darwin$/macos/;s/^Linux$/linux/')"
           url="$(curl -fsSL https://ziglang.org/download/index.json | jq -r --arg k "${arch}-${os}" '."0.16.0"[$k].tarball')"
+          sha="$(curl -fsSL https://ziglang.org/download/index.json | jq -r --arg k "${arch}-${os}" '."0.16.0"[$k].shasum')"
           echo "zig tarball: ${url}"
           curl -fsSL "$url" -o /tmp/zig.tar.xz
+          # 校验和（FIX-114）：index.json 的 shasum 字段逐字节核对——供应链完整性门。
+          if command -v sha256sum >/dev/null 2>&1; then
+            echo "${sha}  /tmp/zig.tar.xz" | sha256sum -c -
+          else
+            echo "${sha}  /tmp/zig.tar.xz" | shasum -a 256 -c -
+          fi
           mkdir -p "$HOME/zig-0.16.0"
           tar -xJf /tmp/zig.tar.xz -C "$HOME/zig-0.16.0" --strip-components=1
           "$HOME/zig-0.16.0/zig" version | grep -qx '0.16.0'
@@ -154,6 +172,12 @@ jobs:
         run: |
           set -euo pipefail
           go build -buildmode=c-shared -tags cshared -o /tmp/libclientcore-smoke.so ./clientcore/cmd/clientcore
+      - name: darwin 冒烟（构建并运行 --version；FIX-114：darwin 产物真 darwin 上能起）
+        if: runner.os == 'macOS'
+        run: |
+          set -euo pipefail
+          go build -o /tmp/homeway-smoke ./cmd/homeway
+          /tmp/homeway-smoke --version | grep -q '^homeway ' && echo "ok: darwin 冒烟（--version）通过"
           want="$(grep -rh '^//export' clientcore/cmd/clientcore/*.go | sort -u | wc -l | tr -d ' ')"
           got="$(nm -g /tmp/libclientcore-smoke.so | grep -c ' T _ClientCore' || true)"
           echo "//export 面：源 ${want} 个 / nm T 符号 ${got} 个"
@@ -189,8 +213,15 @@ jobs:
           arch="$(uname -m | sed 's/^arm64$/aarch64/')"
           os="$(uname -s | sed 's/^Darwin$/macos/;s/^Linux$/linux/')"
           url="$(curl -fsSL https://ziglang.org/download/index.json | jq -r --arg k "${arch}-${os}" '."0.16.0"[$k].tarball')"
+          sha="$(curl -fsSL https://ziglang.org/download/index.json | jq -r --arg k "${arch}-${os}" '."0.16.0"[$k].shasum')"
           echo "zig tarball: ${url}"
           curl -fsSL "$url" -o /tmp/zig.tar.xz
+          # 校验和（FIX-114）：index.json 的 shasum 字段逐字节核对——供应链完整性门。
+          if command -v sha256sum >/dev/null 2>&1; then
+            echo "${sha}  /tmp/zig.tar.xz" | sha256sum -c -
+          else
+            echo "${sha}  /tmp/zig.tar.xz" | shasum -a 256 -c -
+          fi
           mkdir -p "$HOME/zig-0.16.0"
           tar -xJf /tmp/zig.tar.xz -C "$HOME/zig-0.16.0" --strip-components=1
           "$HOME/zig-0.16.0/zig" version | grep -qx '0.16.0'
