@@ -23,10 +23,17 @@ import (
 	"github.com/zhaoyswd/homeway/internal/nodestate"
 )
 
+// spawnAttemptedForTest 拉起动做计数（变异自证判别力：纯读命令不得触发拉起——
+// 「拉起失败被静默吞掉」与「根本没尝试拉起」在输出面不可区分，用计数区分）。
+var spawnAttemptedForTest int
+
 // 测试包级注入默认：拉起 = 确定性错误、launchd 检测 = 恒无。需要真拉起收敛判据的
 // 用例（TestSpawnConvergesSingleLock）在用例内另行注入。
 func init() {
-	spawnStartFn = func(string) (int, error) { return 0, errors.New("测试默认不拉起（真拉起归 e2e）") }
+	spawnStartFn = func(string) (int, error) {
+		spawnAttemptedForTest++
+		return 0, errors.New("测试默认不拉起（真拉起归 e2e）")
+	}
 	detectLaunchdAgentFn = func() string { return "" }
 }
 

@@ -64,8 +64,9 @@ func TestServeGroupLifecycleMatrix(t *testing.T) {
 	if !strings.Contains(out.String(), "停止已应答") {
 		t.Fatalf("stop 应立即应答：\n%s", out.String())
 	}
-	// 提示口径（r1 中-10）：stop 输出不得含「需 …restart 生效」。
-	if strings.Contains(out.String(), "restart 生效") {
+	// 提示口径（r1 中-10）：stop 是生命周期命令，输出不得含「不热更」提示（与纯配置
+	// 写命令的「需 restart 生效」语义相反）。以「不热更」为标记——提示行统一带此前缀。
+	if strings.Contains(out.String(), "不热更") {
 		t.Fatalf("stop 不得打 restart 提示：\n%s", out.String())
 	}
 	waitRoleState(t, proc.sup, "serve", roleStateStopped, 20*time.Second)
@@ -109,7 +110,7 @@ func TestServeGroupLifecycleMatrix(t *testing.T) {
 	if !strings.Contains(out.String(), "已启动") {
 		t.Fatalf("stopped 时 start 应装配：\n%s", out.String())
 	}
-	if strings.Contains(out.String(), "restart 生效") {
+	if strings.Contains(out.String(), "不热更") {
 		t.Fatalf("start 不得打 restart 提示：\n%s", out.String())
 	}
 	waitRoleState(t, proc.sup, "serve", roleStateRunning, 20*time.Second)
@@ -142,6 +143,7 @@ func TestServeGroupStatusDegradedFaces(t *testing.T) {
 		t.Fatal(err)
 	}
 	var out bytes.Buffer
+	before := spawnAttemptedForTest
 	if err := ServeGroupCLI([]string{"status", "--state", dir}, "t", &out); err != nil {
 		t.Fatal(err)
 	}
@@ -149,6 +151,9 @@ func TestServeGroupStatusDegradedFaces(t *testing.T) {
 		if !strings.Contains(out.String(), want) {
 			t.Fatalf("serve status 未跑面缺 %q：\n%s", want, out.String())
 		}
+	}
+	if spawnAttemptedForTest != before {
+		t.Fatal("纯读命令不得尝试拉起（status 未跑 = 读 config 降级）")
 	}
 	out.Reset()
 	if err := RelayGroupCLI([]string{"status", "--state", dir}, "t", &out); err != nil {
