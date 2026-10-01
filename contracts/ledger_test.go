@@ -203,6 +203,9 @@ func TestLedgerExemptRetiredAndKnowledgeKept(t *testing.T) {
 		{"term-frame", "agent", "unknown", "agentLabel"},
 		{"term-frame", "ended-code", "-1", "reason 前置分支消费"},
 		{"speedtest-reason", "reason", "invalid_arg", "speedTestReasonShort 显式 case"},
+		// exec-r1 低-6：stalled 是 App 本地自产码（TxWatchdog），非 wire 产出、文案不退役——
+		// 该例外必须在真源可见（只看台账不误判为漏删 case）。
+		{"bridge-files", "code", "stalled", "App 本地自产码"},
 	}
 	for _, m := range must {
 		found := false

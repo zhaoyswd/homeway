@@ -172,7 +172,7 @@
 {"family":"bridge-files","unit":"code","value":"files_not_enabled","note":"","faces":["napi"],"status":"legacy-unreachable","spec":"bridge-call-layer + file-management"}
 {"family":"bridge-files","unit":"code","value":"files_other_service","note":"","faces":["napi"],"status":"legacy-unreachable","spec":"bridge-call-layer + file-management"}
 {"family":"bridge-files","unit":"code","value":"invalid_addr","note":"","faces":["napi"],"status":"legacy-unreachable","spec":"bridge-call-layer + file-management"}
-{"family":"bridge-files","unit":"code","value":"stalled","note":"","faces":["napi"],"status":"legacy-unreachable","spec":"bridge-call-layer + file-management"}
+{"family":"bridge-files","unit":"code","value":"stalled","note":"App 本地自产码（TxWatchdog 无进展判败），非 wire 产出；App 文案不退役（exec-r1 低-6）","faces":["napi"],"status":"legacy-unreachable","spec":"bridge-call-layer + file-management"}
 {"family":"bridge-term","unit":"code","value":"bad_json","note":"","faces":["napi"],"status":"active","spec":"bridge-call-layer + exit-terminal"}
 {"family":"bridge-term","unit":"code","value":"bad_reply","note":"","faces":["napi"],"status":"active","spec":"bridge-call-layer + exit-terminal"}
 {"family":"bridge-term","unit":"code","value":"invalid_arg","note":"","faces":["napi"],"status":"active","spec":"bridge-call-layer + exit-terminal"}
