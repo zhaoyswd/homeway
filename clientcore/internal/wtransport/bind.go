@@ -121,6 +121,11 @@ type Bind struct {
 	// 结算行在首次采纳时打出（胜者/响应过/未响应），之后静默——「直连候选到底有没有回包」
 	// 从此有据可查（2026-09-20 真机「直连时好时坏」排查时的缺口）。
 	raceSeen map[netip.AddrPort]bool
+	// mirrorLogAt / mirrorLogN：MIRROR 行节流（FIX-13）——未采纳期每包一行会把 8MB
+	// 日志轮转冲爆、吃掉故障现场；每轮赛跑限 3 行且间隔 ≥1s（全量计数在
+	// Status().Mirrored，判据不丢）。
+	mirrorLogAt time.Time
+	mirrorLogN  int
 	// lastSendErrAt：候选发送错误的限流（每候选 5s 一行；本地错误如「无路由」会每包重复）。
 	lastSendErrAt map[netip.AddrPort]time.Time
 	// lastLocalSendErrAt：最近一次**采纳路径**上本地类发送错误的时刻（demand-driven-
@@ -167,8 +172,8 @@ func (b *Bind) SetCandidates(cands []Candidate) {
 	b.mu.Lock()
 	changed := !sameCandidates(b.cfg.Candidates, cands)
 	b.cfg.Candidates = cands
-	b.mu.Unlock()
-	b.rebuildRelayEps()
+	b.rebuildRelayEpsLocked() // 同临界区内重建（FIX-10）：收包路径在锁内读 relayEps，
+	b.mu.Unlock()             // 分离重建会让新中继候选在窗口内被误判直连（裸发被中继丢）
 	if changed {
 		b.cfg.Logf("候选集更新：%d 条（%s）", len(cands), DescribeCandidates(cands))
 	}
@@ -240,6 +245,12 @@ func pathKind(relay bool) string {
 func (b *Bind) rebuildRelayEps() {
 	b.mu.Lock()
 	defer b.mu.Unlock()
+	b.rebuildRelayEpsLocked()
+}
+
+// rebuildRelayEpsLocked 由候选集重建中继端点表（调用方持锁——FIX-10：与
+// cfg.Candidates 的写入同临界区，收包路径的 relay 判定不再有旧表窗口）。
+func (b *Bind) rebuildRelayEpsLocked() {
 	b.relayEps = make(map[netip.AddrPort]struct{}, len(b.cfg.Candidates))
 	for _, c := range b.cfg.Candidates {
 		if c.Relay {
@@ -258,6 +269,7 @@ func (b *Bind) Rearm() {
 	b.relayUnlocked = len(b.directCountLocked()) == 0 // 没有直连候选就没什么可等的
 	b.unlockOnce = false
 	b.raceSeen = nil // 新一轮赛跑：清掉上一轮的来源记录
+	b.mirrorLogN = 0 // 新一轮：MIRROR 行配额复位（FIX-13）
 	b.mu.Unlock()
 	b.cfg.Logf("RARM 候选赛跑重启（直连优先：中继在 %v 后才解锁）", b.cfg.DirectFirst)
 }
@@ -272,6 +284,7 @@ func (b *Bind) RearmSoft() {
 	b.relayUnlocked = true
 	b.unlockOnce = true
 	b.raceSeen = nil
+	b.mirrorLogN = 0 // 新一轮：MIRROR 行配额复位（FIX-13）
 	b.mu.Unlock()
 	b.cfg.Logf("RARM 软赛跑（中继立即参与，同时试直连）")
 }
@@ -562,12 +575,16 @@ func (b *Bind) Open(port uint16) ([]conn.ReceiveFunc, uint16, error) {
 				case proto.FrameTypeControl:
 					// 判据日志：hint 到达/缺失一眼可见（打洞链路的第一环）
 					if addr, err := proto.DecodeHintPayload(payload); err == nil {
-						if b.cfg.OnHint != nil {
+						b.mu.Lock()
+						hasHint := b.cfg.OnHint != nil
+						b.mu.Unlock()
+						if hasHint {
 							b.cfg.Logf("HINT 收到对端地址线索 %s（来自中继 %v）", addr, src)
-							b.cfg.OnHint(addr)
 						} else {
 							b.cfg.Logf("HINT 收到对端地址线索 %s，但没有处理器（缓存未接？）", addr)
 						}
+						// 锁内取、锁外调（FIX-15）：回调会经 SetCandidates 回锁——持锁调必死锁。
+						b.deliverHint(addr)
 					}
 					continue
 				default: // reg（服务端概念）与未知类型：忽略
@@ -673,7 +690,17 @@ func (b *Bind) Send(bufs [][]byte, ep conn.Endpoint) error {
 		}
 		// 赛跑期的一条包镜像到多个候选，但这只是一条逻辑出站包：按包记一次。
 		b.txBytes.Add(int64(len(buf)))
-		b.cfg.Logf("MIRROR 镜像包#%d → %d 候选（直连优先：本次直连 %d / 中继 %d）", m, sent, sent-relaySent, relaySent)
+		b.mu.Lock()
+		now := time.Now()
+		logMirror := b.mirrorLogN < 3 && now.Sub(b.mirrorLogAt) >= time.Second
+		if logMirror {
+			b.mirrorLogN++
+			b.mirrorLogAt = now
+		}
+		b.mu.Unlock()
+		if logMirror {
+			b.cfg.Logf("MIRROR 镜像包#%d → %d 候选（直连优先：本次直连 %d / 中继 %d；本行每轮限 3 条）", m, sent, sent-relaySent, relaySent)
+		}
 		if needTimer {
 			window := b.cfg.DirectFirst
 			go func(pkt, reg []byte) {

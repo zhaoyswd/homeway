@@ -736,3 +736,43 @@ func TestAdoptionHandoverDualSend(t *testing.T) {
 		t.Fatalf("切回候选后不应再双发到未知来源（过渡未清除）：% x", got)
 	}
 }
+
+// TestMirrorLogThrottled（FIX-13）：未采纳期 MIRROR 行每轮限 3 条（旧行为：每包一行，
+// 长连未采纳期把 8MB 日志轮转冲爆、吃掉故障现场）；全量计数仍在 Status().Mirrored。
+func TestMirrorLogThrottled(t *testing.T) {
+	live := mustLocalListener(t)
+	var mu sync.Mutex
+	mirrorLines := 0
+	b := newTestBind(t, Config{
+		Candidates: []Candidate{{Addr: udpAddr(live)}},
+		Logf: func(format string, args ...any) {
+			if strings.HasPrefix(format, "MIRROR 镜像包") {
+				mu.Lock()
+				mirrorLines++
+				mu.Unlock()
+			}
+		},
+	})
+	race, err := b.ParseEndpoint("race")
+	if err != nil {
+		t.Fatal(err)
+	}
+	wg := []byte{1, 2, 3}
+	for i := 0; i < 10; i++ {
+		if err := b.Send([][]byte{wg}, race); err != nil {
+			t.Fatal(err)
+		}
+	}
+	mu.Lock()
+	got := mirrorLines
+	mu.Unlock()
+	if got == 0 {
+		t.Fatal("首条 MIRROR 行必须打出（判据不丢）")
+	}
+	if got > 3 {
+		t.Fatalf("MIRROR 行应每轮限 3 条，实得 %d", got)
+	}
+	if n := b.Status().Mirrored; n != 10 {
+		t.Fatalf("全量镜像计数应照记（10），实得 %d", n)
+	}
+}
