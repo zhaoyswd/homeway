@@ -271,6 +271,12 @@ homeway status --watch         # client 域 live 渲染：快照 + 订阅续播�
 - **状态工件**：`homeway export [--state D] [dest.tar]`（不变量四件 = config.toml +
   serve/ + relay/ + client/，0600 未压缩 tar）/ `homeway import <file>`（布局校验 +
   安全解包 + 落位回滚；目标进程必须在停）/ `homeway reset cache`（清可弃层 cache/）。
+- **旧布局自动迁移**：统一进程首次在旧 state 上启动时自动幂等搬迁（v0.13.x 及更早的
+  exit 布局〔根下 key.bin/tokens.jsonl〕与 daemon 子目录布局）——判据行（`cache/events.log`
+  与终端回显）：每文件一行 `迁移：<旧路径> → <新路径>`、`吸收：daemon/roles.json → 期望态
+  并入 config（client 恒开）`、`迁移备份：<state>/migration-backup-<ts>/`（state 顶层，
+  reset cache 不碰）；目标已存在 = `跳过：…（目标已存在，保留原地）`（幂等）；再次启动
+  零迁移行。初始 `serve.enabled` 按旧形态定（旧 exit 布局 ⇒ true、仅 daemon 布局 ⇒ false）。
 - **单实例**：state 目录 flock 排他锁（统一进程与前台单角色共用 `<state>/lock`），
   二次启动报「已在运行（pid N）」；进程死亡锁自动释放。
 
