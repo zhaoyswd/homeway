@@ -1,5 +1,13 @@
 // Package relay：Homeway 中继（wg-native-stack tasks 6.1–6.5）。
 //
+// 文件划分（FIX-74：原 relay.go 1114 行四职责混排——纯搬移，零行为变更）：
+//
+//	relay.go  装配与生命周期（Config/Relay/New/Run/listen/readLoop/handlePacket/closeAll）
+//	leg.go    注册腿与控制消息（handleControl/腿密钥/登记面）
+//	assoc.go  每客户端分配（forwardUp/回程泵/hint 递送）
+//	reap.go   回收与限速（reapLoop 空闲/过期、每源令牌桶）
+//	status.go 状态面（BackendBriefs/Snapshot/statsLoop）
+//
 // 定位：中继是**路径而不是参与方** —— 只见密文、零 WG 感知、零落盘状态（重启即清）。
 // 安全由两件事构造性保证：
 //   - 控制面：后端注册腿要证明持有 peerId 私钥（X25519 DH 挑战响应），否则拒绝；
@@ -19,8 +27,6 @@ package relay
 
 import (
 	"context"
-	"crypto/rand"
-	"crypto/subtle"
 	"fmt"
 	"net"
 	"net/netip"
@@ -30,7 +36,6 @@ import (
 
 	"github.com/zhaoyswd/homeway/pkg/probe"
 	"github.com/zhaoyswd/homeway/pkg/proto"
-	"golang.org/x/crypto/curve25519"
 )
 
 // 默认参数（可用 Config 覆盖）。
@@ -127,68 +132,8 @@ type Stats struct {
 	LegRejected uint64
 }
 
-type assocKey struct {
-	label  [8]byte
-	client netip.AddrPort
-}
-
-type leg struct {
-	label    [8]byte
-	pubkey   [32]byte
-	addr     netip.AddrPort // 注册腿源地址（后端公网映射，也是给客户端的 hint）
-	last     time.Time
-	ephPriv  [32]byte
-	nonce    [16]byte
-	challAt  time.Time
-	verified bool
-	// ctlVerified：控制面（TCP 挑战）认证过。与 verified（UDP 注册挑战）是**两种
-	// 证明**，转发准入与过期判定用「任一」——不再让控制面认证直接置 verified，
-	// 否则孤儿清理的 !verified 恒假成死代码（review B4）。
-	ctlVerified bool
-	// ctl：控制通道（relay-backend-dial）。非 nil 时客户端到达走「通告+等后端拨腿」，
-	// 而不是 per-client socket 主动发往 lg.addr（那条路在严格 NAT 上恒不通）。
-	ctl *ctlConn
-	// ctlV2：控制对端跑的是 v2 协议（PROOF 带版本，review #25）。只有 v2 后端才
-	// 走拨腿模式（SESSION 带 cookie、腿要认证）；v1 控制连接保持 per-client 旧路径
-	// ——它解不开 v2 SESSION，硬通告只会让它反复拨失败。
-	ctlV2 bool
-}
-
-type assoc struct {
-	key     assocKey
-	backend netip.AddrPort // 注册腿地址（回程发给它；拨腿模式下 = 后端腿的实际源地址）
-	sock    *net.UDPConn   // 该客户端专属的上游 socket（后端看到的"客户端地址"）
-	last    time.Time      // 最近一次任一方向活动（空闲回收判据）
-	// lastDown：最近一次**下行**（腿/后端方向到达）时刻。与 last 分开记：
-	// 半死会话（上行活跃、下行恒零）光看 last 永远活着——DownSilent 用它判死。
-	lastDown time.Time
-	// 拨腿模式（relay-backend-dial）：等后端来拨。首包（LEGUP）到达前，
-	// 客户端包缓冲在 pend（≤16）；到达后 backend = 腿源地址，缓冲放行。
-	// dialed 是**持久**标志（本会话由拨腿承载——backend=腿源地址，与 lg.addr
-	// 是两个概念，地址漂移检查不适用）；dialUp 只标「等待中」。
-	// dialUpAt：等待开始时刻（DialWait 超时判据——后端拨腿失败不回报，
-	// 中继侧必须自持看门狗，否则客户端上行会让会话悬挂到天荒地老）。
-	sid      uint64
-	dialed   bool
-	dialUp   bool
-	dialUpAt time.Time
-	// 腿身份认证（review #3）：cookie 只经控制通道发给会话所属后端；拨腿首包必须
-	// 回带 cookie+MAC，验过才认（authOK）。authSrc = 已认证的腿源（常态跟随它；
-	// 换源必须重新出示合法认证——未知源不改变 backend、不放行 pend、不续命）。
-	cookie  [16]byte
-	authOK  bool
-	authSrc netip.AddrPort
-	pendMu  sync.Mutex
-	pend    [][]byte
-}
-
 // ctlPendMax：拨腿等待窗口的客户端包缓冲上限（同直连引导的 pending 语义）。
 const ctlPendMax = 16
-
-type rateBucket struct {
-	window time.Time
-	count  int
-}
 
 // New 建中继（不监听）。
 func New(cfg Config) *Relay {
@@ -256,61 +201,14 @@ func (r *Relay) Stats() Stats {
 
 // BackendBrief 注册出口列表条目（relay.status 数据源——role-management 2.2，r1 低-14：
 // label 短指纹 + 源地址 + 最近活跃 + 验证态）。
-type BackendBrief struct {
-	Label       string    // 出口中继标签（16 位 hex 短指纹）
-	Addr        string    // 注册腿源地址（后端公网映射，给客户端的 hint）
-	LastActive  time.Time // 最近一次注册/控制活动
-	Verified    bool      // UDP 注册挑战已证明持有 peerId 私钥
-	CtlVerified bool      // TCP 控制面挑战已证明
-	HasCtl      bool      // 控制通道（relay-backend-dial 拨腿模式）在世
-}
 
 // StatusSnapshot relay 状态快照（实际监听地址 + 注册出口列表）。
 // **relay 侧看不到 APP**（在中继注册的是出口、手机流量在 WG 密文里）——事实约束进
 // spec（role-management）；本结构因此只有后端维。
-type StatusSnapshot struct {
-	Listen   string         // 实际监听地址（UDP）
-	Backends []BackendBrief // 注册出口列表
-	Assocs   int            // 活跃客户端分配会话数
-	Open     bool           // 是否开放注册（Secret 零值）
-}
 
 // BackendBriefs 注册出口列表快照（锁内拷贝；未跑 = nil）。
-func (r *Relay) BackendBriefs() []BackendBrief {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	out := make([]BackendBrief, 0, len(r.legs))
-	for label, lg := range r.legs {
-		addr, last := "", time.Time{}
-		if lg != nil {
-			addr = lg.addr.String()
-			last = lg.last
-		}
-		out = append(out, BackendBrief{
-			Label:       fmt.Sprintf("%x", label),
-			Addr:        addr,
-			LastActive:  last,
-			Verified:    lg.verified,
-			CtlVerified: lg.ctlVerified,
-			HasCtl:      lg.ctl != nil,
-		})
-	}
-	return out
-}
 
 // Snapshot 状态快照（relay.status 数据源）。
-func (r *Relay) Snapshot() StatusSnapshot {
-	r.mu.Lock()
-	pc := r.pc
-	assocs := len(r.assocs)
-	open := r.cfg.Secret == ([32]byte{})
-	r.mu.Unlock()
-	snap := StatusSnapshot{Backends: r.BackendBriefs(), Assocs: assocs, Open: open}
-	if pc != nil {
-		snap.Listen = pc.LocalAddr().String()
-	}
-	return snap
-}
 
 // RunWithReady：同 Run，但绑定成功后回调一次（实际地址）—— token 必须在**实际端口**确定后生成。
 func (r *Relay) RunWithReady(ctx context.Context, onReady func(actual netip.AddrPort)) error {
@@ -456,301 +354,16 @@ func (r *Relay) handlePacket(_ context.Context, src netip.AddrPort, pkt []byte) 
 }
 
 // handleControl：后端注册腿的控制消息（Hello/Proof/Keepalive）。
-func (r *Relay) handleControl(src netip.AddrPort, label [8]byte, lg *leg, payload []byte) {
-	sub, _ := proto.RelaySubtype(payload)
-	switch sub {
-	case proto.RelaySubHello:
-		pubkey, err := proto.DecodeRelayHello(payload)
-		if err != nil || proto.RelayID(pubkey) != label {
-			r.bump(func(s *Stats) { s.Forged++ })
-			return
-		}
-		// 出题：临时 X25519 密钥对 + 随机数
-		var ephPriv [32]byte
-		if _, err := rand.Read(ephPriv[:]); err != nil {
-			return
-		}
-		ephPub, err := curve25519.X25519(ephPriv[:], curve25519.Basepoint)
-		if err != nil {
-			return
-		}
-		var nonce [16]byte
-		if _, err := rand.Read(nonce[:]); err != nil {
-			return
-		}
-		var pub [32]byte
-		copy(pub[:], ephPub)
-		r.mu.Lock()
-		cur := r.legs[label]
-		if cur == nil {
-			if len(r.legs) >= r.cfg.MaxLegs {
-				r.mu.Unlock()
-				r.bump(func(s *Stats) { s.Denied++ })
-				r.cfg.Logf("中继：注册腿总数已达上限 %d，拒绝新的 %x（防匿名洪水）", r.cfg.MaxLegs, label[:])
-				return
-			}
-			cur = &leg{label: label, last: time.Now()} // last=now：未验证腿的注册窗口起点（见 reapLoop 的 legBootstrap 分支）
-			r.legs[label] = cur
-		}
-		// **复用既有对象，绝不替换**（review #2，高危）：腿上可能挂着长生命周期子状态
-		// （ctl 控制连接 / ctlVerified）。替换成新对象会让 ctl 指向脱离 map 的旧对象——
-		// 通告与重放全走新对象（无 ctl ⇒ 拨腿模式静默退化回旧敲洞路径），而孤儿控制
-		// 连接还在被回 KEEPALIVE、后端永不重连，两边日志全是"健康"的。中继重启后
-		// （控制先连、UDP Hello 后到）近乎必然踩中。
-		cur.pubkey = pubkey
-		cur.ephPriv, cur.nonce, cur.challAt = ephPriv, nonce, time.Now()
-		r.mu.Unlock()
-		_, _ = r.pc.WriteToUDPAddrPort(proto.EncodeFrame(proto.FrameTypeRelayReg,
-			proto.EncodeRelayChallenge(pub, nonce)), src)
-	case proto.RelaySubProof:
-		if lg == nil {
-			r.bump(func(s *Stats) { s.Forged++ })
-			return
-		}
-		gotNonce, macDH, macPSK, _, err := proto.DecodeRelayProof(payload)
-		if err != nil {
-			r.bump(func(s *Stats) { s.Forged++ })
-			return
-		}
-		r.mu.Lock()
-		if r.legs[label] != lg {
-			// 挑战发出后腿被摘/被换（#2 的守卫）：旧对象上的证明不再作数。
-			r.mu.Unlock()
-			r.bump(func(s *Stats) { s.Forged++ })
-			return
-		}
-		if time.Since(lg.challAt) > challengeTTL || lg.nonce != gotNonce {
-			r.mu.Unlock()
-			r.bump(func(s *Stats) { s.Forged++ })
-			return
-		}
-		var dh []byte
-		if r.cfg.Secret == ([32]byte{}) {
-			dh, err = curve25519.X25519(lg.ephPriv[:], lg.pubkey[:])
-			if err != nil {
-				r.mu.Unlock()
-				r.bump(func(s *Stats) { s.Forged++ })
-				return
-			}
-		}
-		// token 模式只认鉴权 MAC（DH 谁都算得出来，不能当准入）；开放模式看 DH。
-		if r.cfg.Secret != ([32]byte{}) {
-			want := proto.RelayAuthMAC(r.cfg.Secret, lg.nonce, lg.pubkey)
-			if len(macPSK) != 16 || subtle.ConstantTimeCompare(want, macPSK) != 1 {
-				r.mu.Unlock()
-				r.bump(func(s *Stats) { s.Forged++ })
-				r.cfg.Logf("中继：后端 %x 的 token 校验不过（密钥不对/没带 token）—— 拒绝", label[:])
-				return
-			}
-		} else {
-			want := proto.RelayProofMAC(dh, lg.nonce, lg.pubkey)
-			if subtle.ConstantTimeCompare(want, macDH) != 1 {
-				r.mu.Unlock()
-				r.bump(func(s *Stats) { s.Forged++ })
-				return
-			}
-		}
-		moved := lg.addr.IsValid() && lg.addr != src
-		lg.verified, lg.addr, lg.last = true, src, time.Now()
-		// 内存里的挑战私钥用完即弃
-		lg.ephPriv = [32]byte{}
-		var stale []assocKey
-		var staleSids []uint64
-		if moved {
-			// 后端换网/重映射：它的旧分配腿对端地址已变，全部作废重建。
-			// 拨腿会话补发 RELEASE（review B1）：后端侧的腿等它重拨/重放对账。
-			for k, a := range r.assocs {
-				if k.label == label {
-					stale = append(stale, k)
-					if a.sid != 0 {
-						staleSids = append(staleSids, a.sid)
-					}
-					_ = a.sock.Close()
-				}
-			}
-			for _, k := range stale {
-				delete(r.assocs, k)
-			}
-		}
-		r.stats.Registered++
-		r.mu.Unlock()
-		for _, sid := range staleSids {
-			r.releaseSession(lg, sid)
-		}
-		if moved {
-			r.cfg.Logf("中继：后端 %x 注册腿地址变化 → %v（旧分配 %d 条已作废，等客户端重建）",
-				label[:], src, len(stale))
-		} else {
-			r.cfg.Logf("中继：后端 %x 注册成功（腿 %v）", label[:], src)
-		}
-		_, _ = r.pc.WriteToUDPAddrPort(proto.EncodeFrame(proto.FrameTypeRelayReg, proto.EncodeRelayOK()), src)
-	case proto.RelaySubKeepalive:
-		if lg == nil || !(lg.verified || lg.ctlVerified) {
-			// 腿不在了（中继刚重启/已过期）：明确让后端重注册 —— 否则它以为还在，只发保活，
-			// 两边就永远对不上（实测踩过：中继重启后后端一直不重注册）。
-			_, _ = r.pc.WriteToUDPAddrPort(proto.EncodeFrame(proto.FrameTypeRelayReg, proto.EncodeRelayAgain()), src)
-			return
-		}
-		if lg.addr.IsValid() && lg.addr != src {
-			// 换了地址的保活不算数：要求重新走一遍注册（防地址冒用）。
-			_, _ = r.pc.WriteToUDPAddrPort(proto.EncodeFrame(proto.FrameTypeRelayReg, proto.EncodeRelayAgain()), src)
-			return
-		}
-		if !lg.addr.IsValid() {
-			// 无 UDP 注册（纯控制腿）的保活（FIX-68）：addr 无从比对，但**不能**无条件
-			// 续命——此前任何人知道 label 就能发一个「影子保活」把这条腿永久占住
-			//（占腿额、还把真后端的注册用 Again 挡回）。判据：必须挂着控制连接，且保活
-			// 源 IP 与控制连接同 IP（端口可不同：TCP/UDP 各自随机）。
-			if lg.ctl == nil || !sameIPAsControl(lg.ctl, src) {
-				_, _ = r.pc.WriteToUDPAddrPort(proto.EncodeFrame(proto.FrameTypeRelayReg, proto.EncodeRelayAgain()), src)
-				return
-			}
-			// 有活控制连接且同 IP：静默续命（回 Again 只会让后端无意义地重注册刷屏，
-			// review B7③ 的原意保留）。
-		}
-		r.mu.Lock()
-		lg.last = time.Now()
-		r.mu.Unlock()
-	default:
-		r.bump(func(s *Stats) { s.Dropped++ })
-	}
-}
 
 // forwardUp：客户端 → 后端（必要时新建分配 socket），并按需递送 hint。
-func (r *Relay) forwardUp(client netip.AddrPort, lg *leg, typ byte, payload []byte) {
-	key := assocKey{label: lg.label, client: client}
-	r.mu.Lock()
-	a := r.assocs[key]
-	if a != nil && !a.dialed && a.backend != lg.addr {
-		// 后端注册腿换了地址（重映射）：老分配作废，重建。
-		// 拨腿模式不适用：backend = 腿源地址（与 lg.addr 是两个概念，
-		// 无 UDP 注册时 lg.addr 为零值，按它比对会恒不等 → 每包都拆会话重建。
-		_ = a.sock.Close()
-		delete(r.assocs, key)
-		a = nil
-	}
-	if a == nil {
-		// 无可达路径不建会话：既无 UDP 注册腿（lg.addr 无效）也无控制连接时，
-		// 建了也只能指向零值地址（死会话，客户端首包竞态在控制面握手窗口里
-		// 会踩中）——丢弃让客户端重试，等后端任一路径就绪。
-		if !lg.addr.IsValid() && !r.hasControlLocked(lg) {
-			r.mu.Unlock()
-			r.bump(func(s *Stats) { s.Dropped++ })
-			return
-		}
-		if r.countAssocsLocked(lg.label) >= r.cfg.MaxPerPeer {
-			r.mu.Unlock()
-			r.bump(func(s *Stats) { s.Dropped++ })
-			r.cfg.Logf("中继：后端 %x 的分配腿已达上限 %d，丢弃新客户端 %v", lg.label[:], r.cfg.MaxPerPeer, client)
-			return
-		}
-		sock, err := net.ListenUDP("udp", nil)
-		if err != nil {
-			r.mu.Unlock()
-			r.bump(func(s *Stats) { s.Dropped++ })
-			return
-		}
-		a = &assoc{key: key, backend: lg.addr, sock: sock, last: time.Now(), lastDown: time.Now()}
-		// relay-backend-dial：有 v2 控制连接的后端走「通告 + 等拨腿」——
-		// 不主动发往 lg.addr（严格 NAT 上恒不通），首包缓冲、等后端的认证 LEGUP。
-		// v1 控制连接不走拨腿（解不开 v2 SESSION；保持 per-client 旧路径）。
-		if r.hasControlLocked(lg) {
-			r.nextSid++
-			a.sid = r.nextSid
-			a.dialUp = true
-			a.dialed = true
-			a.dialUpAt = time.Now()
-			if lg.ctlV2 {
-				// 每会话随机 cookie（review #3）：只经控制通道发给该后端，
-				// 拨腿首包必须回带 cookie+MAC 才被认作腿。
-				if _, cerr := rand.Read(a.cookie[:]); cerr != nil {
-					// 随机源失效（实践上不会发生）：**不**退化成全零 cookie 的"假 v2"
-					// （那会让 cookie 可预测、认证形同虚设）——拆掉本次会话让客户端
-					// 重试，下一次多半能拿到正常随机数。会话尚未入表，直接关 socket。
-					_ = sock.Close()
-					r.mu.Unlock()
-					r.bump(func(s *Stats) { s.Dropped++ })
-					r.cfg.Logf("⚠️ 中继：会话随机数不可用（%v）——已放弃本次会话，客户端重试即可", cerr)
-					return
-				}
-				a.authOK = false
-			}
-		}
-		r.assocs[key] = a
-		r.stats.Assigned++
-		sid, dialUp := a.sid, a.dialUp
-		cookie, hasCookie := a.cookie, a.sid != 0 && lg.ctlV2
-		r.mu.Unlock()
-		go r.assocReadLoop(a)
-		// 腿建立：两端各推一次对端观察地址（不可信线索）
-		r.sendHintToClient(a, lg)
-		r.sendHintToBackend(a, client)
-		if dialUp {
-			port := uint16(sock.LocalAddr().(*net.UDPAddr).Port)
-			if r.announceSession(lg, proto.CtlSession{ID: sid, DataPort: port, Cookie: cookie, HasCookie: hasCookie}) {
-				r.cfg.Logf("中继：客户端 %v 起会话 #%d（拨腿模式）→ 后端 %x（数据口 %v）",
-					client, sid, lg.label[:], sock.LocalAddr())
-			} else {
-				// 通告失败（连接刚断）：这条会话没腿可等——回收掉，客户端重试会再触发
-				_ = sock.Close()
-				r.mu.Lock()
-				delete(r.assocs, key)
-				r.mu.Unlock()
-				r.bump(func(s *Stats) { s.Dropped++ })
-				return
-			}
-		} else {
-			r.cfg.Logf("中继：客户端 %v 起一条分配腿 → 后端 %x（中继侧出口 %v）",
-				client, lg.label[:], a.sock.LocalAddr())
-		}
-	} else {
-		a.last = time.Now()
-		r.mu.Unlock()
-	}
-	frame := proto.EncodeFrame(typ, payload)
-	r.mu.Lock()
-	if a.dialUp {
-		// 等腿窗口：缓冲（上限外丢弃——QUIC 首包风暴也就 1-2 个包）
-		a.pendMu.Lock()
-		if len(a.pend) < ctlPendMax {
-			a.pend = append(a.pend, frame)
-			a.pendMu.Unlock()
-			r.mu.Unlock()
-			r.bump(func(s *Stats) { s.ForwardedUp++ })
-			return
-		}
-		a.pendMu.Unlock()
-		r.mu.Unlock()
-		r.bump(func(s *Stats) { s.Dropped++ })
-		return
-	}
-	dst := a.backend
-	r.mu.Unlock()
-	_, _ = a.sock.WriteToUDPAddrPort(frame, dst)
-	r.bump(func(s *Stats) { s.ForwardedUp++ })
-}
 
 // hasControlLocked：leg 是否挂着**v2**控制连接（调用方持 r.mu）。v1 控制连接不算——
 // 它解不开 v2 SESSION（cookie），硬通告只会让后端反复拨腿失败（review #25）。
-func (r *Relay) hasControlLocked(lg *leg) bool {
-	return lg != nil && lg.ctl != nil && lg.ctlV2
-}
 
 // legMACKey：腿认证 MAC 的密钥——token 模式 = 中继鉴权密钥（与后端共享）；
 // 开放模式 = cookie 本身（只防盲攻击者；能读线路的观察者在开放模式下本就无防）。
-func (r *Relay) legMACKey(cookie [16]byte) [32]byte {
-	if r.cfg.Secret != ([32]byte{}) {
-		return r.cfg.Secret
-	}
-	var k [32]byte
-	copy(k[:16], cookie[:])
-	return k
-}
 
 // legRejectThrottle：未认证源被拒日志的节流（每会话首几条 + 之后抽样）。
-func legRejectLog(n uint64) bool {
-	return n <= 3 || n%100 == 0
-}
 
 // assocReadLoop：后端 → 客户端。后端回程是**裸 WG**（device 不知道帧），也可能带 hint 腿帧。
 //
@@ -761,254 +374,21 @@ func legRejectLog(n uint64) bool {
 //     的第三方都能收走 WG 密文/黑洞上行/注入 hint，相对旧模型是安全回归）；
 //   - v1 会话（无 cookie，仅存在于 v1 后端的 fallback 路径）维持旧行为：backend 恒为
 //     lg.addr，源变化由 forwardUp 的既有重建路径处理。
-func (r *Relay) assocReadLoop(a *assoc) {
-	buf := make([]byte, 65535)
-	for {
-		n, from, err := a.sock.ReadFromUDPAddrPort(buf)
-		if err != nil {
-			return
-		}
-		pkt := buf[:n]
-		from = unmap(from) // 与 readLoop 同款：4in6 映射形态统一成 v4，否则后续比较恒不等
-		r.mu.Lock()
-		now := time.Now()
-		if a.sid != 0 {
-			// ---- v2 拨腿会话：认证状态机 ----
-			if a.authOK && a.authSrc == from {
-				// 常态：已认证源的下行（裸 WG 数据或重发的 LEGUP 标记都算）。
-				a.last, a.lastDown = now, now
-				r.mu.Unlock()
-			} else if c, isLegup := proto.LegupCookie(pkt); isLegup && c == a.cookie &&
-				proto.VerifyLegupAuth(pkt, a.sid, a.cookie, r.legMACKey(a.cookie)) {
-				// 合法认证：首拨（authOK=false，放行 pend）或已认证腿的重拨/换源
-				//（控制重连重放后的再拨——源变了但 cookie 认得出来）。
-				first := !a.authOK
-				moved := a.authOK && a.authSrc != from
-				a.authOK = true
-				a.authSrc = from
-				a.backend = from
-				a.last, a.lastDown = now, now
-				sid := a.sid // 锁内取值：replaySessions 会在 r.mu 下改写 a.sid（review 复审 b2）
-				r.mu.Unlock()
-				if first {
-					r.mu.Lock()
-					a.dialUp = false
-					r.mu.Unlock()
-					a.pendMu.Lock()
-					pend := a.pend
-					a.pend = nil
-					a.pendMu.Unlock()
-					for _, p := range pend {
-						_, _ = a.sock.WriteToUDPAddrPort(p, from)
-					}
-				}
-				if moved {
-					r.cfg.Logf("中继：会话 #%d 的后端腿重拨 → %v（cookie 认证通过，跟随）", sid, from)
-				}
-			} else {
-				// 未认证/未知源：丢弃并计数，不改变任何状态、不续命（#3）。
-				r.stats.LegRejected++
-				n := r.stats.LegRejected
-				sid := a.sid // 同上：锁内取值
-				rateOK := r.legRateOKLocked(from.Addr())
-				r.mu.Unlock()
-				if rateOK && legRejectLog(n) {
-					r.cfg.Logf("中继：会话 #%d 收到未知源 %v 的包（%dB）—— 已拒绝（未认证不得成为腿；累计 %d 次）",
-						sid, from, len(pkt), n)
-				}
-				continue
-			}
-		} else {
-			// ---- v1 会话（sid==0，fallback：backend = lg.addr）----
-			a.last, a.lastDown = now, now
-			r.mu.Unlock()
-		}
-		// LEGUP 家族吞包（判定在分支外）：首腿、重拨腿与已认证源的重复标记都不外泄
-		//（WG 层虽会丢弃 5 字节残包，但别把标记泄给对端）。
-		if proto.IsPlainLegup(pkt) {
-			continue
-		}
-		if _, isLegup := proto.LegupCookie(pkt); isLegup {
-			continue
-		}
-		frame := pkt
-		if len(pkt) == 0 || pkt[0] != 0xBB {
-			// 裸 WG：包成数据腿帧再发给客户端
-			frame = proto.EncodeFrame(proto.FrameTypeData, pkt)
-		}
-		if _, err := r.pc.WriteToUDPAddrPort(frame, a.key.client); err != nil {
-			return
-		}
-		r.bump(func(s *Stats) { s.ForwardedDown++ })
-	}
-}
 
 // legRateOKLocked：被拒路径的每源限速（**调用方持 r.mu**——它在认证拒绝分支内使用，
 // 包一层 Lock 会当场死锁）。只约束**日志与认证计算**的代价，不碰转发——转发只对
 // 已认证源发生，真实后端不会被限。阈值取准入限流的 10 倍。
-func (r *Relay) legRateOKLocked(ip netip.Addr) bool {
-	now := time.Now()
-	b := r.legRates[ip]
-	limit := r.cfg.RateLimit * 10
-	if b == nil || now.Sub(b.window) >= time.Second {
-		r.legRates[ip] = &rateBucket{window: now, count: 1}
-		return true
-	}
-	b.count++
-	return b.count <= limit
-}
 
 // sendHintToClient：把**后端注册腿的源地址**告诉客户端（客户端据此打洞）。
-func (r *Relay) sendHintToClient(a *assoc, lg *leg) {
-	r.mu.Lock()
-	addr := lg.addr
-	r.mu.Unlock()
-	if !addr.IsValid() {
-		return
-	}
-	frame := proto.EncodeHint(addr.String())
-	_, _ = r.pc.WriteToUDPAddrPort(frame, a.key.client)
-}
 
 // sendHintToBackend：把**客户端在中继眼里的源地址**告诉后端（后端据此盲打 + 学习）。
-func (r *Relay) sendHintToBackend(a *assoc, client netip.AddrPort) {
-	frame := proto.EncodeHint(client.String())
-	// 持锁读 backend（review B5）：assocReadLoop 在锁内写它，裸读是数据竞争。
-	r.mu.Lock()
-	dst := a.backend
-	r.mu.Unlock()
-	if !dst.IsValid() {
-		return // 拨腿等待中（无 backend 可发）
-	}
-	_, _ = a.sock.WriteToUDPAddrPort(frame, dst)
-}
 
 // reapInterval：回收扫描节拍。默认 5s；配置了更短的回收窗时按其一半收缩
 // （测试用百毫秒级超时，不必等 5s 一轮；生产默认值都不收缩）。
-func (r *Relay) reapInterval() time.Duration {
-	d := 5 * time.Second
-	for _, c := range []time.Duration{r.cfg.IdleTimeout, r.cfg.DialWait, r.cfg.DownSilent} {
-		if c > 0 && c/2 < d {
-			d = c / 2
-		}
-	}
-	if d < 20*time.Millisecond {
-		d = 20 * time.Millisecond
-	}
-	return d
-}
 
 // reapLoop：回收空闲分配腿 + 过期注册腿。
-func (r *Relay) reapLoop(ctx context.Context) {
-	t := time.NewTicker(r.reapInterval())
-	defer t.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-t.C:
-		}
-		now := time.Now()
-		var reclaim int
-		var released []*leg
-		var releasedIds []uint64
-		r.mu.Lock()
-		for k, a := range r.assocs {
-			why := ""
-			switch {
-			case now.Sub(a.last) > r.cfg.IdleTimeout:
-				why = "" // 普通空闲：走既有聚合计数，不逐条打日志
-			case a.dialUp && now.Sub(a.dialUpAt) > r.cfg.DialWait:
-				why = fmt.Sprintf("拨腿等待超 %v（通告后无 LEGUP——后端拨腿失败/通告丢失）", r.cfg.DialWait)
-			case !a.dialUp && now.Sub(a.lastDown) > r.cfg.DownSilent:
-				// 拨腿等待中的会话由 DialWait 看门狗负责（见上一条）：它的 lastDown 从
-				// 创建时刻起算，若 DownSilent 比 DialWait 短就会在腿还没认证上来之前被
-				// 当"半死会话"拆掉（review 复审 b1 的抖动根因；生产默认 15s < 5min 掩盖了它）。
-				why = fmt.Sprintf("下行静默超 %v（上行仍活跃——半死会话兜底）", r.cfg.DownSilent)
-			default:
-				continue
-			}
-			if why != "" {
-				r.cfg.Logf("中继：会话 #%d 回收：%s", a.sid, why)
-			}
-			_ = a.sock.Close()
-			delete(r.assocs, k)
-			reclaim++
-			if a.sid != 0 {
-				if lg := r.legs[k.label]; lg != nil {
-					released = append(released, lg)
-					releasedIds = append(releasedIds, a.sid)
-				}
-			}
-		}
-		r.mu.Unlock()
-		// 拨腿会话回收 → 通告后端放腿（锁外写，避免与 announceSession 抢锁序）。
-		for i, lg := range released {
-			r.releaseSession(lg, releasedIds[i])
-		}
-		r.mu.Lock()
-		r.stats.Reclaimed += uint64(reclaim)
-		for label, lg := range r.legs {
-			// 存活判定：挂着控制连接的腿由控制保活续命（readControlLoop 刷 last）；
-			// 已验证（UDP 注册挑战或控制面挑战任一）按 last 在 LegTimeout 内；
-			// **未验证的腿只保留 legBootstrap 注册窗口**——建腿时 last=now（见
-			// legForControl / handleControl Hello），窗口内完成不了验证就摘，
-			// 既防匿名 Hello 占位、又让慢握手不与 reap 轮竞争（见 legBootstrap 注释）。
-			alive := now.Sub(lg.last) <= r.cfg.LegTimeout
-			if lg.ctl == nil && !lg.verified && !lg.ctlVerified {
-				alive = now.Sub(lg.last) <= legBootstrap
-			}
-			if !alive {
-				r.cfg.Logf("中继：后端 %x 注册腿过期（%v 无保活）—— 摘掉", label[:], now.Sub(lg.last).Round(time.Second))
-				if lg.ctl != nil {
-					lg.ctl.close()
-				}
-				for k, a := range r.assocs {
-					if k.label == label {
-						_ = a.sock.Close()
-						delete(r.assocs, k)
-					}
-				}
-				delete(r.legs, label)
-			}
-		}
-		// 限流桶清理（窗口外的直接丢）
-		for ip, b := range r.rates {
-			if now.Sub(b.window) > 2*time.Second {
-				delete(r.rates, ip)
-			}
-		}
-		for ip, b := range r.legRates {
-			if now.Sub(b.window) > 2*time.Second {
-				delete(r.legRates, ip)
-			}
-		}
-		r.mu.Unlock()
-		if reclaim > 0 {
-			r.cfg.Logf("中继：回收 %d 条空闲分配腿（当前 %d 条）", reclaim, r.assocCount())
-		}
-	}
-}
 
 // statsLoop：分钟级统计一行（运维判据：转发量/分配数/丢弃数）。
-func (r *Relay) statsLoop(ctx context.Context) {
-	t := time.NewTicker(time.Minute)
-	defer t.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-t.C:
-		}
-		st := r.Stats()
-		r.mu.Lock()
-		legs, assocs := len(r.legs), len(r.assocs)
-		r.mu.Unlock()
-		r.cfg.Logf("中继统计：注册腿 %d（累计成功 %d，伪造 %d）｜分配腿 %d（累计 %d，回收 %d）｜转发 上 %d / 下 %d 包｜丢弃 %d",
-			legs, st.Registered, st.Forged, assocs, st.Assigned, st.Reclaimed,
-			st.ForwardedUp, st.ForwardedDown, st.Dropped)
-	}
-}
 
 // closeAll：收工（幂等）。关全部会话 socket + 全部控制连接，并尽力给拨腿会话补发
 // RELEASE（review B1——进程即将退出，写不进 TCP 就算了；后端还有 ClearLegs+重放对账
@@ -1045,35 +425,7 @@ func (r *Relay) closeAll() {
 	}
 }
 
-func (r *Relay) assocCount() int {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	return len(r.assocs)
-}
-
-func (r *Relay) countAssocsLocked(label [8]byte) int {
-	n := 0
-	for k := range r.assocs {
-		if k.label == label {
-			n++
-		}
-	}
-	return n
-}
-
 // rateOK：每源每秒包数限流（准入闸：防蹭转发资源/放大器）。
-func (r *Relay) rateOK(ip netip.Addr) bool {
-	now := time.Now()
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	b := r.rates[ip]
-	if b == nil || now.Sub(b.window) >= time.Second {
-		r.rates[ip] = &rateBucket{window: now, count: 1}
-		return true
-	}
-	b.count++
-	return b.count <= r.cfg.RateLimit
-}
 
 func (r *Relay) bump(f func(*Stats)) {
 	r.mu.Lock()
@@ -1089,26 +441,6 @@ func unmap(ap netip.AddrPort) netip.AddrPort {
 }
 
 // RegisterLeg：查一条注册腿是否在（测试/诊断）。
-func (r *Relay) RegisterLeg(label [8]byte) (netip.AddrPort, bool) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	lg := r.legs[label]
-	if lg == nil || !(lg.verified || lg.ctlVerified) {
-		return netip.AddrPort{}, false
-	}
-	return lg.addr, true
-}
 
 // sameIPAsControl 保活源 IP 是否与控制连接同源（FIX-68 的无 addr 腿判据；控制连接
 // 不在/地址取不到 = 不接受该保活）。
-func sameIPAsControl(cc *ctlConn, src netip.AddrPort) bool {
-	ra := cc.c.RemoteAddr()
-	if ra == nil {
-		return false
-	}
-	ap, err := netip.ParseAddrPort(ra.String())
-	if err != nil {
-		return false
-	}
-	return ap.Addr().Unmap() == src.Addr().Unmap()
-}
