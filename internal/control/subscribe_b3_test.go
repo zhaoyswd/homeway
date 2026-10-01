@@ -158,7 +158,7 @@ func TestServerB3SecondSubscribeArmedReceive(t *testing.T) {
 		for i := 1; i <= 5; i++ {
 			b3Pub(t, ts, i)
 		}
-		if _, err := nc.Write(EncodeFrame(OpReq, []byte(`{"corr":1,"op":"events.subscribe","args":{"domains":["session"],"cursor":0}}`))); err != nil {
+		if _, err := nc.Write(EncodeFrame(OpReq, []byte(fmt.Sprintf(`{"corr":1,"op":"events.subscribe","args":{"domains":["session"],"cursor":0,"generation":"%s"}}`, ts.bus.Generation())))); err != nil {
 			t.Fatal(err)
 		}
 		rsp, pre, post := b3ReadUntil(t, nc, r, 1, 5)
@@ -172,7 +172,7 @@ func TestServerB3SecondSubscribeArmedReceive(t *testing.T) {
 				time.Sleep(150 * time.Microsecond)
 			}
 		}()
-		if _, err := nc.Write(EncodeFrame(OpReq, []byte(`{"corr":2,"op":"events.subscribe","args":{"domains":["session"],"cursor":0}}`))); err != nil {
+		if _, err := nc.Write(EncodeFrame(OpReq, []byte(fmt.Sprintf(`{"corr":2,"op":"events.subscribe","args":{"domains":["session"],"cursor":0,"generation":"%s"}}`, ts.bus.Generation())))); err != nil {
 			t.Fatal(err)
 		}
 		rsp2, pre2, post2 := b3ReadUntil(t, nc, r, 2, 46)
@@ -204,7 +204,7 @@ func TestServerB3FirstSubscribeActiveWriter(t *testing.T) {
 		// 订阅请求先行、host.list 风暴紧随其后（同一 goroutine 顺序写）：reader
 		// 逐帧分发，opSubscribe goroutine 与风暴应答交错——writer 持续有 highC
 		// 可排（循环重入 step，非阻塞 evC 分支在注册后即 armed）。
-		if _, err := nc.Write(EncodeFrame(OpReq, []byte(`{"corr":1,"op":"events.subscribe","args":{"domains":["session"],"cursor":0}}`))); err != nil {
+		if _, err := nc.Write(EncodeFrame(OpReq, []byte(fmt.Sprintf(`{"corr":1,"op":"events.subscribe","args":{"domains":["session"],"cursor":0,"generation":"%s"}}`, ts.bus.Generation())))); err != nil {
 			t.Fatal(err)
 		}
 		for c := 1000; c < 1030; c++ {
@@ -226,7 +226,7 @@ func TestServerB3LargeReplayCompleteDelivery(t *testing.T) {
 		b3Pub(t, ts, i)
 	}
 	nc, r := b3RawDial(t, ts)
-	if _, err := nc.Write(EncodeFrame(OpReq, []byte(`{"corr":7,"op":"events.subscribe","args":{"domains":["session"],"cursor":0}}`))); err != nil {
+	if _, err := nc.Write(EncodeFrame(OpReq, []byte(fmt.Sprintf(`{"corr":7,"op":"events.subscribe","args":{"domains":["session"],"cursor":0,"generation":"%s"}}`, ts.bus.Generation())))); err != nil {
 		t.Fatal(err)
 	}
 	rsp, pre, post := b3ReadUntil(t, nc, r, 7, 600)
@@ -277,7 +277,7 @@ func TestServerB3ErrorConfirmClearsLatch(t *testing.T) {
 	ts := startTestServer(t, facade.BusConfig{SubQueue: 256})
 	nc, r := b3RawDial(t, ts)
 	// 先订阅成功（corr=1）——连接成为已订阅形态（writer 驻留 evC 消费）。
-	if _, err := nc.Write(EncodeFrame(OpReq, []byte(`{"corr":1,"op":"events.subscribe","args":{"domains":["session"]}}`))); err != nil {
+	if _, err := nc.Write(EncodeFrame(OpReq, []byte(fmt.Sprintf(`{"corr":1,"op":"events.subscribe","args":{"domains":["session"],"generation":"%s"}}`, ts.bus.Generation())))); err != nil {
 		t.Fatal(err)
 	}
 	rsp, pre, post := b3ReadUntil(t, nc, r, 1, 0)
@@ -353,7 +353,7 @@ func TestServerB3ConfirmBeforeReplayHeldFramesOrder(t *testing.T) {
 			b3Pub(t, ts, i)
 		}
 	}()
-	if _, err := nc.Write(EncodeFrame(OpReq, []byte(`{"corr":3,"op":"events.subscribe","args":{"domains":["session"],"cursor":0}}`))); err != nil {
+	if _, err := nc.Write(EncodeFrame(OpReq, []byte(fmt.Sprintf(`{"corr":3,"op":"events.subscribe","args":{"domains":["session"],"cursor":0,"generation":"%s"}}`, ts.bus.Generation())))); err != nil {
 		t.Fatal(err)
 	}
 	rsp, pre, post := b3ReadUntil(t, nc, r, 3, 20)

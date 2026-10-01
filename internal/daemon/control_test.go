@@ -125,7 +125,7 @@ func TestControlPlaneAssemblyEndToEnd(t *testing.T) {
 	}
 
 	// 订阅 session 域 → host.add（本地签发 token）→ session.added 事件到达。
-	if _, err := c.Subscribe(ctx, []string{facade.DomainSession}, nil, "", ""); err != nil {
+	if _, err := c.Subscribe(ctx, []string{facade.DomainSession}, nil, "", st.Generation); err != nil {
 		t.Fatal(err)
 	}
 	tok := proto.Token{PeerID: [32]byte{9}, Secret: [32]byte{9, 9}, Endpoints: []proto.Endpoint{{Addr: "203.0.113.99:41641"}}}

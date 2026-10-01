@@ -66,6 +66,9 @@ type TableEvents interface {
 	// HostStateChanged 会话状态迁移（session.state_changed——hostsession Observer
 	// 的转发；state 值域随状态机：starting/ready/failed/stopping/idle）。
 	HostStateChanged(id, from, to, reason string)
+	// HostLinkChanged 链路形态变化（link.changed——hostsession LinkChanged 的转发；
+	// via/ep 变化沿，FIX-22 接通：此前 kind 只有消费无生产，watch 链路列恒不更新）。
+	HostLinkChanged(id, via, ep string, rttMs, at int64)
 }
 
 // busEvents TableEvents → 进程级总线（session 域，§3.2 事件源直发——替代已删的
@@ -85,6 +88,11 @@ func (e *busEvents) HostRemoved(id, reason string) {
 func (e *busEvents) HostStateChanged(id, from, to, reason string) {
 	_, _ = e.bus.Publish(DomainSession, KindSessionStateChanged,
 		SessionStateChangedPayload{Host: id, State: to, Reason: reason})
+}
+
+func (e *busEvents) HostLinkChanged(id, via, ep string, rttMs, at int64) {
+	_, _ = e.bus.Publish(DomainLink, KindLinkChanged,
+		LinkChangedPayload{Host: id, Via: via, Ep: ep, RttMs: rttMs, At: at})
 }
 
 // HostRecord hosts.json 的一条：一台后端主机的登记（键 = ID = token 里的后端公钥）。
@@ -239,6 +247,12 @@ func (r *hostTable) startSessionLocked(e *hostEntry) {
 		})
 	}
 	sopts := hostsession.Options{StrictIdentity: r.strict, Observer: obs}
+	if r.events != nil {
+		hostID, ev := rec.ID, r.events
+		sopts.LinkChanged = func(via, ep string, rttMs, at int64) { // link.changed 生产者（FIX-22）
+			ev.HostLinkChanged(hostID, via, ep, rttMs, at)
+		}
+	}
 	if r.hooks != nil {
 		sopts.Demand, sopts.Diag = r.hooks(rec, e) // §6：桌面门 + 诊因发射接线（绑 e）
 	}

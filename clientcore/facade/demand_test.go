@@ -87,7 +87,7 @@ func TestDemandSynthesisThreeSources(t *testing.T) {
 	h.activeNx.Add(-1)
 	// 源③订阅视图：单真（view 声明聚合到主机集合）。
 	sub := bus.NewSubscriber()
-	if err := bus.Subscribe(sub, []string{DomainSession}, nil, "", "host="+hexID); err != nil {
+	if err := bus.Subscribe(sub, []string{DomainSession}, nil, bus.Generation(), "host="+hexID); err != nil {
 		t.Fatal(err)
 	}
 	if a, why := h.evaluate(bus, id); !a || why != "订阅视图" {
@@ -101,7 +101,7 @@ func TestDemandSynthesisThreeSources(t *testing.T) {
 	// 断连入口（exec-r1 低-6）：wire 断开走 Bus.Unsubscribe(c.sub)（server.go
 	// close() 段——与 UnsubscribeDomains 等价但非同一入口）；同入口下 view 聚合
 	// 回落的直接断言（此前只有代码阅读证据）。
-	if err := bus.Subscribe(sub, []string{DomainSession}, nil, "", "host="+hexID); err != nil {
+	if err := bus.Subscribe(sub, []string{DomainSession}, nil, bus.Generation(), "host="+hexID); err != nil {
 		t.Fatal(err)
 	}
 	if a, _ := h.evaluate(bus, id); !a {
@@ -120,13 +120,13 @@ func TestDemandViewAtomicReplace(t *testing.T) {
 	other := strings.Repeat("cc", 32)
 	bus := NewBus(NewGeneration(), BusConfig{})
 	sub := bus.NewSubscriber()
-	if err := bus.Subscribe(sub, []string{DomainSession}, nil, "", "host="+hexID); err != nil {
+	if err := bus.Subscribe(sub, []string{DomainSession}, nil, bus.Generation(), "host="+hexID); err != nil {
 		t.Fatal(err)
 	}
 	if !bus.viewDemand(id) {
 		t.Fatal("view 声明应参与聚合")
 	}
-	if err := bus.Subscribe(sub, []string{DomainLink}, nil, "", "host="+other); err != nil {
+	if err := bus.Subscribe(sub, []string{DomainLink}, nil, bus.Generation(), "host="+other); err != nil {
 		t.Fatal(err)
 	}
 	if bus.viewDemand(id) {
@@ -180,7 +180,7 @@ func TestFacadeWiresDemandDiagHooks(t *testing.T) {
 	}
 	hexID := briefs[0].ID
 	sub := d.Bus().NewSubscriber()
-	if err := d.Bus().Subscribe(sub, []string{DomainSession}, nil, "", ""); err != nil {
+	if err := d.Bus().Subscribe(sub, []string{DomainSession}, nil, d.Bus().Generation(), ""); err != nil {
 		t.Fatal(err)
 	}
 	for _, reason := range []string{"gated", "budget", "probe_window"} {
@@ -252,11 +252,10 @@ func demandTestToken(t *testing.T) string {
 }
 
 // TestDemandTruthTableAlignment §6.4 真值表对齐审计的 **facade 侧向量用例**：
-// 桌面门（hostsession.PatrolEvidenceGate，§6.1 落地）与手机门
-// （cmd/clientcore patrolEvidenceGate，既有用例复核）共享真值表向量（五分支：
-// 成功拍清零 / localNoise 清零 / 无需求清零 / 窗口作废 / 正常计数）——本用例
-// 断言桌面侧全分支兑现（「两侧同向量对照表」的 facade 侧承载；手机侧 =
-// cmd/clientcore/demand_test.go 的 TestPatrolEvidenceGate* 系）。
+// 手机门与桌面门已收口到同一实现（hostsession.PatrolEvidenceGate，FIX-20），
+// 五分支向量（成功拍清零 / localNoise 清零 / 无需求清零 / 窗口作废 / 正常计数）
+// 在本层全量断言；cshared 面的序列级回归见 cmd/clientcore/demand_test.go 的
+// TestPatrolEvidenceGateSuccessResets。
 func TestDemandTruthTableAlignment(t *testing.T) {
 	now := time.Now()
 	errProbe := errors.New("probe fail")
@@ -383,7 +382,7 @@ func TestDemandRefreshKeepsSingleState(t *testing.T) {
 	}
 	// view 需求为真 → 新会话的钩子判定（会话侧写）。
 	sub := d.Bus().NewSubscriber()
-	if err := d.Bus().Subscribe(sub, []string{DomainSession}, nil, "", "host="+hexID); err != nil {
+	if err := d.Bus().Subscribe(sub, []string{DomainSession}, nil, d.Bus().Generation(), "host="+hexID); err != nil {
 		t.Fatal(err)
 	}
 	if a, why := captured[1].Demand(); !a || why != "订阅视图" {

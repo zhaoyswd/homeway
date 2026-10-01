@@ -87,27 +87,6 @@ func demandSnapshotJSON() map[string]any {
 	}
 }
 
-// patrolEvidenceGate 巡检拍的证据推进（纯函数，单测覆盖；评审 H3 整改后成功拍也走这里）：
-//   - 探测成功 ⇒ 计数清零（counted=false——成功拍不计失败证据；旧 patrolFailStreak 的
-//     成功清零语义在此恢复：F,S,F,F 必须停在 2，而不是拼出 3 连败）；
-//   - localNoise（探测窗内有采纳路径本地发送错误）或 !demand ⇒ 计数清零、不计证据；
-//   - 计数拍之间间隔超过 patrolFailWindow ⇒ 计数作废重来（不跨长时间拼凑）；
-//   - 正常计数拍 ⇒ +1。
-//
-// 返回推进后的计数与「本拍是否计入失败证据」。
-func patrolEvidenceGate(localNoise, demand bool, failStreak int, lastCountedFail, now time.Time, probeErr error) (int, bool) {
-	if probeErr == nil {
-		return 0, false // 成功拍清零（"连败"的连续语义）
-	}
-	if localNoise || !demand {
-		return 0, false
-	}
-	if failStreak > 0 && !lastCountedFail.IsZero() && now.Sub(lastCountedFail) > patrolFailWindow {
-		failStreak = 0
-	}
-	return failStreak + 1, true
-}
-
 // patrolDemand 巡检拍的需求合成：本拍 App 出站包数（hub 计数取走）‖ 新鲜的前台/亮屏位。
 // 返回（active, reason）。reason 进边沿日志与状态 JSON，排障时「为什么这拍算/不算需求」
 // 有据可查。TUN 位只代表进隧道的应用流量（栈 B 核心自连与被绕过应用不产生）——

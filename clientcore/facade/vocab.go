@@ -80,13 +80,11 @@ const (
 
 // ---------- 订阅域 ----------
 
-// 订阅域词表（spec 初始集，只增不改）。
+// 订阅域词表（spec 初始集，只增不改）。FIX-23：transfer/log/term 三域随其
+// 无生产者 kind 一并删除（词表与实况对齐——现有事件源只有 session 与 link）。
 const (
-	DomainLink     = "link"
-	DomainSession  = "session"
-	DomainTransfer = "transfer"
-	DomainLog      = "log"
-	DomainTerm     = "term"
+	DomainLink    = "link"
+	DomainSession = "session"
 )
 
 // ---------- 事件 kind 与归属 ----------
@@ -97,13 +95,7 @@ const (
 	KindSessionAdded        = "session.added"
 	KindSessionRemoved      = "session.removed"
 	KindSessionStateChanged = "session.state_changed"
-	KindSessionLadder       = "session.ladder"
-	KindSessionRebuild      = "session.rebuild"
 	KindSessionDiag         = "session.diag" // 词表冻结；自 4a §6.3 起发射（spec「诊因事件词表」）
-	KindTransferSample      = "transfer.sample"
-	KindLogLine             = "log.line"
-	KindTermSessionUpdated  = "term.session_updated" // kind 值冻结；载荷字段初始集为空（后续 delta 增补）
-	KindTermEnded           = "term.ended"           // 同上
 )
 
 // kindDomains kind → 域 的唯一归属表（Publish 校验 + fixtures 对拍真源）。
@@ -112,18 +104,12 @@ var kindDomains = map[string]string{
 	KindSessionAdded:        DomainSession,
 	KindSessionRemoved:      DomainSession,
 	KindSessionStateChanged: DomainSession,
-	KindSessionLadder:       DomainSession,
-	KindSessionRebuild:      DomainSession,
 	KindSessionDiag:         DomainSession,
-	KindTransferSample:      DomainTransfer,
-	KindLogLine:             DomainLog,
-	KindTermSessionUpdated:  DomainTerm,
-	KindTermEnded:           DomainTerm,
 }
 
 // validDomains 订阅域词表。
 var validDomains = map[string]bool{
-	DomainLink: true, DomainSession: true, DomainTransfer: true, DomainLog: true, DomainTerm: true,
+	DomainLink: true, DomainSession: true,
 }
 
 // ---------- 事件载荷字段表（spec「事件流」初始集落实现；字段只增不改） ----------
@@ -158,20 +144,6 @@ type SessionStateChangedPayload struct {
 	Reason string `json:"reason"`
 }
 
-// SessionLadderPayload session.ladder 载荷（发射点归 facade 期，词表先行）。
-type SessionLadderPayload struct {
-	Host    string `json:"host"`
-	Level   string `json:"level"`
-	Outcome string `json:"outcome"`
-	Cause   string `json:"cause"`
-}
-
-// SessionRebuildPayload session.rebuild 载荷。
-type SessionRebuildPayload struct {
-	Host   string `json:"host"`
-	Reason string `json:"reason"`
-}
-
 // SessionDiagPayload session.diag 载荷（词表冻结；自 4a §6.3 起发射；reason 值初始集
 // gated/budget/probe_window——只增不改）。
 type SessionDiagPayload struct {
@@ -185,19 +157,6 @@ const (
 	DiagBudget      = "budget"
 	DiagProbeWindow = "probe_window"
 )
-
-// TransferSamplePayload transfer.sample 载荷。
-type TransferSamplePayload struct {
-	Host    string `json:"host"`
-	RxBytes int64  `json:"rxBytes"`
-	TxBytes int64  `json:"txBytes"`
-}
-
-// LogLinePayload log.line 载荷。
-type LogLinePayload struct {
-	Level string `json:"level"`
-	Msg   string `json:"msg"`
-}
 
 // ---------- 流式通道词汇 ----------
 

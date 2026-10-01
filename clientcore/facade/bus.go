@@ -10,10 +10,8 @@ package facade
 //     不参与——见 server.go handleSnapshotGet）；
 //   ③分发：总线锁内只拷贝订阅者 channel 引用，投递（chan 非阻塞 send）在锁外。
 //
-// 限速在取号之前（spec：总线上已发事件的序号无空洞）：transfer（每 host 默认 1s
-// 一拍）与 log（1s 窗口内有界尾配额）的丢弃不占号——「1s 一拍」按主机采样节拍的
-// 自然语义（per-host），「有界尾」按窗口内最多 N 条（突发日志只放最近 N 条进总线，
-// 其余丢弃——压低环形窗被 log 冲刷的压力，状态域优先保窗）。
+// FIX-23（词表与实况对齐）：transfer/log 两域的限速发射面已随「无生产者 kind」删除
+// ——总线上现有事件源只有 session 与 link 两域，无按域限速需求。
 //
 // 每订阅者队列有界（默认 512）：投递失败不静默丢——标记 overrun 并关闭 sub.Done()
 // （连接层收到即发 goodbye(overrun) 断连，前端 resubscribe + 全量重快照恢复）。
@@ -39,7 +37,6 @@ const (
 	DefaultRingEntries = 4096
 	DefaultRingBytes   = 1 << 20 // 1MiB
 	DefaultSubQueue    = 512
-	DefaultLogBurst    = 20 // log 域 1s 窗口内最多放行条数（有界尾）
 )
 
 // 总线哨兵错误（订阅路径，server 层映射到错误码）。
@@ -61,12 +58,10 @@ type Event struct {
 
 // BusConfig 总线参数（零值 = 全默认；测试注入调小环/队列）。
 type BusConfig struct {
-	RingEntries   int
-	RingBytes     int
-	SubQueue      int
-	TransferEvery time.Duration // transfer 域每 host 采样节拍（默认 1s）
-	LogBurst      int           // log 域 1s 窗口配额（默认 DefaultLogBurst）
-	Now           func() time.Time
+	RingEntries int
+	RingBytes   int
+	SubQueue    int
+	Now         func() time.Time
 }
 
 // Bus 进程内单例事件总线。
@@ -74,20 +69,15 @@ type Bus struct {
 	mu  sync.Mutex
 	gen string
 
-	seq        uint64 // 已发出的最大序号（下一个 = seq+1）
-	ring       []Event
-	ringStart  int // 环内最老元素的起始下标
-	ringLen    int
-	ringBytes  int // 环内 payload 字节量（第二上限）
-	ringCap    int
-	ringMaxBy  int
-	subQueue   int
-	transferEv time.Duration
-	logBurst   int
-	now        func() time.Time
-
-	transferLast map[string]time.Time // per-host 上次放行时刻
-	logTimes     []time.Time          // log 域 1s 窗口内放行时刻（有界尾计数）
+	seq       uint64 // 已发出的最大序号（下一个 = seq+1）
+	ring      []Event
+	ringStart int // 环内最老元素的起始下标
+	ringLen   int
+	ringBytes int // 环内 payload 字节量（第二上限）
+	ringCap   int
+	ringMaxBy int
+	subQueue  int
+	now       func() time.Time
 
 	subs map[*Subscriber]struct{}
 }
@@ -101,23 +91,17 @@ func NewBus(gen string, cfg BusConfig) *Bus {
 		}
 		return v
 	}
-	if cfg.TransferEvery <= 0 {
-		cfg.TransferEvery = time.Second
-	}
 	if cfg.Now == nil {
 		cfg.Now = time.Now
 	}
 	return &Bus{
-		gen:          gen,
-		ring:         make([]Event, fill(cfg.RingEntries, DefaultRingEntries)),
-		ringCap:      fill(cfg.RingEntries, DefaultRingEntries),
-		ringMaxBy:    fill(cfg.RingBytes, DefaultRingBytes),
-		subQueue:     fill(cfg.SubQueue, DefaultSubQueue),
-		transferEv:   cfg.TransferEvery,
-		logBurst:     fill(cfg.LogBurst, DefaultLogBurst),
-		now:          cfg.Now,
-		transferLast: make(map[string]time.Time),
-		subs:         make(map[*Subscriber]struct{}),
+		gen:       gen,
+		ring:      make([]Event, fill(cfg.RingEntries, DefaultRingEntries)),
+		ringCap:   fill(cfg.RingEntries, DefaultRingEntries),
+		ringMaxBy: fill(cfg.RingBytes, DefaultRingBytes),
+		subQueue:  fill(cfg.SubQueue, DefaultSubQueue),
+		now:       cfg.Now,
+		subs:      make(map[*Subscriber]struct{}),
 	}
 }
 
@@ -155,63 +139,8 @@ func (b *Bus) Publish(domain, kind string, payload any) (uint64, error) {
 			raw = b
 		}
 	}
-	if domain == DomainTerm && len(raw) > 0 && string(raw) != "null" && string(raw) != "{}" {
-		return 0, fmt.Errorf("term 域载荷字段初始集为空（收到 %d 字节），字段名由后续 delta 增补", len(raw))
-	}
 	ev := Event{Domain: domain, Kind: kind, Payload: raw}
 	return b.publish(ev)
-}
-
-// PublishTransfer 发布 transfer.sample：**取号前**做每 host 节拍限速（默认 1s 一拍，
-// 窗内的后续采样丢弃、不占号——seq 无洞）。ok=false = 被限速丢弃。
-func (b *Bus) PublishTransfer(p TransferSamplePayload) (seq uint64, ok bool) {
-	now := b.now()
-	b.mu.Lock()
-	if last, have := b.transferLast[p.Host]; have && now.Sub(last) < b.transferEv {
-		b.mu.Unlock()
-		return 0, false // 丢弃发生在取号之前
-	}
-	b.transferLast[p.Host] = now
-	b.mu.Unlock()
-	raw, err := json.Marshal(p)
-	if err != nil {
-		return 0, false
-	}
-	seq, err = b.publish(Event{Domain: DomainTransfer, Kind: KindTransferSample, Payload: raw})
-	if err != nil {
-		return 0, false
-	}
-	return seq, true
-}
-
-// PublishLog 发布 log.line：**取号前**做窗口有界尾限速（1s 窗口内最多 logBurst 条，
-// 超出丢弃、不占号）。ok=false = 被限速丢弃。
-func (b *Bus) PublishLog(p LogLinePayload) (seq uint64, ok bool) {
-	now := b.now()
-	b.mu.Lock()
-	cut := now.Add(-time.Second)
-	keep := b.logTimes[:0]
-	for _, t := range b.logTimes {
-		if t.After(cut) {
-			keep = append(keep, t)
-		}
-	}
-	b.logTimes = keep
-	if len(b.logTimes) >= b.logBurst {
-		b.mu.Unlock()
-		return 0, false // 窗口配额满：丢弃发生在取号之前（保状态域优先占窗）
-	}
-	b.logTimes = append(b.logTimes, now)
-	b.mu.Unlock()
-	raw, err := json.Marshal(p)
-	if err != nil {
-		return 0, false
-	}
-	seq, err = b.publish(Event{Domain: DomainLog, Kind: KindLogLine, Payload: raw})
-	if err != nil {
-		return 0, false
-	}
-	return seq, true
 }
 
 // publish 取号 + 入环 + 分发（锁内取号入环并拷贝订阅者引用，投递在锁外）。
@@ -318,11 +247,15 @@ func (s *Subscriber) OverrunDone() bool { return s.overrun }
 func (s *Subscriber) matches(domain string) bool { return s.domains[domain] }
 
 // Subscribe 挂订阅 + 游标回放（原子：锁内检查游标、回放拷入 pending 段、注册
-// 生效——回放与在线推送之间零缝隙零重叠，B3 订阅原子交付）。同连接重复订阅 =
+// 生效——回放段与在线推送在同一临界区内交接，**不丢**；但二者可能交叠/重复，
+// 交付语义是 at-least-once，前端按 seq 幂等去重（见文件头「投递次序说明」——
+// FIX-24：此前本注释写「零缝隙零重叠」，与 at-least-once 实现相反）。同连接重复订阅 =
 // **替换**（sub.domains 整体换为新载荷集合——daemon-control-plane delta 3b 钉死，
 // B4 澄清：非并集）；pending 回放段同样 = 覆盖（新回放段取代旧段，r3 低-2——
 // 前端按 seq 幂等去重无损）。
 //
+//   - generation 为空 → 普通错误（绑定层映射 bad_request；FIX-24：代际声明必填，
+//     此前空串退化为「仅重放窗检查」，让失配保护可被省略绕过）；
 //   - generation != 当前代际 → ErrCursorStale（前端全量重快照）；
 //   - cursor 超前于当前序号 → ErrCursorFuture（bad_request）；
 //   - cursor+1 早于环内最老 seq（游标过旧/环已被冲刷）→ ErrCursorStale；
@@ -346,9 +279,13 @@ func (b *Bus) Subscribe(sub *Subscriber, domains []string, cursor *uint64, gener
 	}
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	if generation != "" && generation != b.gen {
-		// 代际失配（spec「守护进程重启后旧游标失效」）：cursor_stale 引导全量
-		// 重快照。缺省（不带 generation 的旧前端）退化为仅重放窗检查。
+	if generation == "" {
+		// 代际声明必填（FIX-24，spec 同步为必填）：空串不再退化为「仅重放窗检查」，
+		// 否则失配保护可被前端省略绕过。绑定层把本错误映射为 bad_request。
+		return errors.New("订阅必须携带代际（generation 为空）")
+	}
+	if generation != b.gen {
+		// 代际失配（spec「守护进程重启后旧游标失效」）：cursor_stale 引导全量重快照。
 		return fmt.Errorf("%w: 代际失配（订阅带 %q，当前 %q）", ErrCursorStale, generation, b.gen)
 	}
 	var replay []Event

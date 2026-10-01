@@ -20,9 +20,9 @@ func TestServerBindProbeEndpointsList(t *testing.T) {
 		netip.MustParseAddrPort("[2001:db8::1]:41641"),
 	}
 	b := &ServerBind{
-		Logf:  func(string, ...any) {},
-		Build: "v-probeeps",
-		Caps:  func() byte { return 0 },
+		Logf:           func(string, ...any) {},
+		Build:          "v-probeeps",
+		Caps:           func() byte { return 0 },
 		ProbeEndpoints: func() []netip.AddrPort { return endpoints },
 	}
 	fns, _, err := b.Open(0)

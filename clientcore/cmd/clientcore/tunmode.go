@@ -28,6 +28,8 @@ import (
 	"unsafe"
 
 	"golang.org/x/sys/unix"
+
+	"github.com/zhaoyswd/homeway/clientcore/hostsession"
 )
 
 // tunConfig 已随迁 hostsession.Config（host-registry-daemon D1：本文件经
@@ -147,18 +149,9 @@ func relayUpgradeDue(via string, streak int) bool {
 	return via == "relay" && streak >= relayUpgradeEvery
 }
 
-// patrolFailWindow：「巡检连败」的时间窗（demand-driven-recovery）：相邻两次**计入证据**
-// 的失败间隔超过它，计数作废重来。2026-09-23 事故形态：1/3、2/3、3/3 横跨三小时（计数
-// 是跨挂起存活的局部变量），任一拍需求为真就能把无需求期的失败换算成一次升级——10 分钟
-// 约等于出口设备表活跃宽限期的量级，「连败」本来就该是连续拍的意思。
-const patrolFailWindow = 10 * time.Minute
-
-// localNoiseEscalate：本地错误门控的长停逃逸阈值（评审 4 中-1）。本地类错误混着两种
-// 形态——进程级禁发（挂起 EPERM，换源无效，分钟内随环境恢复解除）与「采纳路径本身
-// 发不出去」（换网后陈 LAN 采纳地址 ENETUNREACH 等）。后者若被噪声门控无限期抑制，
-// 核内将无任何逃逸（旧 handshakeheal 机制已随 4.4 退役）；持续超过本阈值即按质量
-// 失败计——正常升级链的 R3 清采纳正是该形态的解药（D2 只实证了 R1/R2 无效）。
-const localNoiseEscalate = 3 * time.Minute
+// 巡检连败时间窗（10 分钟）：真源 = hostsession.servicePatrolFailWindow（FIX-20
+// 收口——本包 gate 副本已删，手机门直接调 hostsession.PatrolEvidenceGate，窗口
+// 常量随函数单一化；2026-09-23 事故形态见 hostsession 侧注释）。
 
 var (
 	// tunForeground：上次下发的"App 是否在前台"。已不影响巡检节拍（固定 60s），
@@ -867,18 +860,18 @@ func runTun2Tailcat(cfg tunConfig, run *tunRun) error {
 		const perTry = 10 * time.Second
 		failStreak := 0
 		relayStreak := 0             // 连续停留在中继的巡检拍数（见 relayUpgradeEvery）
-		var lastRegRefresh time.Time // 上次补发注册的时刻（见 shouldRefreshReg / regRefreshEvery）
-		var lastLoopAt time.Time     // 上一拍时刻（挂起空窗检测的基线，见 suspendGapDetected）
+		var lastRegRefresh time.Time // 上次补发注册的时刻（见 hostsession.ShouldRefreshReg / RegRefreshEvery）
+		var lastLoopAt time.Time     // 上一拍时刻（挂起空窗检测的基线，见 hostsession.SuspendGapDetected）
 		var busy atomic.Bool
 		// demand-driven-recovery（2026-09-23 弹窗事故整改）：
 		//   - lastCountedFail：上一次**计入证据**的失败时刻——「连败」带时间窗（相邻计数
-		//     失败间隔超过 patrolFailWindow 即作废重来），计数不得跨长时间挂起拼凑
+		//     失败间隔超过 10 分钟窗即作废重来），计数不得跨长时间挂起拼凑
 		//     （事故里 1/3、2/3、3/3 横跨三小时正是靠这个堵住）；
 		//   - gateGated：失败被需求门控拦下的边沿状态（进入拦下态一行、期间静默、
 		//     需求恢复一行——不随 5s/60s 泵刷屏）。
 		var lastCountedFail time.Time
 		gateGated := false
-		// localNoiseSince：本地错误连续持续的起点（长停逃逸的基线，见 localNoiseEscalate）。
+		// localNoiseSince：本地错误连续持续的起点（长停逃逸的基线，见 hostsession.NoiseEscalated）。
 		var localNoiseSince time.Time
 		// probeNow：这一轮不等巡检间隔、立即探测。初始 true（attach 完就立即探——
 		// 界面链路条不必空等第一个间隔）；自重绑成功后也置 true（立刻补一条 link: 行）。
@@ -910,7 +903,7 @@ func runTun2Tailcat(cfg tunConfig, run *tunRun) error {
 			// （>180s 必死）、socket 可能已失效——不等本拍探测失败，直接从轻档起跑阶梯。
 			// 起 goroutine：本拍探测照常进行，两者由阶梯单飞合并。
 			nowAt := time.Now()
-			if suspendGapDetected(lastLoopAt, nowAt, patrolInterval) {
+			if hostsession.SuspendGapDetected(lastLoopAt, nowAt, patrolInterval) {
 				logf("巡检空窗 %v（判为进程被挂起）→ 阶梯恢复", nowAt.Sub(lastLoopAt).Round(time.Second))
 				go runRecoverAt(recoverR1, "挂起唤醒")
 			}
@@ -1013,7 +1006,7 @@ func runTun2Tailcat(cfg tunConfig, run *tunRun) error {
 			// 周期补发注册（demand-driven-recovery 1.7：从探测成功分支移出——失败拍也照发。
 			// 注册走原始 UDP、不依赖 WG 会话与探测结果；此前失败拍靠阶梯 R1 的补注册顺带，
 			// 无需求期的失败拍不起阶梯后就断了保活）。
-			if tr := newTransport(cl); tr != nil && shouldRefreshReg(lastRegRefresh, time.Now()) {
+			if tr := newTransport(cl); tr != nil && hostsession.ShouldRefreshReg(lastRegRefresh, time.Now()) {
 				if tr.RefreshReg() {
 					lastRegRefresh = time.Now()
 				}
@@ -1033,24 +1026,21 @@ func runTun2Tailcat(cfg tunConfig, run *tunRun) error {
 					localNoise = tr.LocalSendErrWithin(perTry + 5*time.Second)
 				}
 			}
-			// 长停逃逸（评审 4 中-1）：本地错误持续超过阈值 ⇒ 不再按环境噪声抑制——
-			// 大概率是采纳路径本身发不出去（换网后陈 LAN 地址），走正常升级链
-			//（R3 清采纳是解药）；挂起禁发通常分钟内随环境恢复解除，到不了这里。
-			if localNoise {
-				if localNoiseSince.IsZero() {
-					localNoiseSince = time.Now()
-				} else if time.Since(localNoiseSince) >= localNoiseEscalate {
-					localNoise = false
-					logf("本地发送错误持续 %s（长停逃逸）：按质量失败计，进入正常升级链",
-						time.Since(localNoiseSince).Round(time.Second))
-					localNoiseSince = time.Time{}
-				}
+			// 长停逃逸（评审 4 中-1，共享纯函数 hostsession.NoiseEscalated）：
+			// 本地错误持续超过阈值 ⇒ 不再按环境噪声抑制——大概率是采纳路径本身
+			// 发不出去（换网后陈 LAN 地址），走正常升级链（R3 清采纳是解药）；
+			// 挂起禁发通常分钟内随环境恢复解除，到不了这里。
+			if esc, ns := hostsession.NoiseEscalated(localNoise, localNoiseSince, time.Now()); esc {
+				logf("本地发送错误持续 %s（长停逃逸）：按质量失败计，进入正常升级链",
+					time.Since(localNoiseSince).Round(time.Second))
+				localNoise = false
+				localNoiseSince = ns
 			} else {
-				localNoiseSince = time.Time{}
+				localNoiseSince = ns
 			}
 			// 赋值而非 `failStreak, counted := ...`：循环体是新块，:= 会 shadow 外层
 			// failStreak（真机复验实测：shadow 后每拍计数恒 1，三连败永远到不了）。
-			newStreak, counted := patrolEvidenceGate(localNoise, demand, failStreak, lastCountedFail, time.Now(), err)
+			newStreak, counted := hostsession.PatrolEvidenceGate(localNoise, demand, failStreak, lastCountedFail, time.Now(), err)
 			failStreak = newStreak
 			if err != nil {
 				if !counted {

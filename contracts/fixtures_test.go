@@ -14,7 +14,7 @@ import (
 	"testing"
 )
 
-// TestLedgerFixturesRefsRule2 规则②：控制面 fixtures v1 的 46 向量里，按路径分类的
+// TestLedgerFixturesRefsRule2 规则②：控制面 fixtures v1 的 44 向量里，按路径分类的
 // 词汇引用值必须 ⊆ 台账对应族/单元。诊断性自由文本（payload.reason/level/msg 等）
 // 不在检查面（D7：仅展示的自由文本不冻结）。
 func TestLedgerFixturesRefsRule2(t *testing.T) {
@@ -112,7 +112,7 @@ func TestLedgerFixturesRefsRule2(t *testing.T) {
 		}
 	}
 	if bad == 0 {
-		t.Log("规则② 绿：46 向量全部词面引用 ⊆ 台账")
+		t.Log("规则② 绿：44 向量全部词面引用 ⊆ 台账")
 	}
 }
 

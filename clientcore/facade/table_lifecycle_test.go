@@ -183,7 +183,8 @@ func (e *reentrantEvents) HostRemoved(id, reason string) {
 	e.mu.Unlock()
 }
 
-func (e *reentrantEvents) HostStateChanged(id, from, to, reason string) {}
+func (e *reentrantEvents) HostStateChanged(id, from, to, reason string)        {}
+func (e *reentrantEvents) HostLinkChanged(id, via, ep string, rttMs, at int64) {}
 
 // TestB6ReentrantCallbackNoDeadlock 重入回调不死锁（有界等待：锁内发射 = 卡死
 // 超时红；锁外 emit = 秒回绿）。

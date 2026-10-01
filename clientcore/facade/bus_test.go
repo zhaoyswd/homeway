@@ -6,6 +6,7 @@ package facade
 // 载荷/词表外 kind 拒绝）。
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"sync"
@@ -34,61 +35,6 @@ func TestBusSeqMonotonicNoHoles(t *testing.T) {
 	}
 	if b.CurrentSeq() != 10 {
 		t.Fatalf("CurrentSeq = %d，期望 10", b.CurrentSeq())
-	}
-}
-
-func TestBusTransferRateLimitBeforeTakingSeq(t *testing.T) {
-	// transfer 限速：同 host 窗内第二条丢弃且**不占号**（总线上已发事件 seq 无洞）。
-	b := NewBus("gen-1", BusConfig{TransferEvery: time.Hour}) // 测试里拍距拉到 1 小时
-	s1, ok1 := b.PublishTransfer(TransferSamplePayload{Host: "h1", RxBytes: 1})
-	if !ok1 || s1 != 1 {
-		t.Fatalf("首条应放行：ok=%v seq=%d", ok1, s1)
-	}
-	_, ok2 := b.PublishTransfer(TransferSamplePayload{Host: "h1", RxBytes: 2})
-	if ok2 {
-		t.Fatalf("同 host 窗内第二条应被限速丢弃")
-	}
-	// 另一个 host 不受影响。
-	s3, ok3 := b.PublishTransfer(TransferSamplePayload{Host: "h2"})
-	if !ok3 || s3 != 2 {
-		t.Fatalf("另一 host 应放行且占号：ok=%v seq=%d", ok3, s3)
-	}
-	// 限速丢弃不占号：session 域下一条 seq = 3（无洞）。
-	seq := pubState(t, b, "h1", "ready")
-	if seq != 3 {
-		t.Fatalf("限速丢弃不能占号：session 事件 seq=%d，期望 3", seq)
-	}
-	// 节拍滑过窗口后恢复放行。
-	b.transferLast["h1"] = time.Now().Add(-2 * time.Hour)
-	s4, ok4 := b.PublishTransfer(TransferSamplePayload{Host: "h1"})
-	if !ok4 || s4 != 4 {
-		t.Fatalf("窗口滑过后应恢复放行：ok=%v seq=%d", ok4, s4)
-	}
-}
-
-func TestBusLogBoundedTailBeforeTakingSeq(t *testing.T) {
-	b := NewBus("gen-1", BusConfig{LogBurst: 3})
-	for i := 0; i < 3; i++ {
-		if _, ok := b.PublishLog(LogLinePayload{Level: "info", Msg: fmt.Sprintf("m%d", i)}); !ok {
-			t.Fatalf("配额内第 %d 条应放行", i)
-		}
-	}
-	if _, ok := b.PublishLog(LogLinePayload{Level: "info", Msg: "m3"}); ok {
-		t.Fatalf("超出窗口配额应丢弃")
-	}
-	// 丢弃不占号。
-	if seq := pubState(t, b, "h", "ready"); seq != 4 {
-		t.Fatalf("log 限速丢弃不能占号：seq=%d 期望 4", seq)
-	}
-	// 窗口滑动（挤掉最老一条）后恢复 1 条配额。
-	cut := time.Now().Add(-2 * time.Second)
-	for i := range b.logTimes {
-		if i == 0 {
-			b.logTimes[i] = cut // 最老一条滑出窗口
-		}
-	}
-	if _, ok := b.PublishLog(LogLinePayload{Level: "info", Msg: "m4"}); !ok {
-		t.Fatalf("窗口滑出后应恢复放行")
 	}
 }
 
@@ -134,6 +80,25 @@ func TestBusGenerationMismatchCursorStale(t *testing.T) {
 	cur := uint64(0)
 	if err := b.Subscribe(sub, []string{DomainSession}, &cur, "gen-old", ""); !errors.Is(err, ErrCursorStale) {
 		t.Fatalf("代际失配应 ErrCursorStale，得到 %v", err)
+	}
+}
+
+// TestBusGenerationRequired FIX-24：代际声明必填——空串不再退化为「仅重放窗
+// 检查」（绑定层映射 bad_request）。变异红路：把 Subscribe 的 generation=="" 分支
+// 改回旧行为（`generation != "" && ...`）⇒ 本用例红。
+func TestBusGenerationRequired(t *testing.T) {
+	b := NewBus("gen-1", BusConfig{})
+	sub := b.NewSubscriber()
+	err := b.Subscribe(sub, []string{DomainSession}, nil, "", "")
+	if err == nil {
+		t.Fatal("空 generation 应被拒（bad_request 面）")
+	}
+	if errors.Is(err, ErrCursorStale) {
+		t.Fatalf("空 generation 不应报 cursor_stale（那是失配语义）：%v", err)
+	}
+	// 同调用带正确代际应成功。
+	if err := b.Subscribe(sub, []string{DomainSession}, nil, b.Generation(), ""); err != nil {
+		t.Fatalf("带代际应成功：%v", err)
 	}
 }
 
@@ -300,20 +265,13 @@ func TestBusKindVocabularyGates(t *testing.T) {
 	if _, err := b.Publish(DomainSession, "session.nonsense", nil); err == nil {
 		t.Fatal("词表外 kind 应拒绝")
 	}
-	if _, err := b.Publish(DomainLog, KindSessionStateChanged, nil); err == nil {
+	if _, err := b.Publish(DomainLink, KindSessionStateChanged, nil); err == nil {
 		t.Fatal("kind/域 不匹配应拒绝")
 	}
 	// session.diag：4a §6.3 起真发射（「本期不发射」硬闸已拆——词表/载荷不动：
 	// host, reason；reason 值域 gated/budget/probe_window 只增不改）。
 	if _, err := b.Publish(DomainSession, KindSessionDiag, SessionDiagPayload{Host: "h", Reason: DiagGated}); err != nil {
 		t.Fatalf("session.diag 应可发射（闸已拆）：%v", err)
-	}
-	// term 域：kind 冻结、载荷初始集为空。
-	if _, err := b.Publish(DomainTerm, KindTermEnded, nil); err != nil {
-		t.Fatalf("term 域空载荷应放行：%v", err)
-	}
-	if _, err := b.Publish(DomainTerm, KindTermEnded, map[string]string{"x": "y"}); err == nil {
-		t.Fatal("term 域非空载荷应拒绝（字段名由后续 delta 增补）")
 	}
 	// link.changed 载荷结构照常发布。
 	if _, err := b.Publish(DomainLink, KindLinkChanged, LinkChangedPayload{Host: "h"}); err != nil {
@@ -349,7 +307,7 @@ func TestBusRingByteBudgetEvicts(t *testing.T) {
 func TestBusConcurrentUnsubscribeDomainsVsPublish(t *testing.T) {
 	b := NewBus("gen-1", BusConfig{SubQueue: 512})
 	sub := b.NewSubscriber()
-	if err := b.Subscribe(sub, []string{DomainSession, DomainLink}, nil, "", ""); err != nil {
+	if err := b.Subscribe(sub, []string{DomainSession, DomainLink}, nil, b.Generation(), ""); err != nil {
 		t.Fatal(err)
 	}
 	var wg sync.WaitGroup
@@ -363,7 +321,7 @@ func TestBusConcurrentUnsubscribeDomainsVsPublish(t *testing.T) {
 	go func() { // 并发订阅/退订域（写 sub.domains——只在 b.mu 内）
 		defer wg.Done()
 		for i := 0; i < 200; i++ {
-			_ = b.Subscribe(sub, []string{DomainSession, DomainLink}, nil, "", "")
+			_ = b.Subscribe(sub, []string{DomainSession, DomainLink}, nil, b.Generation(), "")
 			b.UnsubscribeDomains(sub, []string{DomainSession})
 		}
 	}()
@@ -385,10 +343,10 @@ func TestBusConcurrentUnsubscribeDomainsVsPublish(t *testing.T) {
 func TestSubscribeReplacementNotUnion(t *testing.T) {
 	b := NewBus("gen-b4", BusConfig{SubQueue: 64})
 	sub := b.NewSubscriber()
-	if err := b.Subscribe(sub, []string{DomainLink}, nil, "", ""); err != nil {
+	if err := b.Subscribe(sub, []string{DomainLink}, nil, b.Generation(), ""); err != nil {
 		t.Fatal(err)
 	}
-	if err := b.Subscribe(sub, []string{DomainSession}, nil, "", ""); err != nil {
+	if err := b.Subscribe(sub, []string{DomainSession}, nil, b.Generation(), ""); err != nil {
 		t.Fatal(err)
 	}
 	// 生效域集合 = {session}（matches 为包内可见的过滤真源）。
@@ -422,5 +380,33 @@ func TestSubscribeReplacementNotUnion(t *testing.T) {
 			}
 			return
 		}
+	}
+}
+
+// TestBusEventsHostLinkChanged FIX-22 接通端到端：TableEvents 的 HostLinkChanged
+// 转发（busEvents）→ 总线发布 link.changed（link 域）→ 订阅端收到并解出载荷。
+// 此前该 kind 只有消费无生产（watch 链路列恒不更新），本用例钉住生产侧。
+func TestBusEventsHostLinkChanged(t *testing.T) {
+	b := NewBus("gen-1", BusConfig{})
+	sub := b.NewSubscriber()
+	if err := b.Subscribe(sub, []string{DomainLink}, new(uint64), "gen-1", ""); err != nil {
+		t.Fatalf("订阅 link 域失败：%v", err)
+	}
+	(&busEvents{bus: b}).HostLinkChanged("h1", "direct", "203.0.113.7:41641", 88, 1700000000000)
+	var ev Event
+	select {
+	case ev = <-sub.Events():
+	case <-time.After(time.Second):
+		t.Fatal("link 事件未到达")
+	}
+	if ev.Kind != KindLinkChanged {
+		t.Fatalf("kind = %s，期望 %s", ev.Kind, KindLinkChanged)
+	}
+	var p LinkChangedPayload
+	if err := json.Unmarshal(ev.Payload, &p); err != nil {
+		t.Fatalf("载荷解包失败：%v", err)
+	}
+	if p.Host != "h1" || p.Via != "direct" || p.Ep != "203.0.113.7:41641" || p.RttMs != 88 || p.At != 1700000000000 {
+		t.Fatalf("载荷不符：%+v", p)
 	}
 }

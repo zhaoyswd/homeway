@@ -6,6 +6,8 @@ import (
 	"errors"
 	"testing"
 	"time"
+
+	"github.com/zhaoyswd/homeway/clientcore/hostsession"
 )
 
 // demand-driven-recovery 的纯函数单测：需求合成、activity 新鲜度、证据门控三分支
@@ -53,49 +55,6 @@ func TestPatrolDemandNoDemand(t *testing.T) {
 
 var errBoom = errors.New("boom")
 
-func TestPatrolEvidenceGateNoise(t *testing.T) {
-	// 本地发送错误（挂起禁发）：无论需求状态，清零不计。
-	n, counted := patrolEvidenceGate(true, true, 2, time.Now(), time.Now(), errBoom)
-	if n != 0 || counted {
-		t.Fatalf("本地噪声应清零：n=%d counted=%v", n, counted)
-	}
-}
-
-func TestPatrolEvidenceGateNoDemand(t *testing.T) {
-	// 无需求拍：清零不计——两端的失败不得拼成连败（事故核心形态）。
-	n, counted := patrolEvidenceGate(false, false, 2, time.Now(), time.Now(), errBoom)
-	if n != 0 || counted {
-		t.Fatalf("无需求应清零：n=%d counted=%v", n, counted)
-	}
-}
-
-func TestPatrolEvidenceGateNormal(t *testing.T) {
-	now := time.Now()
-	n, counted := patrolEvidenceGate(false, true, 1, now.Add(-time.Minute), now, errBoom)
-	if n != 2 || !counted {
-		t.Fatalf("需求期失败应 +1：n=%d counted=%v", n, counted)
-	}
-}
-
-func TestPatrolEvidenceGateWindow(t *testing.T) {
-	// 连败时间窗：相邻计数失败间隔 >10 分钟 ⇒ 计数作废重来（事故：三小时攒三败）。
-	now := time.Now()
-	n, counted := patrolEvidenceGate(false, true, 2, now.Add(-3*time.Hour), now, errBoom)
-	if n != 1 || !counted {
-		t.Fatalf("跨窗失败应从 1 重数：n=%d counted=%v", n, counted)
-	}
-	// 窗内则正常累加。
-	n, _ = patrolEvidenceGate(false, true, 2, now.Add(-2*time.Minute), now, errBoom)
-	if n != 3 {
-		t.Fatalf("窗内应累加到 3：n=%d", n)
-	}
-	// 首败（lastCountedFail 零值）不受窗影响。
-	n, _ = patrolEvidenceGate(false, true, 0, time.Time{}, now, errBoom)
-	if n != 1 {
-		t.Fatalf("首败应为 1：n=%d", n)
-	}
-}
-
 // setTunActivityForTest 测试直设（绕过 setTunActivity 的「now」）。
 func setTunActivityForTest(fg, screen bool, pushedAt time.Time) {
 	tunActivity.fg.Store(fg)
@@ -107,20 +66,23 @@ func setTunActivityForTest(fg, screen bool, pushedAt time.Time) {
 	}
 }
 
+// TestPatrolEvidenceGateSharedSequence：gate 收口到 hostsession 单一真源（FIX-20）
+// 后，cshared 面保留一条序列级覆盖（本包测试只在 cshared 面跑；分支向量全表在
+// hostsession/demand_gate_test.go 的无 tag 面真值表）。
 func TestPatrolEvidenceGateSuccessResets(t *testing.T) {
 	// 评审 H3 的验收形态：F,S,F,F 必须停在 2——成功拍清零不许丢（否则 F,S,F,F 拼出
 	// 3 连败 → markUnhealthy，正是本 change 要消灭的假故障升格）。
 	now := time.Now()
-	n, _ := patrolEvidenceGate(false, true, 0, time.Time{}, now, errBoom) // F → 1
+	n, _ := hostsession.PatrolEvidenceGate(false, true, 0, time.Time{}, now, errBoom) // F → 1
 	if n != 1 {
 		t.Fatalf("首败应为 1：%d", n)
 	}
-	n, counted := patrolEvidenceGate(false, true, n, now.Add(time.Minute), now.Add(time.Minute), nil) // S → 0
+	n, counted := hostsession.PatrolEvidenceGate(false, true, n, now.Add(time.Minute), now.Add(time.Minute), nil) // S → 0
 	if n != 0 || counted {
 		t.Fatalf("成功拍应清零：n=%d counted=%v", n, counted)
 	}
-	n, _ = patrolEvidenceGate(false, true, n, now.Add(2*time.Minute), now.Add(2*time.Minute), errBoom) // F → 1
-	n, _ = patrolEvidenceGate(false, true, n, now.Add(3*time.Minute), now.Add(3*time.Minute), errBoom) // F → 2
+	n, _ = hostsession.PatrolEvidenceGate(false, true, n, now.Add(2*time.Minute), now.Add(2*time.Minute), errBoom) // F → 1
+	n, _ = hostsession.PatrolEvidenceGate(false, true, n, now.Add(3*time.Minute), now.Add(3*time.Minute), errBoom) // F → 2
 	if n != 2 {
 		t.Fatalf("F,S,F,F 应停在 2（不是 3 连败）：%d", n)
 	}

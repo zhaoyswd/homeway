@@ -717,7 +717,7 @@ func TestOpsHappyPath(t *testing.T) {
 
 func TestErrorCodeMappingNegativeCases(t *testing.T) {
 	ts := startTestServer(t, facade.BusConfig{})
-	c, _ := dialTest(t, ts)
+	c, w := dialTest(t, ts)
 	ctx := context.Background()
 
 	// unknown_op：不断连（后续请求照常）。
@@ -773,21 +773,21 @@ func TestErrorCodeMappingNegativeCases(t *testing.T) {
 		t.Fatalf("主机不存在应 no_host：%v", err)
 	}
 	// 订阅：词表外域 bad_request；同域重复订阅幂等成功；退订未订阅域幂等成功。
-	if _, err := c.Subscribe(ctx, []string{"nope"}, nil, "", ""); !errors.Is(err, CodeError(facade.CodeBadRequest)) {
+	if _, err := c.Subscribe(ctx, []string{"nope"}, nil, "", w.Generation); !errors.Is(err, CodeError(facade.CodeBadRequest)) {
 		t.Fatalf("词表外域应 bad_request：%v", err)
 	}
-	if _, err := c.Subscribe(ctx, []string{facade.DomainSession}, nil, "", ""); err != nil {
+	if _, err := c.Subscribe(ctx, []string{facade.DomainSession}, nil, "", w.Generation); err != nil {
 		t.Fatalf("订阅失败：%v", err)
 	}
-	if _, err := c.Subscribe(ctx, []string{facade.DomainSession}, nil, "", ""); err != nil {
+	if _, err := c.Subscribe(ctx, []string{facade.DomainSession}, nil, "", w.Generation); err != nil {
 		t.Fatalf("同域重复订阅应幂等成功：%v", err)
 	}
-	if err := c.Unsubscribe(ctx, []string{facade.DomainLog}); err != nil {
+	if err := c.Unsubscribe(ctx, []string{facade.DomainLink}); err != nil {
 		t.Fatalf("退订未订阅域应幂等成功：%v", err)
 	}
 	// 游标超前 bad_request；连接仍在（映射类错误全部不断连）。
 	future := uint64(999)
-	if _, err := c.Subscribe(ctx, []string{facade.DomainSession}, &future, "", ""); !errors.Is(err, CodeError(facade.CodeBadRequest)) {
+	if _, err := c.Subscribe(ctx, []string{facade.DomainSession}, &future, "", w.Generation); !errors.Is(err, CodeError(facade.CodeBadRequest)) {
 		t.Fatalf("超前游标应 bad_request：%v", err)
 	}
 	if _, err := c.Request(ctx, facade.OpHostList, nil); err != nil {
@@ -835,9 +835,9 @@ func TestServerEventSubscribeReplayAndLive(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	c, _ := dialTest(t, ts)
+	c, w := dialTest(t, ts)
 	cur := uint64(0)
-	if _, err := c.Subscribe(context.Background(), []string{facade.DomainSession}, &cur, "view-main", ""); err != nil {
+	if _, err := c.Subscribe(context.Background(), []string{facade.DomainSession}, &cur, "view-main", w.Generation); err != nil {
 		t.Fatal(err)
 	}
 	// 回放 3 条 + 在线 1 条。
@@ -867,8 +867,8 @@ func TestServerEventSubscribeReplayAndLive(t *testing.T) {
 func TestServerOverrunGoodbyeDisconnect(t *testing.T) {
 	// 慢消费者：订阅队列 2、客户端不读事件 → goodbye(overrun) + 断连。
 	ts := startTestServer(t, facade.BusConfig{SubQueue: 2})
-	c, _ := dialTest(t, ts)
-	if _, err := c.Subscribe(context.Background(), []string{facade.DomainSession}, nil, "", ""); err != nil {
+	c, w := dialTest(t, ts)
+	if _, err := c.Subscribe(context.Background(), []string{facade.DomainSession}, nil, "", w.Generation); err != nil {
 		t.Fatal(err)
 	}
 	for i := 0; i < 30; i++ {
@@ -1100,9 +1100,9 @@ func TestListenControlResidue(t *testing.T) {
 // （facade.Bus.UnsubscribeDomains，server 只调）。
 func TestServerConcurrentUnsubscribeVsPublish(t *testing.T) {
 	ts := startTestServer(t, facade.BusConfig{SubQueue: 1024})
-	c, _ := dialTest(t, ts)
+	c, w := dialTest(t, ts)
 	ctx := context.Background()
-	if _, err := c.Subscribe(ctx, []string{facade.DomainSession}, nil, "", ""); err != nil {
+	if _, err := c.Subscribe(ctx, []string{facade.DomainSession}, nil, "", w.Generation); err != nil {
 		t.Fatal(err)
 	}
 	var wg sync.WaitGroup
@@ -1119,7 +1119,7 @@ func TestServerConcurrentUnsubscribeVsPublish(t *testing.T) {
 			if err := c.Unsubscribe(ctx, []string{facade.DomainSession}); err != nil {
 				return // 连接被断（overrun 等）：停（竞态窗口已开过）
 			}
-			if _, err := c.Subscribe(ctx, []string{facade.DomainSession}, nil, "", ""); err != nil {
+			if _, err := c.Subscribe(ctx, []string{facade.DomainSession}, nil, "", w.Generation); err != nil {
 				return
 			}
 		}

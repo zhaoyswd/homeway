@@ -50,12 +50,16 @@ type Options struct {
 	StrictIdentity bool
 	// Demand 巡检拍需求判定钩子（4a §6.1，D5：桌面 DemandSignal 的接入缝）。
 	// **nil = 现行为**（巡检证据门不生效——手机路径不设置，cshared 面零行为
-	// 漂移）；非 nil 时巡检失败拍按手机 patrolEvidenceGate 的全量镜像门语义计
-	// 证据（五分支真值表见 PatrolEvidenceGate）。每巡检拍恰调用一次（判定
-	// 结果 sticky 落需求观测面）。
+	// 漂移）；非 nil 时巡检失败拍按共享证据门 PatrolEvidenceGate 计证据（五分支
+	// 真值表见其注释；手机/桌面同一函数）。每巡检拍恰调用一次（判定结果 sticky
+	// 落需求观测面）。
 	Demand func() (active bool, reason string)
 	// Diag 诊因回调（4a §6.3，D6：gated/budget/probe_window 三 reason 的发射
 	// 点接缝）。nil = 不发射；非 nil 时按**边沿触发 + 每主机单飞**（同因不发
 	// 第二条直至状态离开）由状态机驱动。
 	Diag func(reason string)
+	// LinkChanged 链路形态变化回调（FIX-22 接通 link.changed）：via 或 ep 与上一份
+	// 快照不同时通知（**变化沿**——巡检 60s 一拍都记 rtt 快照，但事件只在形态
+	// 变化时发，事件流不做节拍器）。nil = 不通知（cshared 面零行为）。
+	LinkChanged func(via, ep string, rttMs, at int64)
 }

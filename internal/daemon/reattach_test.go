@@ -117,7 +117,7 @@ func TestReattachKeepsGenerationAndCursor(t *testing.T) {
 	defer c.Close()
 	genBefore := w.Generation
 	rctx := context.Background()
-	if _, err := c.Subscribe(rctx, []string{facade.DomainSession}, nil, "", ""); err != nil {
+	if _, err := c.Subscribe(rctx, []string{facade.DomainSession}, nil, "", w.Generation); err != nil {
 		t.Fatal(err)
 	}
 	tokStr, err := proto.EncodeToken(proto.Token{PeerID: [32]byte{27}, Secret: [32]byte{27, 1}, Endpoints: []proto.Endpoint{{Addr: "203.0.113.27:41641"}}})
@@ -232,7 +232,7 @@ func TestReattachKeepsGenerationAndCursor(t *testing.T) {
 	if _, err := c.Request(rctx, facade.OpHostList, nil); err != nil {
 		t.Fatalf("重挂后 host.list 应恢复（盘上记录在）：%v", err)
 	}
-	if _, err := c.Subscribe(rctx, []string{facade.DomainSession}, &heldSeq, genBefore, ""); err != nil {
+	if _, err := c.Subscribe(rctx, []string{facade.DomainSession}, &heldSeq, "", genBefore); err != nil {
 		t.Fatalf("持游标 resubscribe 不应报错（cursor_stale = 角色重建换了代际/总线——收拢换语义的红路）：%v", err)
 	}
 	raw, err = c.Request(rctx, facade.OpDaemonStatus, nil)

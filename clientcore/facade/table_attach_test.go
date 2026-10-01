@@ -123,7 +123,7 @@ func TestDetachEmitsSessionRemoved(t *testing.T) {
 	}
 	// 先订阅（nil 游标 = 纯在线），再入两台——added/removed 都走在线面。
 	sub := d.Bus().NewSubscriber()
-	if err := d.Bus().Subscribe(sub, []string{DomainSession}, nil, "", ""); err != nil {
+	if err := d.Bus().Subscribe(sub, []string{DomainSession}, nil, d.Bus().Generation(), ""); err != nil {
 		t.Fatal(err)
 	}
 	attachTestHosts(t, d, dir, 22, 23)
@@ -185,7 +185,7 @@ func TestAttachReEmitsSessionAdded(t *testing.T) {
 	// 在途订阅者（控制面连接不断形态）：Detach → removed(detach)；重 Attach
 	// （角色重建形态）→ 装载补发 added。
 	sub := d.Bus().NewSubscriber()
-	if err := d.Bus().Subscribe(sub, []string{DomainSession}, nil, "", ""); err != nil {
+	if err := d.Bus().Subscribe(sub, []string{DomainSession}, nil, d.Bus().Generation(), ""); err != nil {
 		t.Fatal(err)
 	}
 	d.Detach()
@@ -221,7 +221,7 @@ func TestTableEventsPublishToBus(t *testing.T) {
 		t.Fatal(err)
 	}
 	sub := d.Bus().NewSubscriber()
-	if err := d.Bus().Subscribe(sub, []string{DomainSession}, nil, "", ""); err != nil {
+	if err := d.Bus().Subscribe(sub, []string{DomainSession}, nil, d.Bus().Generation(), ""); err != nil {
 		t.Fatal(err)
 	}
 

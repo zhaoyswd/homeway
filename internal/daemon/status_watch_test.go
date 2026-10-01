@@ -231,7 +231,7 @@ func TestDaemonStatusWatchViewOverWire(t *testing.T) {
 
 	id := strings.Repeat("ab", 32)
 	view := "host=" + id + ",host=" + strings.Repeat("cd", 32)
-	r, err := c.Subscribe(ctx, []string{facade.DomainLink, facade.DomainSession}, nil, view, "")
+	r, err := c.Subscribe(ctx, []string{facade.DomainLink, facade.DomainSession}, nil, view, d.Bus().Generation())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -278,7 +278,7 @@ func TestDaemonStatusWatchViewOverWire(t *testing.T) {
 	}
 	c2 := dialDaemon(t, sock)
 	cur := d.Bus().CurrentSeq()
-	if r2, err := c2.Subscribe(ctx, []string{facade.DomainSession}, &cur, "", ""); err != nil {
+	if r2, err := c2.Subscribe(ctx, []string{facade.DomainSession}, &cur, "", d.Bus().Generation()); err != nil {
 		t.Fatalf("新前端持游标订阅应照常：%v", err)
 	} else if r2.Generation == "" {
 		t.Fatal("订阅确认缺代际")

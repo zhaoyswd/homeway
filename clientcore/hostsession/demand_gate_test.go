@@ -39,7 +39,9 @@ func (c *gateCaptureDiag) snapshot() []string {
 
 // newGateSession 手工构造的桌面门测试会话（不经 NewSession 的全量生命周期）。
 func newGateSession(demand func() (bool, string), diag func(string)) *Session {
-	s := &Session{demand: demand, diag: diag}
+	// logf 兜底：手工构造的 Session 若不设 logf，走失败/门控/逃逸分支时调 nil
+	// 函数即 panic（FIX-21 逃逸用例首跑踩中）。
+	s := &Session{demand: demand, diag: diag, logf: func(string, ...any) {}}
 	if diag != nil {
 		s.diagActive = make(map[string]bool)
 		s.recGate.onWait = func() { s.noteDiag(diagProbeWindow) }
@@ -360,5 +362,48 @@ func TestRecoverGateProbeWindowDiag(t *testing.T) {
 	<-waiter3
 	if got := diagCap.snapshot(); len(got) != 2 || got[1] != "probe_window" {
 		t.Fatalf("第二轮 probe_window：%v", got)
+	}
+}
+
+// TestNotePatrolResultNoiseEscape FIX-21 接线：噪声长停逃逸——本地噪声持续超过
+// NoiseEscalateAfter 后不再按环境噪声拦证据（按质量失败计入升级链），门从清零
+// 翻回计数。变异红路：删 notePatrolResult 里的逃逸接线 ⇒ 本用例红（第二拍仍清零）。
+func TestNotePatrolResultNoiseEscape(t *testing.T) {
+	oldNoise := localSendErrWithin
+	localSendErrWithin = func(ExitSession, time.Duration) bool { return true }
+	t.Cleanup(func() { localSendErrWithin = oldNoise })
+
+	fake := newFakeExitSession()
+	s := newGateSession(func() (bool, string) { return true, "测试需求" }, nil)
+	// 首拍噪声：清零 + 记逃逸计时起点。
+	s.notePatrolResult(fake, errGateProbe, true, "", time.Now())
+	if s.patrolStreak != 0 {
+		t.Fatalf("噪声拍应清零：streak=%d", s.patrolStreak)
+	}
+	// 阈值后的第二拍：逃逸命中，按质量失败计（+1），且计时重置。
+	now := time.Now().Add(NoiseEscalateAfter + time.Second)
+	s.notePatrolResult(fake, errGateProbe, true, "", now)
+	if s.patrolStreak != 1 {
+		t.Fatalf("长停逃逸后应按质量失败计数：streak=%d", s.patrolStreak)
+	}
+	if !s.patrolNoiseSince.IsZero() {
+		t.Fatalf("逃逸后计时应重置：%v", s.patrolNoiseSince)
+	}
+}
+
+// TestSetLinkChangedEdge FIX-22：link.changed 生产者的变化沿——via/ep 变化才通知；
+// rtt 波动不触发（巡检 60s 一拍都记快照，若 rtt 入判据事件流就退化成节拍器）。
+// 变异红路：删 setLink 里的变化判定 ⇒ 首记丢失或 rtt 拍误发，本用例红。
+func TestSetLinkChangedEdge(t *testing.T) {
+	var got []string
+	s := &Session{logf: func(string, ...any) {}, linkChanged: func(via, ep string, rttMs, at int64) {
+		got = append(got, via+"/"+ep)
+	}}
+	s.setLink("direct", "1.2.3.4:1", 10) // 零值→值：首记即变化
+	s.setLink("direct", "1.2.3.4:1", 20) // 仅 rtt 变：不通知
+	s.setLink("direct", "1.2.3.4:2", 30) // ep 变：通知
+	s.setLink("relay", "1.2.3.4:2", 40)  // via 变：通知
+	if len(got) != 3 || got[0] != "direct/1.2.3.4:1" || got[1] != "direct/1.2.3.4:2" || got[2] != "relay/1.2.3.4:2" {
+		t.Fatalf("变化沿通知序列不符：%v", got)
 	}
 }
