@@ -449,6 +449,10 @@ internal/daemon     统一进程装配（supervisor + 控制面 + 按需拉起 +
 clientcore/facade   客户端会话面的唯一语义真源（词汇/版本台账/事件总线/主机表/Host 对象）
 internal/control    控制面 wire 绑定（UDS/帧/握手；词汇与总线真源在 clientcore/facade）
 pkg/proto           线上契约：token（hmw1 格式）/ reg 报文 / 中继帧 + golden vectors
+contracts           契约台账（ledger.jsonl：全族词表/版本空间/fixtures 摘要的机器真源）+ 对账器
+                    （`go test ./contracts/...`，CI「契约台账对账门」step）+ 净室解码器（cleanroom）；
+                    各协议族词表**先登台账（spec delta 同批）再进代码**，App 面对账在 tier 仓
+                    `tools/docs/check-vocab-sync.sh`（读 submodule 钉定的 ledger.jsonl）
 ```
 
 ```bash
