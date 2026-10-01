@@ -1165,6 +1165,35 @@ func TestResponseSinkNarrowRule(t *testing.T) {
 	}
 }
 
+// TestEnqueueResponseNonBlocking FIX-25：应答投递**绝不阻塞**（队列满即丢弃并计数）——
+// 毒会话（子进程不读 stdin、PTY 缓冲满）不再能把写阻塞在会话锁上、冻住整个 term 命令面。
+// 变异红路：把 enqueueResponse 的 select/default 改成阻塞发送 ⇒ 本用例在队列满后挂死。
+func TestEnqueueResponseNonBlocking(t *testing.T) {
+	s := &termSession{respChan: make(chan []byte, 4)}
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for i := 0; i < 50; i++ {
+			s.enqueueResponse([]byte("resp"))
+		}
+	}()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("投递阻塞了（队列满时必须有界丢弃）")
+	}
+	if got := len(s.respChan); got != 4 {
+		t.Fatalf("队列应装满 4 条，实得 %d", got)
+	}
+	if got := s.respDropped.Load(); got != 46 {
+		t.Fatalf("丢弃计数应为 46，实得 %d", got)
+	}
+	s.enqueueResponse(nil) // 空载荷不计
+	if got := s.respDropped.Load(); got != 46 {
+		t.Fatalf("空载荷不应计数，实得 %d", got)
+	}
+}
+
 // 集成：host 腿（capsRawTerminal）在场 ⇒ 服务端对 DA1 静默（程序收不到代答）；
 // legacy 腿（未声明）⇒ 服务端代答（程序从回显里能看到一份）。
 func TestResponseSinkOnWire(t *testing.T) {

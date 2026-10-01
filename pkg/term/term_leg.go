@@ -841,8 +841,16 @@ func (s *termSession) rawLegsLocked() []*termClient {
 // 必须持 s.mu。
 //
 // sentinel：尺寸变化时是否注入尺寸哨兵——**注册路径传 false**（attach 的哨兵由 stream
-// 统一注入一次，exec-r1 低7：一次 attach 一次哨兵）；RESIZE / 重选举路径传 true
-// （逼远端 TUI 按新尺寸重绘；输入类活动不会改尺寸，传什么都无哨兵）。
+// 统一注入一次，exec-r1 低7：一次 attach 一次哨兵）；RESIZE / 输入路径传 true。
+//
+// 输入为什么也参与尺寸（FIX-26 复核订正）：spec「窗口尺寸同步与重绘」把活动定义为
+// 「接入 / 上报尺寸 / 输入」，并要求「手机用户下一次输入后尺寸切回手机网格」——输入路径
+// 确实可能改会话尺寸（另一条不同尺寸的腿刚改过），所以这里会走到 applySizeLocked 与哨兵。
+// 代价是**两腿尺寸不同且交替输入**时每次切换都重排一次（PTY setsize + vt reflow + 全腿
+// 全量快照）；这是该契约的固有代价，取消它需要改 spec 并接受手机端失去「一敲即回本机网格」
+// 的体验（见 fix-plan FIX-26 的复核记录），故保持现状。
+//
+// 同腿连续输入不会重复重排：首次输入已把会话尺寸对齐到本腿，后续 c.cols==s.cols 直接跳过。
 func (s *termSession) noteActivityLocked(c *termClient, sentinel bool) {
 	s.activitySeq++
 	c.lastActivitySeq = s.activitySeq

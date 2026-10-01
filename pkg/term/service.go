@@ -501,9 +501,16 @@ type termSession struct {
 	attachSeq uint64
 	// rawTermLegs 是声明了 capsRawTerminal 的腿数（查询应答让位的判据，任务 5.1）。
 	rawTermLegs int
-	// responseFn 是服务端代答的接收方（spawn 时初始化为写 ptmx；updateResponseSinkLocked
+	// responseFn 是服务端代答的接收方（spawn 时初始化为入队；updateResponseSinkLocked
 	// 按腿况在它与 nil 之间切换——拆成字段是为了窄规则可单测：假 sink 计数，任务 5.1）。
 	responseFn func([]byte)
+	// respChan 承接查询应答（DA1/DSR/OSC 10-11）字节，由 responseWriter 独占消费写 ptmx。
+	// **FIX-25**：应答原先在会话锁内同步 `ptmx.Write`（vt 回调在 pump 持锁时同步触发）——
+	// 毒会话（子进程不读 stdin、PTY 缓冲满）会让写阻塞在会话锁上，整个 term 命令面
+	// （LIST/ATTACH/输入…）跟着冻住。改为有界队列 + 专用写者：回调只做非阻塞投递。
+	respChan chan []byte
+	// respDropped 应答丢弃计数（队列满；应答是「查询-应答」尽力语义，丢一条远好于卡住会话锁）。
+	respDropped atomic.Uint64
 	// 会话级写者/背压参数（exec-r1 高2/中4：spawn 时从 cfg 注入；cfg 在 New 后不变，
 	// 写者 goroutine 并发只读安全）。
 	writeTimeout  time.Duration // raw 腿写超时（= 停滞判定阈值）
@@ -835,6 +842,42 @@ func (s *termService) remove(name string, who *termSession) {
 		delete(s.sessions, name)
 	}
 	s.mu.Unlock()
+}
+
+// enqueueResponse 是服务端 vt 查询应答的接收方（FIX-25）。调用点 = vt 的 C 回调，
+// **同步跑在 ghostty_terminal_vt_write 内部，此时 vt 的锁与会话锁都被持有** ⇒ 这里
+// 只做非阻塞投递：队列满即丢弃并计数。应答丢一条，程序最多是一次探测超时；在这里
+// 阻塞写 PTY，毒会话能把整个 term 命令面冻住（旧实现形态）。
+func (s *termSession) enqueueResponse(p []byte) {
+	if len(p) == 0 {
+		return
+	}
+	cp := make([]byte, len(p))
+	copy(cp, p)
+	select {
+	case s.respChan <- cp:
+	default:
+		s.respDropped.Add(1)
+	}
+}
+
+// responseWriter 独占消费应答队列写 ptmx（FIX-25：写盘动作移出会话锁）。退出条件 =
+// 会话收工（surfaceStop 关闭）或 PTY 写失败（会话已死，继续写只会一直报错）。
+// 会话收工后残留的应答由 respChan 容量兜住（写者退出后满即丢弃，符合尽力语义）。
+func (s *termSession) responseWriter() {
+	for {
+		select {
+		case <-s.surfaceStop:
+			return
+		case p := <-s.respChan:
+			if s.ptmx == nil {
+				continue
+			}
+			if _, err := s.ptmx.Write(p); err != nil {
+				return
+			}
+		}
+	}
 }
 
 // pump 常驻读 PTY：写历史、喂扫描器、唤醒各腿写者（永远读，子进程才不会阻塞）。
@@ -1342,6 +1385,9 @@ func (s *termService) spawnLocked(name string, cols, rows uint16) (*termSession,
 	ss.surfaceWake = make(chan struct{}, 1)
 	ss.clipChan = make(chan string, 8)
 	ss.surfaceStop = make(chan struct{})
+	// 查询应答队列（FIX-25）：**总是建**（同 surface 通道的理由——nil channel 的
+	// select 会走 default 分支静默丢弃，建出来让「满/未建」两种丢弃都可计数）。
+	ss.respChan = make(chan []byte, respQueueLen)
 	// 会话级参数注入（exec-r1 高2/中4）。
 	ss.writeTimeout = time.Duration(s.cfg.writeTimeoutMs) * time.Millisecond
 	ss.rawStallLimit = time.Duration(s.cfg.rawStallLimitMs) * time.Millisecond
@@ -1353,8 +1399,7 @@ func (s *termService) spawnLocked(name string, cols, rows uint16) (*termSession,
 		// 剪贴板双向（OSC 52）：写 → CLIPBOARD 帧转给客户端；读 → 命中客户端最近上报的缓存。
 		// 查询应答（DA1/DSR/OSC 10-11）的归属随腿况动态切换（任务 5.1 窄规则：
 		// capsRawTerminal 腿在场时让位）——初始无腿 = 服务端代答，见 updateResponseSinkLocked。
-		ptmxForSink := ptmx
-		ss.responseFn = func(p []byte) { _, _ = ptmxForSink.Write(p) }
+		ss.responseFn = ss.enqueueResponse
 		ss.vt = sv
 		sv.EnableClipboardWrite()
 		sv.EnableClipboardRead()
@@ -1370,6 +1415,7 @@ func (s *termService) spawnLocked(name string, cols, rows uint16) (*termSession,
 		s.logf("term: 新建会话 %s（pid=%d %dx%d shell=%s）", name, ss.pid, cols, rows, shell)
 	}
 	go ss.pump()
+	go ss.responseWriter() // 应答写者（FIX-25）：只在有服务端 vt 时会被投递，常驻开销可忽略
 	if surfaceCapable() {
 		go ss.surfaceLoop()
 	}
@@ -1447,8 +1493,9 @@ func (s *termService) stream(ss *termSession, client *termClient, c net.Conn) {
 		case opData:
 			ss.mu.Lock()
 			ptmx := ss.ptmx
-			// 输入 = 活动（design D4：活动 = 接入 / RESIZE / 输入；输入不改腿尺寸，
-			// 不会触发哨兵——哨兵只在尺寸变化的 RESIZE/选举路径）。
+			// 输入 = 活动（design D4 / spec：活动 = 接入 / 上报尺寸 / 输入）。本腿尺寸
+			// 与会话不同（另一条腿刚改过）时这里也会改尺寸并注入哨兵——见
+			// noteActivityLocked 的 FIX-26 订正说明。
 			ss.noteActivityLocked(client, true)
 			ss.mu.Unlock()
 			if ptmx != nil && len(f.payload) > 0 {
@@ -1691,4 +1738,9 @@ func (s *termService) listJSON() string {
 
 // vtDefaultScrollbackLines 是服务端 vt 回滚行数上限的默认值（与 pkg/term/vt 保持一致；
 // 这里复制一份常量是为了让不带 vt 的构建（term_vt_off.go）也能引用默认值）。
+// respQueueLen 是查询应答队列长度（FIX-25）。应答是「一问一答」的短序列（DA1 ~20B、
+// DSR ~10B、OSC 10/11 ~30B），16 条足够吸收突发；满即丢弃并计数——**绝不阻塞**
+// vt 回调（它跑在会话锁内）。
+const respQueueLen = 16
+
 const vtDefaultScrollbackLines = 10000
