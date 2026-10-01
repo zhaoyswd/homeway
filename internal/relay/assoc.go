@@ -162,7 +162,7 @@ func (r *Relay) assocReadLoop(a *assoc) {
 		if a.sid != 0 {
 			// ---- v2 拨腿会话：认证状态机 ----
 			if a.authOK && a.authSrc == from {
-				// 常态：已认证源的下行（裸 WG 数据或重发的 LEGUP 标记都算）。
+				// 常态：已认证源的下行（数据腿帧或重发的 LEGUP 标记都算）。
 				a.last, a.lastDown = now, now
 				r.mu.Unlock()
 			} else if c, isLegup := proto.LegupCookie(pkt); isLegup && c == a.cookie &&
@@ -215,12 +215,9 @@ func (r *Relay) assocReadLoop(a *assoc) {
 		if _, isLegup := proto.LegupCookie(pkt); isLegup {
 			continue
 		}
-		frame := pkt
-		if len(pkt) == 0 || pkt[0] != 0xBB {
-			// 裸 WG：包成数据腿帧再发给客户端
-			frame = proto.EncodeFrame(proto.FrameTypeData, pkt)
-		}
-		if _, err := r.pc.WriteToUDPAddrPort(frame, a.key.client); err != nil {
+		// FIX-91：出口恒发腿帧（统一线格式）——中继不再做「裸 WG → 套帧」转换，
+		// 原样转发（未知/畸形包由客户端侧按解码失败丢弃）。
+		if _, err := r.pc.WriteToUDPAddrPort(pkt, a.key.client); err != nil {
 			return
 		}
 		r.bump(func(s *Stats) { s.ForwardedDown++ })

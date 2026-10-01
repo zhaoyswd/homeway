@@ -7,19 +7,24 @@ import (
 	"fmt"
 )
 
-// 中继链路帧格式（协议首版即定型，无论中继功能何时实现）：
+// 腿帧格式（协议首版即定型；FIX-91 起**所有腿统一套帧**）：
 //
-//	客户端→中继 listener: [0xAA][peerId(8B)][type(1B)][payload]
-//	其余腿（中继→客户端 / 中继↔后端）: [0xBB][type(1B)][payload]
-//	直连（客户端→后端，无帧）: 裸 WG；首个握手可前缀 reg 报文（"HR" 开头，单数据报）
+//	客户端→中继 listener: [0xAA][peerId(8B)]‖腿帧
+//	其余腿（中继→客户端 / 中继↔后端 / 直连双向）: 腿帧 = [0xBB][type][payload]
+//	首个握手包可搭车 reg：容器帧（type=4）内 [reg][data] 两条消息（单数据报保 1 RTT）
 //
-// 0xAA/0xBB 魔数与 WG 报文类型（1–4）不冲突，直连路径可无歧义判别。
-// type：0=数据（不透明 WG 包）1=控制（hint）2=reg。接收方 MUST 忽略未知 type
-// 且不中断会话（前向兼容的钩子挂在格式上，不挂在实现节奏上）。
+// 例外（明文控制面，非腿）：STUN 观测与参照点探测（probe）保持裸格式。
+// 0xAA/0xBB 魔数与 WG 报文类型（1–4）不冲突。
+// type：0=数据（不透明 WG 包）1=控制（hint）2=reg 3=中继控制 4=容器（见下）。
+// 接收方 MUST 忽略未知 type 且不中断会话（前向兼容的钩子挂在格式上，不挂在实现节奏上）。
 const (
 	FrameTypeData    = byte(0)
 	FrameTypeControl = byte(1)
 	FrameTypeReg     = byte(2)
+	// FrameTypeBatch：帧内多消息容器——一个数据报携带多条消息（首个握手包 =
+	// [reg][data]：同一数据报内 reg 先于 data 被消费，出口无需等下一包即完成登记，
+	// 保 1 RTT）。payload = 消息序列：[type(1)][len(2 BE)][payload]*。
+	FrameTypeBatch = byte(4)
 
 	relayTagMagic = byte(0xAA)
 	legFrameMagic = byte(0xBB)
@@ -53,11 +58,15 @@ func DecodeFrame(b []byte) (typ byte, payload []byte, err error) {
 // EncodeTagged 生成客户端→中继 listener 帧：[0xAA][peerId(8B)]‖腿帧。
 // 中继剥掉前 9 字节路由头后原样转发，后端收到的即无歧义腿帧。
 func EncodeTagged(peerID [8]byte, typ byte, payload []byte) []byte {
-	buf := make([]byte, 0, 1+8+2+len(payload))
+	return EncodeTaggedFrame(peerID, EncodeFrame(typ, payload))
+}
+
+// EncodeTaggedFrame：[0xAA][peerId(8B)]‖已编码腿帧（容器帧等预先编码形态，避免二次套帧）。
+func EncodeTaggedFrame(peerID [8]byte, frame []byte) []byte {
+	buf := make([]byte, 0, 1+8+len(frame))
 	buf = append(buf, relayTagMagic)
 	buf = append(buf, peerID[:]...)
-	buf = append(buf, legFrameMagic, typ)
-	return append(buf, payload...)
+	return append(buf, frame...)
 }
 
 // DecodeTagged 解析 listener 收到的帧。
@@ -69,12 +78,48 @@ func DecodeTagged(b []byte) (peerID [8]byte, typ byte, payload []byte, err error
 	return peerID, b[10], b[11:], nil
 }
 
-// SplitDirectReg 拆直连路径的「reg‖WG」同数据报搭车。非 reg 前缀原样返回 ok=false。
-func SplitDirectReg(b []byte) (reg, rest []byte, ok bool) {
-	if len(b) < regFixedLen || string(b[:2]) != regMagic {
-		return nil, b, false
+// ---------- 容器帧（type=4）----------
+
+// BatchMsg：容器内的一条消息。
+type BatchMsg struct {
+	Type    byte
+	Payload []byte
+}
+
+// EncodeBatch 组容器帧（[0xBB][4] + 消息序列 [type][len(2BE)][payload]*）。
+// 调用方保证每条 payload ≤ 65535 字节（数据面 MTU 远小于此；reg 报文 <1KB）。
+func EncodeBatch(msgs ...BatchMsg) []byte {
+	size := 2
+	for _, m := range msgs {
+		size += 3 + len(m.Payload)
 	}
-	return b[:regFixedLen], b[regFixedLen:], true
+	buf := make([]byte, 0, size)
+	buf = append(buf, legFrameMagic, FrameTypeBatch)
+	for _, m := range msgs {
+		buf = append(buf, m.Type, byte(len(m.Payload)>>8), byte(len(m.Payload)))
+		buf = append(buf, m.Payload...)
+	}
+	return buf
+}
+
+// DecodeBatch 解容器帧的 payload 段（DecodeFrame 返回的 payload）为消息序列。
+func DecodeBatch(payload []byte) ([]BatchMsg, error) {
+	var out []BatchMsg
+	for len(payload) > 0 {
+		if len(payload) < 3 {
+			return nil, ErrFrameMalformed
+		}
+		n := int(payload[1])<<8 | int(payload[2])
+		if 3+n > len(payload) {
+			return nil, ErrFrameMalformed
+		}
+		out = append(out, BatchMsg{Type: payload[0], Payload: payload[3 : 3+n]})
+		payload = payload[3+n:]
+	}
+	if len(out) == 0 {
+		return nil, ErrFrameMalformed
+	}
+	return out, nil
 }
 
 // ---------- 控制子协议：hint（对端观察地址，不可信线索） ----------

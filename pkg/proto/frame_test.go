@@ -75,25 +75,59 @@ func TestHintRoundTrip(t *testing.T) {
 	}
 }
 
-func TestSplitDirectReg(t *testing.T) {
+func TestBatchRoundTrip(t *testing.T) {
 	var secret, pubkey [32]byte
 	var devTag DevTag
 	pubkey[0] = 7
 	devTag[0] = 0x33
 	reg := EncodeReg(secret, pubkey, devTag, time.Now())
 	wgPkt := []byte{1, 0, 0, 0, 0x5a, 0x5a}
-	joined := append(append([]byte{}, reg...), wgPkt...)
 
-	gotReg, rest, ok := SplitDirectReg(joined)
-	if !ok || len(gotReg) != len(reg) || string(rest) != string(wgPkt) {
-		t.Fatalf("ok=%v reg=%d rest=%v", ok, len(gotReg), rest)
+	enc := EncodeBatch(
+		BatchMsg{Type: FrameTypeReg, Payload: reg},
+		BatchMsg{Type: FrameTypeData, Payload: wgPkt},
+	)
+	typ, payload, err := DecodeFrame(enc)
+	if err != nil || typ != FrameTypeBatch {
+		t.Fatalf("容器帧头：typ=%d err=%v", typ, err)
 	}
-	if _, _, err := VerifyReg(secret, gotReg, time.Now(), 0); err != nil {
-		t.Fatalf("拆出的 reg 校验失败: %v", err)
+	msgs, err := DecodeBatch(payload)
+	if err != nil || len(msgs) != 2 {
+		t.Fatalf("解容器：%v msgs=%d", err, len(msgs))
 	}
-	if _, _, ok := SplitDirectReg(wgPkt); ok {
-		t.Fatal("裸 WG 包被误判为 reg 搭车")
+	// 顺序即语义：reg 必须先于 data（保 1 RTT 的登记先行）。
+	if msgs[0].Type != FrameTypeReg || string(msgs[0].Payload) != string(reg) {
+		t.Fatalf("msg[0] 应为 reg：typ=%d", msgs[0].Type)
 	}
+	if msgs[1].Type != FrameTypeData || string(msgs[1].Payload) != string(wgPkt) {
+		t.Fatalf("msg[1] 应为 data：typ=%d", msgs[1].Type)
+	}
+	if _, _, err := VerifyReg(secret, msgs[0].Payload, time.Now(), 0); err != nil {
+		t.Fatalf("容器内 reg 校验失败: %v", err)
+	}
+	// 畸形：截断的消息头 / 长度越界 / 空容器。
+	if _, err := DecodeBatch(payload[:3]); err == nil {
+		t.Fatal("截断消息头应报畸形")
+	}
+	if _, err := DecodeBatch(append([]byte{FrameTypeData, 0xFF, 0xFF}, []byte("x")...)); err == nil {
+		t.Fatal("长度越界应报畸形")
+	}
+	if _, err := DecodeBatch(nil); err == nil {
+		t.Fatal("空容器应报畸形")
+	}
+	// 单消息容器也可解（前向形态）。
+	if msgs, err := DecodeBatch(mustBatchPayload(t, BatchMsg{Type: FrameTypeData, Payload: wgPkt})); err != nil || len(msgs) != 1 {
+		t.Fatalf("单消息容器：%v msgs=%d", err, len(msgs))
+	}
+}
+
+func mustBatchPayload(t *testing.T, m BatchMsg) []byte {
+	t.Helper()
+	_, payload, err := DecodeFrame(EncodeBatch(m))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return payload
 }
 
 func TestRelayIDDeterministic(t *testing.T) {

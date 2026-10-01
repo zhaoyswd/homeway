@@ -371,23 +371,20 @@ func (r *Relay) handlePacket(_ context.Context, src netip.AddrPort, pkt []byte) 
 
 // forwardUp：客户端 → 后端（必要时新建分配 socket），并按需递送 hint。
 
-// hasControlLocked：leg 是否挂着**v2**控制连接（调用方持 r.mu）。v1 控制连接不算——
-// 它解不开 v2 SESSION（cookie），硬通告只会让后端反复拨腿失败（review #25）。
+// hasControlLocked：leg 是否挂着控制连接（调用方持 r.mu；FIX-89 起控制面恒 v2）。
 
 // legMACKey：腿认证 MAC 的密钥——token 模式 = 中继鉴权密钥（与后端共享）；
 // 开放模式 = cookie 本身（只防盲攻击者；能读线路的观察者在开放模式下本就无防）。
 
 // legRejectThrottle：未认证源被拒日志的节流（每会话首几条 + 之后抽样）。
 
-// assocReadLoop：后端 → 客户端。后端回程是**裸 WG**（device 不知道帧），也可能带 hint 腿帧。
+// assocReadLoop：后端 → 客户端。后端回程恒为腿帧（FIX-91 统一线格式），也可能带 hint 腿帧。
 //
 // 拨腿会话（sid!=0）走腿身份认证状态机（review #3）：
 //   - 首个合法的 LEGUP‖cookie‖MAC 才把该源认作腿（authOK/authSrc），放行等腿缓冲；
 //   - 已认证源漂移（NAT 重映射/重拨）必须**重新出示合法认证**——未知源不改变 backend、
 //     不放行 pend、不续命（旧实现「信任首个发包者 + 常态跟随源漂移」，任何扫到数据口
-//     的第三方都能收走 WG 密文/黑洞上行/注入 hint，相对旧模型是安全回归）；
-//   - v1 会话（无 cookie，仅存在于 v1 后端的 fallback 路径）维持旧行为：backend 恒为
-//     lg.addr，源变化由 forwardUp 的既有重建路径处理。
+//     的第三方都能收走 WG 密文/黑洞上行/注入 hint，相对旧模型是安全回归）。
 
 // legRateOKLocked：被拒路径的每源限速（**调用方持 r.mu**——它在认证拒绝分支内使用，
 // 包一层 Lock 会当场死锁）。只约束**日志与认证计算**的代价，不碰转发——转发只对

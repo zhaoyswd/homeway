@@ -108,8 +108,9 @@ func TestRelayLegEndToEnd(t *testing.T) {
 		if string(g.payload) != "wg-handshake-1" {
 			t.Fatalf("出口收到的载荷不对：%q", g.payload)
 		}
-		// 回程：device 会往"看到这条腿帧的来源地址"发裸 WG → 中继包成数据帧给客户端
-		if err := sbind.SendRawTo(g.from, []byte("wg-response-1")); err != nil {
+		// 回程：device 会往"看到这条腿帧的来源地址"发数据腿帧（SendTo 走腿路由 +
+		// FIX-91 统一套帧）→ 中继原样转发给客户端
+		if err := sbind.SendTo(g.from, []byte("wg-response-1")); err != nil {
 			t.Fatal(err)
 		}
 	case <-time.After(3 * time.Second):

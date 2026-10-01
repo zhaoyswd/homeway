@@ -292,7 +292,7 @@ func TestForwardBothWays(t *testing.T) {
 		t.Fatal("转发必须来自 per-client 分配 socket，而不是客户端地址")
 	}
 	// 后端回程（裸 WG 语义）→ 客户端应当收到包在数据腿帧里的同样字节
-	if _, err := be.pc.WriteToUDPAddrPort([]byte{1, 2, 3, 4}, from); err != nil {
+	if _, err := be.pc.WriteToUDPAddrPort(proto.EncodeFrame(proto.FrameTypeData, []byte{1, 2, 3, 4}), from); err != nil {
 		t.Fatal(err)
 	}
 	got, ok := cli.readData(2 * time.Second)
@@ -333,8 +333,8 @@ func TestTwoClientsIsolated(t *testing.T) {
 		t.Fatalf("两条客户端分配到了同一个 socket：%v", seen["one"])
 	}
 	// 分别回程
-	_, _ = be.pc.WriteToUDPAddrPort([]byte("R-one"), seen["one"])
-	_, _ = be.pc.WriteToUDPAddrPort([]byte("R-two"), seen["two"])
+	_, _ = be.pc.WriteToUDPAddrPort(proto.EncodeFrame(proto.FrameTypeData, []byte("R-one")), seen["one"])
+	_, _ = be.pc.WriteToUDPAddrPort(proto.EncodeFrame(proto.FrameTypeData, []byte("R-two")), seen["two"])
 	got1, ok1 := c1.readData(2 * time.Second)
 	got2, ok2 := c2.readData(2 * time.Second)
 	if !ok1 || string(got1) != "R-one" || !ok2 || string(got2) != "R-two" {

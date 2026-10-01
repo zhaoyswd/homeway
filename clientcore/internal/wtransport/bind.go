@@ -4,10 +4,11 @@
 //   - 单 UDP socket；device 的 peer endpoint 恒为伪端点 raceEP——路径知识全部收在
 //     Bind 内（镜像/采纳/漫游/中继腿/reg 搭车），SetEndpointFromPacket(raceEP) 恒等、
 //     不破坏间接层，候选集可随学习缓存动态更新而无需重配 device。
-//   - 未采纳时出站包镜像到全部候选；reg 报文搭车：direct=同数据报 "HR" 前缀，
-//     relay=type=2 帧先行（两数据报背靠背）。
-//   - 收包：来自中继 listener 的腿帧 [0xBB][type][payload]（0=数据入 device /
-//     1=hint 回调 / 2=忽略 / 未知=忽略）；其余来源视为直连裸 WG。
+//   - 未采纳时出站包镜像到全部候选；reg 报文搭车：单数据报容器帧（type=4）内
+//     [reg][data] 两条消息（保 1 RTT），direct/relay 同构（relay 多套 [0xAA] 路由头）。
+//   - 收包（FIX-91 统一线格式）：所有来源都是腿帧 [0xBB][type][payload]
+//     （0=数据入 device / 1=hint 回调 / 其余忽略）；非帧包丢弃。来源是否中继只决定
+//     告警与统计语义（「走中继=需排查的 bug」），不再分派解码路径。
 //   - Rebind 换本地 socket 不换 Identity（漫游=同钥换源地址，会话保持的关键）；
 //     陈旧 socket 的读错在 ReceiveFunc 内换新重试，仅当前 socket 关闭才上抛
 //     net.ErrClosed（device 只对它终止接收循环，FINDINGS 0.1 第 3 条）。
@@ -560,40 +561,36 @@ func (b *Bind) Open(port uint16) ([]conn.ReceiveFunc, uint16, error) {
 					"（可能原因：直连地址不可达 / 出口公网映射失效 / 打洞失败）", src, directN)
 			}
 
-			if isRelayEp {
-				typ, payload, err := proto.DecodeFrame(packets[0][:n])
-				if err != nil {
-					continue // 畸形腿帧：丢弃继续读
-				}
-				switch typ {
-				case proto.FrameTypeData:
-					sizes[0] = len(payload)
-					copy(packets[0], payload)
-					eps[0] = raceEP{}
-					return 1, nil
-				case proto.FrameTypeControl:
-					// 判据日志：hint 到达/缺失一眼可见（打洞链路的第一环）
-					if addr, err := proto.DecodeHintPayload(payload); err == nil {
-						b.mu.Lock()
-						hasHint := b.cfg.OnHint != nil
-						b.mu.Unlock()
-						if hasHint {
-							b.cfg.Logf("HINT 收到对端地址线索 %s（来自中继 %v）", addr, src)
-						} else {
-							b.cfg.Logf("HINT 收到对端地址线索 %s，但没有处理器（缓存未接？）", addr)
-						}
-						// 锁内取、锁外调（FIX-15）：回调会经 SetCandidates 回锁——持锁调必死锁。
-						b.deliverHint(addr)
-					}
-					continue
-				default: // reg（服务端概念）与未知类型：忽略
-					continue
-				}
+			// FIX-91 统一线格式：所有来源（直连/中继）同构腿帧——isRelayEp 只用于
+			// 上方告警与统计语义，不再分派解码路径。
+			typ, payload, err := proto.DecodeFrame(packets[0][:n])
+			if err != nil {
+				continue // 非帧包（旧对端/垃圾）：丢弃继续读
 			}
-			// 直连裸 WG
-			sizes[0] = n
-			eps[0] = raceEP{}
-			return 1, nil
+			switch typ {
+			case proto.FrameTypeData:
+				sizes[0] = len(payload)
+				copy(packets[0], payload)
+				eps[0] = raceEP{}
+				return 1, nil
+			case proto.FrameTypeControl:
+				// 判据日志：hint 到达/缺失一眼可见（打洞链路的第一环）
+				if addr, err := proto.DecodeHintPayload(payload); err == nil {
+					b.mu.Lock()
+					hasHint := b.cfg.OnHint != nil
+					b.mu.Unlock()
+					if hasHint {
+						b.cfg.Logf("HINT 收到对端地址线索 %s（来自 %v）", addr, src)
+					} else {
+						b.cfg.Logf("HINT 收到对端地址线索 %s，但没有处理器（缓存未接？）", addr)
+					}
+					// 锁内取、锁外调（FIX-15）：回调会经 SetCandidates 回锁——持锁调必死锁。
+					b.deliverHint(addr)
+				}
+				continue
+			default: // reg（服务端概念）/ 容器（服务端搭车用）与未知类型：忽略
+				continue
+			}
 		}
 	}
 	b.mu.Lock()
@@ -728,30 +725,26 @@ func (b *Bind) Send(bufs [][]byte, ep conn.Endpoint) error {
 	return nil
 }
 
-// writeCandidate：把一条包发到某个候选（中继候选要套腿帧与路由标签；直连搭车 reg）。
-// 发送失败显式记录（每候选 5s 限流，走 noteMirrorSendErr——镜像口径：不刷粘性信号，
-// 评审 H4）——「无路由/EHOSTUNREACH」这类**本地就失败**的候选与「发出去石沉大海」
-// 从此可分（2026-09-20 直连排查缺口：之前错误全被丢弃）。
+// writeCandidate：把一条包发到某个候选（FIX-91 统一线格式：所有腿套腿帧；有 reg
+// 搭车时用单数据报容器 [reg][data] 保 1 RTT——direct/relay 同构，relay 多套 [0xAA]
+// 路由头）。发送失败显式记录（每候选 5s 限流，走 noteMirrorSendErr——镜像口径：不刷
+// 粘性信号，评审 H4）——「无路由/EHOSTUNREACH」这类**本地就失败**的候选与「发出去
+// 石沉大海」从此可分（2026-09-20 直连排查缺口：之前错误全被丢弃）。
 func (b *Bind) writeCandidate(c *net.UDPConn, cd Candidate, buf, regPkt []byte) {
-	if cd.Relay {
-		if regPkt != nil {
-			if err := b.writeUDP(c, proto.EncodeTagged(b.relayID, proto.FrameTypeReg, regPkt), cd.Addr); err != nil {
-				b.noteMirrorSendErr(cd.Addr, err)
-			}
-		}
-		if err := b.writeUDP(c, proto.EncodeTagged(b.relayID, proto.FrameTypeData, buf), cd.Addr); err != nil {
-			b.noteMirrorSendErr(cd.Addr, err)
-		}
-		return
-	}
+	var frame []byte
 	if regPkt != nil {
-		joined := append(append([]byte{}, regPkt...), buf...)
-		if err := b.writeUDP(c, joined, cd.Addr); err != nil {
-			b.noteMirrorSendErr(cd.Addr, err)
-		}
-		return
+		frame = proto.EncodeBatch(
+			proto.BatchMsg{Type: proto.FrameTypeReg, Payload: regPkt},
+			proto.BatchMsg{Type: proto.FrameTypeData, Payload: buf},
+		)
+	} else {
+		frame = proto.EncodeFrame(proto.FrameTypeData, buf)
 	}
-	if err := b.writeUDP(c, buf, cd.Addr); err != nil {
+	wire := frame
+	if cd.Relay {
+		wire = proto.EncodeTaggedFrame(b.relayID, frame)
+	}
+	if err := b.writeUDP(c, wire, cd.Addr); err != nil {
 		b.noteMirrorSendErr(cd.Addr, err)
 	}
 }
@@ -767,22 +760,24 @@ func (b *Bind) writeUDP(c *net.UDPConn, buf []byte, addr netip.AddrPort) error {
 	return err
 }
 
-// sendTo 采纳路径的封装发送（按目标类型决定是否套腿帧）。
+// sendTo 采纳路径的封装发送（FIX-91 统一线格式：所有腿套数据腿帧；中继多套路由头）。
 func (b *Bind) sendTo(c *net.UDPConn, addr netip.AddrPort, isRelay bool, buf []byte) error {
+	frame := proto.EncodeFrame(proto.FrameTypeData, buf)
 	if isRelay {
-		return b.writeUDP(c, proto.EncodeTagged(b.relayID, proto.FrameTypeData, buf), addr)
+		return b.writeUDP(c, proto.EncodeTaggedFrame(b.relayID, frame), addr)
 	}
-	return b.writeUDP(c, buf, addr)
+	return b.writeUDP(c, frame, addr)
 }
 
 // sendToSilent 同 sendTo 但不进发送计数（过渡双发为尽力语义：旧路径的本地错误
 // 不得污染「环境性禁发」判据的 sendTries/sendLocalFails）。
 func (b *Bind) sendToSilent(c *net.UDPConn, addr netip.AddrPort, isRelay bool, buf []byte) error {
+	frame := proto.EncodeFrame(proto.FrameTypeData, buf)
 	if isRelay {
-		_, err := c.WriteToUDPAddrPort(proto.EncodeTagged(b.relayID, proto.FrameTypeData, buf), addr)
+		_, err := c.WriteToUDPAddrPort(proto.EncodeTaggedFrame(b.relayID, frame), addr)
 		return err
 	}
-	_, err := c.WriteToUDPAddrPort(buf, addr)
+	_, err := c.WriteToUDPAddrPort(frame, addr)
 	return err
 }
 
@@ -908,7 +903,7 @@ func (b *Bind) Rebind() error {
 // 没有任何信号——只能等巡检 3 连败（≈2–4 分钟）走整套自重绑。周期调用它可推进出口的活跃时间；
 // 探测失败时立即调用它，可以把恢复提前到「一次巡检内」。
 //
-// 发送路径 = 已采纳地址（direct = 裸腿帧 [0xBB][2][reg]；relay = 带路由标签的腿帧）。
+// 发送路径 = 已采纳地址（direct = 腿帧 [0xBB][2][reg]；relay = 带路由标签的腿帧）。
 // 未采纳（从未连上）时返回 false —— 首次建连的注册由 Send 搭车负责。
 func (b *Bind) RefreshReg() bool {
 	if b.cfg.Identity == nil {

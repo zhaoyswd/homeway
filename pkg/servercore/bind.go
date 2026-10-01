@@ -20,14 +20,13 @@ import (
 var nowTime = time.Now
 
 // ServerBind：homewayd 的 conn.Bind。与客户端 wtransport 对称但无赛跑逻辑：
-// 监听固定端口，收包按首字节无歧义判别三种形态——
+// 监听固定端口，收包按首字节判别（FIX-91 统一线格式——**所有腿都是腿帧**）：
 //
-//	[0xBB]…      腿帧（来自中继分配 socket）：0=数据入 device / 1=hint 回调 / 2=reg / 未知=忽略
-//	"HR"…‖WG     直连 reg 搭车（SplitDirectReg 拆分，先登记后投递）
-//	其余          直连裸 WG
+//	[0xBB]…   腿帧（直连与中继同构）：0=数据入 device / 1=hint 回调 / 2=reg /
+//	          4=容器（[reg][data] 搭车，先登记后投递）/ 未知=忽略
+//	其余      非腿包（STUN 应答 / 参照点探测在前段单独处理；其余丢弃计数）
 //
-// Send 恒裸发（对端 endpoint 是中继分配地址或客户端直连地址，两者都收裸 WG；
-// 中继负责把回程包包装成腿帧发回客户端）。
+// Send 恒发腿帧（直连地址与中继腿同一个格式；中继原样转发，不再做包装）。
 type ServerBind struct {
 	Port  uint16
 	Table *DeviceTable
@@ -79,6 +78,10 @@ type ServerBind struct {
 	// goroutine 永远退不出（review #8 要的幂等是「不 panic/可重复」，不是「只许一次」）。
 	deadMu sync.Mutex
 	dead_  chan struct{}
+	// reapDone：本世代 legReapLoop 的退出确认（每次 Open 重建；FIX-91 补）。
+	// Close 关 dead_ 后等待它——确定性收工：否则换代遗留的回收 goroutine 可能在
+	// 下一个实例/测试的读写窗口里再摸一次包级测试缝（legSweepEvery 等），-race 报竞态。
+	reapDone chan struct{}
 	// legRecent：最近被摘除的腿远端地址（TTL 内用于 Send 的「不回落主 socket」判定
 	// 与日志归因，review #17）。
 	legRecent map[netip.AddrPort]time.Time
@@ -582,8 +585,13 @@ func (b *ServerBind) Open(port uint16) ([]conn.ReceiveFunc, uint16, error) {
 	b.deadMu.Lock()
 	b.dead_ = make(chan struct{})
 	dead := b.dead_
+	done := make(chan struct{})
+	b.reapDone = done
 	b.deadMu.Unlock()
-	go b.legReapLoop(dead) // 每世代一条（a1）：Close 关信号即退出，重新 Open 再起
+	go func() {
+		defer close(done)
+		b.legReapLoop(dead) // 每世代一条（a1）：Close 关信号即退出，重新 Open 再起
+	}()
 	fn := func(packets [][]byte, sizes []int, eps []conn.Endpoint) (int, error) {
 		for {
 			n, src, err := b.readOnce(c, packets[0])
@@ -695,6 +703,8 @@ func (b *ServerBind) processPacket(packets [][]byte, sizes []int, eps []conn.End
 				}
 			}
 			return 0, nil
+		case proto.FrameTypeBatch:
+			return b.handleBatch(packets, sizes, eps, buf, payload, src)
 		default:
 			// 中继控制帧（type≥3）等留给钩子；没钩子就按前向兼容忽略。
 			b.noteNewSrc(src, fmt.Sprintf("腿帧type=%d", typ), len(buf))
@@ -705,30 +715,53 @@ func (b *ServerBind) processPacket(packets [][]byte, sizes []int, eps []conn.End
 		}
 	}
 
-	if reg, rest, ok := proto.SplitDirectReg(buf); ok {
-		shape := "直连reg搭车"
-		if len(rest) > 0 {
-			shape += "+" + wgMsgName(rest[0])
-		}
-		b.noteNewSrc(src, shape, len(buf))
-		if _, err := b.Table.Register(reg, nowTime()); err != nil {
-			b.logfD("reg 搭车被拒（来源 %v）：%v", src, err)
-			return 0, nil
-		}
-		sizes[0] = len(rest)
-		copy(packets[0], rest)
-		eps[0] = srvEP{src}
-		return 1, nil
-	}
-
-	// 直连裸 WG
-	shape := "直连裸WG"
+	// FIX-91 统一线格式：非帧包不是腿（旧客户端裸 WG / 垃圾）——丢弃计数。
+	// （STUN 应答与参照点探测在前面已单独处理，不走这里。）
+	shape := "非帧包"
 	if len(buf) > 0 {
-		shape = "直连裸" + wgMsgName(buf[0])
+		shape = fmt.Sprintf("非帧（%s，首字节=0x%02x）", wgMsgName(buf[0]), buf[0])
 	}
 	b.noteNewSrc(src, shape, len(buf))
-	sizes[0] = len(buf)
-	copy(packets[0], buf)
+	return 0, nil
+}
+
+// handleBatch：解腿帧容器（首个握手包的 [reg][data] 搭车，保 1 RTT）。按序处理：
+// reg 先登记（同一数据报内必须先于 data 被消费）；data 投递入 device；control 交 hint。
+// 容器约束：最多一条 data（多条时取首条，其余忽略——UDP 单数据报只投一次）。
+func (b *ServerBind) handleBatch(packets [][]byte, sizes []int, eps []conn.Endpoint, raw, payload []byte, src netip.AddrPort) (int, error) {
+	msgs, err := proto.DecodeBatch(payload)
+	if err != nil {
+		b.noteNewSrc(src, "畸形容器", len(raw))
+		return 0, nil
+	}
+	var data []byte
+	for _, m := range msgs {
+		switch m.Type {
+		case proto.FrameTypeReg:
+			if _, rerr := b.Table.Register(m.Payload, nowTime()); rerr != nil {
+				b.logfD("reg 容器被拒（来源 %v）：%v", src, rerr)
+			}
+		case proto.FrameTypeData:
+			if data == nil {
+				data = m.Payload
+			}
+		case proto.FrameTypeControl:
+			if b.OnHint != nil {
+				if addr, herr := proto.DecodeHintPayload(m.Payload); herr == nil {
+					b.OnHint(addr, src)
+				}
+			}
+		default:
+			// 未知消息类型：忽略（前向兼容）。
+		}
+	}
+	if data == nil {
+		b.noteNewSrc(src, "容器（无数据）", len(raw))
+		return 0, nil
+	}
+	b.noteNewSrc(src, "容器数据", len(raw))
+	sizes[0] = len(data)
+	copy(packets[0], data)
 	eps[0] = srvEP{src}
 	return 1, nil
 }
@@ -787,6 +820,13 @@ func (b *ServerBind) logfD(format string, args ...any) {
 // 关当前世代的收工信号（腿侧读循环退出）+ 全部腿 + 主 socket。Open 会重建信号。
 func (b *ServerBind) Close() error {
 	b.closeDead()
+	// 确定性收工：等本世代回收循环退出后再继续（已退出/未起过 = 立即返回）。
+	b.deadMu.Lock()
+	done := b.reapDone
+	b.deadMu.Unlock()
+	if done != nil {
+		<-done
+	}
 	b.legMu.Lock()
 	for _, lg := range b.legByID {
 		_ = lg.sock.Close()
@@ -928,7 +968,7 @@ func (b *ServerBind) Send(bufs [][]byte, ep conn.Endpoint) error {
 	if lg != nil {
 		lg.last.Store(time.Now().UnixMilli())
 		for _, buf := range bufs {
-			if _, err := lg.sock.Write(buf); err != nil {
+			if _, err := lg.sock.Write(proto.EncodeFrame(proto.FrameTypeData, buf)); err != nil {
 				return err
 			}
 		}
@@ -950,7 +990,7 @@ func (b *ServerBind) Send(bufs [][]byte, ep conn.Endpoint) error {
 		return fmt.Errorf("server: socket 还没打开")
 	}
 	for _, buf := range bufs {
-		if _, err := c.WriteToUDPAddrPort(buf, e.ap); err != nil {
+		if _, err := c.WriteToUDPAddrPort(proto.EncodeFrame(proto.FrameTypeData, buf), e.ap); err != nil {
 			return err
 		}
 	}

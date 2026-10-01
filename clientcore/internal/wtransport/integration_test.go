@@ -165,22 +165,38 @@ func (b *srvBind) Open(port uint16) ([]conn.ReceiveFunc, uint16, error) {
 						b.h.registerClient()
 					}
 					continue
+				case proto.FrameTypeBatch:
+					// FIX-91 搭车容器：按序 [reg][data]（先登记后投递）。
+					msgs, berr := proto.DecodeBatch(payload)
+					if berr != nil {
+						continue
+					}
+					var data []byte
+					for _, m := range msgs {
+						switch m.Type {
+						case proto.FrameTypeReg:
+							if _, _, err := proto.VerifyReg(b.h.secret, m.Payload, time.Now(), time.Minute); err == nil {
+								b.h.registerClient()
+							}
+						case proto.FrameTypeData:
+							if data == nil {
+								data = m.Payload
+							}
+						}
+					}
+					if data == nil {
+						continue
+					}
+					sizes[0] = len(data)
+					copy(packets[0], data)
+					eps[0] = srvEP{src}
+					return 1, nil
 				default:
 					continue
 				}
 			}
-			if reg, rest, ok := proto.SplitDirectReg(buf); ok {
-				if _, _, err := proto.VerifyReg(b.h.secret, reg, time.Now(), time.Minute); err == nil {
-					b.h.registerClient()
-				}
-				sizes[0] = len(rest)
-				copy(packets[0], rest)
-				eps[0] = srvEP{src}
-				return 1, nil
-			}
-			sizes[0] = n
-			eps[0] = srvEP{src}
-			return 1, nil
+			// FIX-91 统一线格式：非帧包不是腿（旧对端/垃圾）——丢弃。
+			continue
 		}
 	}
 	return []conn.ReceiveFunc{fn}, actual, nil
@@ -201,7 +217,8 @@ func (b *srvBind) Send(bufs [][]byte, ep conn.Endpoint) error {
 		return fmt.Errorf("srvBind: 未知 endpoint %T", ep)
 	}
 	for _, buf := range bufs {
-		if _, err := b.c.WriteToUDPAddrPort(buf, e.ap); err != nil {
+		// FIX-91 统一线格式：出口恒发数据腿帧。
+		if _, err := b.c.WriteToUDPAddrPort(proto.EncodeFrame(proto.FrameTypeData, buf), e.ap); err != nil {
 			return err
 		}
 	}
@@ -273,8 +290,8 @@ func (r *testRelay) pump(alloc *net.UDPConn, client netip.AddrPort) {
 		if err != nil {
 			return
 		}
-		// 后端回程裸 WG → 包装腿帧发回客户端
-		r.ln.WriteToUDPAddrPort(proto.EncodeFrame(proto.FrameTypeData, buf[:n]), client)
+		// FIX-91：后端回程已是腿帧（出口恒套帧）——原样转发（与生产中继同语义）
+		r.ln.WriteToUDPAddrPort(buf[:n], client)
 	}
 }
 

@@ -18,6 +18,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/zhaoyswd/homeway/pkg/proto"
+
 	"golang.zx2c4.com/wireguard/conn"
 )
 
@@ -42,9 +44,9 @@ func TestSrcSeenConcurrentTwoPaths(t *testing.T) {
 			packets[0] = make([]byte, 65535)
 			sizes := make([]int, 1)
 			eps := make([]conn.Endpoint, 1)
-			// 首字节 4 = WG 传输数据：走「直连裸 WG」分支（两条接收路径共用的最热路径）。
-			pkt := []byte{4, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-				127, 0, 0, 1, 127, 0, 0, 1, 0, 53, 0, 53, 0, 0}
+			// 数据腿帧（FIX-91 统一线格式）：两条接收路径共用的最热路径。
+			pkt := proto.EncodeFrame(proto.FrameTypeData, []byte{4, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+				127, 0, 0, 1, 127, 0, 0, 1, 0, 53, 0, 53, 0, 0})
 			for i := 0; i < 300; i++ {
 				src := netip.AddrPortFrom(base, uint16(20000+g*1000+i))
 				if n, err := b.processPacket(packets, sizes, eps, pkt, src); err != nil || n != 1 {
@@ -120,8 +122,8 @@ func TestSendDropsAfterLegRemoved(t *testing.T) {
 	_ = other.SetReadDeadline(time.Now().Add(time.Second))
 	if n, _, rerr := other.ReadFromUDP(buf); rerr != nil {
 		t.Fatalf("普通未知端点的发送被误丢：%v", rerr)
-	} else if string(buf[:n]) != "plain-direct" {
-		t.Fatalf("对照包内容不对：%q", buf[:n])
+	} else if string(buf[:n]) != string(proto.EncodeFrame(proto.FrameTypeData, []byte("plain-direct"))) {
+		t.Fatalf("对照包内容不对（应为数据腿帧）：%q", buf[:n])
 	}
 }
 
@@ -237,7 +239,7 @@ func TestMainSocketReceiveSurvivesNonCloseErrors(t *testing.T) {
 	}
 	defer peer.Close()
 	port := b.LocalPort()
-	if _, err := peer.WriteToUDP([]byte("ok"), &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: int(port)}); err != nil {
+	if _, err := peer.WriteToUDP(proto.EncodeFrame(proto.FrameTypeData, []byte("ok")), &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: int(port)}); err != nil {
 		t.Fatalf("write: %v", err)
 	}
 	select {

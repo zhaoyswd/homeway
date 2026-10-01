@@ -215,8 +215,8 @@ func TestControlDialSession(t *testing.T) {
 		// 等腿窗口的缓冲应在拨腿后放行（首包不丢；腿上是 0xBB 数据帧，剥帧比对）
 		be.readLeg(t, leg, "ping-dial")
 		t.Logf("通告+拨腿+首包送达 = %v（会话 #%d 数据口 %d）", time.Since(t0), sess.ID, sess.DataPort)
-		// 回程（裸 WG 语义）→ 客户端
-		if _, err := leg.Write([]byte{9, 8, 7}); err != nil {
+		// 回程（数据腿帧语义，与生产出口一致）→ 客户端
+		if _, err := leg.Write(proto.EncodeFrame(proto.FrameTypeData, []byte{9, 8, 7})); err != nil {
 			t.Fatal(err)
 		}
 		got, ok := cli.readData(2 * time.Second)
@@ -353,7 +353,7 @@ func TestControlReplayPromotesFallbackAssocs(t *testing.T) {
 	if !ok || string(payload) != "fallback-flow" {
 		t.Fatalf("fallback 会话不通：payload=%q ok=%v", payload, ok)
 	}
-	if _, err := be.pc.WriteToUDPAddrPort([]byte("R-fb"), from); err != nil {
+	if _, err := be.pc.WriteToUDPAddrPort(proto.EncodeFrame(proto.FrameTypeData, []byte("R-fb")), from); err != nil {
 		t.Fatal(err)
 	}
 	if got, ok := cli.readData(2 * time.Second); !ok || string(got) != "R-fb" {
@@ -434,7 +434,7 @@ func TestControlReplayPromotesFallbackAssocs(t *testing.T) {
 		t.Fatalf("腿上数据：typ=%d payload=%q err=%v", typ, payload, derr)
 	}
 	// 回程照走腿 → 客户端。
-	if _, err := leg.Write([]byte{5, 5}); err != nil {
+	if _, err := leg.Write(proto.EncodeFrame(proto.FrameTypeData, []byte{5, 5})); err != nil {
 		t.Fatal(err)
 	}
 	if got, ok := cli.readData(2 * time.Second); !ok || string(got) != string([]byte{5, 5}) {
@@ -553,7 +553,7 @@ func TestControlRedialLegUpNotForwarded(t *testing.T) {
 			t.Fatal(err)
 		}
 		time.Sleep(100 * time.Millisecond) // 让认证跟随先生效
-		if _, err := leg2.Write([]byte{7, 7}); err != nil {
+		if _, err := leg2.Write(proto.EncodeFrame(proto.FrameTypeData, []byte{7, 7})); err != nil {
 			t.Fatal(err)
 		}
 		// 客户端收到的必须是数据，不是 LEGUP 标记。

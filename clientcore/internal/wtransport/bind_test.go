@@ -44,6 +44,40 @@ func readWithDeadline(t *testing.T, c *net.UDPConn, d time.Duration) []byte {
 	return buf[:n]
 }
 
+// splitCarriedReg：从镜像包拆「容器帧 [reg][data]」（FIX-91 搭车形态）。
+func splitCarriedReg(t *testing.T, pkt []byte) (reg, data []byte, ok bool) {
+	t.Helper()
+	typ, payload, err := proto.DecodeFrame(pkt)
+	if err != nil || typ != proto.FrameTypeBatch {
+		return nil, nil, false
+	}
+	msgs, err := proto.DecodeBatch(payload)
+	if err != nil {
+		return nil, nil, false
+	}
+	for _, m := range msgs {
+		switch m.Type {
+		case proto.FrameTypeReg:
+			reg = m.Payload
+		case proto.FrameTypeData:
+			if data == nil {
+				data = m.Payload
+			}
+		}
+	}
+	return reg, data, reg != nil
+}
+
+// frameData：解数据腿帧（「读对端收到的包」断言用；统一线格式后恒为帧）。
+func frameData(t *testing.T, pkt []byte) []byte {
+	t.Helper()
+	typ, payload, err := proto.DecodeFrame(pkt)
+	if err != nil || typ != proto.FrameTypeData {
+		t.Fatalf("期望数据腿帧：typ=%d err=%v pkt=% x", typ, err, pkt)
+	}
+	return payload
+}
+
 func newTestBind(t *testing.T, cfg Config) *Bind {
 	t.Helper()
 	if cfg.Identity == nil {
@@ -115,7 +149,7 @@ func TestMirrorCountAndAdoption(t *testing.T) {
 	if pkt == nil {
 		t.Fatal("活候选未收到镜像包")
 	}
-	reg, rest, ok := proto.SplitDirectReg(pkt)
+	reg, rest, ok := splitCarriedReg(t, pkt)
 	if !ok {
 		t.Fatalf("镜像包缺 reg 前缀：% x", pkt[:4])
 	}
@@ -127,7 +161,7 @@ func TestMirrorCountAndAdoption(t *testing.T) {
 	}
 
 	// 判据③：活候选应答 → 采纳该来源；后续发送只走采纳路径且不再带 reg
-	live.WriteToUDPAddrPort(wg, localAddr(b.Port()))
+	live.WriteToUDPAddrPort(proto.EncodeFrame(proto.FrameTypeData, wg), localAddr(b.Port()))
 	n, got := callRecv(t, b, 2*time.Second)
 	if n != 1 || string(got) != string(wg) {
 		t.Fatalf("recv n=%d pkt=% x", n, got)
@@ -140,8 +174,22 @@ func TestMirrorCountAndAdoption(t *testing.T) {
 		t.Fatal(err)
 	}
 	pkt2 := readWithDeadline(t, live, 2*time.Second)
-	if pkt2 == nil || string(pkt2) != string(wg) {
-		t.Fatalf("采纳后应裸发 WG：% x", pkt2)
+	if pkt2 == nil || string(frameData(t, pkt2)) != string(wg) {
+		t.Fatalf("采纳后应发数据腿帧：% x", pkt2)
+	}
+}
+
+// TestDirectNonFrameDropped（FIX-91 统一线格式）：直连来源的非帧包（旧对端裸 WG/
+// 垃圾）必须被丢弃——不得直投 device、不得形成采纳。
+func TestDirectNonFrameDropped(t *testing.T) {
+	live := mustLocalListener(t)
+	b := newTestBind(t, Config{Candidates: []Candidate{{Addr: udpAddr(live)}}})
+	// 裸 WG 形态（旧客户端）：统一线格式后应被丢弃。
+	live.WriteToUDPAddrPort([]byte{4, 0, 0, 0, 1, 2, 3}, localAddr(b.Port()))
+	// 随后发合法数据帧：应立即被投递（证明前面的包被丢弃且读取循环未被打断）。
+	live.WriteToUDPAddrPort(proto.EncodeFrame(proto.FrameTypeData, []byte("ok")), localAddr(b.Port()))
+	if n, pkt := callRecv(t, b, 2*time.Second); n != 1 || string(pkt) != "ok" {
+		t.Fatalf("非帧包应被丢弃、合法帧应投递：n=%d pkt=%q", n, pkt)
 	}
 }
 
@@ -153,13 +201,13 @@ func TestAdoptionSwitch(t *testing.T) {
 
 	_ = b.Send([][]byte{wg}, race)
 	// L2 先应答 → 采纳 L2
-	l2.WriteToUDPAddrPort(wg, localAddr(b.Port()))
+	l2.WriteToUDPAddrPort(proto.EncodeFrame(proto.FrameTypeData, wg), localAddr(b.Port()))
 	callRecv(t, b, 2*time.Second)
 	if a, _, ok := b.Adopted(); !ok || a != udpAddr(l2) {
 		t.Fatalf("首个响应者应为 L2：%v", a)
 	}
 	// L1 后应答 → 漫游语义：最新合法来源胜出
-	l1.WriteToUDPAddrPort(wg, localAddr(b.Port()))
+	l1.WriteToUDPAddrPort(proto.EncodeFrame(proto.FrameTypeData, wg), localAddr(b.Port()))
 	callRecv(t, b, 2*time.Second)
 	if a, _, ok := b.Adopted(); !ok || a != udpAddr(l1) {
 		t.Fatalf("后到来源应切换采纳：%v", a)
@@ -182,17 +230,17 @@ func TestRelayLegHintAndUnknownFrame(t *testing.T) {
 	race, _ := b.ParseEndpoint("race")
 	wg := []byte{1, 0x11}
 
-	// 赛跑期发送：中继应收到 [tag reg] 与 [tag data] 两数据报
+	// 赛跑期发送：中继应收到一条 tagged 容器帧（[reg][data] 单数据报，保 1 RTT）
 	_ = b.Send([][]byte{wg}, race)
 	p1 := readWithDeadline(t, rl, 2*time.Second)
-	p2 := readWithDeadline(t, rl, 2*time.Second)
-	_, typ1, _, err := proto.DecodeTagged(p1)
-	if err != nil || typ1 != proto.FrameTypeReg {
-		t.Fatalf("首帧应为 tagged reg：err=%v typ=%d", err, typ1)
+	_, typ1, payload1, err := proto.DecodeTagged(p1)
+	if err != nil || typ1 != proto.FrameTypeBatch {
+		t.Fatalf("首包应为 tagged 容器帧：err=%v typ=%d", err, typ1)
 	}
-	_, typ2, payload2, err := proto.DecodeTagged(p2)
-	if err != nil || typ2 != proto.FrameTypeData || string(payload2) != string(wg) {
-		t.Fatalf("次帧应为 tagged data：err=%v typ=%d", err, typ2)
+	msgs, berr := proto.DecodeBatch(payload1)
+	if berr != nil || len(msgs) != 2 || msgs[0].Type != proto.FrameTypeReg ||
+		msgs[1].Type != proto.FrameTypeData || string(msgs[1].Payload) != string(wg) {
+		t.Fatalf("容器应为 [reg][data]：err=%v msgs=%d", berr, len(msgs))
 	}
 
 	// 回程：hint 帧 → 回调、不产包；未知类型 → 忽略；数据帧 → 入 device
@@ -229,17 +277,17 @@ func TestRearmRegAgain(t *testing.T) {
 	wg := []byte{1, 0}
 
 	_ = b.Send([][]byte{wg}, race)
-	readWithDeadline(t, live, time.Second) // reg‖wg
+	readWithDeadline(t, live, time.Second) // 容器（reg+wg）
 	_ = b.Send([][]byte{wg}, race)
 	p := readWithDeadline(t, live, time.Second)
-	if _, _, ok := proto.SplitDirectReg(p); ok {
+	if _, _, ok := splitCarriedReg(t, p); ok {
 		t.Fatal("同轮赛跑内 reg 只应搭车一次")
 	}
 
 	b.Rearm()
 	_ = b.Send([][]byte{wg}, race)
 	p2 := readWithDeadline(t, live, time.Second)
-	if _, _, ok := proto.SplitDirectReg(p2); !ok {
+	if _, _, ok := splitCarriedReg(t, p2); !ok {
 		t.Fatal("Rearm 后 reg 应重新武装")
 	}
 }
@@ -272,7 +320,7 @@ func TestIdentityLifecycle(t *testing.T) {
 	}
 	_ = b.Send([][]byte{{1, 0}}, race)
 	pkt := readWithDeadline(t, live, 2*time.Second)
-	reg, _, ok := proto.SplitDirectReg(pkt)
+	reg, _, ok := splitCarriedReg(t, pkt)
 	if !ok {
 		t.Fatal("重连后镜像包应重新搭车 reg")
 	}
@@ -311,7 +359,7 @@ func TestBindStatusContract(t *testing.T) {
 
 	// 直连包到达 → via=direct + ep + 新鲜度时间戳
 	dst := netip.AddrPortFrom(netip.MustParseAddr("127.0.0.1"), b.Port())
-	if _, err := peer.WriteToUDPAddrPort([]byte("wg"), dst); err != nil {
+	if _, err := peer.WriteToUDPAddrPort(proto.EncodeFrame(proto.FrameTypeData, []byte("wg")), dst); err != nil {
 		t.Fatal(err)
 	}
 	if n, pkt := callRecv(t, b, time.Second); n != 1 || string(pkt) != "wg" {
@@ -386,12 +434,12 @@ func TestMirrorAndAdoptOverIPv6(t *testing.T) {
 	if pkt == nil {
 		t.Fatal("v6 候选未收到镜像包")
 	}
-	if _, rest, ok := proto.SplitDirectReg(pkt); !ok || string(rest) != string(wg) {
+	if _, rest, ok := splitCarriedReg(t, pkt); !ok || string(rest) != string(wg) {
 		t.Fatalf("v6 镜像包内容不符：% x", pkt)
 	}
 
 	// v6 来源应答 → 采纳；后续裸发
-	if _, err := live.WriteToUDPAddrPort(wg, localPortOf(t, b)); err != nil {
+	if _, err := live.WriteToUDPAddrPort(proto.EncodeFrame(proto.FrameTypeData, wg), localPortOf(t, b)); err != nil {
 		t.Fatal(err)
 	}
 	n, got := callRecv(t, b, 2*time.Second)
@@ -405,8 +453,8 @@ func TestMirrorAndAdoptOverIPv6(t *testing.T) {
 	if err := b.Send([][]byte{wg}, race); err != nil {
 		t.Fatal(err)
 	}
-	if pkt2 := readWithDeadline(t, live, 2*time.Second); pkt2 == nil || string(pkt2) != string(wg) {
-		t.Fatalf("v6 采纳后应裸发 WG：% x", pkt2)
+	if pkt2 := readWithDeadline(t, live, 2*time.Second); pkt2 == nil || string(frameData(t, pkt2)) != string(wg) {
+		t.Fatalf("v6 采纳后应发数据腿帧：% x", pkt2)
 	}
 }
 
@@ -548,7 +596,7 @@ func TestReceiveFuncSurvivesNonCloseErrors(t *testing.T) {
 	defer peer.Close()
 	cur := b.curConn()
 	dst := net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: cur.LocalAddr().(*net.UDPAddr).Port}
-	if _, err := peer.WriteToUDP([]byte("hello-after-rebind"), &dst); err != nil {
+	if _, err := peer.WriteToUDP(proto.EncodeFrame(proto.FrameTypeData, []byte("hello-after-rebind")), &dst); err != nil {
 		t.Fatalf("peer write: %v", err)
 	}
 	select {
@@ -695,7 +743,7 @@ func TestAdoptionHandoverDualSend(t *testing.T) {
 		t.Fatal("live 未收镜像包")
 	}
 	// live 应答 → 采纳 live（稳态）。
-	live.WriteToUDPAddrPort(wg, localAddr(b.Port()))
+	live.WriteToUDPAddrPort(proto.EncodeFrame(proto.FrameTypeData, wg), localAddr(b.Port()))
 	if n, _ := callRecv(t, b, 2*time.Second); n != 1 {
 		t.Fatal("live 应答未被读入")
 	}
@@ -704,7 +752,7 @@ func TestAdoptionHandoverDualSend(t *testing.T) {
 	}
 
 	// 未知来源应答 → 采纳切换（漫游学习语义保留）+ 登记过渡双发。
-	spoof.WriteToUDPAddrPort(wg, localAddr(b.Port()))
+	spoof.WriteToUDPAddrPort(proto.EncodeFrame(proto.FrameTypeData, wg), localAddr(b.Port()))
 	if n, _ := callRecv(t, b, 2*time.Second); n != 1 {
 		t.Fatal("spoof 应答未被读入")
 	}
@@ -715,21 +763,21 @@ func TestAdoptionHandoverDualSend(t *testing.T) {
 	if err := b.Send([][]byte{wg}, race); err != nil {
 		t.Fatal(err)
 	}
-	if got := readWithDeadline(t, spoof, 1*time.Second); string(got) != string(wg) {
+	if got := readWithDeadline(t, spoof, 1*time.Second); string(frameData(t, got)) != string(wg) {
 		t.Fatalf("新路径未收包：% x", got)
 	}
-	if got := readWithDeadline(t, live, 1*time.Second); string(got) != string(wg) {
+	if got := readWithDeadline(t, live, 1*time.Second); string(frameData(t, got)) != string(wg) {
 		t.Fatalf("旧路径未收宽限双发（单发悬崖回归）：% x", got)
 	}
 	// 判据②：切回合法候选（live 再应答）→ 过渡清除，不再向 spoof 双发。
-	live.WriteToUDPAddrPort(wg, localAddr(b.Port()))
+	live.WriteToUDPAddrPort(proto.EncodeFrame(proto.FrameTypeData, wg), localAddr(b.Port()))
 	if n, _ := callRecv(t, b, 2*time.Second); n != 1 {
 		t.Fatal("live 再应答未被读入")
 	}
 	if err := b.Send([][]byte{wg}, race); err != nil {
 		t.Fatal(err)
 	}
-	if got := readWithDeadline(t, live, 1*time.Second); string(got) != string(wg) {
+	if got := readWithDeadline(t, live, 1*time.Second); string(frameData(t, got)) != string(wg) {
 		t.Fatalf("切回后 live 应收包：% x", got)
 	}
 	if got := readWithDeadline(t, spoof, 300*time.Millisecond); got != nil {

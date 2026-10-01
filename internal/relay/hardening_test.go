@@ -161,7 +161,7 @@ func TestLegRedialWithAuthFollows(t *testing.T) {
 		t.Fatal(err)
 	}
 	time.Sleep(100 * time.Millisecond)
-	if _, err := leg2.Write([]byte{9, 9}); err != nil {
+	if _, err := leg2.Write(proto.EncodeFrame(proto.FrameTypeData, []byte{9, 9})); err != nil {
 		t.Fatal(err)
 	}
 	if got, ok := cli.readData(2 * time.Second); !ok || string(got) != string([]byte{9, 9}) {

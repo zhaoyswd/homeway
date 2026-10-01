@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/zhaoyswd/homeway/pkg/proto"
 	"golang.zx2c4.com/wireguard/conn"
 )
 
@@ -188,7 +189,8 @@ func TestServerBindDualStack(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer c4.Close()
-	if _, err := c4.Write([]byte("v4-hello")); err != nil {
+	// FIX-91：非帧包被统一线格式丢弃——探针用合法数据腿帧（测试只关心来源可达）。
+	if _, err := c4.Write(proto.EncodeFrame(proto.FrameTypeData, []byte("v4-hello"))); err != nil {
 		t.Fatal(err)
 	}
 	// v6 客户端
@@ -197,7 +199,7 @@ func TestServerBindDualStack(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer c6.Close()
-	if _, err := c6.Write([]byte("v6-hello")); err != nil {
+	if _, err := c6.Write(proto.EncodeFrame(proto.FrameTypeData, []byte("v6-hello"))); err != nil {
 		t.Fatal(err)
 	}
 	seen4, seen6 := false, false
