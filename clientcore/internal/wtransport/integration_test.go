@@ -144,7 +144,7 @@ func (b *srvBind) Open(port uint16) ([]conn.ReceiveFunc, uint16, error) {
 			buf := packets[0][:n]
 
 			// 参照点探测（tasks 3.6）：与生产 ServerBind 同语义——明文一问一答，不进数据面。
-			if resp := probe.Respond(buf, src, "tier-test", 0x01); resp != nil { // flags bit0：模拟"默认路径能承载 UDP"
+			if resp := probe.Respond(buf, "tier-test", 0x01); resp != nil { // flags bit0：模拟"默认路径能承载 UDP"
 				_, _ = c.WriteToUDPAddrPort(resp, src)
 				continue
 			}
@@ -1275,16 +1275,6 @@ func TestIntegrationProbeReferencePoint(t *testing.T) {
 		t.Fatalf("RTT 异常：%v", rtt)
 	}
 	_ = flags // 能力位由出口决定（测试夹具不回 flags ⇒ 0）
-
-	// hint 应答：后端看到的客户端源地址（回环下应等于本机 socket 地址）
-	seen, _, err := probe.Hint(ctx, cli, target)
-	if err != nil {
-		t.Fatalf("hint 失败：%v", err)
-	}
-	want := cli.LocalAddr().(*net.UDPAddr).AddrPort()
-	if seen != want {
-		t.Fatalf("hint 观察地址=%v 期望 %v", seen, want)
-	}
 
 	// 非探测包（垃圾/裸 WG 形态）不应有任何响应：数据面不受探测通道影响
 	if _, err := cli.WriteToUDP([]byte("not-a-probe-payload"), net.UDPAddrFromAddrPort(target)); err != nil {

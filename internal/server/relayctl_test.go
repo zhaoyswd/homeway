@@ -124,7 +124,11 @@ firstOK:
 	// ② 回程：SendTo 与 WG device 的 Send 同款路由（端点命中腿表 → 腿 socket）→
 	// 中继 → 客户端。**不能用 SendRawTo**：主 socket 的源未过腿认证（#3），中继
 	// 会当未知源拒绝——旧测试能过恰是因为旧实现「任意源漂移跟随」的漏洞。
-	if err := sbind.SendTo(firstFrom, []byte("wg-response")); err != nil {
+	ep, perr := sbind.ParseEndpoint(firstFrom.String())
+	if perr != nil {
+		t.Fatal(perr)
+	}
+	if err := sbind.Send([][]byte{[]byte("wg-response")}, ep); err != nil {
 		t.Fatal(err)
 	}
 	gotReply := false

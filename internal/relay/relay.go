@@ -341,7 +341,7 @@ func (r *Relay) handlePacket(_ context.Context, src netip.AddrPort, pkt []byte) 
 	// 参照点探测（add-host-connectivity）：与出口侧同款语义的明文一问一答——客户端
 	// （添加主机等场景）借此验证中继腿可达。无状态、不进帧协议分派、不受后端注册
 	// 准入约束；防放大不变量由 probe.Respond 协议层保证（应答 ≤ 请求 + 45B）。
-	if resp := probe.Respond(pkt, src, r.cfg.Build, 0); resp != nil {
+	if resp := probe.Respond(pkt, r.cfg.Build, 0); resp != nil {
 		_, _ = r.pc.WriteToUDPAddrPort(resp, src)
 		return
 	}

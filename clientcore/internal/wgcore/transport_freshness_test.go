@@ -337,7 +337,7 @@ func fakeProbeResponder(t *testing.T, endpoints []netip.AddrPort) netip.AddrPort
 			if rerr != nil {
 				return
 			}
-			if resp := probe.RespondEx(buf[:n], src, "v-fresh", 0, endpoints); resp != nil {
+			if resp := probe.RespondEx(buf[:n], "v-fresh", 0, endpoints); resp != nil {
 				_, _ = c.WriteToUDPAddrPort(resp, src)
 			}
 		}

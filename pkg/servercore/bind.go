@@ -459,13 +459,6 @@ func (b *ServerBind) SendRawTo(addr netip.AddrPort, payload []byte) error {
 	return err
 }
 
-// SendTo：与 Send 同款路由（endpoint 命中腿表走腿、否则主 socket、腿已摘则丢弃），
-// 供非 WG 调用方（测试/e2e）按「数据面真实路径」发包。注册/保活/盲打仍用 SendRawTo
-// （那条路刻意钉主 socket：注册腿必须与数据面同端口，NAT 映射才一致）。
-func (b *ServerBind) SendTo(addr netip.AddrPort, buf []byte) error {
-	return b.Send([][]byte{buf}, srvEP{addr})
-}
-
 // PinnedIface 当前钉住的网卡（没绑卡时 nil）。
 func (b *ServerBind) PinnedIface() *net.Interface {
 	b.pinMu.Lock()
@@ -668,7 +661,7 @@ func (b *ServerBind) processPacket(packets [][]byte, sizes []int, eps []conn.End
 	if b.ProbeEndpoints != nil {
 		probeEps = b.ProbeEndpoints()
 	}
-	if resp := probe.RespondEx(buf, src, b.Build, caps, probeEps); resp != nil {
+	if resp := probe.RespondEx(buf, b.Build, caps, probeEps); resp != nil {
 		b.noteNewSrc(src, "参照点探测", len(buf))
 		if c := b.c.Load(); c != nil {
 			_, _ = c.WriteToUDPAddrPort(resp, src)

@@ -786,20 +786,6 @@ func PubFromPriv(priv [32]byte) [32]byte { return wgPub(priv) }
 // 中继日志 `中继：后端 <label> 注册成功` 用的就是它。
 func BackendLabel(priv [32]byte) [8]byte { return proto.RelayID(PubFromPriv(priv)) }
 
-// BackendLabelFromState：从 state 目录里的身份密钥算标签（`homewayd id` 用）。
-func BackendLabelFromState(stateDir string) ([8]byte, [32]byte, error) {
-	st, err := OpenState(stateDir)
-	if err != nil {
-		return [8]byte{}, [32]byte{}, err
-	}
-	priv, err := st.PrivateKey()
-	if err != nil {
-		return [8]byte{}, [32]byte{}, err
-	}
-	pub := PubFromPriv(priv)
-	return proto.RelayID(pub), pub, nil
-}
-
 // wgPub：从 WG 私钥导出公钥（Curve25519 basepoint 乘法）；中继注册要用它作 peerId。
 func wgPub(priv [32]byte) [32]byte {
 	pub, err := curve25519.X25519(priv[:], curve25519.Basepoint)

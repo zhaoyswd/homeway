@@ -64,7 +64,7 @@ func addStartProber(t *testing.T, build string) *addFakeProber {
 				return
 			}
 			fp.hits.Add(1)
-			if resp := probe.Respond(buf[:n], src.AddrPort(), build, 0); resp != nil {
+			if resp := probe.Respond(buf[:n], build, 0); resp != nil {
 				_, _ = pc.WriteToUDP(resp, src)
 			}
 		}

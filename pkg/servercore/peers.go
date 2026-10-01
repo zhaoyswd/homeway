@@ -618,9 +618,6 @@ func (t *DeviceTable) Briefs() []DeviceBrief {
 	return out
 }
 
-// Cap 容量。
-func (t *DeviceTable) Cap() int { return t.max }
-
 // Limits 返回 (cap, ttl, grace)，启动日志用。
 func (t *DeviceTable) Limits() (int, time.Duration, time.Duration) { return t.max, t.ttl, t.grace }
 

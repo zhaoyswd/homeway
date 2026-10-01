@@ -43,7 +43,6 @@ import (
 const (
 	Version   = 1
 	TypePing  = byte(1)
-	TypeHint  = byte(2)
 	minReqLen = 16
 	maxBuild  = 32
 	// MaxEndpoints：端点列表段的上限（出口与消费侧同此约束；8 × 18B + 1B 计数 ≈ 145B）。
@@ -70,7 +69,6 @@ type Response struct {
 	Nonce     [8]byte
 	Build     string
 	Flags     byte             // 出口能力位（type=ping；老出口不回这一段 ⇒ 0）
-	Seen      netip.AddrPort   // type=hint：后端看到的客户端源地址
 	Endpoints []netip.AddrPort // type=ping：出口端点列表段（老出口无此段 ⇒ nil）
 }
 
@@ -104,10 +102,10 @@ func DecodeRequest(b []byte) (Request, error) {
 }
 
 // Respond 处理一个可能为探测包的数据报：是探测且可应答 ⇒ 返回响应字节；否则 nil。
-// src = 后端看到的来源地址（type=hint 回给客户端自己的 NAT 映射）；flags 见 Response.Flags。
-// 无端点列表的旧形态（=RespondEx endpoints=nil），保留给不需要列表的调用方与测试。
-func Respond(req []byte, src netip.AddrPort, build string, flags byte) []byte {
-	return RespondEx(req, src, build, flags, nil)
+// flags 见 Response.Flags。无端点列表的旧形态（=RespondEx endpoints=nil），保留给
+// 不需要列表的调用方与测试。（FIX-95：type=hint 地址观测协议删除——src 参数随之移除。）
+func Respond(req []byte, build string, flags byte) []byte {
+	return RespondEx(req, build, flags, nil)
 }
 
 // RespondEx：Respond + 端点列表段（endpoint-freshness）。
@@ -115,12 +113,12 @@ func Respond(req []byte, src netip.AddrPort, build string, flags byte) []byte {
 // pad 契约（防放大，MUST）：只有「带列表的应答总长 ≤ 请求长度」才附列表——请求方以 pad 后的
 // 长度声明可收上限；老请求方（pad 16，总长 29B）自然拿不到列表段，45B 不变量保持。
 // endpoints 超上限截断到 MaxEndpoints；非法条目（无效地址/零端口）跳过。
-func RespondEx(req []byte, src netip.AddrPort, build string, flags byte, endpoints []netip.AddrPort) []byte {
+func RespondEx(req []byte, build string, flags byte, endpoints []netip.AddrPort) []byte {
 	r, err := DecodeRequest(req)
 	if err != nil {
 		return nil
 	}
-	base := respondBase(r, src, build, flags)
+	base := respondBase(r, build, flags)
 	if base == nil {
 		return nil
 	}
@@ -161,7 +159,7 @@ func RespondEx(req []byte, src netip.AddrPort, build string, flags byte, endpoin
 }
 
 // respondBase：不带列表段的应答（type 分派 + 回声 nonce；未知类型返回 nil）。
-func respondBase(r Request, src netip.AddrPort, build string, flags byte) []byte {
+func respondBase(r Request, build string, flags byte) []byte {
 	out := make([]byte, 0, 48)
 	out = append(out, respMagic[:]...)
 	out = append(out, Version, r.Type)
@@ -178,20 +176,6 @@ func respondBase(r Request, src netip.AddrPort, build string, flags byte) []byte
 		out = append(out, byte(len(build)))
 		out = append(out, build...)
 		out = append(out, flags)
-		return out
-	case TypeHint:
-		if !src.IsValid() {
-			return nil
-		}
-		a := src.Addr()
-		if a.Is4() {
-			a = netip.AddrFrom16(a.As16())
-		}
-		a16 := a.As16()
-		out = append(out, a16[:]...)
-		var port [2]byte
-		binary.BigEndian.PutUint16(port[:], src.Port())
-		out = append(out, port[:]...)
 		return out
 	default:
 		return nil // 未知类型：忽略
@@ -249,18 +233,6 @@ func DecodeResponse(b []byte, wantType byte, nonce [8]byte) (Response, error) {
 				}
 			}
 		}
-	case TypeHint:
-		if len(payload) < 18 {
-			return Response{}, ErrProbeShort
-		}
-		var a16 [16]byte
-		copy(a16[:], payload[:16])
-		addr := netip.AddrFrom16(a16).Unmap()
-		port := binary.BigEndian.Uint16(payload[16:18])
-		if !addr.IsValid() || port == 0 {
-			return Response{}, ErrProbeShort
-		}
-		resp.Seen = netip.AddrPortFrom(addr, port)
 	}
 	return resp, nil
 }
@@ -294,22 +266,6 @@ func PingEx(ctx context.Context, pc net.PacketConn, target netip.AddrPort, build
 		return PingResult{}, err
 	}
 	return PingResult{RTT: time.Since(start), Build: resp.Build, Flags: resp.Flags, Endpoints: resp.Endpoints}, nil
-}
-
-// Hint 问「我在你眼里是哪个地址」（NAT 映射观察；打洞与三档归因共用）。
-func Hint(ctx context.Context, pc net.PacketConn, target netip.AddrPort) (netip.AddrPort, time.Duration, error) {
-	nonce := randomNonce()
-	req := EncodeRequest(TypeHint, nonce, 16)
-	start := time.Now()
-	raw, err := roundTrip(ctx, pc, target, req, TypeHint, nonce)
-	if err != nil {
-		return netip.AddrPort{}, 0, err
-	}
-	resp, err := DecodeResponse(raw, TypeHint, nonce)
-	if err != nil {
-		return netip.AddrPort{}, 0, err
-	}
-	return resp.Seen, time.Since(start), nil
 }
 
 func roundTrip(ctx context.Context, pc net.PacketConn, target netip.AddrPort, req []byte, typ byte, nonce [8]byte) ([]byte, error) {

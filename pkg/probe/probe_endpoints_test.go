@@ -28,7 +28,7 @@ func encodeReqPadded(pad int) ([]byte, [8]byte) {
 
 func TestRespondExCarriesListWhenPadded(t *testing.T) {
 	req, nonce := encodeReqPadded(200)
-	resp := RespondEx(req, netip.AddrPort{}, "v9", 0, testEndpoints)
+	resp := RespondEx(req, "v9", 0, testEndpoints)
 	if resp == nil {
 		t.Fatal("应有应答")
 	}
@@ -64,7 +64,7 @@ func TestRespondExCarriesListWhenPadded(t *testing.T) {
 
 func TestRespondExDropsListWithoutPad(t *testing.T) {
 	req, nonce := encodeReqPadded(16) // 老客户端形态（29B 请求）
-	resp := RespondEx(req, netip.AddrPort{}, "v9", 0, testEndpoints)
+	resp := RespondEx(req, "v9", 0, testEndpoints)
 	if resp == nil {
 		t.Fatal("应有应答")
 	}
@@ -87,7 +87,7 @@ func TestRespondExCapsAndFilters(t *testing.T) {
 		many = append(many, netip.AddrPortFrom(netip.AddrFrom4([4]byte{203, 0, 113, byte(i)}), 41641))
 	}
 	many = append(many, netip.MustParseAddrPort("203.0.113.99:0")) // 零端口：跳过
-	resp := RespondEx(req, netip.AddrPort{}, "", 0, many)
+	resp := RespondEx(req, "", 0, many)
 	_, nonce := encodeReqPadded(600)
 	got, err := DecodeResponse(resp, TypePing, nonce)
 	if err != nil {
@@ -101,7 +101,7 @@ func TestRespondExCapsAndFilters(t *testing.T) {
 func TestDecodeResponseListMalformed(t *testing.T) {
 	// 计数超上限（>8）→ 错误。
 	req, nonce := encodeReqPadded(200)
-	base := RespondEx(req, netip.AddrPort{}, "", 0, nil)
+	base := RespondEx(req, "", 0, nil)
 	bad := append([]byte(nil), base...)
 	bad = append(bad, byte(MaxEndpoints+1))
 	if _, err := DecodeResponse(bad, TypePing, nonce); err == nil {
@@ -130,7 +130,7 @@ func TestPingExOverUDPPadContract(t *testing.T) {
 				return
 			}
 			// 新出口：带列表应答（pad 够的请求自动拿到、不够的自动退老形态）。
-			if resp := RespondEx(buf[:n], src, "v9-endpoint", 0, testEndpoints); resp != nil {
+			if resp := RespondEx(buf[:n], "v9-endpoint", 0, testEndpoints); resp != nil {
 				srv.WriteToUDPAddrPort(resp, src)
 			}
 		}

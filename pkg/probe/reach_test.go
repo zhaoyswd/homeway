@@ -38,7 +38,7 @@ func reachStartFakeProber(t *testing.T, build string) *reachFakeProber {
 				return
 			}
 			fp.hits.Add(1)
-			if resp := Respond(buf[:n], src.AddrPort(), fp.build, 0); resp != nil {
+			if resp := Respond(buf[:n], fp.build, 0); resp != nil {
 				_, _ = pc.WriteToUDP(resp, src)
 			}
 		}

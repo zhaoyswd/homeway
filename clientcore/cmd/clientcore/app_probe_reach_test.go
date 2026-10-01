@@ -41,7 +41,7 @@ func startFakeProber(t *testing.T, build string) *fakeProber {
 			if err != nil {
 				return
 			}
-			if resp := probe.Respond(buf[:n], src.AddrPort(), fp.build, 0); resp != nil {
+			if resp := probe.Respond(buf[:n], fp.build, 0); resp != nil {
 				_, _ = pc.WriteToUDP(resp, src)
 			}
 		}
