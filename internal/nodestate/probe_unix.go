@@ -17,7 +17,11 @@ import (
 // lockHeld 试探 <dir>/lock 是否被活进程持有。文件不存在 = 无人持有（顺手创建，
 // 与 daemon.AcquireInstanceLock 同款 O_CREATE）。
 func lockHeld(dir string) (bool, error) {
-	f, err := os.OpenFile(filepath.Join(dir, "lock"), os.O_CREATE|os.O_RDWR, 0o600)
+	// 不带 O_CREATE：只读探测不该在 state 里造 lock 文件（不存在 = 还没人取过锁）。
+	f, err := os.OpenFile(filepath.Join(dir, "lock"), os.O_RDWR, 0o600)
+	if os.IsNotExist(err) {
+		return false, nil
+	}
 	if err != nil {
 		return false, err
 	}

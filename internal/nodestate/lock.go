@@ -106,7 +106,9 @@ func formOr(form string) string {
 // 「谁占着 state」）。held = 有活进程持锁（flock 试探同 LockHeld）。
 func LockHolderInfo(stateDir string) (held bool, pid int, form string) {
 	path := filepath.Join(stateDir, lockFileName)
-	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o600)
+	// **不带 O_CREATE**（只读探测不该在 state 里造文件；文件不存在 = 还没人取过锁 =
+	// 未运行。O_CREATE 形态会让任何一次「未运行判定/import 前置探测」都留下一个 lock）。
+	f, err := os.OpenFile(path, os.O_RDWR, 0o600)
 	if err != nil {
 		return false, 0, ""
 	}

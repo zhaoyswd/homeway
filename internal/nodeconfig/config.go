@@ -357,33 +357,73 @@ const headerComment = `# homeway 配置（L1 意图层，唯一人写文件；06
 // Save 原子写 config：校验 → 定序序列化（+头部注释）→ 同目录 tmp → rename 原子替换
 // （0600；中断不留半文件——tmp 写失败即清理，目标文件保持写前内容）。
 func Save(path string, c *Config) error {
+	data, err := marshal(path, c)
+	if err != nil {
+		return err
+	}
+	return atomicWrite(path, data)
+}
+
+// marshal 校验 + 定序序列化（Save/Update 共用）。
+func marshal(path string, c *Config) ([]byte, error) {
 	f := toFile(c)
 	if err := validateFile(path, f); err != nil {
-		return err
+		return nil, err
 	}
 	var buf bytes.Buffer
 	buf.WriteString(headerComment)
 	enc := toml.NewEncoder(&buf)
 	enc.Indent = ""
 	if err := enc.Encode(f); err != nil {
-		return &Error{Path: path, Detail: fmt.Sprintf("序列化失败：%v", err)}
+		return nil, &Error{Path: path, Detail: fmt.Sprintf("序列化失败：%v", err)}
 	}
-	return atomicWrite(path, buf.Bytes())
+	return buf.Bytes(), nil
 }
 
 // Update 原子读改写（程序写者 set/clear/add/delete/start/stop 的统一落点）：
 // 读（坏 config = 拒绝写入 + 同款 fail-fast，MUST NOT 以默认覆盖——r1 中-14）→
 // fn 修改 → 校验 → 原子写回。
 func Update(path string, fn func(*Config) error) error {
-	c, err := Load(path)
-	if err != nil {
-		return err
+	// CAS 重试（FIX-56）：程序内写者（控制面）与 CLI 直改是两个进程（单实例锁保证
+	// 不会同时是「进程在跑」与「CLI 直改」——CLI 只在未跑时直改），但 CLI×CLI 或
+	// 「CLI 直改 vs 正在启动的进程」仍会撞：原实现 load→fn→save 是盲写，后写者把
+	// 先写者的更新覆盖掉。这里在写回前比对「文件仍是本次读到的内容」，不是就重来
+	// （读新内容 → 重跑 fn → 再比），最多 updateRetries 轮。
+	for attempt := 0; ; attempt++ {
+		before, rerr := os.ReadFile(path)
+		if rerr != nil && !os.IsNotExist(rerr) {
+			return fmt.Errorf("config: 读 %s 失败：%w", path, rerr)
+		}
+		c, err := Load(path)
+		if err != nil {
+			return err
+		}
+		if err := fn(c); err != nil {
+			return err
+		}
+		data, err := marshal(path, c)
+		if err != nil {
+			return err
+		}
+		cur, cerr := os.ReadFile(path)
+		switch {
+		case cerr == nil && bytes.Equal(cur, before):
+		case os.IsNotExist(cerr) && len(before) == 0:
+		case cerr != nil && !os.IsNotExist(cerr):
+			return fmt.Errorf("config: 复核 %s 失败：%w", path, cerr)
+		default:
+			// 期间被别的写者改过：重来（fn 幂等——set/clear 类操作天然可重放）。
+			if attempt+1 >= updateRetries {
+				return fmt.Errorf("config: %s 并发写入过于频繁（重试 %d 次仍被抢先）——稍后重试", path, updateRetries)
+			}
+			continue
+		}
+		return atomicWrite(path, data)
 	}
-	if err := fn(c); err != nil {
-		return err
-	}
-	return Save(path, c)
 }
+
+// updateRetries Update 的 CAS 重试上限。
+const updateRetries = 8
 
 // atomicWrite tmp+rename（同目录保证同文件系统，rename 原子）；失败清理 tmp。
 func atomicWrite(path string, data []byte) error {

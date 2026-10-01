@@ -228,6 +228,12 @@ func dirEmpty(dir string) (bool, error) {
 	return len(entries) == 0, nil
 }
 
+// 工件规模上限（半可信输入的第一道界；配合单文件 64MB 上限）。
+const (
+	artifactMaxEntries    = 4096      // 条目数上限（目录 + 文件）
+	artifactMaxTotalBytes = 256 << 20 // 总字节上限（256MB）
+)
+
 // readArtifact 读 tar 并做逐条目安全校验（r1 低-4：前缀 = homeway-export/、无 ../
 // 绝对路径/符号链接——工件来自用户、属半可信输入）。
 func readArtifact(path string) ([]artifactEntry, error) {
@@ -237,6 +243,7 @@ func readArtifact(path string) ([]artifactEntry, error) {
 	}
 	defer f.Close()
 	var entries []artifactEntry
+	var totalBytes int64
 	tr := tar.NewReader(f)
 	for {
 		hdr, err := tr.Next()
@@ -245,6 +252,17 @@ func readArtifact(path string) ([]artifactEntry, error) {
 		}
 		if err != nil {
 			return nil, fmt.Errorf("import: 工件不是合法 tar：%w", err)
+		}
+		// 工件来自用户（半可信输入，FIX-55）：**先于解包**界住条目数与总量——
+		// 原实现只有单文件 64MB 上限，10 万个小文件或上千个大文件会把条目全读进内存。
+		if len(entries) >= artifactMaxEntries {
+			return nil, fmt.Errorf("import: 工件条目数超上限（%d）——拒绝", artifactMaxEntries)
+		}
+		if hdr.Typeflag == tar.TypeReg {
+			totalBytes += hdr.Size
+			if totalBytes > artifactMaxTotalBytes {
+				return nil, fmt.Errorf("import: 工件总字节超上限（%d MB）——拒绝", artifactMaxTotalBytes>>20)
+			}
 		}
 		name := hdr.Name
 		switch hdr.Typeflag {

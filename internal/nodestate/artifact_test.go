@@ -357,3 +357,65 @@ func TestResetCacheBoundary(t *testing.T) {
 		t.Fatal("reset cache 不得碰 migration-backup")
 	}
 }
+
+// TestImportRejectsOversizeArtifact（FIX-55）：工件规模上限（条目数 / 总字节）在
+// **解包前**判——10 万个条目的 tar 在旧实现里会被逐条读进内存。
+func TestImportRejectsOversizeArtifact(t *testing.T) {
+	mkTar := func(entries int, fileSize int64) string {
+		path := filepath.Join(t.TempDir(), "big.tar")
+		f, err := os.Create(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		tw := tar.NewWriter(f)
+		// 合法顶层与必件（否则会先撞布局校验，测不到规模闸）。
+		if err := tw.WriteHeader(&tar.Header{Name: exportTop + "/", Typeflag: tar.TypeDir, Mode: 0o700}); err != nil {
+			t.Fatal(err)
+		}
+		if err := tw.WriteHeader(&tar.Header{Name: exportTop + "/config.toml", Typeflag: tar.TypeReg, Mode: 0o600, Size: 1}); err != nil {
+			t.Fatal(err)
+		}
+		_, _ = tw.Write([]byte("#"))
+		for _, sub := range []string{subServe, subRelay, subClient} {
+			if err := tw.WriteHeader(&tar.Header{Name: exportTop + "/" + sub + "/", Typeflag: tar.TypeDir, Mode: 0o700}); err != nil {
+				t.Fatal(err)
+			}
+		}
+		for i := 0; i < entries; i++ {
+			name := fmt.Sprintf("%s/serve/f%05d.bin", exportTop, i)
+			if err := tw.WriteHeader(&tar.Header{Name: name, Typeflag: tar.TypeReg, Mode: 0o600, Size: fileSize}); err != nil {
+				t.Fatal(err)
+			}
+			if fileSize > 0 {
+				_, _ = tw.Write(make([]byte, fileSize))
+			}
+		}
+		if err := tw.Close(); err != nil {
+			t.Fatal(err)
+		}
+		_ = f.Close()
+		return path
+	}
+
+	stateDir := t.TempDir()
+	before, err := os.ReadDir(stateDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = Import(stateDir, mkTar(artifactMaxEntries+10, 0))
+	if err == nil || !strings.Contains(err.Error(), "条目数超上限") {
+		t.Fatalf("条目数超限应被拒：%v", err)
+	}
+	// 总量超限：单文件未超 64MB，但累计超 256MB——同样在解包前拦。
+	err = Import(stateDir, mkTar(8, 40<<20))
+	if err == nil || !strings.Contains(err.Error(), "总字节超上限") {
+		t.Fatalf("总字节超限应被拒：%v", err)
+	}
+	after, err := os.ReadDir(stateDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(after) != len(before) {
+		t.Fatalf("被拒的 import 不得在 state 里留下任何东西：%v", after)
+	}
+}

@@ -263,3 +263,64 @@ func TestUpdateModifyAndWrite(t *testing.T) {
 		t.Fatal("fn 失败不应写回")
 	}
 }
+
+// TestUpdateCASDoesNotLoseConcurrentWrite（FIX-56）：Update 期间有别的写者改了文件
+// ⇒ 必须重读重放而不是盲写覆盖（原实现 load→fn→save 会把并发更新丢掉）。
+// 构造：fn 内先「假装并发写者」把文件改掉（新增 relay.advertise），再只设 serve.listen
+// ——最终文件应同时含两处变更。
+func TestUpdateCASDoesNotLoseConcurrentWrite(t *testing.T) {
+	dir := t.TempDir()
+	path := Path(dir)
+	if err := Save(path, Default()); err != nil {
+		t.Fatal(err)
+	}
+	injected := false
+	err := Update(path, func(c *Config) error {
+		if !injected {
+			injected = true
+			// 模拟并发写者：直接在 fn 执行期间改盘。
+			if err := Update(path, func(other *Config) error {
+				other.Relay.Advertise = "1.2.3.4:41741"
+				return nil
+			}); err != nil {
+				return err
+			}
+		}
+		c.Serve.Listen = 41000
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("Update：%v", err)
+	}
+	got, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Serve.Listen != 41000 {
+		t.Fatalf("本次更新丢失：listen=%d", got.Serve.Listen)
+	}
+	if got.Relay.Advertise != "1.2.3.4:41741" {
+		t.Fatalf("并发写者的更新被覆盖（FIX-56 的原症状）：advertise=%q", got.Relay.Advertise)
+	}
+}
+
+// TestUpdateSerialWritesPreserved（对照）：无并发时多次 Update 串行累积，不误触发重试。
+func TestUpdateSerialWritesPreserved(t *testing.T) {
+	dir := t.TempDir()
+	path := Path(dir)
+	for i := 0; i < 3; i++ {
+		if err := Update(path, func(c *Config) error {
+			c.Serve.Listen = uint16(41000 + i)
+			return nil
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	got, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Serve.Listen != 41002 {
+		t.Fatalf("串行更新应累积到 41002，got %d", got.Serve.Listen)
+	}
+}
