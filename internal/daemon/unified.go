@@ -174,7 +174,7 @@ func assembleUnified(parent context.Context, version, stateDir string, verbose b
 	proc.roles = ro
 
 	// ⑤ client 角色恒开（HD delta：期望态并入 config，client/control 无开关）。
-	sup.Start("client", func() Role { return newClientRole(filepath.Join(stateDir, "client"), dl, d) }, nil)
+	sup.Start("client", func() Role { return newClientRole(nodestate.ClientDir(stateDir), dl, d) }, nil)
 
 	// ⑥ control 角色恒开（首启 Listen fail-fast：监听失败 = 报错退出——控制面是
 	// 统一进程的用户面，静默缺失无从排查）。

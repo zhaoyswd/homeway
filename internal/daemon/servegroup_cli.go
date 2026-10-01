@@ -27,7 +27,6 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"path/filepath"
 	"strings"
 	"time"
 
@@ -602,7 +601,7 @@ func serveTokenCLI(args []string, version string, w io.Writer) error {
 		warnNoEndpoints(w, res.Source, res.Eps)
 		return nil
 	}
-	tok, eps, ok, err := server.RevealLastToken(filepath.Join(*g.stateDir, "serve"))
+	tok, eps, ok, err := server.RevealLastToken(nodestate.ServeDir(*g.stateDir))
 	if err != nil {
 		return fmt.Errorf("读 token 台账失败：%w", err)
 	}
@@ -662,7 +661,7 @@ func deriveRelayTokenOffline(stateDir string) (string, []string, error) {
 	if err != nil {
 		return "", nil, fmt.Errorf("config relay.listen %q 无端口可推算：%w", cfg.Relay.Listen, err)
 	}
-	secret, ok, err := relay.ReadSecret(filepath.Join(stateDir, "relay"))
+	secret, ok, err := relay.ReadSecret(nodestate.RelayDir(stateDir))
 	if err != nil {
 		return "", nil, err
 	}

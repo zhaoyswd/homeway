@@ -253,6 +253,10 @@ func (s *Subscriber) matches(domain string) bool { return s.domains[domain] }
 // **替换**（sub.domains 整体换为新载荷集合——daemon-control-plane delta 3b 钉死，
 // B4 澄清：非并集）；pending 回放段同样 = 覆盖（新回放段取代旧段，r3 低-2——
 // 前端按 seq 幂等去重无损）。
+// FIX-54 复核（绿野评审提「pending 覆盖可产生事件缺口」）：**在本契约下不成立**——
+// 新回放段 = (前端声明的游标, 当前]，而前端声明游标的语义是「我最后一次收到的
+// seq」；旧段里未交付的事件 seq 都 > 该游标，因而必然落在新段里。要丢事件，前端
+// 必须声明一个自己没收到的游标（违反契约）。故维持覆盖语义，不改并集/分槽。
 //
 //   - generation 为空 → 普通错误（绑定层映射 bad_request；FIX-24：代际声明必填，
 //     此前空串退化为「仅重放窗检查」，让失配保护可被省略绕过）；

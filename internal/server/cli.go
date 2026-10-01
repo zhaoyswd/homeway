@@ -146,7 +146,7 @@ func CLI(args []string) error {
 	}
 	return Run(ctx, ServeConfig{
 		// D3 拆分表注入（r2 新-2）：两条进程形态都按表落位，不在状态目录长出旧布局。
-		StateDir:    filepath.Join(*stateDir, "serve"),
+		StateDir:    nodestate.ServeDir(*stateDir),
 		LogDir:      cacheDir,
 		PortFileDir: cacheDir,
 		SockDir:     *stateDir,

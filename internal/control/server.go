@@ -708,8 +708,7 @@ func (c *conn) opHostAdd(corr uint64, args json.RawMessage) {
 		c.reply(corr, nil, errCode(facade.CodeBadRequest))
 		return
 	}
-	if c.s.cfg.Backend.NotReady() {
-		c.reply(corr, nil, errCode(facade.CodeNotReady))
+	if c.gateNotReady(corr) {
 		return
 	}
 	// 服务端验证路径（host-cli 3b，design D1/D3）：decode（bad_token）→ 探测
@@ -740,8 +739,7 @@ func (c *conn) opHostRemove(corr uint64, args json.RawMessage) {
 		c.reply(corr, nil, errCode(facade.CodeBadRequest))
 		return
 	}
-	if c.s.cfg.Backend.NotReady() {
-		c.reply(corr, nil, errCode(facade.CodeNotReady))
+	if c.gateNotReady(corr) {
 		return
 	}
 	if err := c.s.cfg.Backend.RemoveHost(a.Host); errors.Is(err, ErrBackendNoHost) {
@@ -754,8 +752,7 @@ func (c *conn) opHostRemove(corr uint64, args json.RawMessage) {
 }
 
 func (c *conn) opHostList(corr uint64, _ json.RawMessage) {
-	if c.s.cfg.Backend.NotReady() {
-		c.reply(corr, nil, errCode(facade.CodeNotReady))
+	if c.gateNotReady(corr) {
 		return
 	}
 	c.reply(corr, HostListResult{Hosts: c.s.cfg.Backend.HostBriefs()}, nil)
@@ -767,8 +764,7 @@ func (c *conn) opHostList(corr uint64, _ json.RawMessage) {
 // 游标且不在快照里 ⇒ 既不回放也不含于快照 ⇒ 前端该行永久陈旧；seq 先读则该窗口内
 // 事件 seq > 游标 ⇒ 必回放（可能重复，由同键幂等覆盖消化——at-least-once 口径）。）
 func (c *conn) opSnapshotGet(corr uint64, _ json.RawMessage) {
-	if c.s.cfg.Backend.NotReady() {
-		c.reply(corr, nil, errCode(facade.CodeNotReady))
+	if c.gateNotReady(corr) {
 		return
 	}
 	seq := c.s.cfg.Bus.CurrentSeq() // 先取号（保「不漏」；重复允许，见上）
@@ -875,8 +871,7 @@ func (c *conn) opForwardAdd(corr uint64, args json.RawMessage) {
 		c.reply(corr, nil, errCode(facade.CodeBadRequest))
 		return
 	}
-	if c.s.cfg.Backend.NotReady() {
-		c.reply(corr, nil, errCode(facade.CodeNotReady))
+	if c.gateNotReady(corr) {
 		return
 	}
 	res, err := c.s.cfg.Backend.ForwardAdd(a)
@@ -893,8 +888,7 @@ func (c *conn) opForwardRemove(corr uint64, args json.RawMessage) {
 		c.reply(corr, nil, errCode(facade.CodeBadRequest))
 		return
 	}
-	if c.s.cfg.Backend.NotReady() {
-		c.reply(corr, nil, errCode(facade.CodeNotReady))
+	if c.gateNotReady(corr) {
 		return
 	}
 	err := c.s.cfg.Backend.ForwardRemove(a)
@@ -911,8 +905,7 @@ func (c *conn) opForwardList(corr uint64, args json.RawMessage) {
 		c.reply(corr, nil, err)
 		return
 	}
-	if c.s.cfg.Backend.NotReady() {
-		c.reply(corr, nil, errCode(facade.CodeNotReady))
+	if c.gateNotReady(corr) {
 		return
 	}
 	c.reply(corr, c.s.cfg.Backend.ForwardList(a.Host), nil)
@@ -928,8 +921,7 @@ func (c *conn) opSocksOn(corr uint64, args json.RawMessage) {
 		c.reply(corr, nil, errCode(facade.CodeBadRequest))
 		return
 	}
-	if c.s.cfg.Backend.NotReady() {
-		c.reply(corr, nil, errCode(facade.CodeNotReady))
+	if c.gateNotReady(corr) {
 		return
 	}
 	res, err := c.s.cfg.Backend.SocksOn(a.Host, a.Listen)
@@ -946,8 +938,7 @@ func (c *conn) opSocksOff(corr uint64, args json.RawMessage) {
 		c.reply(corr, nil, errCode(facade.CodeBadRequest))
 		return
 	}
-	if c.s.cfg.Backend.NotReady() {
-		c.reply(corr, nil, errCode(facade.CodeNotReady))
+	if c.gateNotReady(corr) {
 		return
 	}
 	res, err := c.s.cfg.Backend.SocksOff(a.Host)
@@ -955,8 +946,7 @@ func (c *conn) opSocksOff(corr uint64, args json.RawMessage) {
 }
 
 func (c *conn) opSocksStatus(corr uint64, _ json.RawMessage) {
-	if c.s.cfg.Backend.NotReady() {
-		c.reply(corr, nil, errCode(facade.CodeNotReady))
+	if c.gateNotReady(corr) {
 		return
 	}
 	c.reply(corr, c.s.cfg.Backend.SocksStatus(), nil)
@@ -972,8 +962,7 @@ func (c *conn) opSpeedtestStart(corr uint64, args json.RawMessage) {
 		c.reply(corr, nil, errCode(facade.CodeBadRequest))
 		return
 	}
-	if c.s.cfg.Backend.NotReady() {
-		c.reply(corr, nil, errCode(facade.CodeNotReady))
+	if c.gateNotReady(corr) {
 		return
 	}
 	// busy 是成功载荷里的 reason（同手机信封形态），不进错误码表。
@@ -995,8 +984,7 @@ func (c *conn) opSpeedtestStatus(corr uint64, args json.RawMessage) {
 		c.reply(corr, nil, errCode(facade.CodeBadRequest))
 		return
 	}
-	if c.s.cfg.Backend.NotReady() {
-		c.reply(corr, nil, errCode(facade.CodeNotReady))
+	if c.gateNotReady(corr) {
 		return
 	}
 	res, err := c.s.cfg.Backend.SpeedtestStatus(a.Host)
@@ -1017,8 +1005,7 @@ func (c *conn) opSpeedtestCancel(corr uint64, args json.RawMessage) {
 		c.reply(corr, nil, errCode(facade.CodeBadRequest))
 		return
 	}
-	if c.s.cfg.Backend.NotReady() {
-		c.reply(corr, nil, errCode(facade.CodeNotReady))
+	if c.gateNotReady(corr) {
 		return
 	}
 	if err := c.s.cfg.Backend.SpeedtestCancel(a.Host); err != nil {
@@ -1205,10 +1192,20 @@ func (c *conn) step() bool {
 // writer 只能靠取后复检覆盖），取出即复检-暂存、不写出；pending 回放段与流数据
 // 在门闩期同样不写出（drainHigh 之外无写出路径）。清位后由 clearSubConfirm 按
 // 「pending 回放段 → 暂存缓冲」次序补写。
+// heldFramesMax 门闩期暂存上限（FIX-54）：暂存此前**无本层界**——订阅者迟迟不
+// 收确认（凭据/网络卡住）而事件持续来时，每连接内存无界增长。触顶按 overrun 断连自保
+// （与请求面 maxInflight/inflight 同款纪律：宁可断这条连接，不拖垮进程）。
+const heldFramesMax = 4096
+
 func (c *conn) takeEvent(ev facade.Event) bool {
 	f := encodeJSONFrame(OpEvt, EventBody{Seq: ev.Seq, Domain: ev.Domain, Kind: ev.Kind, Payload: ev.Payload})
 	c.subMu.Lock()
 	if len(c.subConfirm) > 0 {
+		if len(c.heldFrames) >= heldFramesMax {
+			c.subMu.Unlock()
+			c.fatal(GoodbyeOverrun) // 门闩期暂存超限：overrun 断连（FIX-54）
+			return false
+		}
 		c.heldFrames = append(c.heldFrames, f)
 		c.subMu.Unlock()
 		return true // 门闩置位：暂存不写出，回循环头（highC 仍是唯一消费源）
@@ -1286,6 +1283,17 @@ func (c *conn) writeStreamItem(st *stream, it streamItem) bool {
 		return true
 	}
 	return c.writeFrame(EncodeFrame(OpStreamData, EncodeStreamBody(st.id, it.data)))
+}
+
+// gateNotReady 统一「后端未就绪」门（FIX-52）：此前 13 处手抄同一段——新增 op 忘
+// 加门的概率从散点降为一点，并由 TestNotReadyGateCoversBackendOps 按**操作词表**
+// 逐 op 机器核对（漏加门 = 红）。返回 true = 已回 not_ready，调用方直接 return。
+func (c *conn) gateNotReady(corr uint64) bool {
+	if c.s.cfg.Backend.NotReady() {
+		c.reply(corr, nil, errCode(facade.CodeNotReady))
+		return true
+	}
+	return false
 }
 
 // errText 错误原文（detail 字段用；nil 空串）。

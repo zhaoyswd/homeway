@@ -419,3 +419,59 @@ func TestImportRejectsOversizeArtifact(t *testing.T) {
 		t.Fatalf("被拒的 import 不得在 state 里留下任何东西：%v", after)
 	}
 }
+
+// TestExportWarnsOnSkippedEntries（FIX-51）：白名单外条目要**出声**——此前 export
+// 静默跳过（用户以为整份 state 都备了）。判据 = stderr 出现告警且点名条目；工件本身
+// 仍只含白名单件（行为不变）。
+func TestExportWarnsOnSkippedEntries(t *testing.T) {
+	state := buildState(t)
+	if err := os.WriteFile(filepath.Join(state, "serve", "stray.log"), []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(state, "client", "stray.json"), []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	dest := filepath.Join(t.TempDir(), "out.tar")
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	old := os.Stderr
+	os.Stderr = w
+	werr := Export(state, dest)
+	_ = w.Close()
+	os.Stderr = old
+	if werr != nil {
+		t.Fatalf("Export：%v", werr)
+	}
+	var buf bytes.Buffer
+	if _, err := io.Copy(&buf, r); err != nil {
+		t.Fatal(err)
+	}
+	_ = r.Close()
+	msg := buf.String()
+	for _, want := range []string{"serve/", "stray.log", "client/", "stray.json"} {
+		if !strings.Contains(msg, want) {
+			t.Fatalf("告警应点名被跳过的条目（缺 %q）：%s", want, msg)
+		}
+	}
+	// 工件里不得含被跳过的条目（行为不变：只带白名单件）。
+	f, err := os.Open(dest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	tr := tar.NewReader(f)
+	for {
+		hdr, err := tr.Next()
+		if errors.Is(err, io.EOF) {
+			break
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		if strings.Contains(hdr.Name, "stray") {
+			t.Fatalf("工件不应含白名单外条目：%s", hdr.Name)
+		}
+	}
+}

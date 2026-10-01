@@ -20,15 +20,14 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"github.com/zhaoyswd/homeway/clientcore/facade"
+	"github.com/zhaoyswd/homeway/internal/control"
+	"github.com/zhaoyswd/homeway/internal/nodestate"
 	"io"
 	"os"
 	"os/signal"
-	"path/filepath"
 	"syscall"
 	"time"
-
-	"github.com/zhaoyswd/homeway/clientcore/facade"
-	"github.com/zhaoyswd/homeway/internal/control"
 )
 
 // StatusCLI `homeway status` 入口（cmd/homeway 分发；输出写 w 便于测试）。
@@ -252,7 +251,7 @@ func joinOr(ss []string) string {
 
 // hostCountOnDisk 未跑时从 client/hosts.json 点台数（登记面文件；读不到 = -1）。
 func hostCountOnDisk(stateDir string) int {
-	b, err := os.ReadFile(filepath.Join(stateDir, "client", "hosts.json"))
+	b, err := os.ReadFile(nodestate.HostsPath(stateDir))
 	if err != nil {
 		return -1
 	}

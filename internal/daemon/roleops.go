@@ -16,13 +16,13 @@ package daemon
 import (
 	"errors"
 	"fmt"
-	"path/filepath"
-	"sync"
-
 	"github.com/zhaoyswd/homeway/internal/control"
 	"github.com/zhaoyswd/homeway/internal/nodeconfig"
+	"github.com/zhaoyswd/homeway/internal/nodestate"
 	"github.com/zhaoyswd/homeway/internal/relay"
 	"github.com/zhaoyswd/homeway/internal/server"
+	"path/filepath"
+	"sync"
 )
 
 // roleOps serve/relay 角色管理面（assembleUnified 装配；controlBackend 持有）。
@@ -102,10 +102,10 @@ func serveConfigOf(stateDir, cacheDir string, cfg *nodeconfig.Config, version st
 		return server.ServeConfig{}, fmt.Errorf("bind_interface 解析失败：%w", err)
 	}
 	return server.ServeConfig{
-		StateDir:    filepath.Join(stateDir, "serve"), // L2
-		LogDir:      cacheDir,                         // L3（events/debug 日志）
-		PortFileDir: cacheDir,                         // L3（listen_port/public_endpoint）
-		SockDir:     stateDir,                         // 瞬态（files/term/speedtest.sock）
+		StateDir:    nodestate.ServeDir(stateDir), // L2
+		LogDir:      cacheDir,                     // L3（events/debug 日志）
+		PortFileDir: cacheDir,                     // L3（listen_port/public_endpoint）
+		SockDir:     stateDir,                     // 瞬态（files/term/speedtest.sock）
 		ListenPort:  sc.Listen,
 		BindAddr:    bindAddr,
 		BindIface:   bindIf,
@@ -129,8 +129,8 @@ func relayConfigOf(stateDir, cacheDir string, cfg *nodeconfig.Config, version st
 	return relay.RoleConfig{
 		Addr:      cfg.Relay.Listen,
 		Advertise: cfg.Relay.Advertise,
-		StateDir:  filepath.Join(stateDir, "relay"), // L2（relay.key）
-		LogDir:    cacheDir,                         // L3（relay.log）
+		StateDir:  nodestate.RelayDir(stateDir), // L2（relay.key）
+		LogDir:    cacheDir,                     // L3（relay.log）
 		Build:     version,
 	}
 }
@@ -255,7 +255,7 @@ func (ro *roleOps) ServeStatus() control.ServeStatusResult {
 	}
 	// 角色未装配/未铸出时掩码降级 = 台账末行（reveal 纪律：status 一律掩码、以末行为准）。
 	if out.TokenMask == "" {
-		if tok, _, ok, _ := server.RevealLastToken(filepath.Join(ro.stateDir, "serve")); ok {
+		if tok, _, ok, _ := server.RevealLastToken(nodestate.ServeDir(ro.stateDir)); ok {
 			out.TokenMask = server.MaskToken(tok)
 		}
 	}
@@ -280,7 +280,7 @@ func (ro *roleOps) ServeToken() (control.ServeTokenResult, error) {
 			}
 		}
 	}
-	tok, eps, ok, err := server.RevealLastToken(filepath.Join(ro.stateDir, "serve"))
+	tok, eps, ok, err := server.RevealLastToken(nodestate.ServeDir(ro.stateDir))
 	if err != nil {
 		return control.ServeTokenResult{}, err
 	}

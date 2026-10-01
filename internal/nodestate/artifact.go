@@ -83,8 +83,22 @@ func Export(stateDir, dest string) error {
 			return err
 		}
 		var names []string
+		var skipped []string
 		if sub.specific != nil {
 			names = sub.specific
+			// 点名件集合之外的条目也要告警（FIX-51：export 静默丢白名单外件——
+			// 用户以为备份了整份 state，实际只带了白名单里的几件）。
+			if entries, err := os.ReadDir(sub.dir); err == nil {
+				keep := map[string]bool{}
+				for _, n := range sub.specific {
+					keep[n] = true
+				}
+				for _, e := range entries {
+					if !keep[e.Name()] {
+						skipped = append(skipped, e.Name())
+					}
+				}
+			}
 		} else {
 			entries, err := os.ReadDir(sub.dir)
 			if err != nil {
@@ -96,9 +110,16 @@ func Export(stateDir, dest string) error {
 			for _, e := range entries {
 				if sub.allowed[e.Name()] {
 					names = append(names, e.Name())
+				} else {
+					skipped = append(skipped, e.Name())
 				}
 			}
 			sort.Strings(names)
+		}
+		if len(skipped) > 0 {
+			sort.Strings(skipped)
+			fmt.Fprintf(os.Stderr, "homeway: ⚠️ export 跳过 %s/ 下 %d 个白名单外条目（不进工件，也不影响原 state）：%v\n",
+				sub.name, len(skipped), truncList(skipped, 5))
 		}
 		for _, n := range names {
 			p := filepath.Join(sub.dir, n)
@@ -455,4 +476,13 @@ func ResetCache(stateDir string) error {
 		return err
 	}
 	return os.MkdirAll(filepath.Join(stateDir, subCache), 0o700)
+}
+
+// truncList 列表截断（告警用；超出部分以「…(+N)」示意）。
+func truncList(items []string, max int) []string {
+	if len(items) <= max {
+		return items
+	}
+	out := append([]string{}, items[:max]...)
+	return append(out, fmt.Sprintf("…(+%d)", len(items)-max))
 }

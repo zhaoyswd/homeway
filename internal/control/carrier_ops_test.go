@@ -9,7 +9,9 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"net"
 	"testing"
+	"time"
 
 	"github.com/zhaoyswd/homeway/clientcore/facade"
 )
@@ -318,5 +320,74 @@ func TestCarrierErrDetailCarried(t *testing.T) {
 	var ce CodeError
 	if !errors.As(err, &ce) || string(ce) != facade.CodeBadRequest {
 		t.Fatalf("errors.As 应取到码：%v", err)
+	}
+}
+
+// TestHeldFramesBounded（FIX-54）：订阅确认门闩期的事件暂存有显式上限——超限按
+// overrun 断连自保（原实现无界，订阅者不收确认 + 事件持续来 = 每连接内存无界增长）。
+func TestHeldFramesBounded(t *testing.T) {
+	// 手搓最小可用 conn（门闩置位 = 确认未写出的形态）：close 需要 highC（可排空）、
+	// nc（可 Close）、streams/subConfirm（非 nil）三件；s.sub 保持 nil，不走 Bus。
+	nc1, nc2 := net.Pipe()
+	defer nc2.Close()
+	c := &conn{
+		nc:         nc1,
+		highC:      make(chan highItem, 8),
+		closed:     make(chan struct{}),
+		streams:    map[uint32]*stream{},
+		subConfirm: map[uint64]bool{1: true},
+	}
+	// 先塞到接近上限，再跨过——跨过那次必须触发 fatal（overrun）。
+	for i := 0; i < heldFramesMax; i++ {
+		if !c.takeEvent(facade.Event{Seq: uint64(i + 1), Domain: facade.DomainLink, Kind: facade.KindLinkChanged}) {
+			t.Fatalf("第 %d 条暂存不应触发断连", i+1)
+		}
+	}
+	if c.takeEvent(facade.Event{Seq: uint64(heldFramesMax + 1), Domain: facade.DomainLink, Kind: facade.KindLinkChanged}) {
+		t.Fatal("超限应拒绝（overrun 断连）")
+	}
+	select {
+	case <-c.closed:
+	case <-time.After(time.Second):
+		t.Fatal("超限应关闭连接（fatal → closed）")
+	}
+}
+
+// TestNotReadyGateCoversBackendOps（FIX-52）：**操作词表级**的 NotReady 门核对——
+// 后端类 op（host.*/snapshot.get/承载面 9 op）在未就绪时都必须回 not_ready。门已统一
+// 成 gateNotReady 一处；本表按 spec 词表逐个 op 打一遍，新增 op 漏加门 = 本用例红。
+// 非后端类（daemon.status/events.*/stream.*/serve|relay.*）不在此表：它们不依赖后端
+// 就绪（角色面由 Backend 方法自己的错误映射承载）。
+func TestNotReadyGateCoversBackendOps(t *testing.T) {
+	ts := startTestServer(t, facade.BusConfig{})
+	c, _ := dialTest(t, ts)
+	ctx := context.Background()
+	a := regCarrierHost(t, ts, carrierHostA, "ali")
+	ts.backend.mu.Lock()
+	ts.backend.notReady = true
+	ts.backend.mu.Unlock()
+
+	ops := []struct {
+		op   string
+		args any
+	}{
+		{facade.OpHostAdd, HostAddArgs{Token: "hmw1x"}},
+		{facade.OpHostRemove, HostRemoveArgs{Host: a}},
+		{facade.OpHostList, nil},
+		{facade.OpSnapshotGet, nil},
+		{facade.OpForwardAdd, ForwardAddArgs{Host: a, Listen: 8080}},
+		{facade.OpForwardRemove, ForwardRemoveArgs{Host: a, Listen: 8080}},
+		{facade.OpForwardList, ForwardListArgs{}},
+		{facade.OpSocksOn, SocksOnArgs{Host: a}},
+		{facade.OpSocksOff, SocksOffArgs{Host: a}},
+		{facade.OpSocksStatus, nil},
+		{facade.OpSpeedtestStart, SpeedtestStartArgs{Host: a}},
+		{facade.OpSpeedtestStatus, SpeedtestStatusArgs{Host: a}},
+		{facade.OpSpeedtestCancel, SpeedtestCancelArgs{Host: a}},
+	}
+	for _, tc := range ops {
+		if _, err := c.Request(ctx, tc.op, tc.args); err == nil || errCodeOf(err) != facade.CodeNotReady {
+			t.Fatalf("%s 未就绪应 not_ready（gateNotReady 漏挂？）：%v", tc.op, err)
+		}
 	}
 }
