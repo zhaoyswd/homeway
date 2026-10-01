@@ -135,6 +135,15 @@ void runCase(const std::string& name, const std::string& category, const std::st
         if (ok) {
             checkBytes(encodeCapabilityBlock(caps), wantHex, name);
         }
+    } else if (category == "hello-tail") {
+        // HELLO 尾随块（FIX-29 版本门）：args = caps,ver,id（ver/id 空 = 不出现）。
+        // caps 带 kCapsProtoVer（0x80）时 encodeHelloTail 在 caps 块后写 1 字节 kProtoVer；
+        // 期望 hex 钉死整段布局（与服务端 pkg/term encHelloTail 逐字节一致）。
+        ok = parts.size() == 3;
+        if (ok) {
+            const uint8_t caps = static_cast<uint8_t>(parseNum(parts[0]));
+            checkBytes(encodeHelloTail(caps, parts[2]), wantHex, name);
+        }
     } else {
         ok = false;
     }

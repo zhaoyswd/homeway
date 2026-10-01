@@ -1,4 +1,4 @@
-{"name":"greeting.basic","category":"greeting","op":"0x0c","payloadHex":"013f000000","expect":{"greeting":{"ver":1,"features":63}}}
+{"name":"greeting.basic","category":"greeting","op":"0x0c","payloadHex":"017f000000","expect":{"greeting":{"ver":1,"features":127}}}
 {"name":"hello.create","category":"hello","op":"0x00","payloadHex":"78002800010a6465762d616263313233","expect":{"hello":{"cols":120,"rows":40,"flags":1,"name":"dev-abc123"}}}
 {"name":"resize.basic","category":"resize","op":"0x02","payloadHex":"64001e00","expect":{"resize":{"cols":100,"rows":30}}}
 {"name":"data.cjk-ansi","category":"data","op":"0x01","payloadHex":"68656c6c6f201b5b33316de4b896e7958c1b5b306d","expect":{"data":{"bytes":"68656c6c6f201b5b33316de4b896e7958c1b5b306d"}}}

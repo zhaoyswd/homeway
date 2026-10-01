@@ -1362,13 +1362,22 @@ func TestSurfacePayloadRoundTrip(t *testing.T) {
 		}
 	}
 
+	// 经 encHelloTail 组整段尾随（0xff 含 capsProtoVer 声明位 ⇒ 版本字节必须一起产出；
+	// 单块 encCapability 不带版本字节，是「声明位在而字节缺」的畸形形态——见 TestHelloTailShape）。
 	for _, caps := range []byte{0, capsSurface, 0xff} {
-		c, present, _, err := decHelloTail(encCapability(caps))
+		c, present, _, ver, verPresent, err := decHelloTail(encHelloTail(caps, true, ""))
 		if err != nil || !present || c != caps {
 			t.Errorf("capability 往返不一致：%d %v %v", c, present, err)
 		}
+		if wantVer := caps&capsProtoVer != 0; verPresent != wantVer || (wantVer && ver != termProtoVer) {
+			t.Errorf("caps=0x%02x 版本字节形态不对：present=%v ver=%d", caps, verPresent, ver)
+		}
 	}
-	if _, present, _, err := decHelloTail(nil); err != nil || present {
+	// encCapability 单独一块（不带版本字节）语义不变：不带声明位时照常解析。
+	if c, present, _, _, verPresent, err := decHelloTail(encCapability(capsSurface)); err != nil || !present || c != capsSurface || verPresent {
+		t.Errorf("capsSurface 单块应照常解析：%v %v %#x present=%v", err, present, c, verPresent)
+	}
+	if _, present, _, _, _, err := decHelloTail(nil); err != nil || present {
 		t.Errorf("无尾随字节应是「不携带」而不是错误：%v %v", present, err)
 	}
 }

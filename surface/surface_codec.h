@@ -38,10 +38,20 @@ constexpr uint8_t kOpClipboard = 0x13;     // S↔C OSC 52 转发
 constexpr uint8_t kOpNotify = 0x14;        // S→C OSC 9 通知
 constexpr uint8_t kOpFetchSnapshot = 0x15; // C→S 请求全量
 
+// 帧协议版本（GREETING ver 字节；与服务端 pkg/term termProtoVer 同值）。
+constexpr uint8_t kProtoVer = 1;
+
 // GREETING features 的 surface 能力位（客户端见位才在 HELLO 尾随 capability 块）。
 constexpr uint32_t kFeatSurface = 1u << 5;
+// GREETING features 的「HELLO 版本声明可协商」位（FIX-29 服务端版本门；与服务端
+// pkg/term featProtoVerBit 同值）：出口置位 ⇒ 客户端在 HELLO 尾随声明协议版本
+// （kCapsProtoVer + 1 字节 kProtoVer），出口据此比对、错配回 ERROR(term_version) 拒腿。
+// 旧出口不置位 ⇒ 不声明，尾随字节与旧版逐字节一致（旧出口的严格耗尽解析不被打断）。
+constexpr uint32_t kFeatProtoVer = 1u << 6;
 // capability 块里的 surface 标志位。
 constexpr uint8_t kCapsSurface = 1u << 0;
+// capability 块里的「后随 1 字节协议版本」声明位（与服务端 pkg/term capsProtoVer 同值）。
+constexpr uint8_t kCapsProtoVer = 1u << 7;
 
 // 双传输开关（任务 3.5）：**模块级**设置（进程内所有页面共用），对之后新建的腿生效。
 //   Auto          = 出口声明了 featSurface 位才走 surface（M3 起的默认值）；
@@ -403,6 +413,10 @@ std::vector<uint8_t> encodeFocusEvent(bool gained);
 std::vector<uint8_t> encodeTheme(const uint8_t fg[3], const uint8_t bg[3], bool dark);
 std::vector<uint8_t> encodeClipboardAnswer(const std::string& text);
 std::vector<uint8_t> encodeCapabilityBlock(uint8_t caps);
+// encodeHelloTail 组 HELLO 尾随块 [capLen][caps][ver?][idLen][id]（与服务端 pkg/term
+// encHelloTail 同布局）：caps 带 kCapsProtoVer 时在 caps 块后插入 1 字节 kProtoVer；
+// id 为空则不出 ID 块（与服务端「无 caps 不产 ID」的编码约束同族）。
+std::vector<uint8_t> encodeHelloTail(uint8_t caps, const std::string& clientID);
 
 // NOTIFY / CLIPBOARD 的入站解码（任务 3.4 的消费侧）。
 bool decodeNotify(const uint8_t* p, size_t len, std::string& out, std::string& error);

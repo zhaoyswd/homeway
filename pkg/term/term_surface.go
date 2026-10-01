@@ -607,6 +607,12 @@ const capsSurface = 1 << 0
 // 腿在 LIST 里记 kind=host。位号 1 已被 capsSurface 之前的提案预留检查过，无冲突。
 const capsRawTerminal = 1 << 1
 
+// capsProtoVer 是「1 字节协议版本跟在 caps 块之后」的声明位（2026-10-01 服务端版本门，
+// FIX-29）。客户端**只在出口的 GREETING 带 featProtoVerBit 时**置位（混合部署开关，见
+// featProtoVerBit 注释）；出口比对声明值与本端 termProtoVer，不符回 ERROR(term_version)
+// 拒腿。位号 7 是刻意的：caps 是只增位图，将来扩位从 2 起顺延，与被广泛解析的低位不撞车。
+const capsProtoVer = 1 << 7
+
 // encCapability 组 HELLO 尾随的 capability 块：[capLen:1][flags:capLen]。
 //
 // 用「长度 + 位图」而不是单个字节：将来加能力只加位，不必改布局；capLen 让旧出口能安全忽略

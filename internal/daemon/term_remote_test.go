@@ -253,8 +253,10 @@ func (h *fakeTermHost) serve(c net.Conn) {
 		h.mu.Unlock()
 		_ = c.Close()
 	}()
-	// GREETING（CLI 只查 op，载荷不解析）。
-	if _, err := c.Write(encTermFrame(tOpGreeting, make([]byte, 5))); err != nil {
+	// GREETING：CLI 自 FIX-29 起解析 ver 并比对（载荷不再可以全零）；features 公布
+	// featProtoVerBit（0x40，与服务端 pkg/term featProtoVerBit 同值）让 CLI 走版本声明
+	// 路径——假主机不解析尾随，多出的 1 字节版本只进 written 计数。
+	if _, err := c.Write(encTermFrame(tOpGreeting, []byte{1, 0x40, 0, 0, 0})); err != nil {
 		return
 	}
 	writeData := func(payload []byte) bool {

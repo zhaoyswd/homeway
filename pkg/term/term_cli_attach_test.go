@@ -553,6 +553,8 @@ func TestCLIAttachHelloShape(t *testing.T) {
 		flags       byte
 		caps        byte
 		capsPresent bool
+		ver         byte
+		verPresent  bool
 		id          string
 		cols, rows  uint16
 	}
@@ -579,8 +581,8 @@ func TestCLIAttachHelloShape(t *testing.T) {
 					return
 				}
 				cols, rows, flags, name, _ := decHello(f.payload)
-				caps, present, id, _ := decHelloTail(helloTail(f.payload, name))
-				helloCh <- helloInfo{flags, caps, present, id, cols, rows}
+				caps, present, id, ver, verPresent, _ := decHelloTail(helloTail(f.payload, name))
+				helloCh <- helloInfo{flags, caps, present, ver, verPresent, id, cols, rows}
 				// 用 no_session 让 CLI 确定性退出（也验证协议错误透出）。
 				_, _ = c.Write(encodeTermFrame(opError, encError("no_session", "会话 "+name+" 不存在")))
 			}(c)
@@ -611,8 +613,14 @@ func TestCLIAttachHelloShape(t *testing.T) {
 	if plain.flags != 0 {
 		t.Fatalf("普通 attach 的 flags 应为 0，实际 0x%02x", plain.flags)
 	}
-	if !plain.capsPresent || plain.caps != capsRawTerminal {
+	if !plain.capsPresent || plain.caps&capsRawTerminal == 0 {
 		t.Fatalf("caps 块应声明 capsRawTerminal：present=%v caps=0x%02x", plain.capsPresent, plain.caps)
+	}
+	// FIX-29 版本声明：假服务端的 GREETING 带 featProtoVerBit（encGreeting）⇒ CLI 应在
+	// caps 里声明 capsProtoVer 并带 1 字节本端协议版本。
+	if plain.caps&capsProtoVer == 0 || !plain.verPresent || plain.ver != termProtoVer {
+		t.Fatalf("出口公布 featProtoVerBit 时 CLI 应声明协议版本：caps=0x%02x ver=%d present=%v",
+			plain.caps, plain.ver, plain.verPresent)
 	}
 	if plain.id == "" || len(plain.id) > termMaxClientIDLen || !strings.Contains(plain.id, "-") {
 		t.Fatalf("实例标识形态不对：%q", plain.id)

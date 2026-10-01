@@ -352,6 +352,21 @@ func uplinkArgsToFields(category, args string) (map[string]any, error) {
 			return map[string]any{"capLen": float64(1), "flags": float64(1)}, nil // kCapsSurface = 1<<0
 		}
 		return nil, errBadArgs
+	case "hello-tail":
+		// args = caps,ver,id（ver/id 空串 = 不出现；与 DecodeUplink 的 0/"" 同口径）。
+		if err := need(3); err != nil {
+			return nil, err
+		}
+		var ver float64
+		if parts[1] != "" {
+			ver = num(parts[1])
+			if ver < 0 {
+				return nil, errBadArgs
+			}
+		}
+		return map[string]any{
+			"caps": num(parts[0]), "ver": ver, "id": parts[2],
+		}, nil
 	}
 	return nil, errBadArgs
 }

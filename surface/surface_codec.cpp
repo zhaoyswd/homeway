@@ -882,6 +882,19 @@ std::vector<uint8_t> encodeCapabilityBlock(uint8_t caps) {
     return std::vector<uint8_t>{1, caps};
 }
 
+std::vector<uint8_t> encodeHelloTail(uint8_t caps, const std::string& clientID) {
+    // 布局与服务端 pkg/term encHelloTail 逐字节一致：[capLen][caps][ver?][idLen][id]。
+    std::vector<uint8_t> out = encodeCapabilityBlock(caps);
+    if ((caps & kCapsProtoVer) != 0) {
+        out.push_back(kProtoVer);
+    }
+    if (!clientID.empty()) {
+        out.push_back(static_cast<uint8_t>(clientID.size()));
+        out.insert(out.end(), clientID.begin(), clientID.end());
+    }
+    return out;
+}
+
 bool decodeNotify(const uint8_t* p, size_t len, std::string& out, std::string& error) {
     if (len < 2) {
         error = "NOTIFY 载荷过短";

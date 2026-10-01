@@ -1194,11 +1194,21 @@ func (s *termService) ServeConn(c net.Conn) {
 			_ = client.frame(opError, encError("bad_hello", derr.Error()))
 			return
 		}
-		// 能力协商 + 实例标识（任务 2.1/2.3）：HELLO 尾随 [capLen][caps][idLen][clientID]，
+		// 能力协商 + 实例标识（任务 2.1/2.3）：HELLO 尾随 [capLen][caps][ver?][idLen][clientID]，
 		// 形状不符（如缺 caps 长度前缀的裸 ID 块）必须拒绝——沿用 bad_capability 错误码。
-		caps, capsPresent, clientID, caperr := decHelloTail(helloTail(f.payload, name))
+		caps, capsPresent, clientID, cver, cverPresent, caperr := decHelloTail(helloTail(f.payload, name))
 		if caperr != nil {
 			_ = client.frame(opError, encError("bad_capability", caperr.Error()))
+			return
+		}
+		// 服务端版本门（2026-10-01，FIX-29）：客户端在尾随声明的协议版本与本出口不符 ⇒
+		// 当场拒腿 + 可行动文案。此前版本门只在客户端一侧（App / clientcore 的 GREETING
+		// 检查），出口对错配客户端零检测——错配只能以读帧错乱、静默误解或超时收场。
+		// 未声明（旧客户端，或未公布 featProtoVerBit 的协商）⇒ 按既有 raw/legacy 语义照常服务。
+		if cverPresent && cver != termProtoVer {
+			_ = client.frame(opError, encError(termErrVersion, fmt.Sprintf(
+				"客户端终端协议版本 %d 与本出口 %d 不符：请把 App / homeway term 与出口升到同一版本",
+				cver, termProtoVer)))
 			return
 		}
 		if capsPresent && wantsSurface(caps) {
@@ -1267,6 +1277,9 @@ const (
 	termErrSpawnFailed    = "spawn_failed"     // 会话进程起不来
 	termErrTooMany        = "too_many"         // 会话数达上限
 	termErrTooManyClients = "too_many_clients" // 同会话腿数达上限
+	// termErrVersion：客户端在 HELLO 尾随声明的协议版本与本出口不符（FIX-29 服务端
+	// 版本门；与「surface 协商失败」是不同错误面——客户端据本位给「升级客户端」文案）。
+	termErrVersion = "term_version"
 )
 
 func termErrf(code, format string, args ...any) *termErr {

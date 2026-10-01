@@ -13,3 +13,7 @@ theme.dark	theme	1,1a1a1a,ffffff	011a1a1affffff
 clipboard.answer	clipboard	abc	020300616263
 clipboard.answer-empty	clipboard		020000
 caps.surface	caps	surface	0101
+hello-tail.raw-id	hello-tail	0x02,,host-1234	010209686f73742d31323334
+hello-tail.caps-only	hello-tail	0x01,,	0101
+hello-tail.surface-ver-id	hello-tail	0x81,0x01,id-1	0181010469642d31
+hello-tail.surface-ver-noid	hello-tail	0x81,0x01,	018101

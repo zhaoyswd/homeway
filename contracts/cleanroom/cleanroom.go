@@ -334,6 +334,34 @@ func DecodeUplink(category string, p []byte) (map[string]any, error) {
 			flags |= b
 		}
 		return map[string]any{"capLen": float64(p[0]), "flags": float64(flags)}, nil
+	case "hello-tail": // [capLen:1][caps:capLen][ver:1?][idLen:1][id]（FIX-29 版本门）
+		// ver 只在 caps 位 7（capsProtoVer）置位时出现；未出现与 args 同口径返回 0。
+		const capsProtoVerBit = 0x80 // 与服务端 pkg/term capsProtoVer / codec kCapsProtoVer 同值
+		if len(p) < 1 || 1+int(p[0]) > len(p) {
+			return nil, ErrBadPayload
+		}
+		var caps byte
+		for _, b := range p[1 : 1+int(p[0])] {
+			caps |= b
+		}
+		off := 1 + int(p[0])
+		var ver byte
+		if caps&capsProtoVerBit != 0 {
+			if off >= len(p) {
+				return nil, ErrBadPayload
+			}
+			ver = p[off]
+			off++
+		}
+		id := ""
+		if off < len(p) {
+			n := int(p[off])
+			if off+1+n > len(p) {
+				return nil, ErrBadPayload
+			}
+			id = string(p[off+1 : off+1+n])
+		}
+		return map[string]any{"caps": float64(caps), "ver": float64(ver), "id": id}, nil
 	}
 	return nil, fmt.Errorf("cleanroom: 上行 category %q 不认识（扩表须同步两端）", category)
 }

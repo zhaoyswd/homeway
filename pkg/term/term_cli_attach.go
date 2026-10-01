@@ -163,8 +163,12 @@ func cliAttachCmd(o attachOpts) error {
 // （capsRawTerminal + 实例标识尾随——远程面复用同一编码路径，kind=host）→ 首帧。
 //
 // HELLO 尾随**必须先 caps 后 ID、带 ID 必带 caps**（design D8 编码侧约束，encHelloTail 保证）。
+//
+// 版本声明（FIX-29）：出口公布 featProtoVerBit 时在 caps 里加 capsProtoVer ⇒ 尾随带
+// 1 字节 termProtoVer，供出口的版本门比对。出口不公布（旧出口）⇒ 不声明，尾随字节与
+// 旧版逐字节一致（旧出口的严格耗尽解析不被新字节打断）。
 func cliAttachDial(t *termTarget, o attachOpts, tty *cliTTY, name string) (io.ReadWriteCloser, []byte, error) {
-	conn, err := cliDialTerm(t)
+	conn, feats, err := cliDialTerm(t)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -179,8 +183,12 @@ func cliAttachDial(t *termTarget, o attachOpts, tty *cliTTY, name string) (io.Re
 	if o.takeover {
 		flags |= helloFlagTakeover // `attach -d` 显式接管（D8）
 	}
+	caps := byte(capsRawTerminal)
+	if feats&featProtoVerBit != 0 {
+		caps |= capsProtoVer
+	}
 	hello := encHelloFlags(cols, rows, flags, name)
-	hello = append(hello, encHelloTail(capsRawTerminal, true, cliClientID())...)
+	hello = append(hello, encHelloTail(caps, true, cliClientID())...)
 	if _, err := conn.Write(encodeTermFrame(opHello, hello)); err != nil {
 		conn.Close()
 		return nil, nil, fmt.Errorf("发 HELLO：%w", err)

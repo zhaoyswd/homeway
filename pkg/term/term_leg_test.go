@@ -309,28 +309,45 @@ func TestSurfaceQueueFailureModesSeparate(t *testing.T) {
 
 func TestHelloTailShape(t *testing.T) {
 	// 无尾随：旧客户端形态，照常解析（不携带、不报错）。
-	caps, present, id, err := decHelloTail(nil)
-	if err != nil || present || id != "" {
+	caps, present, id, ver, verPresent, err := decHelloTail(nil)
+	if err != nil || present || id != "" || verPresent {
 		t.Fatalf("无尾随应解析为不携带：%v %v %q", caps, present, id)
 	}
 	// 仅 caps 块（既有形态）。
-	caps, present, id, err = decHelloTail(encCapability(capsSurface))
-	if err != nil || !present || caps != capsSurface || id != "" {
+	caps, present, id, _, verPresent, err = decHelloTail(encCapability(capsSurface))
+	if err != nil || !present || caps != capsSurface || id != "" || verPresent {
 		t.Fatalf("仅 caps 块应照常解析：%v %v %#x %q", err, present, caps, id)
 	}
 	// caps + ID（CLI / 新客户端形态）。
-	caps, present, id, err = decHelloTail(encHelloTail(capsSurface|capsRawTerminal, true, "host-1234"))
-	if err != nil || !present || caps != capsSurface|capsRawTerminal || id != "host-1234" {
+	caps, present, id, _, verPresent, err = decHelloTail(encHelloTail(capsSurface|capsRawTerminal, true, "host-1234"))
+	if err != nil || !present || caps != capsSurface|capsRawTerminal || id != "host-1234" || verPresent {
 		t.Fatalf("caps+ID 形状应解析：%v %v %#x %q", err, present, caps, id)
 	}
+	// caps（带 capsProtoVer 声明位）+ ID：版本字节在 caps 块之后、ID 块之前（FIX-29）。
+	vcaps := byte(capsSurface | capsProtoVer)
+	caps, present, id, ver, verPresent, err = decHelloTail(encHelloTail(vcaps, true, "host-1234"))
+	if err != nil || !present || caps != vcaps || id != "host-1234" {
+		t.Fatalf("caps+ver+ID 形状应解析：%v %v %#x %q", err, present, caps, id)
+	}
+	if !verPresent || ver != termProtoVer {
+		t.Fatalf("版本字节应原样解出 termProtoVer=%d：present=%v ver=%d", termProtoVer, verPresent, ver)
+	}
+	// 声明位在而版本字节缺失 = 畸形（不静默补默认值放行——那正是版本门要拦的静默错配）。
+	if _, _, _, _, _, err := decHelloTail([]byte{1, capsProtoVer}); err == nil {
+		t.Fatal("声明了版本字节但缺失必须被拒")
+	}
+	// 声明位在、版本字节后仍有内容却不是 ID 块（残留）= 畸形。
+	if _, _, _, _, _, err := decHelloTail([]byte{1, capsProtoVer, termProtoVer, 9}); err == nil {
+		t.Fatal("版本字节后的残留必须被拒")
+	}
 	// 声明长度越界的裸字节串（idLen 被当成 capLen）仍拒绝。
-	if _, _, _, err := decHelloTail([]byte{5, 'h', 'o', 's', 't'}); err == nil {
+	if _, _, _, _, _, err := decHelloTail([]byte{5, 'h', 'o', 's', 't'}); err == nil {
 		t.Fatal("声明长度越界的尾随必须被拒")
 	}
 	// 长度自洽的裸 ID 块（exec-r1 中3，口径 (a)）：两段同形不可判别 ⇒ 按形状**合法**，
 	// 被当作 caps 块解析（OR 出的位可能同时命中 surface/raw）——这是格式固有属性，
 	// 约束在编码侧（encHelloTail 不产出无 caps 的 ID；客户端必须先 caps 后 ID）。
-	caps2, present2, id2, err := decHelloTail([]byte{4, 'h', 'o', 's', 't'})
+	caps2, present2, id2, _, _, err := decHelloTail([]byte{4, 'h', 'o', 's', 't'})
 	if err != nil || !present2 || id2 != "" {
 		t.Fatalf("长度自洽裸 ID 块应按 caps 解析（口径 a）：%v %v %#x %q", err, present2, caps2, id2)
 	}
@@ -343,20 +360,20 @@ func TestHelloTailShape(t *testing.T) {
 		t.Fatalf("无 caps 块时不应产出 ID（口径 a 编码约束）：% x", tail)
 	}
 	// 空 caps 块（capLen=0）消费 1 字节：[0][idLen][id] 是合法形状（未声明能力 + ID）。
-	caps3, present3, id3, err := decHelloTail([]byte{0, 4, 'a', 'b', 'c', 'd'})
+	caps3, present3, id3, _, _, err := decHelloTail([]byte{0, 4, 'a', 'b', 'c', 'd'})
 	if err != nil || present3 || caps3 != 0 || id3 != "abcd" {
 		t.Fatalf("空 caps 块 + ID 应解析：%v %v %#x %q", err, present3, caps3, id3)
 	}
 	// caps 块声明长度越界（既有负例，r1 P2-9 同步）。
-	if _, _, _, err := decHelloTail([]byte{9, capsSurface}); err == nil {
+	if _, _, _, _, _, err := decHelloTail([]byte{9, capsSurface}); err == nil {
 		t.Fatal("capLen 越界必须被拒")
 	}
 	// ID 块声明长度越界。
-	if _, _, _, err := decHelloTail([]byte{1, capsSurface, 9, 'a'}); err == nil {
+	if _, _, _, _, _, err := decHelloTail([]byte{1, capsSurface, 9, 'a'}); err == nil {
 		t.Fatal("idLen 越界必须被拒")
 	}
 	// 尾随残留字节。
-	if _, _, _, err := decHelloTail([]byte{1, capsSurface, 2, 'a', 'b', 'X'}); err == nil {
+	if _, _, _, _, _, err := decHelloTail([]byte{1, capsSurface, 2, 'a', 'b', 'X'}); err == nil {
 		t.Fatal("尾随块后残留字节必须被拒")
 	}
 	// ID 超上限。
@@ -366,7 +383,7 @@ func TestHelloTailShape(t *testing.T) {
 	}
 	over := append([]byte{1, capsSurface}, byte(len(long)))
 	over = append(over, long...)
-	if _, _, _, err := decHelloTail(over); err == nil {
+	if _, _, _, _, _, err := decHelloTail(over); err == nil {
 		t.Fatal("ID 超上限必须被拒")
 	}
 }
@@ -1375,19 +1392,22 @@ func TestCreateOp(t *testing.T) {
 	defer c.Close()
 }
 
-// ---- 6.3 GREETING 位值回归（不新增多腿能力位）----
+// ---- 6.3 GREETING 位值回归（能力位增删必须显式过这里 + 台账 feat 族）----
 
 func TestGreetingFeaturesNoNewBit(t *testing.T) {
-	want := uint32(featList | featReplay | featModes | featAgent | featTitle | featSurfaceBit)
+	// term-host-cli 时代本用例守「六位不动」；FIX-29 起了第一处刻意的协议增量
+	// （featProtoVerBit，HELLO 版本声明协商）——守卫形态随之改为**已知位集对账**：
+	// 再加位必须同批改这里、台账 feat 族、两端客户端（App C++ / CLI）与 spec。
+	want := uint32(featList | featReplay | featModes | featAgent | featTitle | featSurfaceBit | featProtoVerBit)
 	if uint32(termFeatures) != want {
-		t.Fatalf("termFeatures = 0x%x，应保持既有六位 0x%x（不新增多腿位）", termFeatures, want)
+		t.Fatalf("termFeatures = 0x%x，应恰为已登记位集 0x%x（新增位须同批登记）", termFeatures, want)
 	}
 	ver, feats, err := decGreeting(encGreeting())
 	if err != nil || ver != termProtoVer || feats != want {
 		t.Fatalf("GREETING 往返：ver=%d feats=0x%x err=%v（期望 0x%x）", ver, feats, err, want)
 	}
-	if want != 0x3f {
-		t.Fatalf("六位能力位值应为 0x3f，实际 0x%x", want)
+	if want != 0x7f {
+		t.Fatalf("已登记能力位值应为 0x7f，实际 0x%x", want)
 	}
 }
 

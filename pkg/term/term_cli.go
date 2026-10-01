@@ -241,7 +241,13 @@ func dialErrText(sock string, err error) error {
 // 唯一拨号缝（1.1 收敛面：本地面连 <state>/term.sock；远端经注入缝 Resolve →
 // DialTerm，term 帧协议端到端原样承载）。explainSession 原自带的独立拨号点
 // （net.Dial 直连）已随动并入（r2 低⑥）。
-func cliDialTerm(t *termTarget) (io.ReadWriteCloser, error) {
+//
+// 返回出口声明的 GREETING features：attach 是否声明协议版本由它决定（FIX-29）。
+//
+// CLI 侧版本门（2026-10-01，FIX-29）：出口 ver != 本端 termProtoVer 当场拒。App /
+// clientcore 早有此门（term_version），CLI 此前只查首帧 op——帧布局换代时它会以读帧
+// 错乱收场。今天两端同为 v1，本门不影响任何同版本组合。
+func cliDialTerm(t *termTarget) (io.ReadWriteCloser, uint32, error) {
 	var conn io.ReadWriteCloser
 	if t.remoteMode() {
 		// 远程：解析（幂等缓存）→ 拨号；两步各用一次 --timeout 预算（默认各 10s，
@@ -252,7 +258,7 @@ func cliDialTerm(t *termTarget) (io.ReadWriteCloser, error) {
 			id, _, rerr := t.remote.ResolveHostRef(rctx, t.stateDir, t.hostRef)
 			rcancel()
 			if rerr != nil {
-				return nil, rerr
+				return nil, 0, rerr
 			}
 			t.hostID = id
 		}
@@ -261,38 +267,47 @@ func cliDialTerm(t *termTarget) (io.ReadWriteCloser, error) {
 		var err error
 		conn, err = t.remote.DialTerm(ctx, t.stateDir, t.hostID)
 		if err != nil {
-			return nil, err
+			return nil, 0, err
 		}
 	} else {
 		if t.hostRef != "" {
 			// 防御：CLI 入口恒注入（cmd/homeway 接线）；只跑本地面的调用方给了 --host。
-			return nil, errors.New("--host 需要远程接入缝（本构建未注入）；本地面请去掉 --host")
+			return nil, 0, errors.New("--host 需要远程接入缝（本构建未注入）；本地面请去掉 --host")
 		}
 		if t.timeout > 0 {
 			// exec-r1 L6：本地面不设预算（连 <state>/term.sock 即时返回），静默忽略
 			// --timeout 与本命令面「不认识的参数」严格风格不一致——显式报错。
-			return nil, errors.New("--timeout 仅 --host 模式可用（远程的解析/打开预算）；本地面请去掉 --timeout")
+			return nil, 0, errors.New("--timeout 仅 --host 模式可用（远程的解析/打开预算）；本地面请去掉 --timeout")
 		}
 		if t.stateDir == "" {
-			return nil, errors.New("拿不到 state 目录（用 --state 指定）")
+			return nil, 0, errors.New("拿不到 state 目录（用 --state 指定）")
 		}
 		sock := filepath.Join(t.stateDir, "term.sock")
 		var err error
 		conn, err = net.Dial("unix", sock)
 		if err != nil {
-			return nil, dialErrText(sock, err)
+			return nil, 0, dialErrText(sock, err)
 		}
 	}
 	f, err := readTermFrame(conn)
 	if err != nil {
 		conn.Close()
-		return nil, fmt.Errorf("读 GREETING：%w", err)
+		return nil, 0, fmt.Errorf("读 GREETING：%w", err)
 	}
 	if f.op != opGreeting {
 		conn.Close()
-		return nil, fmt.Errorf("首帧应为 GREETING，收到 op 0x%02x", f.op)
+		return nil, 0, fmt.Errorf("首帧应为 GREETING，收到 op 0x%02x", f.op)
 	}
-	return conn, nil
+	ver, feats, derr := decGreeting(f.payload)
+	if derr != nil {
+		conn.Close()
+		return nil, 0, fmt.Errorf("GREETING 体非法：%w", derr)
+	}
+	if ver != termProtoVer {
+		conn.Close()
+		return nil, 0, fmt.Errorf("出口终端服务协议版本 %d 与本端 %d 不符：出口与客户端需同批升级", ver, termProtoVer)
+	}
+	return conn, feats, nil
 }
 
 // cliRoundTrip 一锤子命令：发一帧、读应答；ERROR 帧翻成 protoError。
@@ -386,7 +401,7 @@ func cliList(args []string, remote RemoteTerm) error {
 
 // cliListFetch 经拨号缝取 LIST（表格与「attach 省略名字」的最近活跃解析共用）。
 func cliListFetch(t *termTarget) ([]cliSessionInfo, []byte, error) {
-	conn, err := cliDialTerm(t)
+	conn, _, err := cliDialTerm(t)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -556,7 +571,7 @@ func cliNewDetached(o newOpts, remote RemoteTerm) error {
 }
 
 func cliCreateOnce(t *termTarget, name string, flags byte) error {
-	conn, err := cliDialTerm(t)
+	conn, _, err := cliDialTerm(t)
 	if err != nil {
 		return err
 	}
@@ -607,7 +622,7 @@ func cliDelete(args []string, remote RemoteTerm) error {
 	if err := validateName(name); err != nil {
 		return err
 	}
-	conn, err := cliDialTerm(c.target(remote))
+	conn, _, err := cliDialTerm(c.target(remote))
 	if err != nil {
 		return err
 	}
@@ -790,7 +805,7 @@ func explainFile(o explainOpts) (explainOutput, error) {
 // 已并入 cliDialTerm，r2 低⑥）。
 func explainSession(o explainOpts, remote RemoteTerm) (explainOutput, error) {
 	t := newTermTarget(remote, o.stateDir, o.hostRef, o.timeout, o.noSpawn)
-	conn, err := cliDialTerm(t)
+	conn, _, err := cliDialTerm(t)
 	if err != nil {
 		return explainOutput{}, err
 	}

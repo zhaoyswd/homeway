@@ -21,6 +21,8 @@ package term
 import (
 	"encoding/hex"
 	"errors"
+	"fmt"
+	"strings"
 	"testing"
 )
 
@@ -104,6 +106,81 @@ func governanceSurfaceBodies(t *testing.T) map[string][]byte {
 		"snapshot":       encSnapshotBody(snap),
 		"diff":           encDiffBody(diff),
 		"fetchRowsReply": encFetchRowsReply(frr),
+	}
+}
+
+// TestVersionGovernanceHelloDeclGate：FIX-29 服务端版本门（HELLO 尾随的客户端声明）。
+// 三种形态都钉住：① 声明 == termProtoVer ⇒ 照常 ATTACHED；② 声明 != ⇒ ERROR(term_version)
+// 拒腿（不是 bad_capability / 不是静默放行）；③ 未声明（旧客户端形态，无版本位）⇒ 照常。
+// 变异自证：拆掉 service.go 的 `cverPresent && cver != termProtoVer` 分支 ⇒ ② 会收到
+// ATTACHED，本用例必红。
+func TestVersionGovernanceHelloDeclGate(t *testing.T) {
+	svc, ln := startTestTermService(t)
+	defer svc.Close()
+	defer ln.Close()
+	// 手工组尾随 [capLen=1][caps][ver][idLen][id]：encHelloTail 恒写 termProtoVer，
+	// 这里要注入任意声明值（① 用本端值、② 用 ±1）。
+	helloWithVer := func(name string, ver byte) []byte {
+		id := "gov-" + name
+		hello := encHello(80, 24, true, name)
+		hello = append(hello, 1, byte(capsSurface|capsProtoVer), ver, byte(len(id)))
+		return append(hello, id...)
+	}
+	// ① 声明本端版本：照常接入。
+	c1 := dialTerm(t, ln)
+	defer c1.Close()
+	if f := readTermFrameT(t, c1); f.op != opGreeting {
+		t.Fatal("首帧应为 GREETING")
+	}
+	writeTermFrame(t, c1, opHello, helloWithVer("govok", termProtoVer))
+	if f := readTermFrameT(t, c1); f.op != opAttached {
+		t.Fatalf("声明 == termProtoVer 应照常接入，收到 0x%02x（%q）", f.op, f.payload)
+	}
+	// ② 声明错配版本：ERROR(term_version) 拒腿（每档 ±1 各验一次）。
+	for _, ver := range []byte{termProtoVer - 1, termProtoVer + 1} {
+		c := dialTerm(t, ln)
+		if f := readTermFrameT(t, c); f.op != opGreeting {
+			t.Fatal("首帧应为 GREETING")
+		}
+		writeTermFrame(t, c, opHello, helloWithVer(fmt.Sprintf("govbad%d", ver), ver))
+		f := readTermFrameT(t, c)
+		_ = c.Close()
+		if f.op != opError {
+			t.Fatalf("声明 ver=%d 应被拒（ERROR），收到 0x%02x", ver, f.op)
+		}
+		code, msg, derr := decError(f.payload)
+		if derr != nil || code != termErrVersion {
+			t.Fatalf("错误码应为 %s，实际 %q（err=%v）", termErrVersion, code, derr)
+		}
+		if !strings.Contains(msg, "版本") {
+			t.Fatalf("错误文案应含可行动归因（版本），实际 %q", msg)
+		}
+	}
+	// ③ 未声明（旧客户端形态）：照常接入（raw/legacy 语义不变）。
+	c3 := dialTerm(t, ln)
+	defer c3.Close()
+	if f := readTermFrameT(t, c3); f.op != opGreeting {
+		t.Fatal("首帧应为 GREETING")
+	}
+	writeTermFrame(t, c3, opHello, append(encHello(80, 24, true, "govlegacy"),
+		encHelloTail(capsRawTerminal, true, "gov-legacy")...))
+	if f := readTermFrameT(t, c3); f.op != opAttached {
+		t.Fatalf("未声明版本的旧客户端形态应照常接入，收到 0x%02x（%q）", f.op, f.payload)
+	}
+	// ④ 声明位在而版本字节缺：畸形（bad_capability），不得被当成「未声明」放行。
+	c4 := dialTerm(t, ln)
+	defer c4.Close()
+	if f := readTermFrameT(t, c4); f.op != opGreeting {
+		t.Fatal("首帧应为 GREETING")
+	}
+	writeTermFrame(t, c4, opHello, append(encHello(80, 24, true, "govmal"),
+		encCapability(capsSurface|capsProtoVer)...))
+	f4 := readTermFrameT(t, c4)
+	if f4.op != opError {
+		t.Fatalf("声明位在而字节缺应被拒，收到 0x%02x", f4.op)
+	}
+	if code, _, _ := decError(f4.payload); code != "bad_capability" {
+		t.Fatalf("畸形尾随的错误码应为 bad_capability，实际 %q", code)
 	}
 }
 

@@ -76,7 +76,18 @@ const (
 	// featSurface 是 surface 能力位（任务 2.1）：客户端见位才在 HELLO 尾随 capability 块。
 	featSurfaceBit = 1 << 5
 
-	termFeatures = featList | featReplay | featModes | featAgent | featTitle | featSurfaceBit
+	// featProtoVerBit 是「HELLO 版本声明可协商」位（2026-10-01 服务端版本门，FIX-29）：
+	// 出口置位 = 本出口认识 client 在 HELLO 尾随里声明的协议版本（capsProtoVer 标记 +
+	// 1 字节版本，见 encHelloTail），客户端**见位才声明**。置位与否是混合部署的开关：
+	// 旧出口不置位 ⇒ 新客户端不发版本字节 ⇒ 旧出口那套「尾随块必须恰好耗尽」的解析
+	// 不会被新字节打断（新客户端 × 旧出口照常工作）；旧客户端不认位 ⇒ 不声明 ⇒ 出口按
+	// 未声明处理（= 既有 raw/legacy 语义）。与服务端的对照检查在 service.go ServeConn：
+	// 声明值 != termProtoVer ⇒ ERROR(term_version) 拒腿。版本门从此**双侧**：客户端旧有
+	// GREETING 门（App / clientcore app_term.go），出口新增本门（此前出口对错配客户端零检测，
+	// 错配只能以读帧错乱/超时收场）。
+	featProtoVerBit = 1 << 6
+
+	termFeatures = featList | featReplay | featModes | featAgent | featTitle | featSurfaceBit | featProtoVerBit
 )
 
 // agent 枚举（与 App 侧一一对应）。STATE/ATTACHED 的 state 字节值域 = stateV2 枚举
@@ -245,11 +256,12 @@ func helloTail(p []byte, name string) []byte {
 	return p[off:]
 }
 
-// ---- HELLO 尾随块：capability + 客户端实例标识（term-host-cli 任务 2.3，design D8）----
+// ---- HELLO 尾随块：capability + 协议版本 + 客户端实例标识（term-host-cli 任务 2.3，design D8）----
 //
-// 形状（顺序固定）：[capLen:1][caps:capLen][idLen:1][clientID:idLen]，两段都可省略，
+// 形状（顺序固定）：[capLen:1][caps:capLen][ver:1?][idLen:1][clientID:idLen]，三段都可省略，
 // 解析**必须恰好耗尽**尾随字节（畸形声明长度/残留字节一律拒绝，沿用 bad_capability
-// 错误码，r1 P2-9）。
+// 错误码，r1 P2-9）。ver 字节**只在 caps 带 capsProtoVer 位时出现**（FIX-29 版本门）——
+// 位即信号，不做位置推断，因此不扩大「同形不可判别」面。
 //
 // ⚠️ 同形不可判别（exec-r1 中3，口径 (a)）：两段都是 [len][bytes]，解码器无法从形状上
 // 区分「裸 ID 块」与「caps 块」——长度自洽的裸 ID 块（如 [4]"host"）会被当作 caps 解析
@@ -264,10 +276,17 @@ const termMaxClientIDLen = 64
 //
 // 编码约束（exec-r1 中3）：**带 ID 必带 caps 块**——没声明能力就不产出 ID 块（静默丢弃，
 // 与解码侧的「同形不可判别」配套：ID 块只允许跟在 caps 块之后出现）。
+//
+// 版本字节（2026-10-01，FIX-29）：caps 里带 capsProtoVer 位时，caps 块之后、ID 块之前
+// 插入 1 字节 termProtoVer。**位是「存在」的信号**（不是靠位置推断），所以解析无同形歧义；
+// 不带位的尾随字节与从前逐字节一致（旧出口/旧客户端互操作不变）。
 func encHelloTail(caps byte, capsPresent bool, id string) []byte {
 	var out []byte
 	if capsPresent {
 		out = append(out, encCapability(caps)...)
+		if caps&capsProtoVer != 0 {
+			out = append(out, termProtoVer)
+		}
 		if id != "" {
 			out = append(out, byte(len(id)))
 			out = append(out, id...)
@@ -276,15 +295,16 @@ func encHelloTail(caps byte, capsPresent bool, id string) []byte {
 	return out
 }
 
-// decHelloTail 解 HELLO 尾随：形状校验 + capability + 实例标识。
-// 返回 (caps, 是否携带 caps, clientID, 错误)；畸形形状返回错误（调用方报 bad_capability）。
-func decHelloTail(tail []byte) (caps byte, capsPresent bool, id string, err error) {
+// decHelloTail 解 HELLO 尾随：形状校验 + capability + 协议版本 + 实例标识。
+// 返回 (caps, 是否携带 caps, clientID, 版本, 是否声明版本, 错误)；畸形形状返回错误
+// （调用方报 bad_capability）。声明位在而版本字节缺失 = 畸形（拒收，不静默补默认值）。
+func decHelloTail(tail []byte) (caps byte, capsPresent bool, id string, ver byte, verPresent bool, err error) {
 	off := 0
 	if len(tail) > off {
 		n := int(tail[off])
 		if n > 0 {
 			if len(tail) < off+1+n {
-				return 0, false, "", fmt.Errorf("%w: capability 块声明 %d 字节，实际只有 %d",
+				return 0, false, "", 0, false, fmt.Errorf("%w: capability 块声明 %d 字节，实际只有 %d",
 					errTermFrame, n, len(tail)-off-1)
 			}
 			for i := 0; i < n; i++ {
@@ -296,23 +316,32 @@ func decHelloTail(tail []byte) (caps byte, capsPresent bool, id string, err erro
 		// [0][idLen][id] 是合法形状（= 未声明能力 + 携带 ID——编码侧不会产出，但形状合法）。
 		off += 1 + n
 	}
+	// 版本字节（FIX-29）：caps 声明位在 ⇒ 下一字节必是版本（编码侧 encHelloTail 保证；
+	// 缺失即畸形——绝不默认成「本端版本」放行，那正是版本门要拦的静默错配）。
+	if capsPresent && caps&capsProtoVer != 0 {
+		if len(tail) <= off {
+			return 0, false, "", 0, false, fmt.Errorf("%w: capability 声明了协议版本但版本字节缺失", errTermFrame)
+		}
+		ver, verPresent = tail[off], true
+		off++
+	}
 	if len(tail) > off {
 		n := int(tail[off])
 		if len(tail) < off+1+n {
-			return 0, false, "", fmt.Errorf("%w: 实例标识块声明 %d 字节，实际只有 %d",
+			return 0, false, "", 0, false, fmt.Errorf("%w: 实例标识块声明 %d 字节，实际只有 %d",
 				errTermFrame, n, len(tail)-off-1)
 		}
 		if n > termMaxClientIDLen {
-			return 0, false, "", fmt.Errorf("%w: 实例标识 %d 字节超过上限 %d",
+			return 0, false, "", 0, false, fmt.Errorf("%w: 实例标识 %d 字节超过上限 %d",
 				errTermFrame, n, termMaxClientIDLen)
 		}
 		id = string(tail[off+1 : off+1+n])
 		off += 1 + n
 	}
 	if len(tail) > off {
-		return 0, false, "", fmt.Errorf("%w: 尾随块后还有 %d 字节残留", errTermFrame, len(tail)-off)
+		return 0, false, "", 0, false, fmt.Errorf("%w: 尾随块后还有 %d 字节残留", errTermFrame, len(tail)-off)
 	}
-	return caps, capsPresent, id, nil
+	return caps, capsPresent, id, ver, verPresent, nil
 }
 
 // ---- CREATE（任务 6.2）：[flags:1][nameLen:1][name]，flags bit0 = reuse-if-exists ----
