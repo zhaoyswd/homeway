@@ -15,6 +15,7 @@ set -euo pipefail
 cd "$(dirname "$0")/.."   # 仓库根
 
 GOLDEN_DIR=surface/test/golden
+INPUT_CASES=surface/test/host/surface_input_cases.tsv
 OUT_DIR=$(mktemp -d)
 trap 'rm -rf "$OUT_DIR"' EXIT
 
@@ -67,7 +68,7 @@ echo "surface-host-test(golden): 运行（样例目录 ${GOLDEN_DIR}）"
 "$OUT_DIR/surface_golden_test" "$GOLDEN_DIR"
 echo "surface-scroll: 运行（回滚模型判据）"
 "$OUT_DIR/surface_scroll_test"
-echo "surface-input: 运行（上行帧判据）"
-"$OUT_DIR/surface_input_test"
+echo "surface-input: 运行（上行帧判据，manifest ${INPUT_CASES}）"
+"$OUT_DIR/surface_input_test" "$INPUT_CASES"
 echo "surface-selection: 运行（文本选择判据）"
 "$OUT_DIR/surface_selection_test"

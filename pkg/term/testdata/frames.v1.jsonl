@@ -1,0 +1,13 @@
+{"name":"greeting.basic","category":"greeting","op":"0x0c","payloadHex":"013f000000","expect":{"greeting":{"ver":1,"features":63}}}
+{"name":"hello.create","category":"hello","op":"0x00","payloadHex":"78002800010a6465762d616263313233","expect":{"hello":{"cols":120,"rows":40,"flags":1,"name":"dev-abc123"}}}
+{"name":"resize.basic","category":"resize","op":"0x02","payloadHex":"64001e00","expect":{"resize":{"cols":100,"rows":30}}}
+{"name":"data.cjk-ansi","category":"data","op":"0x01","payloadHex":"68656c6c6f201b5b33316de4b896e7958c1b5b306d","expect":{"data":{"bytes":"68656c6c6f201b5b33316de4b896e7958c1b5b306d"}}}
+{"name":"replay-done.flags","category":"replay","op":"0x0a","payloadHex":"3930000003","expect":{"replayDone":{"rev":12345,"flags":3}}}
+{"name":"ended.killed","category":"ended","op":"0x03","payloadHex":"feffffff066b696c6c6564","expect":{"ended":{"code":-2,"reason":"killed"}}}
+{"name":"state.codex-working","category":"state","op":"0x07","payloadHex":"01011200636f64657820c2b720e5b7a5e4bd9ce4b8ad","expect":{"state":{"agent":1,"stateV2":1,"title":"codex · 工作中"}}}
+{"name":"error.no-session","category":"error","op":"0x06","payloadHex":"0a6e6f5f73657373696f6e0f00e4bc9ae8af9de4b88de5ad98e59ca8","expect":{"error":{"code":"no_session","msg":"会话不存在"}}}
+{"name":"ok.empty","category":"ok","op":"0x0b","expect":{"ok":{}}}
+{"name":"kill.name","category":"kill","op":"0x05","payloadHex":"0a6465762d616263313233","expect":{"kill":{"name":"dev-abc123"}}}
+{"name":"negative.short-header","category":"negative","op":"0x01","hex":"01","expect":{"error":"short_header"}}
+{"name":"negative.truncated-payload","category":"negative","op":"0x01","hex":"0110006f6e6c792d612d666577","expect":{"error":"truncated"}}
+{"name":"negative.hello-short-payload","category":"negative","op":"0x00","hex":"000300010203","expect":{"error":"bad_payload"}}

@@ -116,8 +116,9 @@ func TestLedgerFixturesRefsRule2(t *testing.T) {
 	}
 }
 
-// TestLedgerFixturesDigestsRule3 规则③（字节冻结门）：台账摘要行 == 实算 sha256。
-// cp-v1 = 整行原文摘要（帧字节/期望/name 全冻结；重排行序绿）；golden = 文件字节。
+// TestLedgerFixturesDigestsRule3 规则③（字节冻结门）：台账摘要行 == 实算摘要。
+// cp-v1 / term-v1 / surface-input-cases = 整行原文 sha256（帧字节/期望/name 全冻结，
+// 重排行序绿）；golden = 文件字节 sha256 + 逐样例 FNV-1a 64 文本摘要（manifest 既有口径）。
 func TestLedgerFixturesDigestsRule3(t *testing.T) {
 	root := testRoot(t)
 	led, err := Load(root)
@@ -127,23 +128,44 @@ func TestLedgerFixturesDigestsRule3(t *testing.T) {
 	// 实算侧。
 	actual := map[string]map[string]string{
 		"cp-v1": {}, "surface-golden-bin": {}, "surface-golden-manifest": {},
+		"term-v1": {}, "surface-input-cases": {}, "surface-golden-fnv": {},
 	}
-	data, err := os.ReadFile(filepath.Join(root, "internal/control/testdata/fixtures/v1/frames.jsonl"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	for _, line := range strings.Split(string(data), "\n") {
-		if strings.TrimSpace(line) == "" {
-			continue
-		}
-		var v struct {
-			Name string `json:"name"`
-		}
-		if err := json.Unmarshal([]byte(line), &v); err != nil {
+	for _, jl := range []struct{ unit, path string }{
+		{"cp-v1", filepath.Join(root, "internal/control/testdata/fixtures/v1/frames.jsonl")},
+		{"term-v1", filepath.Join(root, "pkg/term/testdata/frames.v1.jsonl")},
+	} {
+		data, err := os.ReadFile(jl.path)
+		if err != nil {
 			t.Fatal(err)
 		}
-		sum := sha256.Sum256([]byte(line))
-		actual["cp-v1"][v.Name] = hex.EncodeToString(sum[:])
+		for _, line := range strings.Split(string(data), "\n") {
+			if strings.TrimSpace(line) == "" {
+				continue
+			}
+			var v struct {
+				Name string `json:"name"`
+			}
+			if err := json.Unmarshal([]byte(line), &v); err != nil {
+				t.Fatal(err)
+			}
+			sum := sha256.Sum256([]byte(line))
+			actual[jl.unit][v.Name] = hex.EncodeToString(sum[:])
+		}
+	}
+	// 上行字节表：TSV 行原文（name = 首列）。
+	{
+		data, err := os.ReadFile(filepath.Join(root, "surface/test/host/surface_input_cases.tsv"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, line := range strings.Split(string(data), "\n") {
+			if strings.TrimSpace(line) == "" {
+				continue
+			}
+			name := strings.SplitN(line, "\t", 2)[0]
+			sum := sha256.Sum256([]byte(line))
+			actual["surface-input-cases"][name] = hex.EncodeToString(sum[:])
+		}
 	}
 	gd := filepath.Join(root, "surface/test/golden")
 	entries, err := os.ReadDir(gd)
@@ -158,6 +180,17 @@ func TestLedgerFixturesDigestsRule3(t *testing.T) {
 		sum := sha256.Sum256(b)
 		if e.Name() == "manifest.tsv" {
 			actual["surface-golden-manifest"][e.Name()] = hex.EncodeToString(sum[:])
+			// 逐样例 FNV-1a 64 文本摘要（3.3 双记的另一记）：manifest 第 6 列。
+			for _, line := range strings.Split(strings.TrimSpace(string(b)), "\n") {
+				if line == "" {
+					continue
+				}
+				f := strings.Split(line, "\t")
+				if len(f) < 6 {
+					t.Fatalf("golden manifest 行缺列：%q", line)
+				}
+				actual["surface-golden-fnv"][f[0]] = f[5]
+			}
 		} else {
 			actual["surface-golden-bin"][e.Name()] = hex.EncodeToString(sum[:])
 		}

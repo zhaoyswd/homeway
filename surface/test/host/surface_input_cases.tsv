@@ -1,0 +1,15 @@
+key.ctrl-a	key	0x0041,0x0002,1,	00410002000100
+key.with-text	key	0x0041,0x0000,1,a	0041000000010161
+text.basic	text	hi,0,0,0	010002006869
+text.paste	text	hi,1,0,0	010102006869
+text.paste-first	text	hi,1,1,0	010302006869
+text.paste-mid	text	hi,1,1,1	010702006869
+text.paste-last	text	hi,1,0,1	010502006869
+mouse.press-left	mouse	0,1,0x0004,12,34	02000104000c002200
+focus.gained	focus	1	0301
+focus.lost	focus	0	0300
+theme.light	theme	0,1a1a1a,ffffff	001a1a1affffff
+theme.dark	theme	1,1a1a1a,ffffff	011a1a1affffff
+clipboard.answer	clipboard	abc	020300616263
+clipboard.answer-empty	clipboard		020000
+caps.surface	caps	surface	0101
