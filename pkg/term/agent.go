@@ -107,17 +107,27 @@ const (
 	stateV2Idle    byte = 3
 )
 
+// stateV2 的字符串词面（stateNameV2 渲染；LIST JSON / App 的 resolveStateKey·
+// agentStateKey 按值分派——contract-ledger 台账族② stateV2 子族，与上方字节枚举
+// 一一对应、只增不改；4b 2.1 提常量前是 stateNameV2 的返回字面量）。
+const (
+	stateV2NameUnknown = "unknown"
+	stateV2NameWorking = "working"
+	stateV2NameBlocked = "blocked"
+	stateV2NameIdle    = "idle"
+)
+
 // stateNameV2 把枚举渲染成字符串（LIST JSON 与 CLI 表格/标题用）。
 func stateNameV2(s byte) string {
 	switch s {
 	case stateV2Working:
-		return "working"
+		return stateV2NameWorking
 	case stateV2Blocked:
-		return "blocked"
+		return stateV2NameBlocked
 	case stateV2Idle:
-		return "idle"
+		return stateV2NameIdle
 	}
-	return "unknown"
+	return stateV2NameUnknown
 }
 
 // 判定阈值（2026-09-18 实测标定，Mac mini / codex 1.x / opencode 1.18）：

@@ -1,0 +1,326 @@
+{"family":"cp","unit":"code","value":"unknown_op","note":"","faces":["cp"],"status":"active","spec":"daemon-control-plane"}
+{"family":"cp","unit":"code","value":"no_stream","note":"","faces":["cp"],"status":"active","spec":"daemon-control-plane"}
+{"family":"cp","unit":"code","value":"bad_json","note":"","faces":["cp"],"status":"active","spec":"daemon-control-plane"}
+{"family":"cp","unit":"code","value":"bad_request","note":"","faces":["cp"],"status":"active","spec":"daemon-control-plane"}
+{"family":"cp","unit":"code","value":"bad_frame","note":"","faces":["cp"],"status":"active","spec":"daemon-control-plane"}
+{"family":"cp","unit":"code","value":"not_ready","note":"","faces":["cp"],"status":"active","spec":"daemon-control-plane"}
+{"family":"cp","unit":"code","value":"shutting_down","note":"","faces":["cp"],"status":"active","spec":"daemon-control-plane"}
+{"family":"cp","unit":"code","value":"host_exists","note":"","faces":["cp"],"status":"active","spec":"daemon-control-plane"}
+{"family":"cp","unit":"code","value":"no_host","note":"","faces":["cp"],"status":"active","spec":"daemon-control-plane"}
+{"family":"cp","unit":"code","value":"bad_token","note":"","faces":["cp"],"status":"active","spec":"daemon-control-plane"}
+{"family":"cp","unit":"code","value":"host_unreachable","note":"","faces":["cp"],"status":"active","spec":"daemon-control-plane"}
+{"family":"cp","unit":"code","value":"stream_refused","note":"","faces":["cp"],"status":"active","spec":"daemon-control-plane"}
+{"family":"cp","unit":"code","value":"cursor_stale","note":"","faces":["cp"],"status":"active","spec":"daemon-control-plane"}
+{"family":"cp","unit":"op","value":"daemon.status","note":"","faces":["cp"],"status":"active","spec":"daemon-control-plane"}
+{"family":"cp","unit":"op","value":"host.add","note":"","faces":["cp"],"status":"active","spec":"daemon-control-plane"}
+{"family":"cp","unit":"op","value":"host.remove","note":"","faces":["cp"],"status":"active","spec":"daemon-control-plane"}
+{"family":"cp","unit":"op","value":"host.list","note":"","faces":["cp"],"status":"active","spec":"daemon-control-plane"}
+{"family":"cp","unit":"op","value":"snapshot.get","note":"","faces":["cp"],"status":"active","spec":"daemon-control-plane"}
+{"family":"cp","unit":"op","value":"events.subscribe","note":"","faces":["cp"],"status":"active","spec":"daemon-control-plane"}
+{"family":"cp","unit":"op","value":"events.unsubscribe","note":"","faces":["cp"],"status":"active","spec":"daemon-control-plane"}
+{"family":"cp","unit":"op","value":"stream.open","note":"","faces":["cp"],"status":"active","spec":"daemon-control-plane"}
+{"family":"cp","unit":"op","value":"stream.close","note":"","faces":["cp"],"status":"active","spec":"daemon-control-plane"}
+{"family":"cp","unit":"op","value":"forward.add","note":"","faces":["cp"],"status":"active","spec":"daemon-control-plane"}
+{"family":"cp","unit":"op","value":"forward.remove","note":"","faces":["cp"],"status":"active","spec":"daemon-control-plane"}
+{"family":"cp","unit":"op","value":"forward.list","note":"","faces":["cp"],"status":"active","spec":"daemon-control-plane"}
+{"family":"cp","unit":"op","value":"socks.on","note":"","faces":["cp"],"status":"active","spec":"daemon-control-plane"}
+{"family":"cp","unit":"op","value":"socks.off","note":"","faces":["cp"],"status":"active","spec":"daemon-control-plane"}
+{"family":"cp","unit":"op","value":"socks.status","note":"","faces":["cp"],"status":"active","spec":"daemon-control-plane"}
+{"family":"cp","unit":"op","value":"speedtest.start","note":"","faces":["cp"],"status":"active","spec":"daemon-control-plane"}
+{"family":"cp","unit":"op","value":"speedtest.status","note":"","faces":["cp"],"status":"active","spec":"daemon-control-plane"}
+{"family":"cp","unit":"op","value":"speedtest.cancel","note":"","faces":["cp"],"status":"active","spec":"daemon-control-plane"}
+{"family":"cp","unit":"op","value":"serve.start","note":"","faces":["cp"],"status":"active","spec":"daemon-control-plane"}
+{"family":"cp","unit":"op","value":"serve.stop","note":"","faces":["cp"],"status":"active","spec":"daemon-control-plane"}
+{"family":"cp","unit":"op","value":"serve.restart","note":"","faces":["cp"],"status":"active","spec":"daemon-control-plane"}
+{"family":"cp","unit":"op","value":"serve.status","note":"","faces":["cp"],"status":"active","spec":"daemon-control-plane"}
+{"family":"cp","unit":"op","value":"serve.token","note":"","faces":["cp"],"status":"active","spec":"daemon-control-plane"}
+{"family":"cp","unit":"op","value":"relay.start","note":"","faces":["cp"],"status":"active","spec":"daemon-control-plane"}
+{"family":"cp","unit":"op","value":"relay.stop","note":"","faces":["cp"],"status":"active","spec":"daemon-control-plane"}
+{"family":"cp","unit":"op","value":"relay.restart","note":"","faces":["cp"],"status":"active","spec":"daemon-control-plane"}
+{"family":"cp","unit":"op","value":"relay.status","note":"","faces":["cp"],"status":"active","spec":"daemon-control-plane"}
+{"family":"cp","unit":"op","value":"relay.token","note":"","faces":["cp"],"status":"active","spec":"daemon-control-plane"}
+{"family":"cp","unit":"domain","value":"link","note":"","faces":["cp"],"status":"active","spec":"daemon-control-plane"}
+{"family":"cp","unit":"domain","value":"session","note":"","faces":["cp"],"status":"active","spec":"daemon-control-plane"}
+{"family":"cp","unit":"domain","value":"transfer","note":"","faces":["cp"],"status":"active","spec":"daemon-control-plane"}
+{"family":"cp","unit":"domain","value":"log","note":"","faces":["cp"],"status":"active","spec":"daemon-control-plane"}
+{"family":"cp","unit":"domain","value":"term","note":"跨单元同值：stream-kind unit 亦有 term——两空间独立","faces":["cp"],"status":"active","spec":"daemon-control-plane"}
+{"family":"cp","unit":"kind","value":"link.changed","note":"","faces":["cp"],"status":"active","spec":"daemon-control-plane"}
+{"family":"cp","unit":"kind","value":"session.added","note":"","faces":["cp"],"status":"active","spec":"daemon-control-plane"}
+{"family":"cp","unit":"kind","value":"session.removed","note":"","faces":["cp"],"status":"active","spec":"daemon-control-plane"}
+{"family":"cp","unit":"kind","value":"session.state_changed","note":"","faces":["cp"],"status":"active","spec":"daemon-control-plane"}
+{"family":"cp","unit":"kind","value":"session.ladder","note":"词表先行：无事件源（D7 不虚构值域）","faces":["cp"],"status":"active","spec":"daemon-control-plane"}
+{"family":"cp","unit":"kind","value":"session.rebuild","note":"","faces":["cp"],"status":"active","spec":"daemon-control-plane"}
+{"family":"cp","unit":"kind","value":"session.diag","note":"","faces":["cp"],"status":"active","spec":"daemon-control-plane"}
+{"family":"cp","unit":"kind","value":"transfer.sample","note":"","faces":["cp"],"status":"active","spec":"daemon-control-plane"}
+{"family":"cp","unit":"kind","value":"log.line","note":"","faces":["cp"],"status":"active","spec":"daemon-control-plane"}
+{"family":"cp","unit":"kind","value":"term.session_updated","note":"词表先行：无事件源（D7 不虚构值域）","faces":["cp"],"status":"active","spec":"daemon-control-plane"}
+{"family":"cp","unit":"kind","value":"term.ended","note":"词表先行：无事件源（D7 不虚构值域）","faces":["cp"],"status":"active","spec":"daemon-control-plane"}
+{"family":"cp","unit":"payload-field","value":"host","note":"spec-only：事件载荷字段名（struct tag 非 const，规则①只比 const 值集——r3 N-12）","faces":["cp"],"status":"active","spec":"daemon-control-plane 事件流（字段表）"}
+{"family":"cp","unit":"payload-field","value":"via","note":"spec-only：事件载荷字段名（struct tag 非 const，规则①只比 const 值集——r3 N-12）","faces":["cp"],"status":"active","spec":"daemon-control-plane 事件流（字段表）"}
+{"family":"cp","unit":"payload-field","value":"ep","note":"spec-only：事件载荷字段名（struct tag 非 const，规则①只比 const 值集——r3 N-12）","faces":["cp"],"status":"active","spec":"daemon-control-plane 事件流（字段表）"}
+{"family":"cp","unit":"payload-field","value":"rttMs","note":"spec-only：事件载荷字段名（struct tag 非 const，规则①只比 const 值集——r3 N-12）","faces":["cp"],"status":"active","spec":"daemon-control-plane 事件流（字段表）"}
+{"family":"cp","unit":"payload-field","value":"at","note":"spec-only：事件载荷字段名（struct tag 非 const，规则①只比 const 值集——r3 N-12）","faces":["cp"],"status":"active","spec":"daemon-control-plane 事件流（字段表）"}
+{"family":"cp","unit":"payload-field","value":"name","note":"spec-only：事件载荷字段名（struct tag 非 const，规则①只比 const 值集——r3 N-12）","faces":["cp"],"status":"active","spec":"daemon-control-plane 事件流（字段表）"}
+{"family":"cp","unit":"payload-field","value":"addedAt","note":"spec-only：事件载荷字段名（struct tag 非 const，规则①只比 const 值集——r3 N-12）","faces":["cp"],"status":"active","spec":"daemon-control-plane 事件流（字段表）"}
+{"family":"cp","unit":"payload-field","value":"reason","note":"spec-only：事件载荷字段名（struct tag 非 const，规则①只比 const 值集——r3 N-12）","faces":["cp"],"status":"active","spec":"daemon-control-plane 事件流（字段表）"}
+{"family":"cp","unit":"payload-field","value":"state","note":"spec-only：事件载荷字段名（struct tag 非 const，规则①只比 const 值集——r3 N-12）","faces":["cp"],"status":"active","spec":"daemon-control-plane 事件流（字段表）"}
+{"family":"cp","unit":"payload-field","value":"level","note":"spec-only：事件载荷字段名（struct tag 非 const，规则①只比 const 值集——r3 N-12）","faces":["cp"],"status":"active","spec":"daemon-control-plane 事件流（字段表）"}
+{"family":"cp","unit":"payload-field","value":"outcome","note":"spec-only：事件载荷字段名（struct tag 非 const，规则①只比 const 值集——r3 N-12）","faces":["cp"],"status":"active","spec":"daemon-control-plane 事件流（字段表）"}
+{"family":"cp","unit":"payload-field","value":"cause","note":"spec-only：事件载荷字段名（struct tag 非 const，规则①只比 const 值集——r3 N-12）","faces":["cp"],"status":"active","spec":"daemon-control-plane 事件流（字段表）"}
+{"family":"cp","unit":"payload-field","value":"rxBytes","note":"spec-only：事件载荷字段名（struct tag 非 const，规则①只比 const 值集——r3 N-12）","faces":["cp"],"status":"active","spec":"daemon-control-plane 事件流（字段表）"}
+{"family":"cp","unit":"payload-field","value":"txBytes","note":"spec-only：事件载荷字段名（struct tag 非 const，规则①只比 const 值集——r3 N-12）","faces":["cp"],"status":"active","spec":"daemon-control-plane 事件流（字段表）"}
+{"family":"cp","unit":"payload-field","value":"msg","note":"spec-only：事件载荷字段名（struct tag 非 const，规则①只比 const 值集——r3 N-12）","faces":["cp"],"status":"active","spec":"daemon-control-plane 事件流（字段表）"}
+{"family":"cp","unit":"stream-kind","value":"term","note":"跨单元同值：订阅域 unit 亦有 term——两空间独立","faces":["cp"],"status":"active","spec":"daemon-control-plane"}
+{"family":"cp","unit":"stream-kind","value":"files","note":"","faces":["cp"],"status":"active","spec":"daemon-control-plane"}
+{"family":"cp","unit":"stream-end","value":"closed","note":"跨族同值：族⑧ streamend 同值——空间独立","faces":["cp"],"status":"active","spec":"daemon-control-plane"}
+{"family":"cp","unit":"stream-end","value":"gone","note":"跨族同值：族⑧ streamend 同值——空间独立","faces":["cp"],"status":"active","spec":"daemon-control-plane"}
+{"family":"cp","unit":"reach","value":"direct","note":"跨族同值：族⑪ via 同值——空间独立","faces":["cp"],"status":"active","spec":"daemon-control-plane"}
+{"family":"cp","unit":"reach","value":"relay","note":"跨族同值：族⑪ via 同值——空间独立","faces":["cp"],"status":"active","spec":"daemon-control-plane"}
+{"family":"cp","unit":"reach","value":"skipped","note":"","faces":["cp"],"status":"active","spec":"daemon-control-plane"}
+{"family":"cp","unit":"close-reason","value":"proto_mismatch","note":"","faces":["cp"],"status":"active","spec":"daemon-control-plane（reload/goodbye 关帧原因）"}
+{"family":"cp","unit":"close-reason","value":"overrun","note":"","faces":["cp"],"status":"active","spec":"daemon-control-plane（reload/goodbye 关帧原因）"}
+{"family":"event-payload","unit":"via","value":"direct","note":"","faces":["napi","cp"],"status":"active","spec":"daemon-control-plane（值域冻结）+ contract-ledger"}
+{"family":"event-payload","unit":"via","value":"relay","note":"","faces":["napi","cp"],"status":"active","spec":"daemon-control-plane（值域冻结）+ contract-ledger"}
+{"family":"event-payload","unit":"via","value":"none","note":"单函数 default：applyLink 无 case 走 else；ExitHealth.ets 对 'none' 有比较 ⇒ 不入豁免减法（r4 新-3）。via 单元的 '' 空串哨兵（App 本地态、无生产者）不计入 App 值集","faces":["napi","cp"],"status":"active","spec":"daemon-control-plane（值域冻结）+ contract-ledger"}
+{"family":"event-payload","unit":"via","value":"tunnel","note":"App 保留分支（applyLink 'tunnel' case）；本仓零产出者（bind.go 只产 direct/relay/none）；tier 旧 spec tailcat-direct-handshake-connect 历史口径（未注册时 via=tunnel）","faces":["napi","cp"],"status":"legacy-unreachable","spec":"daemon-control-plane（值域冻结）+ contract-ledger"}
+{"family":"event-payload","unit":"state","value":"idle","note":"","faces":["napi","cp"],"status":"active","spec":"daemon-control-plane（值域冻结）+ contract-ledger"}
+{"family":"event-payload","unit":"state","value":"starting","note":"","faces":["napi","cp"],"status":"active","spec":"daemon-control-plane（值域冻结）+ contract-ledger"}
+{"family":"event-payload","unit":"state","value":"ready","note":"","faces":["napi","cp"],"status":"active","spec":"daemon-control-plane（值域冻结）+ contract-ledger"}
+{"family":"event-payload","unit":"state","value":"failed","note":"","faces":["napi","cp"],"status":"active","spec":"daemon-control-plane（值域冻结）+ contract-ledger"}
+{"family":"event-payload","unit":"state","value":"stopping","note":"App 走 default（ServiceSession.ets SVC_* 仅 4 值）","faces":["napi","cp"],"status":"active","spec":"daemon-control-plane（值域冻结）+ contract-ledger"}
+{"family":"event-payload","unit":"diag","value":"gated","note":"App 无按值分派对象（spec 清单显式排除）","faces":["cp"],"status":"active","spec":"daemon-control-plane 诊因事件词表"}
+{"family":"event-payload","unit":"diag","value":"budget","note":"App 无按值分派对象（spec 清单显式排除）","faces":["cp"],"status":"active","spec":"daemon-control-plane 诊因事件词表"}
+{"family":"event-payload","unit":"diag","value":"probe_window","note":"App 无按值分派对象（spec 清单显式排除）","faces":["cp"],"status":"active","spec":"daemon-control-plane 诊因事件词表"}
+{"family":"term-frame","unit":"ended-code","value":"-1","note":"App 走 default（endedMessage 仅 −2/−3 有 case；−1 由 reason 前置分支消费）","faces":["direct","napi"],"status":"active","spec":"exit-terminal + term-host-cli D8"}
+{"family":"term-frame","unit":"ended-code","value":"-2","note":"","faces":["direct","napi"],"status":"active","spec":"exit-terminal + term-host-cli D8"}
+{"family":"term-frame","unit":"ended-code","value":"-3","note":"","faces":["direct","napi"],"status":"active","spec":"exit-terminal + term-host-cli D8"}
+{"family":"term-frame","unit":"ended-code","value":"math.MinInt32","note":"termEndNone 哨兵：不发 ENDED（客户端裸 EOF）；App 无分派","faces":["direct","napi"],"status":"active","spec":"exit-terminal + term-host-cli D8"}
+{"family":"term-frame","unit":"ended-reason","value":"replaced","note":"","faces":["direct","napi"],"status":"active","spec":"exit-terminal + term-host-cli D8"}
+{"family":"term-frame","unit":"ended-reason","value":"self_reconnect","note":"","faces":["direct","napi"],"status":"active","spec":"exit-terminal + term-host-cli D8"}
+{"family":"term-frame","unit":"feat","value":"1","note":"featList（真源 pkg/term feat*，位值十进制）；App 无按值分派对象（位字段，spec 清单排除）","faces":["direct","napi"],"status":"active","spec":"term-host-cli / term-surface-protocol"}
+{"family":"term-frame","unit":"feat","value":"2","note":"featReplay（真源 pkg/term feat*，位值十进制）；App 无按值分派对象（位字段，spec 清单排除）","faces":["direct","napi"],"status":"active","spec":"term-host-cli / term-surface-protocol"}
+{"family":"term-frame","unit":"feat","value":"4","note":"featModes（真源 pkg/term feat*，位值十进制）；App 无按值分派对象（位字段，spec 清单排除）","faces":["direct","napi"],"status":"active","spec":"term-host-cli / term-surface-protocol"}
+{"family":"term-frame","unit":"feat","value":"8","note":"featAgent（真源 pkg/term feat*，位值十进制）；App 无按值分派对象（位字段，spec 清单排除）","faces":["direct","napi"],"status":"active","spec":"term-host-cli / term-surface-protocol"}
+{"family":"term-frame","unit":"feat","value":"16","note":"featTitle（真源 pkg/term feat*，位值十进制）；App 无按值分派对象（位字段，spec 清单排除）","faces":["direct","napi"],"status":"active","spec":"term-host-cli / term-surface-protocol"}
+{"family":"term-frame","unit":"feat","value":"32","note":"featSurfaceBit（真源 pkg/term feat*，位值十进制）；App 无按值分派对象（位字段，spec 清单排除）","faces":["direct","napi"],"status":"active","spec":"term-host-cli / term-surface-protocol"}
+{"family":"term-frame","unit":"caps","value":"1","note":"capsSurface（真源 pkg/term term_surface.go）；App 无按值分派对象（位字段，spec 清单排除）","faces":["direct","napi"],"status":"active","spec":"term-host-cli / term-surface-protocol"}
+{"family":"term-frame","unit":"caps","value":"2","note":"capsRawTerminal（真源 pkg/term term_surface.go）；App 无按值分派对象（位字段，spec 清单排除）","faces":["direct","napi"],"status":"active","spec":"term-host-cli / term-surface-protocol"}
+{"family":"term-frame","unit":"hello-flag","value":"1","note":"helloFlagCreate（真源 pkg/term helloFlag*）；App 无按值分派对象（位字段，spec 清单排除）","faces":["direct","napi"],"status":"active","spec":"term-host-cli D8"}
+{"family":"term-frame","unit":"hello-flag","value":"2","note":"helloFlagOnlyIfAbsent（真源 pkg/term helloFlag*）；App 无按值分派对象（位字段，spec 清单排除）","faces":["direct","napi"],"status":"active","spec":"term-host-cli D8"}
+{"family":"term-frame","unit":"hello-flag","value":"4","note":"helloFlagTakeover（真源 pkg/term helloFlag*）；App 无按值分派对象（位字段，spec 清单排除）","faces":["direct","napi"],"status":"active","spec":"term-host-cli D8"}
+{"family":"term-frame","unit":"stateV2-byte","value":"0","note":"STATE 帧 state 字节（agentStateKey 按字节分派）","faces":["direct","napi"],"status":"active","spec":"term-agent-state"}
+{"family":"term-frame","unit":"stateV2-byte","value":"1","note":"STATE 帧 state 字节（agentStateKey 按字节分派）","faces":["direct","napi"],"status":"active","spec":"term-agent-state"}
+{"family":"term-frame","unit":"stateV2-byte","value":"2","note":"STATE 帧 state 字节（agentStateKey 按字节分派）","faces":["direct","napi"],"status":"active","spec":"term-agent-state"}
+{"family":"term-frame","unit":"stateV2-byte","value":"3","note":"STATE 帧 state 字节（agentStateKey 按字节分派）","faces":["direct","napi"],"status":"active","spec":"term-agent-state"}
+{"family":"term-frame","unit":"stateV2","value":"unknown","note":"App 走 default（resolveStateKey 无 'unknown' case，落 default 返回 'unknown'）","faces":["direct","napi"],"status":"active","spec":"term-agent-state"}
+{"family":"term-frame","unit":"stateV2","value":"working","note":"","faces":["direct","napi"],"status":"active","spec":"term-agent-state"}
+{"family":"term-frame","unit":"stateV2","value":"blocked","note":"","faces":["direct","napi"],"status":"active","spec":"term-agent-state"}
+{"family":"term-frame","unit":"stateV2","value":"idle","note":"","faces":["direct","napi"],"status":"active","spec":"term-agent-state"}
+{"family":"term-frame","unit":"agent-byte","value":"0","note":"（字节枚举，STATE/ATTACHED agent 字段）","faces":["direct","napi"],"status":"active","spec":"term-agent-state"}
+{"family":"term-frame","unit":"agent-byte","value":"1","note":"（字节枚举，STATE/ATTACHED agent 字段）","faces":["direct","napi"],"status":"active","spec":"term-agent-state"}
+{"family":"term-frame","unit":"agent-byte","value":"2","note":"（字节枚举，STATE/ATTACHED agent 字段）","faces":["direct","napi"],"status":"active","spec":"term-agent-state"}
+{"family":"term-frame","unit":"agent-byte","value":"3","note":"（字节枚举，STATE/ATTACHED agent 字段）","faces":["direct","napi"],"status":"active","spec":"term-agent-state"}
+{"family":"term-frame","unit":"agent-byte","value":"4","note":"（字节枚举，STATE/ATTACHED agent 字段）","faces":["direct","napi"],"status":"active","spec":"term-agent-state"}
+{"family":"term-frame","unit":"agent-byte","value":"5","note":"（字节枚举，STATE/ATTACHED agent 字段）","faces":["direct","napi"],"status":"active","spec":"term-agent-state"}
+{"family":"term-frame","unit":"agent-byte","value":"255","note":"agentUnknown 哨兵（无可判 agent 时）（字节枚举，STATE/ATTACHED agent 字段）","faces":["direct","napi"],"status":"active","spec":"term-agent-state"}
+{"family":"term-frame","unit":"agent","value":"shell","note":"","faces":["direct","napi"],"status":"active","spec":"term-agent-state"}
+{"family":"term-frame","unit":"agent","value":"codex","note":"","faces":["direct","napi"],"status":"active","spec":"term-agent-state"}
+{"family":"term-frame","unit":"agent","value":"claude","note":"","faces":["direct","napi"],"status":"active","spec":"term-agent-state"}
+{"family":"term-frame","unit":"agent","value":"opencode","note":"","faces":["direct","napi"],"status":"active","spec":"term-agent-state"}
+{"family":"term-frame","unit":"agent","value":"openclaw","note":"","faces":["direct","napi"],"status":"active","spec":"term-agent-state"}
+{"family":"term-frame","unit":"agent","value":"other","note":"","faces":["direct","napi"],"status":"active","spec":"term-agent-state"}
+{"family":"term-frame","unit":"agent","value":"unknown","note":"App 走 default（agentLabel·agentIcon 6 case）","faces":["direct","napi"],"status":"active","spec":"term-agent-state"}
+{"family":"term-error","unit":"code","value":"already_exists","note":"跨族同值：族④ files 同值——空间独立；经族⑦透传（App 分派见族⑦行）","faces":["direct","napi"],"status":"active","spec":"exit-terminal（ERROR 帧）+ term-host-cli / term-agent-state"}
+{"family":"term-error","unit":"code","value":"detect_off","note":"经族⑦透传、App 走 default","faces":["direct","napi"],"status":"active","spec":"exit-terminal（ERROR 帧）+ term-host-cli / term-agent-state"}
+{"family":"term-error","unit":"code","value":"marshal","note":"经族⑦透传、App 走 default","faces":["direct","napi"],"status":"active","spec":"exit-terminal（ERROR 帧）+ term-host-cli / term-agent-state"}
+{"family":"term-error","unit":"code","value":"no_agent","note":"经族⑦透传、App 走 default","faces":["direct","napi"],"status":"active","spec":"exit-terminal（ERROR 帧）+ term-host-cli / term-agent-state"}
+{"family":"term-error","unit":"code","value":"no_session","note":"经族⑦透传（App 分派见族⑦行）","faces":["direct","napi"],"status":"active","spec":"exit-terminal（ERROR 帧）+ term-host-cli / term-agent-state"}
+{"family":"term-error","unit":"code","value":"no_vt","note":"经族⑦透传、App 走 default","faces":["direct","napi"],"status":"active","spec":"exit-terminal（ERROR 帧）+ term-host-cli / term-agent-state"}
+{"family":"term-error","unit":"code","value":"spawn_failed","note":"经族⑦透传（App 分派见族⑦行）","faces":["direct","napi"],"status":"active","spec":"exit-terminal（ERROR 帧）+ term-host-cli / term-agent-state"}
+{"family":"term-error","unit":"code","value":"too_many","note":"经族⑦透传（App 分派见族⑦行）","faces":["direct","napi"],"status":"active","spec":"exit-terminal（ERROR 帧）+ term-host-cli / term-agent-state"}
+{"family":"term-error","unit":"code","value":"too_many_clients","note":"经族⑦透传、App 走 default","faces":["direct","napi"],"status":"active","spec":"exit-terminal（ERROR 帧）+ term-host-cli / term-agent-state"}
+{"family":"files-proto","unit":"code","value":"invalid_arg","note":"","faces":["direct","napi"],"status":"active","spec":"file-management"}
+{"family":"files-proto","unit":"code","value":"invalid_name","note":"","faces":["direct","napi"],"status":"active","spec":"file-management"}
+{"family":"files-proto","unit":"code","value":"not_found","note":"","faces":["direct","napi"],"status":"active","spec":"file-management"}
+{"family":"files-proto","unit":"code","value":"permission","note":"","faces":["direct","napi"],"status":"active","spec":"file-management"}
+{"family":"files-proto","unit":"code","value":"is_dir","note":"","faces":["direct","napi"],"status":"active","spec":"file-management"}
+{"family":"files-proto","unit":"code","value":"already_exists","note":"跨族同值：族③ term 同值——空间独立","faces":["direct","napi"],"status":"active","spec":"file-management"}
+{"family":"files-proto","unit":"code","value":"op_failed","note":"","faces":["direct","napi"],"status":"active","spec":"file-management"}
+{"family":"files-proto","unit":"code","value":"canceled","note":"","faces":["direct","napi"],"status":"active","spec":"file-management"}
+{"family":"files-proto","unit":"code","value":"stream_open","note":"CodeStreamOpen（client.go 孤立常量：流开场失败）；connect 路径直透 App、op 路径被归一成 bridge_down","faces":["direct","napi"],"status":"active","spec":"file-management"}
+{"family":"speedtest-reason","unit":"reason","value":"busy","note":"","faces":["napi","cp"],"status":"active","spec":"speedtest"}
+{"family":"speedtest-reason","unit":"reason","value":"link_down","note":"","faces":["napi","cp"],"status":"active","spec":"speedtest"}
+{"family":"speedtest-reason","unit":"reason","value":"bridge_down","note":"","faces":["napi","cp"],"status":"active","spec":"speedtest"}
+{"family":"speedtest-reason","unit":"reason","value":"bridge_auth","note":"","faces":["napi","cp"],"status":"active","spec":"speedtest"}
+{"family":"speedtest-reason","unit":"reason","value":"not_supported","note":"","faces":["napi","cp"],"status":"active","spec":"speedtest"}
+{"family":"speedtest-reason","unit":"reason","value":"interrupted","note":"","faces":["napi","cp"],"status":"active","spec":"speedtest"}
+{"family":"speedtest-reason","unit":"reason","value":"timeout","note":"","faces":["napi","cp"],"status":"active","spec":"speedtest"}
+{"family":"speedtest-reason","unit":"reason","value":"cancelled","note":"","faces":["napi","cp"],"status":"active","spec":"speedtest"}
+{"family":"speedtest-reason","unit":"reason","value":"invalid_arg","note":"单函数 default：speedTestReasonShort 无 case、Text 有 case ⇒ 不入豁免减法（r3 N-13）","faces":["napi","cp"],"status":"active","spec":"speedtest"}
+{"family":"speedtest-reason","unit":"cli-reason","value":"control_error","note":"CLI 自产（控制面调用失败的归因码；引擎不产生、App 不见）","faces":["cli"],"status":"active","spec":"speedtest-cli"}
+{"family":"bridge-files","unit":"code","value":"bridge_down","note":"","faces":["napi"],"status":"active","spec":"bridge-call-layer + file-management"}
+{"family":"bridge-files","unit":"code","value":"bridge_auth","note":"","faces":["napi"],"status":"active","spec":"bridge-call-layer + file-management"}
+{"family":"bridge-files","unit":"code","value":"busy","note":"","faces":["napi"],"status":"active","spec":"bridge-call-layer + file-management"}
+{"family":"bridge-files","unit":"code","value":"invalid_arg","note":"","faces":["napi"],"status":"active","spec":"bridge-call-layer + file-management"}
+{"family":"bridge-files","unit":"code","value":"no_session","note":"","faces":["napi"],"status":"active","spec":"bridge-call-layer + file-management"}
+{"family":"bridge-files","unit":"code","value":"op_failed","note":"App 走 default（filesErrorMessage 无 case）","faces":["napi"],"status":"active","spec":"bridge-call-layer + file-management"}
+{"family":"bridge-files","unit":"code","value":"stream_open","note":"App 走 default（filesErrorMessage 无 case）；connect 路径直透","faces":["napi"],"status":"active","spec":"bridge-call-layer + file-management"}
+{"family":"bridge-files","unit":"code","value":"marshal","note":"App 走 default（filesErrorMessage 无 case）","faces":["napi"],"status":"active","spec":"bridge-call-layer + file-management"}
+{"family":"bridge-files","unit":"code","value":"already_exists","note":"④稳定码透传","faces":["napi"],"status":"active","spec":"bridge-call-layer + file-management"}
+{"family":"bridge-files","unit":"code","value":"canceled","note":"④稳定码透传","faces":["napi"],"status":"active","spec":"bridge-call-layer + file-management"}
+{"family":"bridge-files","unit":"code","value":"invalid_name","note":"④稳定码透传","faces":["napi"],"status":"active","spec":"bridge-call-layer + file-management"}
+{"family":"bridge-files","unit":"code","value":"is_dir","note":"④稳定码透传","faces":["napi"],"status":"active","spec":"bridge-call-layer + file-management"}
+{"family":"bridge-files","unit":"code","value":"not_found","note":"④稳定码透传","faces":["napi"],"status":"active","spec":"bridge-call-layer + file-management"}
+{"family":"bridge-files","unit":"code","value":"permission","note":"④稳定码透传","faces":["napi"],"status":"active","spec":"bridge-call-layer + file-management"}
+{"family":"bridge-files","unit":"code","value":"dial_failed","note":"","faces":["napi"],"status":"legacy-unreachable","spec":"bridge-call-layer + file-management"}
+{"family":"bridge-files","unit":"code","value":"files_not_enabled","note":"","faces":["napi"],"status":"legacy-unreachable","spec":"bridge-call-layer + file-management"}
+{"family":"bridge-files","unit":"code","value":"files_other_service","note":"","faces":["napi"],"status":"legacy-unreachable","spec":"bridge-call-layer + file-management"}
+{"family":"bridge-files","unit":"code","value":"invalid_addr","note":"","faces":["napi"],"status":"legacy-unreachable","spec":"bridge-call-layer + file-management"}
+{"family":"bridge-files","unit":"code","value":"stalled","note":"","faces":["napi"],"status":"legacy-unreachable","spec":"bridge-call-layer + file-management"}
+{"family":"bridge-term","unit":"code","value":"bad_json","note":"","faces":["napi"],"status":"active","spec":"bridge-call-layer + exit-terminal"}
+{"family":"bridge-term","unit":"code","value":"bad_reply","note":"","faces":["napi"],"status":"active","spec":"bridge-call-layer + exit-terminal"}
+{"family":"bridge-term","unit":"code","value":"invalid_arg","note":"","faces":["napi"],"status":"active","spec":"bridge-call-layer + exit-terminal"}
+{"family":"bridge-term","unit":"code","value":"bridge_down","note":"","faces":["napi"],"status":"active","spec":"bridge-call-layer + exit-terminal"}
+{"family":"bridge-term","unit":"code","value":"bridge_auth","note":"","faces":["napi"],"status":"active","spec":"bridge-call-layer + exit-terminal"}
+{"family":"bridge-term","unit":"code","value":"term_unreachable","note":"","faces":["napi"],"status":"active","spec":"bridge-call-layer + exit-terminal"}
+{"family":"bridge-term","unit":"code","value":"term_foreign_service","note":"","faces":["napi"],"status":"active","spec":"bridge-call-layer + exit-terminal"}
+{"family":"bridge-term","unit":"code","value":"term_version","note":"","faces":["napi"],"status":"active","spec":"bridge-call-layer + exit-terminal"}
+{"family":"bridge-term","unit":"code","value":"io","note":"","faces":["napi"],"status":"active","spec":"bridge-call-layer + exit-terminal"}
+{"family":"bridge-term","unit":"code","value":"remote","note":"App 走 default（termErrorMessage 无 case）","faces":["napi"],"status":"active","spec":"bridge-call-layer + exit-terminal"}
+{"family":"bridge-term","unit":"code","value":"marshal","note":"App 走 default（termErrorMessage 无 case）","faces":["napi"],"status":"active","spec":"bridge-call-layer + exit-terminal"}
+{"family":"bridge-term","unit":"code","value":"already_exists","note":"③透传","faces":["napi"],"status":"active","spec":"bridge-call-layer + exit-terminal"}
+{"family":"bridge-term","unit":"code","value":"detect_off","note":"App 走 default（termErrorMessage 无 case）；③透传","faces":["napi"],"status":"active","spec":"bridge-call-layer + exit-terminal"}
+{"family":"bridge-term","unit":"code","value":"no_agent","note":"App 走 default（termErrorMessage 无 case）；③透传","faces":["napi"],"status":"active","spec":"bridge-call-layer + exit-terminal"}
+{"family":"bridge-term","unit":"code","value":"no_session","note":"③透传","faces":["napi"],"status":"active","spec":"bridge-call-layer + exit-terminal"}
+{"family":"bridge-term","unit":"code","value":"no_vt","note":"App 走 default（termErrorMessage 无 case）；③透传","faces":["napi"],"status":"active","spec":"bridge-call-layer + exit-terminal"}
+{"family":"bridge-term","unit":"code","value":"spawn_failed","note":"③透传","faces":["napi"],"status":"active","spec":"bridge-call-layer + exit-terminal"}
+{"family":"bridge-term","unit":"code","value":"too_many","note":"③透传","faces":["napi"],"status":"active","spec":"bridge-call-layer + exit-terminal"}
+{"family":"bridge-term","unit":"code","value":"too_many_clients","note":"App 走 default（termErrorMessage 无 case）；③透传","faces":["napi"],"status":"active","spec":"bridge-call-layer + exit-terminal"}
+{"family":"bridge-term","unit":"code","value":"async_failed","note":"","faces":["napi"],"status":"legacy-unreachable","spec":"bridge-call-layer + exit-terminal"}
+{"family":"bridge-term","unit":"code","value":"invalid_name","note":"","faces":["napi"],"status":"legacy-unreachable","spec":"bridge-call-layer + exit-terminal"}
+{"family":"bridge-term","unit":"code","value":"timeout","note":"","faces":["napi"],"status":"legacy-unreachable","spec":"bridge-call-layer + exit-terminal"}
+{"family":"bridge-term","unit":"code","value":"term_not_enabled","note":"","faces":["napi"],"status":"legacy-unreachable","spec":"bridge-call-layer + exit-terminal"}
+{"family":"streamend","unit":"reason","value":"closed","note":"跨族同值：族① stream-end 同值——空间独立","faces":["cp","cli"],"status":"active","spec":"files-cli D3/D5"}
+{"family":"streamend","unit":"reason","value":"gone","note":"跨族同值：族① stream-end 同值——空间独立","faces":["cp","cli"],"status":"active","spec":"files-cli D3/D5"}
+{"family":"streamend","unit":"reason","value":"conn","note":"客户端本地终结态（CLI/客户端消费；控制面 stream.end 只消费 closed/gone）","faces":["cli"],"status":"active","spec":"files-cli D3/D5"}
+{"family":"bridge-tables","unit":"deterministic-files","value":"files_not_enabled","note":"值源族⑥（no_host 源族①）","faces":["napi"],"status":"active","spec":"bridge-call-layer"}
+{"family":"bridge-tables","unit":"deterministic-files","value":"files_other_service","note":"值源族⑥（no_host 源族①）","faces":["napi"],"status":"active","spec":"bridge-call-layer"}
+{"family":"bridge-tables","unit":"deterministic-files","value":"invalid_addr","note":"值源族⑥（no_host 源族①）","faces":["napi"],"status":"active","spec":"bridge-call-layer"}
+{"family":"bridge-tables","unit":"deterministic-files","value":"permission","note":"值源族⑥（no_host 源族①）","faces":["napi"],"status":"active","spec":"bridge-call-layer"}
+{"family":"bridge-tables","unit":"deterministic-files","value":"busy","note":"值源族⑥（no_host 源族①）","faces":["napi"],"status":"active","spec":"bridge-call-layer"}
+{"family":"bridge-tables","unit":"deterministic-files","value":"canceled","note":"值源族⑥（no_host 源族①）","faces":["napi"],"status":"active","spec":"bridge-call-layer"}
+{"family":"bridge-tables","unit":"deterministic-files","value":"stalled","note":"值源族⑥（no_host 源族①）","faces":["napi"],"status":"active","spec":"bridge-call-layer"}
+{"family":"bridge-tables","unit":"deterministic-files","value":"already_exists","note":"值源族⑥（no_host 源族①）","faces":["napi"],"status":"active","spec":"bridge-call-layer"}
+{"family":"bridge-tables","unit":"deterministic-files","value":"invalid_name","note":"值源族⑥（no_host 源族①）","faces":["napi"],"status":"active","spec":"bridge-call-layer"}
+{"family":"bridge-tables","unit":"deterministic-files","value":"not_found","note":"值源族⑥（no_host 源族①）","faces":["napi"],"status":"active","spec":"bridge-call-layer"}
+{"family":"bridge-tables","unit":"deterministic-files","value":"is_dir","note":"值源族⑥（no_host 源族①）","faces":["napi"],"status":"active","spec":"bridge-call-layer"}
+{"family":"bridge-tables","unit":"deterministic-files","value":"invalid_arg","note":"值源族⑥（no_host 源族①）","faces":["napi"],"status":"active","spec":"bridge-call-layer"}
+{"family":"bridge-tables","unit":"deterministic-files","value":"bad_json","note":"值源族⑥（no_host 源族①）","faces":["napi"],"status":"active","spec":"bridge-call-layer"}
+{"family":"bridge-tables","unit":"deterministic-files","value":"no_host","note":"值源族⑥（no_host 源族①）","faces":["napi"],"status":"active","spec":"bridge-call-layer"}
+{"family":"bridge-tables","unit":"deterministic-term","value":"term_not_enabled","note":"值源族⑦（invalid_name 亦在族⑥ legacy）","faces":["napi"],"status":"active","spec":"bridge-call-layer"}
+{"family":"bridge-tables","unit":"deterministic-term","value":"term_foreign_service","note":"值源族⑦（invalid_name 亦在族⑥ legacy）","faces":["napi"],"status":"active","spec":"bridge-call-layer"}
+{"family":"bridge-tables","unit":"deterministic-term","value":"term_version","note":"值源族⑦（invalid_name 亦在族⑥ legacy）","faces":["napi"],"status":"active","spec":"bridge-call-layer"}
+{"family":"bridge-tables","unit":"deterministic-term","value":"spawn_failed","note":"值源族⑦（invalid_name 亦在族⑥ legacy）","faces":["napi"],"status":"active","spec":"bridge-call-layer"}
+{"family":"bridge-tables","unit":"deterministic-term","value":"invalid_name","note":"值源族⑦（invalid_name 亦在族⑥ legacy）","faces":["napi"],"status":"active","spec":"bridge-call-layer"}
+{"family":"bridge-tables","unit":"deterministic-term","value":"too_many","note":"值源族⑦（invalid_name 亦在族⑥ legacy）","faces":["napi"],"status":"active","spec":"bridge-call-layer"}
+{"family":"bridge-tables","unit":"deterministic-term","value":"bad_reply","note":"值源族⑦（invalid_name 亦在族⑥ legacy）","faces":["napi"],"status":"active","spec":"bridge-call-layer"}
+{"family":"bridge-tables","unit":"deterministic-term","value":"bad_json","note":"值源族⑦（invalid_name 亦在族⑥ legacy）","faces":["napi"],"status":"active","spec":"bridge-call-layer"}
+{"family":"bridge-tables","unit":"deterministic-term","value":"async_failed","note":"值源族⑦（invalid_name 亦在族⑥ legacy）","faces":["napi"],"status":"active","spec":"bridge-call-layer"}
+{"family":"bridge-tables","unit":"deterministic-term","value":"invalid_arg","note":"值源族⑦（invalid_name 亦在族⑥ legacy）","faces":["napi"],"status":"active","spec":"bridge-call-layer"}
+{"family":"bridge-tables","unit":"channel-files","value":"bridge_down","note":"值源族⑥","faces":["napi"],"status":"active","spec":"bridge-call-layer"}
+{"family":"bridge-tables","unit":"channel-term","value":"bridge_down","note":"值源族⑦","faces":["napi"],"status":"active","spec":"bridge-call-layer"}
+{"family":"bridge-tables","unit":"channel-term","value":"io","note":"值源族⑦","faces":["napi"],"status":"active","spec":"bridge-call-layer"}
+{"family":"bridge-tables","unit":"channel-term","value":"term_unreachable","note":"值源族⑦","faces":["napi"],"status":"active","spec":"bridge-call-layer"}
+{"family":"bridge-tables","unit":"auth-codes","value":"bridge_auth","note":"值源族⑥⑦","faces":["napi"],"status":"active","spec":"bridge-call-layer"}
+{"family":"bridge-tables","unit":"auth-codes","value":"no_session","note":"值源族⑥⑦","faces":["napi"],"status":"active","spec":"bridge-call-layer"}
+{"family":"versions","unit":"control-proto","value":"1","note":"ControlProtoVersion=1；真源 internal/control ProtoVersion；升版规则：布局/语义不兼容变更才升","faces":["cp"],"status":"active","spec":"clientcore-facade（4a versions.go）"}
+{"family":"versions","unit":"term-proto","value":"1","note":"TermProtoVersion=1；真源 pkg/term termProtoVer；升版规则：帧布局变更升版本、两端同批","faces":["direct","napi"],"status":"active","spec":"clientcore-facade（4a versions.go）"}
+{"family":"versions","unit":"surface-payload","value":"4","note":"SurfacePayloadVersion=4（v2 光标块→v3 回滚条→v4 模式位）；真源 pkg/term surfaceVer；升版规则：载荷布局变更 MUST 升版本","faces":["direct","napi"],"status":"active","spec":"clientcore-facade（4a versions.go）"}
+{"family":"versions","unit":"hello-flag","value":"1","note":"HelloFlagCreate（位真源 pkg/term helloFlag*）；只增位不复用","faces":["direct","napi"],"status":"active","spec":"clientcore-facade（4a versions.go）"}
+{"family":"versions","unit":"hello-flag","value":"2","note":"HelloFlagOnlyIfAbsent（位真源 pkg/term helloFlag*）；只增位不复用","faces":["direct","napi"],"status":"active","spec":"clientcore-facade（4a versions.go）"}
+{"family":"versions","unit":"hello-flag","value":"4","note":"HelloFlagTakeover（位真源 pkg/term helloFlag*）；只增位不复用","faces":["direct","napi"],"status":"active","spec":"clientcore-facade（4a versions.go）"}
+{"family":"versions","unit":"caps","value":"1","note":"CapsSurface（位真源 pkg/term caps*）；长度+位图布局，只增位","faces":["direct","napi"],"status":"active","spec":"clientcore-facade（4a versions.go）"}
+{"family":"versions","unit":"caps","value":"2","note":"CapsRawTerminal（位真源 pkg/term caps*）；长度+位图布局，只增位","faces":["direct","napi"],"status":"active","spec":"clientcore-facade（4a versions.go）"}
+{"family":"versions","unit":"feat","value":"1","note":"FeatList（位真源 pkg/term feat*）；客户端不认识的位忽略、只增","faces":["direct","napi"],"status":"active","spec":"clientcore-facade（4a versions.go）"}
+{"family":"versions","unit":"feat","value":"2","note":"FeatReplay（位真源 pkg/term feat*）；客户端不认识的位忽略、只增","faces":["direct","napi"],"status":"active","spec":"clientcore-facade（4a versions.go）"}
+{"family":"versions","unit":"feat","value":"4","note":"FeatModes（位真源 pkg/term feat*）；客户端不认识的位忽略、只增","faces":["direct","napi"],"status":"active","spec":"clientcore-facade（4a versions.go）"}
+{"family":"versions","unit":"feat","value":"8","note":"FeatAgent（位真源 pkg/term feat*）；客户端不认识的位忽略、只增","faces":["direct","napi"],"status":"active","spec":"clientcore-facade（4a versions.go）"}
+{"family":"versions","unit":"feat","value":"16","note":"FeatTitle（位真源 pkg/term feat*）；客户端不认识的位忽略、只增","faces":["direct","napi"],"status":"active","spec":"clientcore-facade（4a versions.go）"}
+{"family":"versions","unit":"feat","value":"32","note":"FeatSurface（位真源 pkg/term feat*）；客户端不认识的位忽略、只增","faces":["direct","napi"],"status":"active","spec":"clientcore-facade（4a versions.go）"}
+{"family":"versions","unit":"statev2","value":"0","note":"StateV2Unknown（位真源 pkg/term stateV2*）；值域只增不改（与 App 侧一一对应）","faces":["direct","napi"],"status":"active","spec":"clientcore-facade（4a versions.go）"}
+{"family":"versions","unit":"statev2","value":"1","note":"StateV2Working（位真源 pkg/term stateV2*）；值域只增不改（与 App 侧一一对应）","faces":["direct","napi"],"status":"active","spec":"clientcore-facade（4a versions.go）"}
+{"family":"versions","unit":"statev2","value":"2","note":"StateV2Blocked（位真源 pkg/term stateV2*）；值域只增不改（与 App 侧一一对应）","faces":["direct","napi"],"status":"active","spec":"clientcore-facade（4a versions.go）"}
+{"family":"versions","unit":"statev2","value":"3","note":"StateV2Idle（位真源 pkg/term stateV2*）；值域只增不改（与 App 侧一一对应）","faces":["direct","napi"],"status":"active","spec":"clientcore-facade（4a versions.go）"}
+{"family":"napi-face","unit":"export","value":"ClientCoreFilesCall","note":"//export 面形状冻结（NAPI 四处同步，tier check-napi-sync.sh）","faces":["napi"],"status":"active","spec":"clientcore-distribution / NAPI 契约"}
+{"family":"napi-face","unit":"export","value":"ClientCoreProbeAddr","note":"//export 面形状冻结（NAPI 四处同步，tier check-napi-sync.sh）","faces":["napi"],"status":"active","spec":"clientcore-distribution / NAPI 契约"}
+{"family":"napi-face","unit":"export","value":"ClientCoreProbeReach","note":"//export 面形状冻结（NAPI 四处同步，tier check-napi-sync.sh）","faces":["napi"],"status":"active","spec":"clientcore-distribution / NAPI 契约"}
+{"family":"napi-face","unit":"export","value":"ClientCoreServiceStart","note":"//export 面形状冻结（NAPI 四处同步，tier check-napi-sync.sh）","faces":["napi"],"status":"active","spec":"clientcore-distribution / NAPI 契约"}
+{"family":"napi-face","unit":"export","value":"ClientCoreServiceStatus","note":"//export 面形状冻结（NAPI 四处同步，tier check-napi-sync.sh）","faces":["napi"],"status":"active","spec":"clientcore-distribution / NAPI 契约"}
+{"family":"napi-face","unit":"export","value":"ClientCoreServiceStop","note":"//export 面形状冻结（NAPI 四处同步，tier check-napi-sync.sh）","faces":["napi"],"status":"active","spec":"clientcore-distribution / NAPI 契约"}
+{"family":"napi-face","unit":"export","value":"ClientCoreSpeedTestCancel","note":"//export 面形状冻结（NAPI 四处同步，tier check-napi-sync.sh）","faces":["napi"],"status":"active","spec":"clientcore-distribution / NAPI 契约"}
+{"family":"napi-face","unit":"export","value":"ClientCoreSpeedTestStart","note":"//export 面形状冻结（NAPI 四处同步，tier check-napi-sync.sh）","faces":["napi"],"status":"active","spec":"clientcore-distribution / NAPI 契约"}
+{"family":"napi-face","unit":"export","value":"ClientCoreSpeedTestStatus","note":"//export 面形状冻结（NAPI 四处同步，tier check-napi-sync.sh）","faces":["napi"],"status":"active","spec":"clientcore-distribution / NAPI 契约"}
+{"family":"napi-face","unit":"export","value":"ClientCoreTermCall","note":"//export 面形状冻结（NAPI 四处同步，tier check-napi-sync.sh）","faces":["napi"],"status":"active","spec":"clientcore-distribution / NAPI 契约"}
+{"family":"napi-face","unit":"export","value":"ClientCoreTunAttach","note":"//export 面形状冻结（NAPI 四处同步，tier check-napi-sync.sh）","faces":["napi"],"status":"active","spec":"clientcore-distribution / NAPI 契约"}
+{"family":"napi-face","unit":"export","value":"ClientCoreTunPrepare","note":"//export 面形状冻结（NAPI 四处同步，tier check-napi-sync.sh）","faces":["napi"],"status":"active","spec":"clientcore-distribution / NAPI 契约"}
+{"family":"napi-face","unit":"export","value":"ClientCoreTunRecover","note":"//export 面形状冻结（NAPI 四处同步，tier check-napi-sync.sh）","faces":["napi"],"status":"active","spec":"clientcore-distribution / NAPI 契约"}
+{"family":"napi-face","unit":"export","value":"ClientCoreTunRunning","note":"//export 面形状冻结（NAPI 四处同步，tier check-napi-sync.sh）","faces":["napi"],"status":"active","spec":"clientcore-distribution / NAPI 契约"}
+{"family":"napi-face","unit":"export","value":"ClientCoreTunSetActivity","note":"//export 面形状冻结（NAPI 四处同步，tier check-napi-sync.sh）","faces":["napi"],"status":"active","spec":"clientcore-distribution / NAPI 契约"}
+{"family":"napi-face","unit":"export","value":"ClientCoreTunSetForeground","note":"//export 面形状冻结（NAPI 四处同步，tier check-napi-sync.sh）","faces":["napi"],"status":"active","spec":"clientcore-distribution / NAPI 契约"}
+{"family":"napi-face","unit":"export","value":"ClientCoreTunSetPortForwards","note":"//export 面形状冻结（NAPI 四处同步，tier check-napi-sync.sh）","faces":["napi"],"status":"active","spec":"clientcore-distribution / NAPI 契约"}
+{"family":"napi-face","unit":"export","value":"ClientCoreTunStatus","note":"//export 面形状冻结（NAPI 四处同步，tier check-napi-sync.sh）","faces":["napi"],"status":"active","spec":"clientcore-distribution / NAPI 契约"}
+{"family":"napi-face","unit":"export","value":"ClientCoreTunStop","note":"//export 面形状冻结（NAPI 四处同步，tier check-napi-sync.sh）","faces":["napi"],"status":"active","spec":"clientcore-distribution / NAPI 契约"}
+{"family":"napi-face","unit":"export","value":"ClientCoreVersion","note":"//export 面形状冻结（NAPI 四处同步，tier check-napi-sync.sh）","faces":["napi"],"status":"active","spec":"clientcore-distribution / NAPI 契约"}
+{"family":"fixtures","unit":"cp-v1","name":"hello.cli","sha256":"cc32ca04028faa3d6fabb287493d07e17daf7ed986d7240d72bf2d2cfdb0ee5f","note":"frames.jsonl:1（整行原文摘要）","faces":[],"status":"active","spec":"daemon-control-plane fixtures v1"}
+{"family":"fixtures","unit":"cp-v1","name":"welcome.ok","sha256":"de91d1256f5246022e672ab901e5be39cc74d54e4c02ee65ef70e1738845e91d","note":"frames.jsonl:2（整行原文摘要）","faces":[],"status":"active","spec":"daemon-control-plane fixtures v1"}
+{"family":"fixtures","unit":"cp-v1","name":"reload.proto_mismatch","sha256":"df8c98bfc968e3e23e4520cfc2da70da1cb7cdc7f501771a4d5669d5732417eb","note":"frames.jsonl:3（整行原文摘要）","faces":[],"status":"active","spec":"daemon-control-plane fixtures v1"}
+{"family":"fixtures","unit":"cp-v1","name":"goodbye.overrun","sha256":"6162897e4ffd67eb10f8493d828e642f90176f4b904506f3e43bc4915460b0ef","note":"frames.jsonl:4（整行原文摘要）","faces":[],"status":"active","spec":"daemon-control-plane fixtures v1"}
+{"family":"fixtures","unit":"cp-v1","name":"goodbye.bad_frame","sha256":"89171b33bccb99e0a360cab884dcf9bf59c36d6250e92884c4dbe5a49b44bcb0","note":"frames.jsonl:5（整行原文摘要）","faces":[],"status":"active","spec":"daemon-control-plane fixtures v1"}
+{"family":"fixtures","unit":"cp-v1","name":"req.snapshot.get","sha256":"bee930aa2e4fffc71fa18041d52a74dee1d5fa85cb22e633c01132fc02dc1984","note":"frames.jsonl:6（整行原文摘要）","faces":[],"status":"active","spec":"daemon-control-plane fixtures v1"}
+{"family":"fixtures","unit":"cp-v1","name":"rsp.snapshot.ok","sha256":"3efdf830e66b8092d9da31f7aa7c395e7a69a219b5a772e0e65529ef562845de","note":"frames.jsonl:7（整行原文摘要）","faces":[],"status":"active","spec":"daemon-control-plane fixtures v1"}
+{"family":"fixtures","unit":"cp-v1","name":"rsp.error.unknown_op","sha256":"4d0bf65a8afd564a68b202f16753f8f0da34f6af4ef54d6259ac7c6d1667cf86","note":"frames.jsonl:8（整行原文摘要）","faces":[],"status":"active","spec":"daemon-control-plane fixtures v1"}
+{"family":"fixtures","unit":"cp-v1","name":"rsp.error.cursor_stale","sha256":"d375ef17e517f052a73802a1f4dc7f5b7f5fdb8484131dab61f63560aa339f37","note":"frames.jsonl:9（整行原文摘要）","faces":[],"status":"active","spec":"daemon-control-plane fixtures v1"}
+{"family":"fixtures","unit":"cp-v1","name":"rsp.error.no_stream.notify","sha256":"ab8355ba871fe6d9beae3d7e546330217c51cd00417804c097e823a2d223c93e","note":"frames.jsonl:10（整行原文摘要）","faces":[],"status":"active","spec":"daemon-control-plane fixtures v1"}
+{"family":"fixtures","unit":"cp-v1","name":"evt.session.state_changed","sha256":"eb595a71233f1b179df2e4315d5cd97569b82cae9b9001cb437c8f4f3835e049","note":"frames.jsonl:11（整行原文摘要）","faces":[],"status":"active","spec":"daemon-control-plane fixtures v1"}
+{"family":"fixtures","unit":"cp-v1","name":"evt.link.changed","sha256":"d4e46d632953816630ca0c12d92f089f64064d84dc673b75692637eb8f0648c4","note":"frames.jsonl:12（整行原文摘要）","faces":[],"status":"active","spec":"daemon-control-plane fixtures v1"}
+{"family":"fixtures","unit":"cp-v1","name":"evt.log.line","sha256":"6b016675f5d4ac7c466c5b52b7118a2d86103c91a9c1a465cc9e529a48501ac6","note":"frames.jsonl:13（整行原文摘要）","faces":[],"status":"active","spec":"daemon-control-plane fixtures v1"}
+{"family":"fixtures","unit":"cp-v1","name":"evt.transfer.sample","sha256":"19f2366bf517d4502b223c5d64fab8dd4ffe95ea43bba4bb3eda08881b8c1180","note":"frames.jsonl:14（整行原文摘要）","faces":[],"status":"active","spec":"daemon-control-plane fixtures v1"}
+{"family":"fixtures","unit":"cp-v1","name":"req.events.subscribe","sha256":"93168d1084af3d6cae8d08b7544999964f6b6ffefca58fcf5af9a584ea0f4652","note":"frames.jsonl:15（整行原文摘要）","faces":[],"status":"active","spec":"daemon-control-plane fixtures v1"}
+{"family":"fixtures","unit":"cp-v1","name":"rsp.subscribe.ok","sha256":"4b55223b055da02679ba31728d0c5ce947bf9d9470047008c41c92914e37e271","note":"frames.jsonl:16（整行原文摘要）","faces":[],"status":"active","spec":"daemon-control-plane fixtures v1"}
+{"family":"fixtures","unit":"cp-v1","name":"resync.cursor_stale","sha256":"89c95936200678ae85256b527231872b2b39b68b4bcaf63d02a4f74d98b7699a","note":"frames.jsonl:17（整行原文摘要）","faces":[],"status":"active","spec":"daemon-control-plane fixtures v1"}
+{"family":"fixtures","unit":"cp-v1","name":"stream.end.gone","sha256":"faf721fb776e547cc3fc9c02eec8ca29a3cf3a263a3e70d6858705d24a59f756","note":"frames.jsonl:18（整行原文摘要）","faces":[],"status":"active","spec":"daemon-control-plane fixtures v1"}
+{"family":"fixtures","unit":"cp-v1","name":"stream.end.closed","sha256":"4702b3c81991f96793c8039b1ad8745b7c719b607d5c8bf6862b02db145bcba9","note":"frames.jsonl:19（整行原文摘要）","faces":[],"status":"active","spec":"daemon-control-plane fixtures v1"}
+{"family":"fixtures","unit":"cp-v1","name":"stream.data.binary","sha256":"90b507e5c8d0d74a99c3332b956171e2934c34ce6085ac24ba8f71a24bb84788","note":"frames.jsonl:20（整行原文摘要）","faces":[],"status":"active","spec":"daemon-control-plane fixtures v1"}
+{"family":"fixtures","unit":"cp-v1","name":"req.host.add.force","sha256":"e6bbacf6750ee2b4774894cf33a3c6ba62268648ecad23b5dc1fe331574e8fe2","note":"frames.jsonl:21（整行原文摘要）","faces":[],"status":"active","spec":"daemon-control-plane fixtures v1"}
+{"family":"fixtures","unit":"cp-v1","name":"rsp.host.add.reach.ok","sha256":"a55dcd3938155345e096691652343bfdb23e2285060099da7d483222f8275f38","note":"frames.jsonl:22（整行原文摘要）","faces":[],"status":"active","spec":"daemon-control-plane fixtures v1"}
+{"family":"fixtures","unit":"cp-v1","name":"rsp.host.add.reach.skipped","sha256":"a2c6fdbb2198780f32f270c4149bbdab4deaa59213575c38031e42593fe8942b","note":"frames.jsonl:23（整行原文摘要）","faces":[],"status":"active","spec":"daemon-control-plane fixtures v1"}
+{"family":"fixtures","unit":"cp-v1","name":"rsp.host.add.unreachable","sha256":"29024a37c82016e1daad8a16013e58ac05e42213dd5d3e29c91c7c45a2fe001c","note":"frames.jsonl:24（整行原文摘要）","faces":[],"status":"active","spec":"daemon-control-plane fixtures v1"}
+{"family":"fixtures","unit":"cp-v1","name":"rsp.subscribe.replace.ok","sha256":"7e9c75b3b3f923cc9b4fa3b472bf6a4b997c1f003e37a5a4a5d7974bcc8fb53e","note":"frames.jsonl:25（整行原文摘要）","faces":[],"status":"active","spec":"daemon-control-plane fixtures v1"}
+{"family":"fixtures","unit":"cp-v1","name":"req.stream.open.term","sha256":"4996ecd98464e56950a923d672e26ffc34e59f0967fd415d3c5aceaf31cc46ae","note":"frames.jsonl:26（整行原文摘要）","faces":[],"status":"active","spec":"daemon-control-plane fixtures v1"}
+{"family":"fixtures","unit":"cp-v1","name":"req.stream.open.files","sha256":"db83dc01c52876caf83dbc93dc15ef9de981e3885ea3a5d7c8d713d947d04398","note":"frames.jsonl:27（整行原文摘要）","faces":[],"status":"active","spec":"daemon-control-plane fixtures v1"}
+{"family":"fixtures","unit":"cp-v1","name":"req.forward.add","sha256":"124a9dbff29c92b3cd403f8f0f5878fe2a0d6ff4cb91fe6c3bdde0b181550b84","note":"frames.jsonl:28（整行原文摘要）","faces":[],"status":"active","spec":"daemon-control-plane fixtures v1"}
+{"family":"fixtures","unit":"cp-v1","name":"req.forward.remove","sha256":"51f4362a601dafbcc1043b5f4fc3f992dbc9372e2931d401c3a34066bc6824b9","note":"frames.jsonl:29（整行原文摘要）","faces":[],"status":"active","spec":"daemon-control-plane fixtures v1"}
+{"family":"fixtures","unit":"cp-v1","name":"req.forward.list","sha256":"8650077dd44e7aebcedfc52c8ce24f31140ef1e5f1394e88d61819fe6b41b688","note":"frames.jsonl:30（整行原文摘要）","faces":[],"status":"active","spec":"daemon-control-plane fixtures v1"}
+{"family":"fixtures","unit":"cp-v1","name":"req.socks.on","sha256":"52300e718873535cf02e153cfd42009f7ecee381720d12186668d589464c92fb","note":"frames.jsonl:31（整行原文摘要）","faces":[],"status":"active","spec":"daemon-control-plane fixtures v1"}
+{"family":"fixtures","unit":"cp-v1","name":"req.socks.off","sha256":"11afc5cb76d482c3a46fb9436d6db263e0da2ba53f0673cb34c909b7569d2fb6","note":"frames.jsonl:32（整行原文摘要）","faces":[],"status":"active","spec":"daemon-control-plane fixtures v1"}
+{"family":"fixtures","unit":"cp-v1","name":"req.socks.status","sha256":"3d908d293e0a91708ea2ee4454516734a51c45fa6fd35d136fabc6757ca416f5","note":"frames.jsonl:33（整行原文摘要）","faces":[],"status":"active","spec":"daemon-control-plane fixtures v1"}
+{"family":"fixtures","unit":"cp-v1","name":"req.speedtest.start","sha256":"3c8b80d719f514e725d75177b5705ae78172a828eac147163f1e7f8e3208b971","note":"frames.jsonl:34（整行原文摘要）","faces":[],"status":"active","spec":"daemon-control-plane fixtures v1"}
+{"family":"fixtures","unit":"cp-v1","name":"req.speedtest.status","sha256":"c81a0db31c70b85393848f64e5870c95fa0b5a0957f4195f418a5e8ba299542a","note":"frames.jsonl:35（整行原文摘要）","faces":[],"status":"active","spec":"daemon-control-plane fixtures v1"}
+{"family":"fixtures","unit":"cp-v1","name":"req.speedtest.cancel","sha256":"b685f72ff0b8efbd71491348bb5c840789b7247f88baa6d8ba0aa080b4fc2fda","note":"frames.jsonl:36（整行原文摘要）","faces":[],"status":"active","spec":"daemon-control-plane fixtures v1"}
+{"family":"fixtures","unit":"cp-v1","name":"req.serve.start","sha256":"108c13dc2545a33dbde68b7237400559541007e072e1cad7106687506f02744b","note":"frames.jsonl:37（整行原文摘要）","faces":[],"status":"active","spec":"daemon-control-plane fixtures v1"}
+{"family":"fixtures","unit":"cp-v1","name":"req.serve.stop","sha256":"fc0a255ccb2f238ae295eab7fd719dceb2860aee93e999defd7a5a79661e45e6","note":"frames.jsonl:38（整行原文摘要）","faces":[],"status":"active","spec":"daemon-control-plane fixtures v1"}
+{"family":"fixtures","unit":"cp-v1","name":"req.serve.restart","sha256":"d05d635d681a2600bba1f1aa1eac5f569228a05e0ccda4ab6094f58d747a36cd","note":"frames.jsonl:39（整行原文摘要）","faces":[],"status":"active","spec":"daemon-control-plane fixtures v1"}
+{"family":"fixtures","unit":"cp-v1","name":"req.serve.status","sha256":"f32c163710a53f57ccf9c11f2c1ec8bf54ad3eb4619be79e338ee893d5de81dd","note":"frames.jsonl:40（整行原文摘要）","faces":[],"status":"active","spec":"daemon-control-plane fixtures v1"}
+{"family":"fixtures","unit":"cp-v1","name":"req.serve.token","sha256":"03c9b219bbaa7d8c68bd02503c8d3c08bd20a7ad898c51245f357609b2bd4496","note":"frames.jsonl:41（整行原文摘要）","faces":[],"status":"active","spec":"daemon-control-plane fixtures v1"}
+{"family":"fixtures","unit":"cp-v1","name":"req.relay.start","sha256":"7583f0c0e0ed203622e271e22617c6ab3fbba4f3d75adc54a00709153b490175","note":"frames.jsonl:42（整行原文摘要）","faces":[],"status":"active","spec":"daemon-control-plane fixtures v1"}
+{"family":"fixtures","unit":"cp-v1","name":"req.relay.stop","sha256":"e82ffd16e3bd536c42b5caa2319082b9c63fa0d932bb5d7e3671862c195a9325","note":"frames.jsonl:43（整行原文摘要）","faces":[],"status":"active","spec":"daemon-control-plane fixtures v1"}
+{"family":"fixtures","unit":"cp-v1","name":"req.relay.restart","sha256":"9774f245d51bfcf583e05c0b78cff4c98855d1d027daa777c2d25cc10daca719","note":"frames.jsonl:44（整行原文摘要）","faces":[],"status":"active","spec":"daemon-control-plane fixtures v1"}
+{"family":"fixtures","unit":"cp-v1","name":"req.relay.status","sha256":"3fbcfe57d51cd99dc4a7ec5d1b418dac604f186e34c8eef2b0d59836ef8b6b8c","note":"frames.jsonl:45（整行原文摘要）","faces":[],"status":"active","spec":"daemon-control-plane fixtures v1"}
+{"family":"fixtures","unit":"cp-v1","name":"req.relay.token","sha256":"f9071b0049d0e3d90c6acfb0d27c07569489935ea71a1d81dbec1224321557b6","note":"frames.jsonl:46（整行原文摘要）","faces":[],"status":"active","spec":"daemon-control-plane fixtures v1"}
+{"family":"fixtures","unit":"surface-golden-bin","name":"session-cjk-diff.bin","sha256":"4279fc1c9c94577963b1e8648bf84dccb67731b24b1cae9b912b99489c48fd46","note":"下行 golden 字节","faces":[],"status":"active","spec":"term-surface-protocol golden"}
+{"family":"fixtures","unit":"surface-golden-bin","name":"session-cjk.bin","sha256":"e6af9617a25ca866f71ea5602752f23a59cd1f749b26438b51a61938a5f43bda","note":"下行 golden 字节","faces":[],"status":"active","spec":"term-surface-protocol golden"}
+{"family":"fixtures","unit":"surface-golden-bin","name":"session-git-log-diff.bin","sha256":"9b2b96619a8ebc96a9b4e2c5624c06036a73a75b9db528e75108e6f5c957cafd","note":"下行 golden 字节","faces":[],"status":"active","spec":"term-surface-protocol golden"}
+{"family":"fixtures","unit":"surface-golden-bin","name":"session-git-log.bin","sha256":"ed2dc7a2cc53cf18dca19c07abaa3e89ba17e7bbc9753fb1ecb5527a186c04b4","note":"下行 golden 字节","faces":[],"status":"active","spec":"term-surface-protocol golden"}
+{"family":"fixtures","unit":"surface-golden-bin","name":"session-hexdump-diff.bin","sha256":"2685218575526e0d838bb8f007be004b9d064a4eef21fbd6540bbc3f282a688c","note":"下行 golden 字节","faces":[],"status":"active","spec":"term-surface-protocol golden"}
+{"family":"fixtures","unit":"surface-golden-bin","name":"session-hexdump.bin","sha256":"ddc4c098dacd159273cdcdac86bc40c0a75bd9fefb1000a5325dee4cdd2c6745","note":"下行 golden 字节","faces":[],"status":"active","spec":"term-surface-protocol golden"}
+{"family":"fixtures","unit":"surface-golden-manifest","name":"manifest.tsv","sha256":"a272ca84acffd9a12079d94750c7d3eed3152b601e3ab3818c1ba250d9e6b743","note":"golden 清单（FNV 摘要列在内）","faces":[],"status":"active","spec":"term-surface-protocol golden"}

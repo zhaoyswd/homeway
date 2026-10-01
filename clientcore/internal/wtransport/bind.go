@@ -304,6 +304,15 @@ func (b *Bind) Adopted() (addr netip.AddrPort, relay, valid bool) {
 	return b.adopted, b.adoptedIsRelay, b.valid
 }
 
+// via 词表（链路形态三态——contract-ledger 台账族⑪ via 子族，只增不改；App 的
+// applyLink/ExitHealth 按值分派。历史值 tunnel 仅 App 侧保留分支，本仓零产出者
+// = legacy-unreachable。4b 2.1 提常量前是 Status() 里的赋值字面量）。
+const (
+	viaNone   = "none"
+	viaRelay  = "relay"
+	viaDirect = "direct"
+)
+
 // Status：状态上报数据源（tasks 2.6）。核心把它映射进既有 tunStatusJSON 的 link 段
 // （契约键名 via/ep 不变：via ∈ direct|relay|none），其余字段供诊断/候选展示。
 type Status struct {
@@ -326,12 +335,12 @@ type CandidateStatus struct {
 func (b *Bind) Status() Status {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	st := Status{Via: "none", Mirrored: b.mirrored}
+	st := Status{Via: viaNone, Mirrored: b.mirrored}
 	if b.valid {
 		if b.adoptedIsRelay {
-			st.Via = "relay"
+			st.Via = viaRelay
 		} else {
-			st.Via = "direct"
+			st.Via = viaDirect
 		}
 		st.Ep = b.adopted.String()
 	}

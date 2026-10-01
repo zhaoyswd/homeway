@@ -80,21 +80,21 @@ func (s *Session) Close() error { return s.conn.Close() }
 // CLI 侧看门 Close 打断——传输不设 deadline 与取消可观察两口径分开，design D1）。
 func (s *Session) call(ctx context.Context, req Request) (Response, error) {
 	if err := ctx.Err(); err != nil {
-		return Response{}, Errw("canceled", err, "已取消")
+		return Response{}, Errw(CodeCanceled, err, "已取消")
 	}
 	if err := WriteLine(s.conn, req); err != nil {
-		return Response{}, Errw("op_failed", err, "发请求失败：%v", err)
+		return Response{}, Errw(CodeOpFailed, err, "发请求失败：%v", err)
 	}
 	if err := ctx.Err(); err != nil {
-		return Response{}, Errw("canceled", err, "已取消")
+		return Response{}, Errw(CodeCanceled, err, "已取消")
 	}
 	line, err := s.br.ReadBytes('\n')
 	if err != nil {
-		return Response{}, Errw("op_failed", err, "读响应失败：%v", err)
+		return Response{}, Errw(CodeOpFailed, err, "读响应失败：%v", err)
 	}
 	var resp Response
 	if err := unmarshalLine(line, &resp); err != nil {
-		return Response{}, Errw("op_failed", err, "响应不是 JSON：%v", err)
+		return Response{}, Errw(CodeOpFailed, err, "响应不是 JSON：%v", err)
 	}
 	if !resp.Ok {
 		code := resp.Code
@@ -132,7 +132,7 @@ func (c *Client) Stat(ctx context.Context, path string) (Entry, error) {
 		return Entry{}, err
 	}
 	if resp.Entry == nil {
-		return Entry{}, Errf("op_failed", "响应缺 entry")
+		return Entry{}, Errf(CodeOpFailed, "响应缺 entry")
 	}
 	return *resp.Entry, nil
 }
@@ -185,17 +185,17 @@ func (c *Client) DownloadTo(ctx context.Context, path string, w io.Writer, onSiz
 	var total int64
 	for {
 		if cerr := ctx.Err(); cerr != nil {
-			return total, Errw("canceled", cerr, "已取消")
+			return total, Errw(CodeCanceled, cerr, "已取消")
 		}
 		n, err := ReadFrame(s.br, buf)
 		if err != nil {
-			return total, Errw("op_failed", err, "下载中断：%v", err)
+			return total, Errw(CodeOpFailed, err, "下载中断：%v", err)
 		}
 		if n == 0 {
 			return total, nil
 		}
 		if _, err := w.Write(buf[:n]); err != nil {
-			return total, Errw("op_failed", err, "写本地失败：%v", err)
+			return total, Errw(CodeOpFailed, err, "写本地失败：%v", err)
 		}
 		total += int64(n)
 	}
@@ -231,17 +231,17 @@ func (c *Client) upload(ctx context.Context, path string, r io.Reader, size int6
 	var total int64
 	for {
 		if err := ctx.Err(); err != nil {
-			return total, Errw("canceled", err, "已取消")
+			return total, Errw(CodeCanceled, err, "已取消")
 		}
 		n, rerr := r.Read(buf)
 		if n > 0 {
 			if rate != nil {
 				if aerr := rate.Await(ctx, n); aerr != nil {
-					return total, Errw("canceled", aerr, "已取消")
+					return total, Errw(CodeCanceled, aerr, "已取消")
 				}
 			}
 			if err := WriteFrame(s.conn, buf[:n]); err != nil {
-				return total, Errw("op_failed", err, "上传中断：%v", err)
+				return total, Errw(CodeOpFailed, err, "上传中断：%v", err)
 			}
 			total += int64(n)
 			if onProgress != nil {
@@ -252,19 +252,19 @@ func (c *Client) upload(ctx context.Context, path string, r io.Reader, size int6
 			if errors.Is(rerr, io.EOF) {
 				break
 			}
-			return total, Errw("op_failed", rerr, "读本地失败：%v", rerr)
+			return total, Errw(CodeOpFailed, rerr, "读本地失败：%v", rerr)
 		}
 	}
 	if err := WriteFrame(s.conn, nil); err != nil { // 终止帧 = 提交
-		return total, Errw("op_failed", err, "提交失败：%v", err)
+		return total, Errw(CodeOpFailed, err, "提交失败：%v", err)
 	}
 	line, err := s.br.ReadBytes('\n')
 	if err != nil {
-		return total, Errw("op_failed", err, "读提交结果失败：%v", err)
+		return total, Errw(CodeOpFailed, err, "读提交结果失败：%v", err)
 	}
 	var resp Response
 	if err := unmarshalLine(line, &resp); err != nil {
-		return total, Errw("op_failed", err, "提交结果不是 JSON：%v", err)
+		return total, Errw(CodeOpFailed, err, "提交结果不是 JSON：%v", err)
 	}
 	if !resp.Ok {
 		return total, &Error{Code: resp.Code, Msg: resp.Msg}

@@ -1203,6 +1203,20 @@ type termErr struct {
 
 func (e *termErr) Error() string { return e.code + ": " + e.msg }
 
+// ERROR 帧码词表（termErrf 首参——contract-ledger 台账族③，只增不改；App 桥层经族⑦
+// 透传消费）。首参一律引用本表，散点字面量已随 4b 2.1 提常量收拢。
+const (
+	termErrAlreadyExists  = "already_exists"   // HELLO/CREATE：同名会话且不复用
+	termErrDetectOff      = "detect_off"       // explain：出口侧检测被环境变量关掉
+	termErrMarshal        = "marshal"          // explain：应答编码失败
+	termErrNoAgent        = "no_agent"         // explain：前台不是已知 agent
+	termErrNoSession      = "no_session"       // 会话不存在/已结束
+	termErrNoVt           = "no_vt"            // explain：会话没有服务端 vt
+	termErrSpawnFailed    = "spawn_failed"     // 会话进程起不来
+	termErrTooMany        = "too_many"         // 会话数达上限
+	termErrTooManyClients = "too_many_clients" // 同会话腿数达上限
+)
+
 func termErrf(code, format string, args ...any) *termErr {
 	return &termErr{code: code, msg: fmt.Sprintf(format, args...)}
 }
@@ -1219,17 +1233,17 @@ func (s *termService) attachOrCreate(name string, cols, rows uint16, create, onl
 	if ss == nil {
 		if !create {
 			s.mu.Unlock()
-			return nil, termErrf("no_session", "会话 %s 不存在", name)
+			return nil, termErrf(termErrNoSession, "会话 %s 不存在", name)
 		}
 		if len(s.sessions) >= s.cfg.maxSessions {
 			s.mu.Unlock()
-			return nil, termErrf("too_many", "会话数已达上限 %d，请先关闭一些会话", s.cfg.maxSessions)
+			return nil, termErrf(termErrTooMany, "会话数已达上限 %d，请先关闭一些会话", s.cfg.maxSessions)
 		}
 		var err error
 		ss, err = s.spawnLocked(name, cols, rows)
 		if err != nil {
 			s.mu.Unlock()
-			return nil, termErrf("spawn_failed", "%v", err)
+			return nil, termErrf(termErrSpawnFailed, "%v", err)
 		}
 		s.sessions[name] = ss
 		s.mu.Unlock()
@@ -1237,7 +1251,7 @@ func (s *termService) attachOrCreate(name string, cols, rows uint16, create, onl
 	}
 	s.mu.Unlock()
 	if create && onlyIfAbsent {
-		return nil, termErrf("already_exists", "会话 %s 已存在；要接入请用 attach，或加 -A 复用", name)
+		return nil, termErrf(termErrAlreadyExists, "会话 %s 已存在；要接入请用 attach，或加 -A 复用", name)
 	}
 	return ss, nil
 }
@@ -1252,16 +1266,16 @@ func (s *termService) createOnly(name string, reuseIfExists bool) *termErr {
 		if reuseIfExists {
 			return nil
 		}
-		return termErrf("already_exists", "会话 %s 已存在；要接入请用 attach，或加 -A 复用", name)
+		return termErrf(termErrAlreadyExists, "会话 %s 已存在；要接入请用 attach，或加 -A 复用", name)
 	}
 	if len(s.sessions) >= s.cfg.maxSessions {
 		s.mu.Unlock()
-		return termErrf("too_many", "会话数已达上限 %d，请先关闭一些会话", s.cfg.maxSessions)
+		return termErrf(termErrTooMany, "会话数已达上限 %d，请先关闭一些会话", s.cfg.maxSessions)
 	}
 	ss, err := s.spawnLocked(name, 0, 0)
 	if err != nil {
 		s.mu.Unlock()
-		return termErrf("spawn_failed", "%v", err)
+		return termErrf(termErrSpawnFailed, "%v", err)
 	}
 	s.sessions[name] = ss
 	s.mu.Unlock()
@@ -1527,28 +1541,28 @@ func (s *termSession) cwdLocked() string {
 // 「explain 与列表判定一致」）。
 func (s *termService) explainJSON(name string) (string, *termErr) {
 	if s.manifests == nil {
-		return "", termErrf("detect_off", "本出口的检测被 HOMEWAY_TERM_DETECT=off 关闭")
+		return "", termErrf(termErrDetectOff, "本出口的检测被 HOMEWAY_TERM_DETECT=off 关闭")
 	}
 	s.mu.Lock()
 	ss := s.sessions[name]
 	s.mu.Unlock()
 	if ss == nil {
-		return "", termErrf("no_session", "会话 %s 不存在", name)
+		return "", termErrf(termErrNoSession, "会话 %s 不存在", name)
 	}
 	ss.mu.Lock()
 	defer ss.mu.Unlock()
 	if !ss.vt.Available() {
-		return "", termErrf("no_vt", "会话 %s 没有服务端 vt（legacy-only），没有屏幕证据可判", name)
+		return "", termErrf(termErrNoVt, "会话 %s 没有服务端 vt（legacy-only），没有屏幕证据可判", name)
 	}
 	screen := ss.vt.PlainText()
 	agent := foregroundAgentNameFor(s.manifests, s, ss)
 	if agent == "" {
-		return "", termErrf("no_agent", "会话 %s 前台不是已知 agent，没有规则可跑", name)
+		return "", termErrf(termErrNoAgent, "会话 %s 前台不是已知 agent，没有规则可跑", name)
 	}
 	out := runExplain(s.manifests, agent, screen, name)
 	b, err := json.Marshal(out)
 	if err != nil {
-		return "", termErrf("marshal", "explain 输出编码失败：%v", err)
+		return "", termErrf(termErrMarshal, "explain 输出编码失败：%v", err)
 	}
 	return string(b), nil
 }
@@ -1571,7 +1585,7 @@ func (s *termService) kill(name string) *termErr {
 	ss := s.sessions[name]
 	s.mu.Unlock()
 	if ss == nil {
-		return termErrf("no_session", "会话 %s 不存在", name)
+		return termErrf(termErrNoSession, "会话 %s 不存在", name)
 	}
 	ss.mu.Lock()
 	pid := ss.pid
@@ -1579,7 +1593,7 @@ func (s *termService) kill(name string) *termErr {
 	ss.killed = true
 	ss.mu.Unlock()
 	if done {
-		return termErrf("no_session", "会话 %s 已结束", name)
+		return termErrf(termErrNoSession, "会话 %s 已结束", name)
 	}
 	if err := signalPgid(pid, 1); err != nil { // 1 = SIGHUP
 		// 组信号失败就退化为单进程终止。

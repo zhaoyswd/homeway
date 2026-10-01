@@ -127,13 +127,13 @@ func (s *Server) dispatch(w io.Writer, br *bufio.Reader, req *Request) *Error {
 	case "write":
 		return s.write(w, br, req)
 	default:
-		return Errf("invalid_arg", "未知操作 %q", req.Op)
+		return Errf(CodeInvalidArg, "未知操作 %q", req.Op)
 	}
 }
 
 func writeLineErr(w io.Writer, v any) *Error {
 	if err := WriteLine(w, v); err != nil {
-		return Errf("op_failed", "写响应失败：%v", err)
+		return Errf(CodeOpFailed, "写响应失败：%v", err)
 	}
 	return nil
 }
@@ -148,14 +148,14 @@ func relPath(p string) (string, *Error) {
 	}
 	for _, r := range p {
 		if r == 0 || r < 0x20 || r == 0x7f {
-			return "", Errf("invalid_arg", "路径含非法字符")
+			return "", Errf(CodeInvalidArg, "路径含非法字符")
 		}
 	}
 	// 任何 `..` 段一律拒绝（spec：`..` 穿越必须被拒绝）。注意不能只靠 Clean：
 	// path.Clean("/" + "../x") = "/x"，会把越界悄悄「洗白」成根内路径。
 	for _, seg := range strings.Split(p, "/") {
 		if seg == ".." {
-			return "", Errf("invalid_arg", "路径越界：%q", p)
+			return "", Errf(CodeInvalidArg, "路径越界：%q", p)
 		}
 	}
 	clean := path.Clean("/" + strings.TrimPrefix(p, "/")) // 钉成绝对再 Clean ⇒ 消掉 ..
@@ -164,7 +164,7 @@ func relPath(p string) (string, *Error) {
 	}
 	rel := strings.TrimPrefix(clean, "/")
 	if rel == ".." || strings.HasPrefix(rel, "../") {
-		return "", Errf("invalid_arg", "路径越界：%q", p)
+		return "", Errf(CodeInvalidArg, "路径越界：%q", p)
 	}
 	return rel, nil
 }
@@ -172,15 +172,15 @@ func relPath(p string) (string, *Error) {
 func mapOSErr(op, p string, err error) *Error {
 	switch {
 	case errors.Is(err, os.ErrNotExist):
-		return Errf("not_found", "%s %s：不存在", op, p)
+		return Errf(CodeNotFound, "%s %s：不存在", op, p)
 	case errors.Is(err, os.ErrPermission):
-		return Errf("permission", "%s %s：拒绝访问", op, p)
+		return Errf(CodePermission, "%s %s：拒绝访问", op, p)
 	}
 	// os.Root 对逃逸（..、符号链接指向根外）返回的错误：归到 not_found，不泄漏根外信息
 	if msg := err.Error(); strings.Contains(msg, "escapes from parent") || strings.Contains(msg, "outside of root") {
-		return Errf("not_found", "%s %s：不存在", op, p)
+		return Errf(CodeNotFound, "%s %s：不存在", op, p)
 	}
-	return Errf("op_failed", "%s %s：%v", op, p, err)
+	return Errf(CodeOpFailed, "%s %s：%v", op, p, err)
 }
 
 func entryOf(fi os.FileInfo) Entry {
@@ -243,13 +243,13 @@ func (s *Server) mkdir(p string) *Error {
 	}
 	name := path.Base(rel)
 	if rel == "." || name == "." || name == "/" || name == "" {
-		return Errf("invalid_name", "目录名不合法：%q", name)
+		return Errf(CodeInvalidName, "目录名不合法：%q", name)
 	}
 	if strings.Contains(name, "/") {
-		return Errf("invalid_name", "目录名不合法：%q", name)
+		return Errf(CodeInvalidName, "目录名不合法：%q", name)
 	}
 	if _, oerr := s.root.Stat(rel); oerr == nil {
-		return Errf("already_exists", "同名条目已存在")
+		return Errf(CodeAlreadyExists, "同名条目已存在")
 	}
 	if oerr := s.root.Mkdir(rel, 0o755); oerr != nil {
 		return mapOSErr("mkdir", p, oerr)
@@ -267,7 +267,7 @@ func (s *Server) read(w io.Writer, req *Request) *Error {
 		return mapOSErr("read", req.Path, oerr)
 	}
 	if fi.IsDir() {
-		return Errf("is_dir", "是目录，不是文件")
+		return Errf(CodeIsDir, "是目录，不是文件")
 	}
 	maxBytes := req.MaxBytes
 	if maxBytes <= 0 {
@@ -310,7 +310,7 @@ func (s *Server) download(w io.Writer, req *Request) *Error {
 		return mapOSErr("download", req.Path, oerr)
 	}
 	if fi.IsDir() {
-		return Errf("is_dir", "是目录，不是文件")
+		return Errf(CodeIsDir, "是目录，不是文件")
 	}
 	f, oerr := s.root.Open(rel)
 	if oerr != nil {
@@ -318,7 +318,7 @@ func (s *Server) download(w io.Writer, req *Request) *Error {
 	}
 	defer f.Close()
 	if err := WriteLine(w, Response{Ok: true, Size: fi.Size()}); err != nil {
-		return Errf("op_failed", "写响应失败：%v", err)
+		return Errf(CodeOpFailed, "写响应失败：%v", err)
 	}
 	buf := make([]byte, MaxChunk)
 	for {
@@ -332,7 +332,7 @@ func (s *Server) download(w io.Writer, req *Request) *Error {
 			if errors.Is(rerr, io.EOF) {
 				break
 			}
-			return Errf("op_failed", "读文件失败：%v", rerr)
+			return Errf(CodeOpFailed, "读文件失败：%v", rerr)
 		}
 	}
 	if err := WriteFrame(w, nil); err != nil {
@@ -349,7 +349,7 @@ func (s *Server) write(w io.Writer, br *bufio.Reader, req *Request) *Error {
 		return err
 	}
 	if rel == "." {
-		return Errf("invalid_name", "不能写入根目录本身")
+		return Errf(CodeInvalidName, "不能写入根目录本身")
 	}
 	part := rel + uploadPartSuffix
 	f, oerr := s.root.OpenFile(part, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o644)
@@ -372,7 +372,7 @@ func (s *Server) write(w io.Writer, br *bufio.Reader, req *Request) *Error {
 		n, rerr := ReadFrame(br, buf)
 		if rerr != nil {
 			// 未收到终止帧：取消/中断。响应写不出去也无妨。
-			return Errf("canceled", "上传中断（已收到 %d 字节，已清理临时文件）", total)
+			return Errf(CodeCanceled, "上传中断（已收到 %d 字节，已清理临时文件）", total)
 		}
 		if n == 0 { // 终止帧 = 提交
 			break
@@ -405,11 +405,11 @@ func (s *Server) write(w io.Writer, br *bufio.Reader, req *Request) *Error {
 func (s *Server) renameInRoot(part, rel string) error {
 	base := path.Base(rel)
 	if base == "." || base == ".." || base == "/" || base == "" || strings.ContainsAny(base, `/\`) {
-		return Errf("invalid_name", "文件名不合法：%q", base)
+		return Errf(CodeInvalidName, "文件名不合法：%q", base)
 	}
 	dir := path.Dir(rel)
 	if path.Dir(part) != dir {
-		return Errf("op_failed", "临时文件与目标不在同一目录")
+		return Errf(CodeOpFailed, "临时文件与目标不在同一目录")
 	}
 	d, oerr := s.root.Open(dir)
 	if oerr != nil {

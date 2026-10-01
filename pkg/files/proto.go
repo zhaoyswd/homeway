@@ -41,6 +41,20 @@ const MaxRequestLine = 64 * 1024
 // MaxChunk 单帧载荷上限（客户端应遵守；服务端只做防御性校验）。
 const MaxChunk = 256 * 1024
 
+// 协议错误码词表（包粒度 8 码 = 7 稳定码 + canceled——contract-ledger 台账族④，只增
+// 不改；Errf/Errw 首参一律引用本表，散点字面量已随 4b 2.1 提常量收拢）。CodeStreamOpen
+// （stream_open，client.go 流开场失败）同属本族、随其真源声明在 client.go。
+const (
+	CodeInvalidArg    = "invalid_arg"
+	CodeInvalidName   = "invalid_name"
+	CodeNotFound      = "not_found"
+	CodePermission    = "permission"
+	CodeIsDir         = "is_dir"
+	CodeAlreadyExists = "already_exists"
+	CodeOpFailed      = "op_failed"
+	CodeCanceled      = "canceled"
+)
+
 // Request 一条命令的请求。
 type Request struct {
 	Op       string `json:"op"`
@@ -131,10 +145,10 @@ func ReadRequest(br *bufio.Reader) (*Request, error) {
 	}
 	var req Request
 	if err := json.Unmarshal(line, &req); err != nil {
-		return nil, Errf("invalid_arg", "请求不是合法 JSON：%v", err)
+		return nil, Errf(CodeInvalidArg, "请求不是合法 JSON：%v", err)
 	}
 	if req.Op == "" {
-		return nil, Errf("invalid_arg", "缺少 op")
+		return nil, Errf(CodeInvalidArg, "缺少 op")
 	}
 	return &req, nil
 }
@@ -145,7 +159,7 @@ func readLineLimited(br *bufio.Reader, max int) ([]byte, error) {
 		chunk, err := br.ReadSlice('\n')
 		buf = append(buf, chunk...)
 		if len(buf) > max {
-			return nil, Errf("invalid_arg", "请求行超过 %d 字节", max)
+			return nil, Errf(CodeInvalidArg, "请求行超过 %d 字节", max)
 		}
 		if err == nil {
 			return trimEOL(buf), nil
@@ -194,10 +208,10 @@ func ReadFrame(r io.Reader, buf []byte) (int, error) {
 		return 0, nil
 	}
 	if n > MaxChunk {
-		return 0, Errf("invalid_arg", "帧长 %d 超过上限 %d", n, MaxChunk)
+		return 0, Errf(CodeInvalidArg, "帧长 %d 超过上限 %d", n, MaxChunk)
 	}
 	if n > len(buf) {
-		return 0, Errf("invalid_arg", "帧长 %d 超过缓冲区 %d", n, len(buf))
+		return 0, Errf(CodeInvalidArg, "帧长 %d 超过缓冲区 %d", n, len(buf))
 	}
 	if _, err := io.ReadFull(r, buf[:n]); err != nil {
 		return 0, err

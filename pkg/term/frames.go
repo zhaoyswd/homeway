@@ -92,6 +92,19 @@ const (
 	agentUnknown  byte = 255
 )
 
+// agent 身份的字符串词面（agentName 渲染；LIST JSON / 日志 / App 的 agentLabel·
+// agentIcon 按值分派——contract-ledger 台账族② agent 子族，与上方字节枚举一一对应、
+// 只增不改；4b 2.1 提常量前是 agentName 的返回字面量）。
+const (
+	agentNameShell    = "shell"
+	agentNameCodex    = "codex"
+	agentNameClaude   = "claude"
+	agentNameOpencode = "opencode"
+	agentNameOpenclaw = "openclaw"
+	agentNameOther    = "other"
+	agentNameUnknown  = "unknown"
+)
+
 // ended 的 code：≥0 是子进程退出码；负数表示由服务侧给出的原因（见 reason）。
 const (
 	termEndReplaced       = -1 // 同一会话被新的 attach 顶掉
@@ -114,19 +127,19 @@ const (
 func agentName(a byte) string {
 	switch a {
 	case agentShell:
-		return "shell"
+		return agentNameShell
 	case agentCodex:
-		return "codex"
+		return agentNameCodex
 	case agentClaude:
-		return "claude"
+		return agentNameClaude
 	case agentOpencode:
-		return "opencode"
+		return agentNameOpencode
 	case agentOpenclaw:
-		return "openclaw"
+		return agentNameOpenclaw
 	case agentOther:
-		return "other"
+		return agentNameOther
 	}
-	return "unknown"
+	return agentNameUnknown
 }
 
 // stateName 已随 legacy 状态枚举退役（term-remote 3.3 单轨化）：STATE/ATTACHED/LIST

@@ -59,6 +59,20 @@ type filesError struct {
 
 func (e *filesError) Error() string { return e.Code + ": " + e.Msg }
 
+// files 桥层归一码词表（filesErrf 首参——contract-ledger 台账族⑥，与 App 的
+// FilesRules.ets filesErrorMessage 对账、只增不改；与 pkg/files 协议码〔族④〕是两个
+// 独立冻结空间，值交集之外的同名仅为透传巧合。4b 2.1 提常量前是调用点字面量；
+// marshal 原为 marshalFiles 兜底里的原始 JSON 字面量，随 2.1 收进构造器）。
+const (
+	filesCodeBridgeDown = "bridge_down"
+	filesCodeBridgeAuth = "bridge_auth"
+	filesCodeNoSession  = "no_session"
+	filesCodeInvalidArg = "invalid_arg"
+	filesCodeOpFailed   = "op_failed"
+	filesCodeBusy       = "busy"
+	filesCodeMarshal    = "marshal"
+)
+
 func filesErrf(code, format string, args ...any) *filesError {
 	return &filesError{Code: code, Msg: fmt.Sprintf(format, args...)}
 }
@@ -90,7 +104,9 @@ func marshalFiles(res filesResult, ferr *filesError) string {
 	}
 	b, err := json.Marshal(out)
 	if err != nil {
-		return `{"error":{"code":"marshal","msg":"结果序列化失败"}}`
+		// 兜底走构造器（marshal 进族⑥ active 集、可提取——r2 N-1）；marshalFiles(nil, …)
+		// 输出与旧原始 JSON 字面量逐字同形（error 单键 map）。
+		return marshalFiles(nil, filesErrf(filesCodeMarshal, "结果序列化失败"))
 	}
 	return string(b)
 }

@@ -916,23 +916,23 @@ func streamEndMessage(reason string) string {
 // 访问」；is_dir 仅 read/get——put 到已存在目录 = op_failed 如实标注）。
 func codeMessage(code, msg string) string {
 	switch code {
-	case "invalid_arg":
+	case CodeInvalidArg:
 		return "路径不合法（含非法字符或 .. 越界段）：" + msg
-	case "invalid_name":
+	case CodeInvalidName:
 		return "名字不合法：" + msg
-	case "not_found":
+	case CodeNotFound:
 		return "不存在或不允许访问：" + msg
-	case "permission":
+	case CodePermission:
 		return "拒绝访问（权限不足）：" + msg
-	case "is_dir":
+	case CodeIsDir:
 		return "是目录（read/get 只支持文件）：" + msg
-	case "already_exists":
+	case CodeAlreadyExists:
 		return "同名条目已存在：" + msg
-	case "op_failed":
+	case CodeOpFailed:
 		return "操作失败：" + msg
 	case CodeStreamOpen:
 		return "files 服务不可达（流开场失败——拨号后未收到问候帧或即断）：" + msg
-	case "canceled":
+	case CodeCanceled:
 		return "已取消：" + msg
 	}
 	return msg + "（" + code + "）"

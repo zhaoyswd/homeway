@@ -64,15 +64,15 @@ type nativeFilesSession struct {
 // ClientCoreServiceStatus）——app-bridge-uds 起承载是沙箱内 UDS，鉴权保留为纵深。
 func nativeFilesDial(ctx context.Context, authHex, sock string) (net.Conn, error) {
 	if sock == "" {
-		return nil, filesErrf("bridge_down", "文件通道暂时不可用（桥未就绪：VPN 未连接且服务会话未就绪，或正在恢复）")
+		return nil, filesErrf(filesCodeBridgeDown, "文件通道暂时不可用（桥未就绪：VPN 未连接且服务会话未就绪，或正在恢复）")
 	}
 	conn, err := net.DialTimeout("unix", sock, filesConnectTimeout)
 	if err != nil {
-		return nil, filesErrf("bridge_down", "文件通道暂时不可用（桥未就绪或正在恢复）：%v", err)
+		return nil, filesErrf(filesCodeBridgeDown, "文件通道暂时不可用（桥未就绪或正在恢复）：%v", err)
 	}
 	if err := bridgeWriteAuth(conn, authHex); err != nil {
 		_ = conn.Close()
-		return nil, filesErrf("bridge_auth", "文件通道鉴权失败：%v", err)
+		return nil, filesErrf(filesCodeBridgeAuth, "文件通道鉴权失败：%v", err)
 	}
 	// 读预算落到 conn deadline：pkg/files 的 Open/call 只把 ctx 用于拨流，读侧没有
 	// deadline，对端「连着但不说话」时读会无限挂死（真机 2026-09-22：退后台回前台
@@ -104,7 +104,7 @@ func mapNativeFilesErr(err error) *filesError {
 	if errors.As(err, &fdErr) {
 		return fdErr
 	}
-	return filesErrf("op_failed", "%s", err.Error())
+	return filesErrf(filesCodeOpFailed, "%s", err.Error())
 }
 
 // normalizeOpStreamErr 把**操作路径**上的流开场失败归一成 bridge_down（其余原样透传）。
@@ -122,11 +122,11 @@ func mapNativeFilesErr(err error) *filesError {
 // 为什么不用文案前缀（旧做法）：上游改一句文案就静默失效且没有测试会红。这个码与 `pkg/files`
 // 同版本发布（本地 replace / 钉版本），改任一侧都要同步本函数与 `TestNormalizeOpStreamErr`。
 func normalizeOpStreamErr(fe *filesError) *filesError {
-	if fe == nil || fe.Code != "stream_open" {
+	if fe == nil || fe.Code != files.CodeStreamOpen {
 		return fe
 	}
 	filesLogf("操作失败于流开场（归一 bridge_down 触发通道重试）：%s", fe.Msg)
-	return filesErrf("bridge_down", "文件通道当时不可用：%s", fe.Msg)
+	return filesErrf(filesCodeBridgeDown, "文件通道当时不可用：%s", fe.Msg)
 }
 
 // mapOpErr = 透传稳定码 + 开场失败归一（操作路径专用；connect 路径见 nativeFilesConnect）。
@@ -153,9 +153,9 @@ func nativeFilesConnect(op map[string]any) (filesResult, *filesError) {
 		// bridge_down 的自动重试（FilesPage ×5），而恢复阶梯（丢会话+补注册）已在首拨
 		// 触发，第二次进来即用（真机 2026-09-20：挂起唤醒后连接 EOF 连败需手动重试）。
 		mapped := mapNativeFilesErr(err)
-		if mapped.Code == "op_failed" {
+		if mapped.Code == files.CodeOpFailed {
 			filesLogf("连接失败（归一 bridge_down 触发自动重试）：%v", err)
-			return nil, filesErrf("bridge_down", "文件通道当时不可用：%v", err)
+			return nil, filesErrf(filesCodeBridgeDown, "文件通道当时不可用：%v", err)
 		}
 		return nil, mapped
 	}
@@ -199,7 +199,7 @@ func nativeGetSession(handle int) (*nativeFilesSession, *filesError) {
 	defer filesMu.Unlock()
 	s := nativeFilesSessions[handle]
 	if s == nil {
-		return nil, filesErrf("no_session", "会话不存在或已关闭")
+		return nil, filesErrf(filesCodeNoSession, "会话不存在或已关闭")
 	}
 	s.lastUsed = time.Now()
 	return s, nil
@@ -223,7 +223,7 @@ func (s *nativeFilesSession) shutdown() {
 func nativeFilesDispatch(opJson string) string {
 	var op map[string]any
 	if err := json.Unmarshal([]byte(opJson), &op); err != nil {
-		return marshalFiles(nil, filesErrf("invalid_arg", "参数不是合法 JSON：%v", err))
+		return marshalFiles(nil, filesErrf(filesCodeInvalidArg, "参数不是合法 JSON：%v", err))
 	}
 	name, _ := op["op"].(string)
 	handle := 0
@@ -317,7 +317,7 @@ func nativeFilesDispatch(opJson string) string {
 	case "cancel":
 		res = s.nativeCancel(int(int64v("transferId", 0)))
 	default:
-		ferr = filesErrf("invalid_arg", "未知操作 %q", name)
+		ferr = filesErrf(filesCodeInvalidArg, "未知操作 %q", name)
 	}
 	return marshalFiles(res, ferr)
 }
@@ -326,16 +326,16 @@ func nativeFilesDispatch(opJson string) string {
 
 func (s *nativeFilesSession) startNativeTransfer(direction, remotePath, localPath string) (filesResult, *filesError) {
 	if remotePath == "" || localPath == "" {
-		return nil, filesErrf("invalid_arg", "remotePath 与 localPath 必填")
+		return nil, filesErrf(filesCodeInvalidArg, "remotePath 与 localPath 必填")
 	}
 	if direction != "download" && direction != "upload" {
-		return nil, filesErrf("invalid_arg", "未知方向 %q", direction)
+		return nil, filesErrf(filesCodeInvalidArg, "未知方向 %q", direction)
 	}
 	s.txMu.Lock()
 	defer s.txMu.Unlock()
 	for _, tx := range s.txs {
 		if !tx.done {
-			return nil, filesErrf("busy", "已有传输进行中，请等它完成或取消")
+			return nil, filesErrf(filesCodeBusy, "已有传输进行中，请等它完成或取消")
 		}
 	}
 	s.txNext++

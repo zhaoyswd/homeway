@@ -79,10 +79,10 @@ func ClientCoreSpeedTestCancel() *C.char {
 func speedStart(raw string) map[string]any {
 	var p speedParams
 	if err := json.Unmarshal([]byte(raw), &p); err != nil {
-		return speedFail("invalid_arg", fmt.Sprintf("参数不是合法 JSON：%v", err))
+		return speedFail(speedtest.ReasonInvalidArg, fmt.Sprintf("参数不是合法 JSON：%v", err))
 	}
 	if p.Auth == "" || p.Sock == "" {
-		return speedFail("bridge_down", "桥未就绪（缺 auth/sock：VPN 未连接且服务会话未就绪）")
+		return speedFail(speedtest.ReasonBridgeDown, "桥未就绪（缺 auth/sock：VPN 未连接且服务会话未就绪）")
 	}
 	params := speedtest.Params{
 		Down:    time.Duration(p.DownMs) * time.Millisecond,
@@ -91,7 +91,7 @@ func speedStart(raw string) map[string]any {
 		Streams: p.Streams,
 	}
 	if _, err := params.Normalize(); err != nil {
-		return speedFail("invalid_arg", err.Error())
+		return speedFail(speedtest.ReasonInvalidArg, err.Error())
 	}
 	res := speed.Start(context.Background(), func(ctx context.Context) (net.Conn, error) {
 		return speedDial(p.Auth, p.Sock)
@@ -108,11 +108,11 @@ func speedStart(raw string) map[string]any {
 func speedDial(authHex, sock string) (net.Conn, error) {
 	conn, err := net.Dial("unix", sock)
 	if err != nil {
-		return nil, speedtest.DialErrf("bridge_down", "测速通道暂时不可用（桥未就绪或正在恢复）：%v", err)
+		return nil, speedtest.DialErrf(speedtest.ReasonBridgeDown, "测速通道暂时不可用（桥未就绪或正在恢复）：%v", err)
 	}
 	if err := bridgeWriteAuth(conn, authHex); err != nil {
 		_ = conn.Close()
-		return nil, speedtest.DialErrf("bridge_auth", "测速通道鉴权失败：%v", err)
+		return nil, speedtest.DialErrf(speedtest.ReasonBridgeAuth, "测速通道鉴权失败：%v", err)
 	}
 	return conn, nil
 }
@@ -163,9 +163,19 @@ func speedSnapshotJSON(s speedtest.Snapshot) map[string]any {
 // ---------- JSON 信封 ----------
 
 func speedMarshal(res map[string]any) *C.char {
+	return C.CString(speedMarshalJSON(res))
+}
+
+// speedMarshalJSON speedMarshal 的纯 Go 面（返回 string——兜底字节的逐字回归可不经
+// cgo 直接测，contract-ledger 2.1；行为与旧一体式逐字相同）。
+func speedMarshalJSON(res map[string]any) string {
 	out, err := json.Marshal(res)
 	if err != nil {
-		out = []byte(`{"ok":false,"reason":"invalid_arg","msg":"结果序列化失败"}`)
+		// 兜底改走 speedFail 构造器（首参 reason 进族⑤词表对账——r2 N-1）；键序用固定
+		// 模板钉成与迁移前字面量逐字同形（ok,reason,msg——map 经 json.Marshal 是字母序，
+		// 会改字节序）。
+		f := speedFail(speedtest.ReasonInvalidArg, "结果序列化失败")
+		out = []byte(fmt.Sprintf(`{"ok":false,"reason":%q,"msg":%q}`, f["reason"], f["msg"]))
 	}
-	return C.CString(string(out))
+	return string(out)
 }

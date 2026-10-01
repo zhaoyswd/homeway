@@ -654,7 +654,7 @@ func (s *termSession) breakLeg(c *termClient, reason string) {
 // → ③ 上限腾位（淘汰停滞/最久空闲腿）→ ④ 入表 + 活动选举（接入即活动）。
 func (s *termSession) registerLegLocked(c *termClient, takeover bool) *termErr {
 	if s.done {
-		return termErrf("no_session", "会话 %s 已结束", s.name)
+		return termErrf(termErrNoSession, "会话 %s 已结束", s.name)
 	}
 	if c.clientID != "" {
 		for _, old := range append([]*termClient{}, s.legs...) {
@@ -672,7 +672,7 @@ func (s *termSession) registerLegLocked(c *termClient, takeover bool) *termErr {
 		s.evictForSlotLocked()
 	}
 	if len(s.legs) >= s.svc.cfg.maxClients {
-		return termErrf("too_many_clients",
+		return termErrf(termErrTooManyClients,
 			"会话 %s 的客户端腿数已达上限 %d；可用 -d 显式接管，或先分离其它客户端", s.name, s.svc.cfg.maxClients)
 	}
 	first := len(s.legs) == 0
