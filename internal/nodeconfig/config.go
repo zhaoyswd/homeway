@@ -53,9 +53,12 @@ type Serve struct {
 	Relay         string        // 上游中继 token（rl1…）或裸 IP:port（开放模式）；空 = 不用
 	MaxPeers      int           // 设备表容量
 	PeerTTL       time.Duration // 失联设备回收 TTL；**0 = 关**（缺省 7d 由 Default() 落、省略键即缺省；<0 非法）
-	DNSPort       uint16        // DNS 代答端口；0 = 关闭代答
-	FilesRoot     string        // files 根；空 = $HOME
-	DDNS          []string      // DDNS 裸域名，可多条（出口只读解析，不自更记录）
+	// PublicEndpoint 显式公网端点（逗号分隔 ip:port；FIX-61）：非空 = 配置覆盖公布端点，
+	// 跳过 UPnP/STUN 推断（推断在不能枚举/观测的环境里无解）。
+	PublicEndpoint string
+	DNSPort        uint16   // DNS 代答端口；0 = 关闭代答
+	FilesRoot      string   // files 根；空 = $HOME
+	DDNS           []string // DDNS 裸域名，可多条（出口只读解析，不自更记录）
 }
 
 // Relay 中继角色节（[relay]）。
@@ -95,18 +98,19 @@ type fileConfig struct {
 }
 
 type fileServe struct {
-	Enabled       bool          `toml:"enabled"`
-	Listen        int           `toml:"listen"`
-	BindInterface string        `toml:"bind_interface"`
-	UPnP          bool          `toml:"upnp"`
-	STUN          string        `toml:"stun"`
-	STUN6         string        `toml:"stun6"`
-	Relay         string        `toml:"relay"`
-	MaxPeers      int           `toml:"max_peers"`
-	PeerTTL       time.Duration `toml:"peer_ttl"`
-	DNSPort       int           `toml:"dns_port"`
-	FilesRoot     string        `toml:"files_root"`
-	DDNS          []fileDDNS    `toml:"ddns"`
+	Enabled        bool          `toml:"enabled"`
+	Listen         int           `toml:"listen"`
+	BindInterface  string        `toml:"bind_interface"`
+	UPnP           bool          `toml:"upnp"`
+	STUN           string        `toml:"stun"`
+	STUN6          string        `toml:"stun6"`
+	Relay          string        `toml:"relay"`
+	MaxPeers       int           `toml:"max_peers"`
+	PeerTTL        time.Duration `toml:"peer_ttl"`
+	PublicEndpoint string        `toml:"public_endpoint"`
+	DNSPort        int           `toml:"dns_port"`
+	FilesRoot      string        `toml:"files_root"`
+	DDNS           []fileDDNS    `toml:"ddns"`
 }
 
 type fileDDNS struct {
@@ -127,17 +131,18 @@ func defaultFile() *fileConfig {
 func toFile(c *Config) *fileConfig {
 	f := &fileConfig{
 		Serve: fileServe{
-			Enabled:       c.Serve.Enabled,
-			Listen:        int(c.Serve.Listen),
-			BindInterface: c.Serve.BindInterface,
-			UPnP:          c.Serve.UPnP,
-			STUN:          c.Serve.STUN,
-			STUN6:         c.Serve.STUN6,
-			Relay:         c.Serve.Relay,
-			MaxPeers:      c.Serve.MaxPeers,
-			PeerTTL:       c.Serve.PeerTTL,
-			DNSPort:       int(c.Serve.DNSPort),
-			FilesRoot:     c.Serve.FilesRoot,
+			Enabled:        c.Serve.Enabled,
+			Listen:         int(c.Serve.Listen),
+			BindInterface:  c.Serve.BindInterface,
+			UPnP:           c.Serve.UPnP,
+			STUN:           c.Serve.STUN,
+			STUN6:          c.Serve.STUN6,
+			Relay:          c.Serve.Relay,
+			MaxPeers:       c.Serve.MaxPeers,
+			PeerTTL:        c.Serve.PeerTTL,
+			PublicEndpoint: c.Serve.PublicEndpoint,
+			DNSPort:        int(c.Serve.DNSPort),
+			FilesRoot:      c.Serve.FilesRoot,
 		},
 		Relay: fileRelay{
 			Enabled:   c.Relay.Enabled,
@@ -154,17 +159,18 @@ func toFile(c *Config) *fileConfig {
 func (f *fileConfig) toConfig() *Config {
 	c := &Config{
 		Serve: Serve{
-			Enabled:       f.Serve.Enabled,
-			Listen:        uint16(f.Serve.Listen),
-			BindInterface: f.Serve.BindInterface,
-			UPnP:          f.Serve.UPnP,
-			STUN:          f.Serve.STUN,
-			STUN6:         f.Serve.STUN6,
-			Relay:         f.Serve.Relay,
-			MaxPeers:      f.Serve.MaxPeers,
-			PeerTTL:       f.Serve.PeerTTL,
-			DNSPort:       uint16(f.Serve.DNSPort),
-			FilesRoot:     f.Serve.FilesRoot,
+			Enabled:        f.Serve.Enabled,
+			Listen:         uint16(f.Serve.Listen),
+			BindInterface:  f.Serve.BindInterface,
+			UPnP:           f.Serve.UPnP,
+			STUN:           f.Serve.STUN,
+			STUN6:          f.Serve.STUN6,
+			Relay:          f.Serve.Relay,
+			MaxPeers:       f.Serve.MaxPeers,
+			PeerTTL:        f.Serve.PeerTTL,
+			PublicEndpoint: f.Serve.PublicEndpoint,
+			DNSPort:        uint16(f.Serve.DNSPort),
+			FilesRoot:      f.Serve.FilesRoot,
 		},
 		Relay: Relay{
 			Enabled:   f.Relay.Enabled,
@@ -257,6 +263,13 @@ func validateFile(path string, f *fileConfig) error {
 	}
 	if err := validateBindInterface(path, f.Serve.BindInterface); err != nil {
 		return err
+	}
+	if f.Serve.PublicEndpoint != "" {
+		for _, line := range strings.Split(f.Serve.PublicEndpoint, ",") {
+			if _, err := netip.ParseAddrPort(strings.TrimSpace(line)); err != nil {
+				return bad("serve.public_endpoint", "%q 非法（%v；须为逗号分隔的 ip:port）", line, err)
+			}
+		}
 	}
 	if f.Serve.PeerTTL < 0 {
 		return bad("serve.peer_ttl", "%v 非法（时长串，如 \"168h\"；须 ≥ 0，0 = 关闭 TTL 回收）", f.Serve.PeerTTL)

@@ -11,6 +11,8 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"github.com/zhaoyswd/homeway/internal/nodeconfig"
+	"github.com/zhaoyswd/homeway/internal/nodestate"
 	"net"
 	"net/netip"
 	"os"
@@ -19,9 +21,6 @@ import (
 	"strings"
 	"syscall"
 	"time"
-
-	"github.com/zhaoyswd/homeway/internal/nodeconfig"
-	"github.com/zhaoyswd/homeway/internal/nodestate"
 )
 
 // CLI 解析出口参数并启动，阻塞到进程收到 SIGINT/SIGTERM（前台单角色形态保留
@@ -30,6 +29,7 @@ func CLI(args []string) error {
 	fs := flag.NewFlagSet("homeway serve", flag.ExitOnError)
 	stateDir := fs.String("state", defaultStateDir(), "统一 state 根（L2=<state>/serve、L3=<state>/cache、socket=<state>；首启自动迁移旧布局）")
 	listen := fs.Uint("listen", 41641, "WG 监听端口（被占用自动退让；未显式给 = 用 config）")
+	publicEndpoint := fs.String("public-endpoint", "", "显式公网端点（逗号分隔 ip:port；给了就跳过 UPnP/STUN 推断直接公布，FIX-61）")
 	relayServer := fs.String("relay", "", "中继 token（rl1…，由 `homeway relay` 启动时打印；空 = 不用中继；未显式给 = 用 config）")
 	bindIface := fs.String("bind-interface", "auto", "WG socket 钉哪张卡：auto（默认，探针自动挑能出网的物理网卡）/ none（不绑，走系统默认路由）/ 网卡名 / IP 字面量")
 	upnp := fs.Bool("upnp", true, "向路由器申请 UDP 端口映射（默认开；--upnp=false 关）")
@@ -94,6 +94,16 @@ func CLI(args []string) error {
 	if explicit["listen"] {
 		listenPort = uint16(*listen)
 	}
+	publicEp := cfgFile.Serve.PublicEndpoint
+	if explicit["public-endpoint"] {
+		// 显式给的值**当场校验**（fail fast）：用户明确写了端点，静默清空/忽略比报错更糟。
+		for _, line := range strings.Split(*publicEndpoint, ",") {
+			if _, perr := netip.ParseAddrPort(strings.TrimSpace(line)); perr != nil {
+				return fmt.Errorf("--public-endpoint %q 非法（%v；须为逗号分隔的 ip:port）", line, perr)
+			}
+		}
+		publicEp = *publicEndpoint
+	}
 	relay := sc.Relay
 	if explicit["relay"] {
 		relay = *relayServer
@@ -149,24 +159,25 @@ func CLI(args []string) error {
 	}
 	return Run(ctx, ServeConfig{
 		// D3 拆分表注入（r2 新-2）：两条进程形态都按表落位，不在状态目录长出旧布局。
-		StateDir:    nodestate.ServeDir(*stateDir),
-		LogDir:      cacheDir,
-		PortFileDir: cacheDir,
-		SockDir:     *stateDir,
-		ListenPort:  listenPort,
-		Verbose:     *verbose,
-		BindAddr:    bindAddr,
-		BindIface:   bindIf,
-		BindMode:    bindMode,
-		UPnP:        useUPnP,
-		STUN:        stun,
-		STUN6:       stun6,
-		DDNS:        ddnsList,
-		Relay:       relay,
-		MaxDevices:  maxDevices,
-		PeerTTL:     ttl,
-		DNSPort:     dns,
-		FilesRoot:   sc.FilesRoot,
+		StateDir:       nodestate.ServeDir(*stateDir),
+		LogDir:         cacheDir,
+		PortFileDir:    cacheDir,
+		SockDir:        *stateDir,
+		ListenPort:     listenPort,
+		Verbose:        *verbose,
+		BindAddr:       bindAddr,
+		BindIface:      bindIf,
+		BindMode:       bindMode,
+		UPnP:           useUPnP,
+		STUN:           stun,
+		STUN6:          stun6,
+		DDNS:           ddnsList,
+		Relay:          relay,
+		MaxDevices:     maxDevices,
+		PeerTTL:        ttl,
+		PublicEndpoint: publicEp,
+		DNSPort:        dns,
+		FilesRoot:      sc.FilesRoot,
 	})
 }
 

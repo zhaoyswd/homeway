@@ -376,3 +376,37 @@ func TestCloseCleansPartialAssembly(t *testing.T) {
 	}
 	_ = pc.Close()
 }
+
+// TestManualPublicEndpointIsPublished（FIX-61）：--public-endpoint = 配置覆盖最高优先
+// ——跳过 UPnP/STUN 推断，端点文件与 lastPublished 直接就是配置值（推断在不能枚举/观测
+// 的环境里无解：macOS launchd 形态的 SSDP 被本地网络隐私静默拒即一例）。
+func TestManualPublicEndpointIsPublished(t *testing.T) {
+	dir := t.TempDir()
+	cfg := ServeConfig{
+		StateDir:       dir,
+		UPnP:           false,
+		STUN:           "",
+		PublicEndpoint: "203.0.113.9:41641,[2001:db8::1]:41641",
+	}
+	s, err := Start(context.Background(), cfg)
+	if err != nil {
+		t.Fatalf("Start：%v", err)
+	}
+	defer s.Close()
+	// 手动分支是同步写（refreshPublicEndpoint 的第一段）：直接读文件。
+	b, rerr := os.ReadFile(PublicEndpointPath(dir))
+	if rerr != nil {
+		t.Fatalf("端点文件应已写出：%v", rerr)
+	}
+	got := strings.TrimSpace(string(b))
+	if got != "203.0.113.9:41641\n[2001:db8::1]:41641" {
+		t.Fatalf("端点文件应逐行等于配置值，got %q", got)
+	}
+	// 非法值：fill 阶段即被拒（按未配置处理，不阻断启动但也不信）。
+	var bad ServeConfig
+	bad.PublicEndpoint = "not-an-endpoint"
+	bad.fill()
+	if bad.PublicEndpoint != "" {
+		t.Fatal("非法 --public-endpoint 应被清空（按未配置处理）")
+	}
+}

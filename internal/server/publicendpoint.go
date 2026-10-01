@@ -60,7 +60,7 @@ func PublicEndpointPath(stateDir string) string { return filepath.Join(stateDir,
 
 // StartPublicEndpoint 起后台循环（非阻塞）。--ddns 自检挂在本循环同拍（endpoint-freshness）。
 func (s *Server) StartPublicEndpoint(ctx context.Context, opts PublicOpts) {
-	if !opts.UPnP && opts.STUN == "" {
+	if !opts.UPnP && opts.STUN == "" && s.cfg.PublicEndpoint == "" {
 		if len(s.cfg.DDNS) > 0 {
 			logf("DDNS：公网端点探测未开（--upnp=false --stun=''），自检没有观测可比对、跳过；" +
 				"token 的域名条目端口按实际监听口")
@@ -113,6 +113,25 @@ func (s *Server) KickPublicEndpoint() {
 // refreshPublicEndpoint 跑一轮探测；返回是否成功公布。
 func (s *Server) refreshPublicEndpoint(ctx context.Context, opts PublicOpts) bool {
 	logf := opts.Logf
+	if manual := s.cfg.PublicEndpoint; manual != "" {
+		// 配置覆盖（FIX-61）：显式端点最高优先——推断在「不能枚举/不能观测」的环境里
+		// 无解（macOS launchd 形态 SSDP 被本地网络隐私拒即一例）。照常写文件 + 打
+		// token（DDNS 自检读的也是这个文件，语义一致）。
+		var lines []string
+		for _, line := range strings.Split(manual, ",") {
+			lines = append(lines, strings.TrimSpace(line))
+		}
+		if err := os.WriteFile(PublicEndpointPath(opts.PortFileDir), []byte(strings.Join(lines, "\n")+"\n"), 0o600); err != nil {
+			logf("公网端点：写 %s 失败（%v）", PublicEndpointPath(opts.PortFileDir), err)
+			return false
+		}
+		logf("公网端点：已按 **--public-endpoint 配置**公布 %v（跳过 UPnP/STUN 推断；写进 %s）", lines, publicFile)
+		s.tokMu.Lock()
+		s.lastPublished = lines
+		s.tokMu.Unlock()
+		s.printClientToken(lines)
+		return true
+	}
 	port := waitLocalPort(ctx, opts.Bind, 30*time.Second)
 	if port == 0 {
 		dlogf("公网端点：WG socket 30s 内还没开，跳过本轮")

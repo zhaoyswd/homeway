@@ -21,3 +21,14 @@ func TestServeListenFlagRange(t *testing.T) {
 		}
 	}
 }
+
+// --public-endpoint 值域（FIX-61）：非法形态在启动前拒绝；合法值照常进配置。
+func TestServePublicEndpointFlagValidation(t *testing.T) {
+	dir := t.TempDir()
+	// 非法：非 ip:port。
+	if err := CLI([]string{"--state", dir, "--public-endpoint", "example.com"}); err == nil {
+		t.Fatal("非法 --public-endpoint 应报错")
+	}
+	// 合法值不在本用例覆盖（CLI 会真的起服务并阻塞）；装载与公布面见
+	// TestManualPublicEndpointIsPublished（Start 级）。
+}

@@ -56,23 +56,27 @@ type ServeConfig struct {
 	StateDir      string // L2：<state>/serve/（key.bin / tokens.jsonl）
 	ListenPort    uint16
 	TunnelIP      netip.Addr
-	FilesPort     uint16         // files 服务在本机的监听端口（客户端经隧道 IP 豁免转投到它）
-	FilesRoot     string         // files 根（空 = 用户主目录；协议恒读写）
-	TermPort      uint16         // 终端会话 / agent gateway 在本机的监听端口
-	SpeedtestPort uint16         // 测速服务在本机的监听端口（StateDir 为空时该服务不启用）
-	DNSPort       uint16         // DNS 代答监听端口（0 = 禁用：:53 按原目标过境重拨；cli 默认 DefaultDNSPort）
-	MaxDevices    int            // 设备表容量（0 = 32）
-	PeerTTL       time.Duration  // 长期不活跃设备的回收期限（**0 = 关闭 TTL 回收**；缺省 7 天由 config/flag 层落值，FIX-62）
-	BuildTag      string         // 探测应答里回报的构建标记（空 = 用内置默认）
-	BindAddr      netip.Addr     // 非零 = 把 WG UDP socket 绑到该地址（该网卡出站；STUN 观测同 socket）
-	BindIface     *net.Interface // 非空 = 双栈监听并整条 socket 钉在该网卡（同时支持 v4/v6 客户端）
-	BindMode      BindMode       // WG socket 钉哪张卡：auto（默认，自动挑）/explicit（用 BindIface）/off（不绑）
-	UPnP          bool           // 启动后向路由器申请 UDP 端口映射并 30 分钟续期
-	STUN          string         // 非空 = 在监听 socket 上向该 STUN 服务器观测公网映射（如 stun.miwifi.com:3478）
-	STUN6         string         // 非空 = 用该服务器做 **IPv6** 路径校验（要有 AAAA，如 stun.cloudflare.com:3478）
-	DDNS          []string       // DDNS 域名（可多条，endpoint-freshness）：token 叠加 host:端口 条目（不解析不踢除；域名记录由用户 DDNS 设施维护）
-	Relay         string         // 非空 = 向该中继注册一条反向注册腿（host:port），NAT 后的出口由此可被客户端到达
-	Verbose       bool
+	FilesPort     uint16        // files 服务在本机的监听端口（客户端经隧道 IP 豁免转投到它）
+	FilesRoot     string        // files 根（空 = 用户主目录；协议恒读写）
+	TermPort      uint16        // 终端会话 / agent gateway 在本机的监听端口
+	SpeedtestPort uint16        // 测速服务在本机的监听端口（StateDir 为空时该服务不启用）
+	DNSPort       uint16        // DNS 代答监听端口（0 = 禁用：:53 按原目标过境重拨；cli 默认 DefaultDNSPort）
+	MaxDevices    int           // 设备表容量（0 = 32）
+	PeerTTL       time.Duration // 长期不活跃设备的回收期限（**0 = 关闭 TTL 回收**；缺省 7 天由 config/flag 层落值，FIX-62）
+	// PublicEndpoint 显式公网端点（逗号分隔 `ip:port` 列表；FIX-61）：非空 = **配置覆盖**，
+	// 跳过 UPnP/STUN 推断直接公布（推断在「不能枚举/不能观测」的环境里没有出口——
+	// macOS launchd 形态的 SSDP 被本地网络隐私静默拒就是一例）。空 = 保持推断。
+	PublicEndpoint string
+	BuildTag       string         // 探测应答里回报的构建标记（空 = 用内置默认）
+	BindAddr       netip.Addr     // 非零 = 把 WG UDP socket 绑到该地址（该网卡出站；STUN 观测同 socket）
+	BindIface      *net.Interface // 非空 = 双栈监听并整条 socket 钉在该网卡（同时支持 v4/v6 客户端）
+	BindMode       BindMode       // WG socket 钉哪张卡：auto（默认，自动挑）/explicit（用 BindIface）/off（不绑）
+	UPnP           bool           // 启动后向路由器申请 UDP 端口映射并 30 分钟续期
+	STUN           string         // 非空 = 在监听 socket 上向该 STUN 服务器观测公网映射（如 stun.miwifi.com:3478）
+	STUN6          string         // 非空 = 用该服务器做 **IPv6** 路径校验（要有 AAAA，如 stun.cloudflare.com:3478）
+	DDNS           []string       // DDNS 域名（可多条，endpoint-freshness）：token 叠加 host:端口 条目（不解析不踢除；域名记录由用户 DDNS 设施维护）
+	Relay          string         // 非空 = 向该中继注册一条反向注册腿（host:port），NAT 后的出口由此可被客户端到达
+	Verbose        bool
 
 	// 三层布局路径注入（role-management 2.1，D3 拆分表——r1 高-2）：统一进程与前台
 	// 单角色两形态都由装配层按表注入；**空 = 现状单旋钮缺省**（按 StateDir 落——
@@ -105,6 +109,16 @@ func (c *ServeConfig) sockDir() string {
 }
 
 func (c *ServeConfig) fill() {
+	if c.PublicEndpoint != "" {
+		// 显式端点先校验（fail fast，别等巡检轮才在日志里发现格式错）。
+		for _, line := range strings.Split(c.PublicEndpoint, ",") {
+			if _, err := netip.ParseAddrPort(strings.TrimSpace(line)); err != nil {
+				logf("⚠️ --public-endpoint %q 非法（%v）——按未配置处理", line, err)
+				c.PublicEndpoint = ""
+				break
+			}
+		}
+	}
 	if c.ListenPort == 0 {
 		c.ListenPort = 41641
 	}

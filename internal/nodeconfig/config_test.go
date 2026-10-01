@@ -365,3 +365,25 @@ func TestPeerTTLZeroOffAbsentDefault(t *testing.T) {
 		t.Fatalf("负值应被校验拒绝：%v", err)
 	}
 }
+
+// TestPublicEndpointConfigValidation（FIX-61）：显式公网端点键的装载与校验。
+func TestPublicEndpointConfigValidation(t *testing.T) {
+	dir := t.TempDir()
+	path := Path(dir)
+	if err := os.WriteFile(path, []byte("[serve]\nlisten = 41641\npublic_endpoint = \"203.0.113.9:41641,[2001:db8::1]:41641\"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	c, err := Load(path)
+	if err != nil {
+		t.Fatalf("合法值应装载：%v", err)
+	}
+	if c.Serve.PublicEndpoint != "203.0.113.9:41641,[2001:db8::1]:41641" {
+		t.Fatalf("装载不符：%q", c.Serve.PublicEndpoint)
+	}
+	if err := os.WriteFile(path, []byte("[serve]\nlisten = 41641\npublic_endpoint = \"example.com\"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Load(path); err == nil || !strings.Contains(err.Error(), "public_endpoint") {
+		t.Fatalf("非法值应被拒：%v", err)
+	}
+}
