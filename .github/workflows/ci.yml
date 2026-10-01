@@ -1,0 +1,52 @@
+name: ci
+
+# 轻量门（FIX-98，2026-10-02）：push main / PR 即跑——此前全部门禁只挂在 tag/dispatch 的
+# release.yml 上，与 main 脱钩（「main 破了没人知道，直到发版」）。
+#
+# 本 workflow 只跑**不需要 zig/libghostty-vt** 的子集（分钟级）：
+#   ① go directive 守卫（OHOS 构建机 go1.24.5 绑定）；② gofmt；③ 契约台账对账
+#   （contracts 全量：词表规则 + fixtures 摘要 + 净室对拍）+ 版本治理生产侧
+#   （internal/control 半——GREETING/协议版本门；pkg/term 半需 vt，留在 release.yml）；
+#   ④ 第三方声明一致性；⑤ off 变体构建（CGO_ENABLED=0，armv7/windows 桩路径可编性）。
+# 重活（四平台构建、全量测试、cshared 面、surface 宿主测试、冒烟、Release）仍只在
+# release.yml 的 v* tag / workflow_dispatch 流程里。
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  light-gates:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: go directive 守卫（>1.24.5 即红）
+        run: |
+          set -euo pipefail
+          directive="$(awk '$1=="go"{print $2; exit}' go.mod)"
+          case "$directive" in
+            1.24|1.24.0|1.24.[1-5]) echo "ok: go directive = ${directive}（≤1.24.5，OHOS 构建机绑定满足）" ;;
+            *) echo "error: go.mod go directive = ${directive} > 1.24.5——OHOS 构建机工具链是 go1.24.5，clientcore 被硬钉（见 release.yml 同门注释），请走嵌套子模块预案而非上调" >&2; exit 1 ;;
+          esac
+      - name: gofmt（全仓）
+        run: |
+          set -euo pipefail
+          out="$(gofmt -l . || true)"
+          if [ -n "$out" ]; then echo "gofmt 需要格式化的文件："; echo "$out"; exit 1; fi
+          echo "ok: gofmt 全仓干净"
+      - name: 契约台账对账门（contracts 全量 + 版本治理生产侧·control 半）
+        run: |
+          set -euo pipefail
+          go test ./contracts/... -count=1 -v
+          go test ./internal/control/ -run 'TestVersionGovernance' -count=1 -v
+      - name: 第三方声明一致性（改了依赖没重跑生成脚本即红）
+        run: bash tools/gen-third-party-notices.sh --check
+      - name: off 变体构建（CGO_ENABLED=0；armv7/windows 桩路径可编性）
+        run: |
+          set -euo pipefail
+          CGO_ENABLED=0 go build $(go list ./... | grep -vE '/clientcore/cmd/clientcore$')
+          GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build $(go list ./... | grep -vE '/clientcore/cmd/clientcore$')

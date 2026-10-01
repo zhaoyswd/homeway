@@ -1,4 +1,7 @@
-//go:build !windows
+//go:build !windows && (darwin || linux) && (amd64 || arm64) && cgo
+
+// （tag 与 term_surface_golden_test.go 一致——本文件共用其 decodedGridRows/goldenStyleText，
+// 且 import vt（cgo）；FIX-98 顺带修复：原 tag 只有 !windows，linux+CGO_ENABLED=0 下编译必断。）
 
 package term
 

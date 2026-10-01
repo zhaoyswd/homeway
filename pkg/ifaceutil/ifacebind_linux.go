@@ -5,7 +5,6 @@ package ifaceutil
 import (
 	"fmt"
 	"net"
-	"net/netip"
 
 	"golang.org/x/sys/unix"
 )
@@ -28,38 +27,15 @@ func PinSocketToIface(conn *net.UDPConn, ifi *net.Interface) error {
 	return nil
 }
 
-func ifaceForAddr(ip netip.Addr) *net.Interface {
-	ifis, err := net.Interfaces()
-	if err != nil {
-		return nil
-	}
-	for i := range ifis {
-		addrs, err := ifis[i].Addrs()
-		if err != nil {
-			continue
-		}
-		for _, a := range addrs {
-			ipn, ok := a.(*net.IPNet)
-			if !ok {
-				continue
-			}
-			if got, ok := netip.AddrFromSlice(ipn.IP); ok && got.Unmap() == ip.Unmap() {
-				return &ifis[i]
-			}
-		}
-	}
-	return nil
-}
-
-// pinToFD 裸 fd 版钉卡（两族都设、单栈容错）。
+// pinToFD 裸 fd 版钉卡（SO_BINDTODEVICE；egress 的拨号 socket 路径）。
+// 修复（FIX-98 顺带）：FIX-72 迁移时本函数误抄了 darwin 的 IP_BOUND_IF 实现
+// （Linux 无此常量，构建必断——CI 与 main 脱钩期间从未暴露）。
 func pinToFD(fd int, ifi *net.Interface) error {
 	if ifi == nil {
 		return nil
 	}
-	serr4 := unix.SetsockoptInt(fd, unix.IPPROTO_IP, unix.IP_BOUND_IF, ifi.Index)
-	serr6 := unix.SetsockoptInt(fd, unix.IPPROTO_IPV6, unix.IPV6_BOUND_IF, ifi.Index)
-	if serr4 != nil && serr6 != nil {
-		return fmt.Errorf("IP_BOUND_IF/IPV6_BOUND_IF: %v / %v", serr4, serr6)
+	if err := unix.SetsockoptString(fd, unix.SOL_SOCKET, unix.SO_BINDTODEVICE, ifi.Name); err != nil {
+		return fmt.Errorf("SO_BINDTODEVICE %q: %w", ifi.Name, err)
 	}
 	return nil
 }
