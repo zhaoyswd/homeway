@@ -223,3 +223,120 @@ func waitTransferDone(t *testing.T, s *nativeFilesSession, id int, within time.D
 		time.Sleep(10 * time.Millisecond)
 	}
 }
+
+// TestNativeFilesDialHonorsCanceledCtx（FIX-39）：ctx 已取消时拨号必须**当场拒绝**，
+// 而不是照常连上去（内核 backlog 会替冻结宿主代答，只看墙钟的实现分辨不出来）。
+// 变异自证：把 DialContext 换回 net.DialTimeout ⇒ 本用例会拿到可用连接而红。
+func TestNativeFilesDialHonorsCanceledCtx(t *testing.T) {
+	dir := shortBridgeDir(t)
+	sock := filepath.Join(dir, "files.sock")
+	ln, err := net.Listen("unix", sock)
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer ln.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	conn, derr := nativeFilesDial(ctx, strings.Repeat("ab", 48), sock)
+	if derr == nil {
+		if conn != nil {
+			_ = conn.Close()
+		}
+		t.Fatal("ctx 已取消仍拨通了——取消在途拨号的契约在生产拨号缝上不成立")
+	}
+	// 平台文案不统一（"context canceled" / "operation was canceled"）——按 cancel 判。
+	if !strings.Contains(strings.ToLower(derr.Error()), "cancel") {
+		t.Fatalf("应归因到 ctx 取消，实际 %v", derr)
+	}
+}
+
+// stallAfterResponseDial 假桥：完成问候 + 读请求 + 回响应行（声明 size），随后**卡住
+// 不发正文**——把客户端钉在「阻塞于 ReadFrame」的状态上，用来验取消/收工能否打断 I/O。
+func stallAfterResponseDial(t *testing.T, declared int64) (files.StreamDial, chan struct{}) {
+	t.Helper()
+	release := make(chan struct{})
+	t.Cleanup(func() { close(release) })
+	dial := func(ctx context.Context) (net.Conn, error) {
+		c1, c2 := net.Pipe()
+		go func() {
+			defer c2.Close()
+			if err := files.WriteLine(c2, files.Greeting{Ok: true, Root: "/fake", Ver: files.Version}); err != nil {
+				return
+			}
+			br := bufio.NewReader(c2)
+			if _, err := files.ReadRequest(br); err != nil {
+				return
+			}
+			if err := files.WriteLine(c2, files.Response{Ok: true, Size: declared}); err != nil {
+				return
+			}
+			<-release // 卡住：正文永不到来（客户端将长期阻塞在 Read）
+		}()
+		return c1, nil
+	}
+	return dial, release
+}
+
+// TestTransferCancelCutsBlockedIO（FIX-42）：传输正文阻塞中取消，必须**当场**打断
+// 阻塞在读上的 I/O 并把传输落定（done=true / canceled）——只 close(cancel) 时
+// Download 的读不吃 ctx，传输会永远卡在非 done 态（后续传输全被 busy 挡住）。
+// 变异自证：去掉 cutBlockedIO 调用 ⇒ 本用例等满窗口仍不 done 而红。
+func TestTransferCancelCutsBlockedIO(t *testing.T) {
+	dial, _ := stallAfterResponseDial(t, 1<<20)
+	s := &nativeFilesSession{id: 1, cli: &files.Client{Dial: dial}, txs: map[int]*filesTransfer{}}
+	res, ferr := s.startNativeTransfer("download", "big.bin", filepath.Join(t.TempDir(), "out.bin"))
+	if ferr != nil {
+		t.Fatalf("startNativeTransfer: %v", ferr)
+	}
+	id := res["transferId"].(int)
+
+	// 等它进入「已收响应行、卡在正文读」的稳态（首字节没来，bytes 仍为 0）。
+	time.Sleep(150 * time.Millisecond)
+	s.txMu.Lock()
+	st := s.txs[id]
+	s.txMu.Unlock()
+	if st == nil || st.done {
+		t.Fatalf("传输应还在跑（未 done）：%+v", st)
+	}
+	s.nativeCancel(id)
+	waitTransferDone(t, s, id, 2*time.Second, func(errText string, bytes int64) {
+		if !strings.Contains(errText, "canceled") && !strings.Contains(errText, "已取消") {
+			t.Fatalf("取消后应落 canceled 归因，实际 = %q", errText)
+		}
+	})
+}
+
+// TestSessionShutdownCutsBlockedIO（FIX-42）：会话收工 / 表满淘汰走的是同一个
+// shutdown()——同样要打断在途 I/O（淘汰路径此前只从会话表摘名，传输成孤儿）。
+func TestSessionShutdownCutsBlockedIO(t *testing.T) {
+	dial, _ := stallAfterResponseDial(t, 1<<20)
+	s := &nativeFilesSession{id: 2, cli: &files.Client{Dial: dial}, txs: map[int]*filesTransfer{}}
+	res, ferr := s.startNativeTransfer("download", "big.bin", filepath.Join(t.TempDir(), "out.bin"))
+	if ferr != nil {
+		t.Fatalf("startNativeTransfer: %v", ferr)
+	}
+	id := res["transferId"].(int)
+	time.Sleep(150 * time.Millisecond)
+	// shutdown 会把传输表清空——先拿住指针，直接观察它落定（表里查不到了是设计使然）。
+	s.txMu.Lock()
+	st := s.txs[id]
+	s.txMu.Unlock()
+	s.shutdown()
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		s.txMu.Lock()
+		done, errText := st.done, st.err
+		s.txMu.Unlock()
+		if done {
+			if !strings.Contains(errText, "canceled") && !strings.Contains(errText, "已取消") {
+				t.Fatalf("收工后应落 canceled 归因，实际 = %q", errText)
+			}
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("shutdown 后传输仍在阻塞（I/O 未被收口）")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}

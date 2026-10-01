@@ -1,6 +1,7 @@
 package files
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"errors"
@@ -33,8 +34,8 @@ func TestClientAgainstServer(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
-	if s.Root != srv.RootDir() || s.Ver != Version || s.ReadOnly {
-		t.Fatalf("问候字段不符：root=%q ver=%d ro=%v", s.Root, s.Ver, s.ReadOnly)
+	if s.Root != srv.RootDir() || s.Ver != Version {
+		t.Fatalf("问候字段不符：root=%q ver=%d", s.Root, s.Ver)
 	}
 	s.Close()
 
@@ -126,4 +127,66 @@ func (r *failReader) Read(p []byte) (int, error) {
 	n := copy(p, strings.Repeat("x", r.limit-r.sent))
 	r.sent += n
 	return n, nil
+}
+
+// fakeDownloadServer 起一个只服务一条流的假服务端：问候 → 读请求 → 回响应行
+// （声明 size）→ 发 payload → 发终止帧。用来构造真服务端做不到的畸形形态。
+func fakeDownloadServer(t *testing.T, declared int64, payload []byte) StreamDial {
+	t.Helper()
+	return func(ctx context.Context) (net.Conn, error) {
+		c1, c2 := net.Pipe()
+		go func() {
+			defer c2.Close()
+			if err := WriteLine(c2, Greeting{Ok: true, Root: "/fake", Ver: Version}); err != nil {
+				return
+			}
+			br := bufio.NewReader(c2)
+			if _, err := ReadRequest(br); err != nil {
+				return
+			}
+			if err := WriteLine(c2, Response{Ok: true, Size: declared}); err != nil {
+				return
+			}
+			if len(payload) > 0 {
+				if err := WriteFrame(c2, payload); err != nil {
+					return
+				}
+			}
+			_ = WriteFrame(c2, nil) // 终止帧（对端自称传完）
+		}()
+		return c1, nil
+	}
+}
+
+// TestDownloadShortTransferRejected（FIX-40）：响应行声明 100 字节、实际只给 10 就发
+// 终止帧——必须报错（此前静默成功 = 半截文件落盘）。
+func TestDownloadShortTransferRejected(t *testing.T) {
+	cli := &Client{Dial: fakeDownloadServer(t, 100, bytes.Repeat([]byte("x"), 10))}
+	var out bytes.Buffer
+	n, err := cli.Download(context.Background(), "f.bin", &out)
+	if err == nil {
+		t.Fatalf("短传应报错，实际成功（收 %d 字节）", n)
+	}
+	if !strings.Contains(err.Error(), "下载不完整") || !strings.Contains(err.Error(), "100") ||
+		!strings.Contains(err.Error(), "10") {
+		t.Fatalf("错误应含声明/实收数字：%v", err)
+	}
+	var fe *Error
+	if !errors.As(err, &fe) || fe.Code != CodeOpFailed {
+		t.Fatalf("应归 CodeOpFailed：%v", err)
+	}
+}
+
+// TestDownloadGrowingFileTolerated（FIX-40 的反面）：实收**多于**声明（下载途中被
+// 追加的合法形态）不报错——声明值只是取快照那刻的大小。
+func TestDownloadGrowingFileTolerated(t *testing.T) {
+	cli := &Client{Dial: fakeDownloadServer(t, 10, bytes.Repeat([]byte("x"), 32))}
+	var out bytes.Buffer
+	n, err := cli.Download(context.Background(), "grow.log", &out)
+	if err != nil {
+		t.Fatalf("生长中的文件不应报错：%v", err)
+	}
+	if n != 32 || out.Len() != 32 {
+		t.Fatalf("应完整收到 32 字节，实际 %d/%d", n, out.Len())
+	}
 }

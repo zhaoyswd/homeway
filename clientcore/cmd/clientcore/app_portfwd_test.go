@@ -230,3 +230,47 @@ func TestTunSetPortForwardsRejectsDuplicateListen(t *testing.T) {
 		t.Fatalf("重复监听端口应返回 -2，得 %d", rc)
 	}
 }
+
+// TestPfTargetTextResolvesPort0（FIX-46）：目标端口 0 = 同监听端口——呈现必须落成
+// 实际端口（此前原样打 0，页面显示「1.2.3.4:0」/「主机:0」）。语义与
+// facade.DescribeForwardTarget 同源。
+func TestPfTargetTextResolvesPort0(t *testing.T) {
+	cases := []struct {
+		name string
+		f    tunPortForward
+		want string
+	}{
+		{"ip+0 ⇒ 同监听端口", tunPortForward{TargetIp: "1.2.3.4", TargetPort: 0, Listen: 8080}, "1.2.3.4:8080"},
+		{"ip+显式端口", tunPortForward{TargetIp: "1.2.3.4", TargetPort: 9090, Listen: 8080}, "1.2.3.4:9090"},
+		{"空 ip+0 ⇒ 同端口文案", tunPortForward{TargetIp: "", TargetPort: 0, Listen: 8080}, "主机（同端口）"},
+		{"空 ip+端口", tunPortForward{TargetIp: "", TargetPort: 9090, Listen: 8080}, "主机:9090"},
+	}
+	for _, c := range cases {
+		if got := pfTargetText(c.f); got != c.want {
+			t.Errorf("%s：got %q want %q", c.name, got, c.want)
+		}
+	}
+}
+
+// TestTunSetPortForwardsRangeGate（FIX-43）：整表校验补值域——80 这类特权端口此前
+// 在 App 侧能过（只查非 0/重复）、桌面被拒，同一条规则两种答案。判据 = 返回 -2
+// （参数非法，先于世代/阶段判定）。
+func TestTunSetPortForwardsRangeGate(t *testing.T) {
+	cases := []struct {
+		name string
+		json string
+		want int
+	}{
+		{"listen 低于 1024", `{"portForwards":[{"listen":80,"targetIp":"","targetPort":8080}]}`, -2},
+		// 目标端口**无 1024 下界**（出口去拨、不 bind——与 facade/spec 同口径）：
+		// 参数面放行，落到「无世代」的 -1（而不是参数非法的 -2）。
+		{"targetPort 22 合法", `{"portForwards":[{"listen":8080,"targetIp":"1.2.3.4","targetPort":22}]}`, -1},
+		{"目标非 IPv4", `{"portForwards":[{"listen":8080,"targetIp":"example.com","targetPort":8080}]}`, -2},
+		{"同表重复 listen", `{"portForwards":[{"listen":8080,"targetIp":"","targetPort":8080},{"listen":8080,"targetIp":"","targetPort":9090}]}`, -2},
+	}
+	for _, c := range cases {
+		if got := tunSetPortForwardsJSON(c.json); got != c.want {
+			t.Errorf("%s：got %d want %d", c.name, got, c.want)
+		}
+	}
+}

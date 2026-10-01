@@ -2,12 +2,15 @@ package files
 
 import (
 	"bufio"
+	"bytes"
 	"encoding/base64"
 	"encoding/json"
 	"net"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
+	"time"
 )
 
 // ---------- 测试客户端（真客户端在手机核里，见 tasks 4.2） ----------
@@ -31,7 +34,7 @@ func dial(t *testing.T, srv *Server) (*testClient, chan struct{}) {
 	br := bufio.NewReader(c1)
 	var g Greeting
 	readJSONLine(t, br, &g)
-	if !g.Ok || g.Ver != Version || !g.RW {
+	if !g.Ok || g.Ver != Version {
 		t.Fatalf("问候帧不符：%+v", g)
 	}
 	if g.Root != srv.RootDir() {
@@ -213,8 +216,8 @@ func TestRoundTripVerbs(t *testing.T) {
 	if err != nil || string(raw) != string(payload) {
 		t.Fatalf("落盘内容不符：%v %q", err, raw)
 	}
-	if _, err := os.Stat(filepath.Join(root, "sub", "newdir", "u.bin"+uploadPartSuffix)); !os.IsNotExist(err) {
-		t.Fatalf("应无 .tierpart 残留：%v", err)
+	if parts := partsOf(t, filepath.Join(root, "sub", "newdir"), "u.bin"); len(parts) != 0 {
+		t.Fatalf("应无 .tierpart 残留：%v", parts)
 	}
 }
 
@@ -383,5 +386,199 @@ func TestBadRequestLine(t *testing.T) {
 	readJSONLine(t, c2.br, &resp)
 	if resp.Ok || resp.Code != "invalid_arg" {
 		t.Fatalf("缺 op 应回 invalid_arg：%+v", resp)
+	}
+}
+
+// ---------- FIX-36/37：并发闸 / 空闲期限 / 临时文件（随机名 + 陈旧回收） ----------
+
+// partsOf 列出目录里某目标的临时残留（<name>.tierpart*）。
+func partsOf(t *testing.T, dir, name string) []string {
+	t.Helper()
+	ents, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var out []string
+	for _, e := range ents {
+		if strings.HasPrefix(e.Name(), name+uploadPartSuffix) {
+			out = append(out, e.Name())
+		}
+	}
+	return out
+}
+
+// TestServerBusyOnConnLimit（FIX-36）：在册流占满 MaxConns 后，新流会被明确回
+// server_busy（不是静默断；客户端能给出可行动文案）。
+func TestServerBusyOnConnLimit(t *testing.T) {
+	root := newRoot(t)
+	srv := newServer(t, root)
+	// 占住 n 条长流：都开着 write（等 ready 之后不发终止帧，服务端一直等在读帧）。
+	n := MaxConns
+	held := make([]*testClient, 0, n)
+	for i := 0; i < n; i++ {
+		c, _ := dial(t, srv)
+		if err := WriteLine(c.conn, Request{Op: "write", Path: "hold.bin"}); err != nil {
+			t.Fatal(err)
+		}
+		var ready Response
+		readJSONLine(t, c.br, &ready)
+		if !ready.Ok {
+			t.Fatalf("第 %d 条流应被受理：%+v", i+1, ready)
+		}
+		held = append(held, c)
+	}
+	// 超限流：问候 → 请求 → 应回 server_busy。
+	over, _ := dial(t, srv)
+	resp := over.req(Request{Op: "list", Path: "/"})
+	if resp.Ok || resp.Code != CodeServerBusy {
+		t.Fatalf("超限流应回 %s，实际 %+v", CodeServerBusy, resp)
+	}
+	// 释放一条后应能再进（闸是计数，不是闩锁）。
+	_ = held[0].conn.Close()
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		c, _ := dial(t, srv)
+		resp := c.req(Request{Op: "list", Path: "/"})
+		if resp.Ok {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("释放一条后仍拒绝（%+v）——闸没回收", resp)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
+// TestServerIdleTimeoutClosesStream（FIX-36）：静默超期即收流——挂着不说话的
+// 流不会无限占着工位/句柄。
+func TestServerIdleTimeoutClosesStream(t *testing.T) {
+	root := newRoot(t)
+	srv := newServer(t, root)
+	srv.SetIdleTimeout(150 * time.Millisecond)
+	c, _ := dial(t, srv)
+	// 不发请求，静默等超期：服务端读请求超时 ⇒ 按既有一行错误响应报出（可归因），
+	// 随后收流（EOF）。客户端读超时兜底 3s（防挂死）。
+	_ = c.conn.SetReadDeadline(time.Now().Add(3 * time.Second))
+	var resp Response
+	readJSONLine(t, c.br, &resp)
+	if resp.Ok || resp.Code != CodeOpFailed {
+		t.Fatalf("静默超期应回可归因错误（%s），实际 %+v", CodeOpFailed, resp)
+	}
+	if _, err := c.br.ReadByte(); err == nil {
+		t.Fatal("报错后应收流（EOF）")
+	}
+}
+
+// TestUploadConcurrentSamePathNoCorruption（FIX-37）：同名并发上传不再互踩——
+// 各自随机临时名，最终文件是**其中一份完整内容**，两份都被报成功。
+func TestUploadConcurrentSamePathNoCorruption(t *testing.T) {
+	root := newRoot(t)
+	srv := newServer(t, root)
+	payloadA := bytes.Repeat([]byte("A"), 512<<10)
+	payloadB := bytes.Repeat([]byte("B"), 512<<10)
+	type res struct {
+		resp Response
+	}
+	ch := make(chan res, 2)
+	run := func(data []byte) {
+		c, _ := dial(t, srv)
+		// 大内容分多帧写：让两条流真正重叠在途。
+		if err := WriteLine(c.conn, Request{Op: "write", Path: "same.bin", Size: int64(len(data))}); err != nil {
+			ch <- res{Response{Ok: false, Msg: err.Error()}}
+			return
+		}
+		var ready Response
+		readJSONLine(t, c.br, &ready)
+		if !ready.Ok {
+			ch <- res{ready}
+			return
+		}
+		for off := 0; off < len(data); off += 64 << 10 {
+			end := off + (64 << 10)
+			if end > len(data) {
+				end = len(data)
+			}
+			if err := WriteFrame(c.conn, data[off:end]); err != nil {
+				ch <- res{Response{Ok: false, Msg: err.Error()}}
+				return
+			}
+		}
+		if err := WriteFrame(c.conn, nil); err != nil {
+			ch <- res{Response{Ok: false, Msg: err.Error()}}
+			return
+		}
+		var resp Response
+		readJSONLine(t, c.br, &resp)
+		ch <- res{resp}
+	}
+	go run(payloadA)
+	go run(payloadB)
+	for i := 0; i < 2; i++ {
+		r := <-ch
+		if !r.resp.Ok {
+			t.Fatalf("并发上传应各自成功：%+v", r.resp)
+		}
+	}
+	got, err := os.ReadFile(filepath.Join(root, "same.bin"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, payloadA) && !bytes.Equal(got, payloadB) {
+		t.Fatalf("最终文件既不是 A 也不是 B（长度 %d）——并发写互相污染了", len(got))
+	}
+	if parts := partsOf(t, root, "same.bin"); len(parts) != 0 {
+		t.Fatalf("提交后不应有临时残留：%v", parts)
+	}
+}
+
+// TestUploadDoesNotClobberUserPartFile（FIX-37）：用户自己就叫 `<名字>.tierpart`
+// 的文件不再被 O_TRUNC 清空/删除。
+func TestUploadDoesNotClobberUserPartFile(t *testing.T) {
+	root := newRoot(t)
+	srv := newServer(t, root)
+	victim := filepath.Join(root, "keep.tierpart")
+	if err := os.WriteFile(victim, []byte("USER-DATA"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	c, _ := dial(t, srv)
+	payload := []byte("payload")
+	if resp := c.upload("keep", payload, true); !resp.Ok {
+		t.Fatalf("上传应成功：%+v", resp)
+	}
+	got, err := os.ReadFile(victim)
+	if err != nil || string(got) != "USER-DATA" {
+		t.Fatalf("用户的同名 .tierpart 文件被动过：%v %q", err, got)
+	}
+	if got, err := os.ReadFile(filepath.Join(root, "keep")); err != nil || !bytes.Equal(got, payload) {
+		t.Fatalf("目标文件不符：%v %q", err, got)
+	}
+}
+
+// TestStalePartCleanup（FIX-36）：陈旧残留（超 stalePartAge）在下一次写同路径时
+// 被回收；新鲜的（正在用的形态）不动。
+func TestStalePartCleanup(t *testing.T) {
+	root := newRoot(t)
+	srv := newServer(t, root)
+	stale := filepath.Join(root, "x.bin.tierpart.deadbeef")
+	fresh := filepath.Join(root, "x.bin.tierpart.cafebabe")
+	if err := os.WriteFile(stale, []byte("stale"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(fresh, []byte("fresh"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	old := time.Now().Add(-2 * stalePartAge)
+	if err := os.Chtimes(stale, old, old); err != nil {
+		t.Fatal(err)
+	}
+	c, _ := dial(t, srv)
+	if resp := c.upload("x.bin", []byte("new"), true); !resp.Ok {
+		t.Fatalf("上传应成功：%+v", resp)
+	}
+	if _, err := os.Stat(stale); !os.IsNotExist(err) {
+		t.Fatalf("陈旧残留应被回收：%v", err)
+	}
+	if _, err := os.Stat(fresh); err != nil {
+		t.Fatalf("新鲜临时文件不得被误删：%v", err)
 	}
 }

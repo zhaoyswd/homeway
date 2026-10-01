@@ -805,15 +805,30 @@ func (e *Engine) finishOK(gen uint64, downBps, upBps float64) Result {
 
 // CancelActive 取消当前在跑的一轮（幂等；空闲时无害空操作）。只波及当轮（评审 F2）：
 // 关当轮连接 + 置当轮旗标，全局相位同步标记。
+// CancelActive 取消**当下在跑的那一轮**（FIX-44）。语义（与 finishOK/runRound 的
+// gen 守卫合起来读）：
+//   - 已经落定（phase 已是最终态）⇒ no-op——「完成/失败」赢过**迟到的取消**。原实现
+//     在锁外 setPhase(cancelled)，会把刚写好的 done 覆盖成 cancelled（窗口 = runRound
+//     返回后、Start 收尾把 running 置 false 之前），UI 显示「已取消」而调用方拿着
+//     OK 结果；
+//   - 取消生效后，这一轮走 runRound 的 cancelled 结果路径，phase 由它自己按 gen 写
+//     （不会把 done 写回来）。
+//
+// 残留（登记）：不带世代号——调用方若有「我看到的某一轮」的概念（例如远程 CLI 的
+// `speedtest cancel` 跨网络返回后才到），迟到的 cancel 会打到**下一轮**上。要根治
+// 需要把 gen 透出到 status 与 cancel 请求（控制面 op 参数 + CLI + App 三处契约），
+// 本轮按「只取消当下这一轮」的口径 + 本注释收口。
 func (e *Engine) CancelActive() {
 	e.mu.Lock()
 	r, running := e.run, e.running
-	e.mu.Unlock()
-	if r == nil || !running {
+	if r == nil || !running ||
+		e.phase == PhaseDone || e.phase == PhaseFailed || e.phase == PhaseCancelled {
+		e.mu.Unlock()
 		return
 	}
+	e.phase, e.reason = PhaseCancelled, ReasonCancelled
+	e.mu.Unlock()
 	r.cancel()
-	e.setPhase(PhaseCancelled, ReasonCancelled)
 }
 
 // Snapshot Status 的快照（页面 250ms 轮询 / runner 状态面）。

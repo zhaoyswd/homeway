@@ -66,7 +66,13 @@ func nativeFilesDial(ctx context.Context, authHex, sock string) (net.Conn, error
 	if sock == "" {
 		return nil, filesErrf(filesCodeBridgeDown, "文件通道暂时不可用（桥未就绪：VPN 未连接且服务会话未就绪，或正在恢复）")
 	}
-	conn, err := net.DialTimeout("unix", sock, filesConnectTimeout)
+	// 拨号吃 ctx（FIX-39）：调用方（files.Client 的 Dial 缝）把请求 ctx 一路带进来，
+	// 取消/超时要能**打断在途拨号**。原实现 net.DialTimeout 只有一个墙钟预算，ctx
+	// 取消形同虚设（「取消即时」的契约此前只在测试桩上成立）。
+	dctx, dcancel := context.WithTimeout(ctx, filesConnectTimeout)
+	defer dcancel()
+	var d net.Dialer
+	conn, err := d.DialContext(dctx, "unix", sock)
 	if err != nil {
 		return nil, filesErrf(filesCodeBridgeDown, "文件通道暂时不可用（桥未就绪或正在恢复）：%v", err)
 	}
@@ -177,6 +183,12 @@ func nativeFilesConnect(op map[string]any) (filesResult, *filesError) {
 		}
 		if oldest != nil {
 			delete(nativeFilesSessions, oldest.id)
+			// FIX-42：淘汰必须连在跑传输一起收（原实现只从表里摘名——被淘汰会话的
+			// 传输 goroutine 继续跑/继续阻塞，其 I/O 与本地文件句柄都成孤儿）。
+			// 锁外调用：shutdown 取 txMu，与 filesMu 无嵌套序。
+			filesMu.Unlock()
+			oldest.shutdown()
+			filesMu.Lock()
 		}
 	}
 	filesNext++
@@ -214,7 +226,11 @@ func (s *nativeFilesSession) shutdown() {
 	s.txs = map[int]*filesTransfer{}
 	s.txMu.Unlock()
 	for _, tx := range txs {
-		tx.cancelOnce.Do(func() { close(tx.cancel) })
+		tx.cancelOnce.Do(func() {
+			tx.cancelled.Store(true) // 先归因后断 I/O（见 filesTransfer.cancelled 注释）
+			close(tx.cancel)
+		})
+		tx.cutBlockedIO() // FIX-42：收工时打断阻塞中的传输 I/O
 	}
 }
 
@@ -380,6 +396,8 @@ func (s *nativeFilesSession) runNativeTransfer(tx *filesTransfer) {
 		if err != nil {
 			return nil, err
 		}
+		// 断 I/O 出口（FIX-42）：取消/淘汰/收工都走它，打断阻塞中的 Read/Write。
+		tx.setCut(func() { _ = conn.SetDeadline(time.Now()) })
 		openGuard = time.AfterFunc(transferOpenBudget, func() {
 			filesLogf("传输 %d 开场超时（%v 无正文字节）：断读收口", tx.id, transferOpenBudget)
 			_ = conn.SetReadDeadline(time.Now())
@@ -425,7 +443,7 @@ func (s *nativeFilesSession) runNativeTransfer(tx *filesTransfer) {
 		_, err = cli.Upload(ctx, tx.RemotePath, lf, tx.total, progress)
 	}
 	if err != nil {
-		if errors.Is(ctx.Err(), context.Canceled) {
+		if tx.cancelled.Load() || errors.Is(ctx.Err(), context.Canceled) {
 			setDone("canceled: 已取消")
 		} else {
 			setDone(err.Error())
@@ -474,7 +492,11 @@ func (s *nativeFilesSession) nativeCancel(id int) filesResult {
 	tx := s.txs[id]
 	s.txMu.Unlock()
 	if tx != nil {
-		tx.cancelOnce.Do(func() { close(tx.cancel) })
+		tx.cancelOnce.Do(func() {
+			tx.cancelled.Store(true)
+			close(tx.cancel)
+		})
+		tx.cutBlockedIO() // FIX-42：取消要立即打断阻塞中的 I/O（只关 channel 叫不动 Read）
 	}
 	return filesResult{"ok": true}
 }

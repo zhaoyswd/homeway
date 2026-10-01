@@ -9,12 +9,14 @@ package main
 
 import (
 	"bufio"
+	"context"
 	"encoding/hex"
 	"encoding/json"
 	"io"
 	"net"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -398,5 +400,36 @@ func TestSpeedEngineCancelDuringWait(t *testing.T) {
 		}
 	case <-time.After(10 * time.Second):
 		t.Fatal("取消后引擎未收场")
+	}
+}
+
+// TestSpeedDialHonorsCanceledCtx（FIX-39）：测速拨号缝同款——ctx 取消/超时要能
+// 打断在途拨号（引擎的拨号预算是经这个 ctx 到达的；原实现的 net.Dial 完全不看它）。
+// 变异自证：换回 net.Dial ⇒ 本用例会拨通而红。
+func TestSpeedDialHonorsCanceledCtx(t *testing.T) {
+	dir, err := os.MkdirTemp("/tmp", "spd-ctx-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.RemoveAll(dir) })
+	sock := filepath.Join(dir, "speed.sock")
+	ln, lerr := net.Listen("unix", sock)
+	if lerr != nil {
+		t.Fatalf("listen: %v", lerr)
+	}
+	defer ln.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	conn, derr := speedDial(ctx, strings.Repeat("ab", 48), sock)
+	if derr == nil {
+		if conn != nil {
+			_ = conn.Close()
+		}
+		t.Fatal("ctx 已取消仍拨通了测速桥——拨号预算对在途拨号无效")
+	}
+	// 平台文案不统一（"context canceled" / "operation was canceled"）——按 cancel 判。
+	if !strings.Contains(strings.ToLower(derr.Error()), "cancel") {
+		t.Fatalf("应归因到 ctx 取消，实际 %v", derr)
 	}
 }

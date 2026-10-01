@@ -72,7 +72,7 @@ const maxPayload = 65535
 
 // Limits 服务端限额（spec「出口测速服务边界」：并发会话数、单会话时长、帧大小上限）。
 type Limits struct {
-	MaxConns    int           // 并发测速连接上限（0 = 8）
+	MaxConns    int           // 并发测速连接上限（0 = 12：客户端上下行各 4 流 + 摘表时差余量，评审 r2-D1）
 	ConnTimeout time.Duration // 单连接硬超时（0 = 30s；覆盖 5s 预热 + 15s 窗口 + 余量）
 	MaxWarmup   time.Duration // 预热时长上限（0 = 5s）
 	MaxWindow   time.Duration // 窗口时长上限（0 = 15s）

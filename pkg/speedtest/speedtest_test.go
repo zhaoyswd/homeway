@@ -326,3 +326,30 @@ func contains(s, sub string) bool {
 	}
 	return false
 }
+
+// TestLimitsDefaults（FIX-41）：限额缺省值逐个钉死——字段注释曾写「0 = 8」而实际是
+// 12（评审 r2-D1 调过值没同步注释），这类漂移只有断言能拦住。
+func TestLimitsDefaults(t *testing.T) {
+	got := Limits{}.withDefaults()
+	want := Limits{
+		MaxConns:    12,
+		ConnTimeout: 30 * time.Second,
+		MaxWarmup:   5 * time.Second,
+		MaxWindow:   15 * time.Second,
+		MaxBlock:    maxPayload,
+		SendBlock:   maxPayload,
+	}
+	if got != want {
+		t.Fatalf("限额缺省值漂移：\n got %+v\nwant %+v", got, want)
+	}
+	// 非法/越界值也归一到同一组缺省（>maxPayload 的 MaxBlock 会被夹回）。
+	got2 := Limits{MaxConns: -1, ConnTimeout: -1, MaxBlock: maxPayload + 1, SendBlock: -1}.withDefaults()
+	if got2 != want {
+		t.Fatalf("非法值应归一：\n got %+v\nwant %+v", got2, want)
+	}
+	// 合法自定义值原样保留（SendBlock 不得超 MaxBlock）。
+	got3 := Limits{MaxConns: 3, MaxBlock: 4096, SendBlock: 99999}.withDefaults()
+	if got3.MaxConns != 3 || got3.MaxBlock != 4096 || got3.SendBlock != 4096 {
+		t.Fatalf("自定义值处理不符：%+v", got3)
+	}
+}

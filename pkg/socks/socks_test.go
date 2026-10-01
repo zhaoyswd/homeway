@@ -447,3 +447,52 @@ func TestConnLimit(t *testing.T) {
 		t.Fatal("超限连接应收口")
 	}
 }
+
+// TestCloseCancelsInflightResolve（FIX-45）：解析腿的预算挂服务端生命周期 ctx——
+// Close（socks off）要能**当场**取消在途解析，而不是等 ResolveBudget 烧满
+// （原实现挂 context.Background()，off 后回包无人消费 = 悬挂）。
+func TestCloseCancelsInflightResolve(t *testing.T) {
+	entered := make(chan struct{})
+	canceled := make(chan struct{})
+	// 解析器阻塞到 ctx 取消为止：把「在途解析」钉住。
+	resolver := func(ctx context.Context, host string) ([]netip.Addr, error) {
+		close(entered)
+		<-ctx.Done()
+		close(canceled)
+		return nil, ctx.Err()
+	}
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := New(ServerConfig{
+		Resolver:      resolver,
+		Dialer:        dialTo(),
+		Logf:          func(string, ...any) {},
+		ResolveBudget: time.Minute, // 长预算：若不挂 base，Close 后要等一分钟
+	})
+	go func() { _ = srv.Serve(ln) }()
+	defer ln.Close()
+
+	cli := dialSocks(t, ln.Addr().String())
+	cli.negotiate(0x00)
+	// CONNECT 走域名（ATYP=domain）⇒ 触达解析腿；解析器阻塞 ⇒ connect 在途。
+	// 请求字节手写直发（不走 cli.connect：它读应答时会 t.Fatalf，而服务端在解析
+	// 阶段就被关 → 那个 Fatalf 会跑在测试结束后的 goroutine 里 = panic）。
+	go func() {
+		_, _ = cli.conn.Write([]byte{5, 1, 0, 3, byte(len("example.com"))})
+		_, _ = cli.conn.Write([]byte("example.com"))
+		_, _ = cli.conn.Write([]byte{0, 80})
+	}()
+	select {
+	case <-entered:
+	case <-time.After(3 * time.Second):
+		t.Fatal("解析腿未被触达")
+	}
+	srv.Close()
+	select {
+	case <-canceled:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Close 后 2s 解析仍未取消（预算挂在 Background 上？）")
+	}
+}

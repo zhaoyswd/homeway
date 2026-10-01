@@ -29,6 +29,7 @@ import (
 	"sync/atomic"
 
 	"C"
+	"github.com/zhaoyswd/homeway/pkg/portfwd"
 )
 
 // tunPortForward 已随迁 hostsession.PortForward（host-registry-daemon D1：tunConfig
@@ -36,10 +37,19 @@ import (
 
 // pfTargetText 展示用目标文本（与 ArkTS 侧 forwardTargetText 同语义）。
 func pfTargetText(f tunPortForward) string {
+	// port 0 = 同监听端口（语义真源 = facade.DescribeForwardTarget，FIX-46）：原实现
+	// 原样呈现 0，页面显示「1.2.3.4:0」「主机:0」——用户看不出转发到哪。
 	if f.TargetIp == "" {
+		if f.TargetPort == 0 {
+			return "主机（同端口）"
+		}
 		return fmt.Sprintf("主机:%d", f.TargetPort)
 	}
-	return netip.AddrPortFrom(netip.MustParseAddr(f.TargetIp), f.TargetPort).String()
+	port := f.TargetPort
+	if port == 0 {
+		port = f.Listen
+	}
+	return netip.AddrPortFrom(netip.MustParseAddr(f.TargetIp), port).String()
 }
 
 // pfState 一条映射的运行状态（tunStatusJSON 下发给扩展，端口转发页展示）。
@@ -122,6 +132,14 @@ func tunSetPortForwardsJSON(cfg string) int {
 	seen := make(map[uint16]struct{}, len(v.PortForwards))
 	for _, f := range v.PortForwards {
 		if f.Listen == 0 || f.TargetPort == 0 {
+			return -2
+		}
+		// 值域与目标语义走共享包（FIX-43）：此前手机核只查非 0/重复，桌面强制
+		// 1024–65535——「App 能存、CLI 被拒」的同一条规则两种答案。
+		if err := portfwd.ValidateListen(f.Listen); err != nil {
+			return -2
+		}
+		if err := portfwd.ValidateTarget(f.TargetIp, f.TargetPort); err != nil {
 			return -2
 		}
 		if _, dup := seen[f.Listen]; dup {

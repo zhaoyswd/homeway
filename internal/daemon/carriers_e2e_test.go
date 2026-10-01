@@ -10,14 +10,15 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
-	"net"
-	"strings"
-	"testing"
-	"time"
-
 	"github.com/zhaoyswd/homeway/clientcore/facade"
 	"github.com/zhaoyswd/homeway/internal/control"
+	"net"
+	"strings"
+	"syscall"
+	"testing"
+	"time"
 )
 
 // freeTCPPort 抓一个空闲回环端口（听完即关——存在与并发达抢的窗口，测试串行下可用）。
@@ -68,10 +69,15 @@ func TestCarriersE2EForwardAndSocks(t *testing.T) {
 		t.Fatalf("add 输出：%s", out.String())
 	}
 	conn, err := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", port), 2*time.Second)
-	if err != nil {
+	// 上游是假端点 ⇒ accept 后立刻按失败收口（SetLinger(0) RST）。负载高时那个 RST 可能
+	// 赶在 dial 完成前到达，connect 直接以 ECONNRESET 返回——它同样是「监听在、有人在
+	// accept」的证据（判据是「端口上有服务」，不是「握手一定成功」）。
+	if err != nil && !errors.Is(err, syscall.ECONNRESET) {
 		t.Fatalf("监听未起：%v", err)
 	}
-	_ = conn.Close() // 上游拨号对假端点失败属预期（RST/快速收口）
+	if err == nil {
+		_ = conn.Close()
+	}
 
 	// 同端口再 add（含跨 socks）→ bad_request 语义（真管理器全局唯一）。
 	out.Reset()

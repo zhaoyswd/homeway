@@ -130,21 +130,35 @@ func (m *SocksManager) On(host string, listen uint16) (uint16, error) {
 		if e.ln != nil && listen != 0 && e.rec.Listen == listen {
 			return listen, nil // 幂等：同端口已开
 		}
-		if e.ln != nil {
-			m.stopListener(e) // 换端口：关旧（显式关在世连接）
-		}
-		e.rec.Listen = listen
-		e.err = ""
-		if err := m.startListener(e); err != nil {
-			_ = m.saveLocked()
+		// 先算后写（FIX-38）：**先在新端口上把 listener 起起来**，成功了才换监听与
+		// 记忆；失败时旧监听照常在役、记忆保持上一次成功的端口（与「off 不抹端口
+		// 记忆」同口径）。原实现先写 e.rec.Listen 再 startListener，失败还把改写后的
+		// 记忆落盘——`on --listen <被占端口>` 一次失败就永久改写记忆，且当场把在役
+		// 监听拆掉（成功路径与失败路径都踩）。
+		next := &socksEntryRT{rec: SocksEntry{Host: host, On: true, Listen: listen}}
+		if err := m.startListener(next); err != nil {
 			return 0, fmt.Errorf("监听 127.0.0.1:%d 失败（%w）", listen, err)
 		}
-		port, err := m.settleListenPortLocked(e)
-		if err != nil {
+		if next.rec.Listen == 0 {
+			next.rec.Listen = listenerPort(next.ln)
+			if next.rec.Listen == 0 {
+				m.stopListener(next)
+				return 0, errors.New("socks: 无法确定监听端口")
+			}
+		}
+		prevRec, prevLn, prevSrv, prevCache := e.rec, e.ln, e.srv, e.cache
+		e.rec, e.ln, e.srv, e.cache, e.err = next.rec, next.ln, next.srv, next.cache, ""
+		if err := m.saveLocked(); err != nil {
+			// 落盘失败：换回旧监听与旧记忆（旧监听尚未停），零副作用收口新监听。
+			m.stopListener(next)
+			e.rec, e.ln, e.srv, e.cache = prevRec, prevLn, prevSrv, prevCache
 			return 0, err
 		}
-		m.logf("socks: %s on 127.0.0.1:%d", shortHost(host), port)
-		return port, nil
+		if prevLn != nil {
+			m.stopListener(&socksEntryRT{rec: prevRec, ln: prevLn, srv: prevSrv, cache: prevCache}) // 换端口：关旧（显式关在世连接）
+		}
+		m.logf("socks: %s on 127.0.0.1:%d", shortHost(host), e.rec.Listen)
+		return e.rec.Listen, nil
 	}
 	e := &socksEntryRT{rec: SocksEntry{Host: host, On: true, Listen: listen}}
 	if err := m.startListener(e); err != nil {

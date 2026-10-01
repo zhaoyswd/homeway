@@ -142,6 +142,7 @@
 {"family":"files-proto","unit":"code","value":"op_failed","note":"","faces":["direct","napi"],"status":"active","spec":"file-management"}
 {"family":"files-proto","unit":"code","value":"canceled","note":"","faces":["direct","napi"],"status":"active","spec":"file-management"}
 {"family":"files-proto","unit":"code","value":"stream_open","note":"CodeStreamOpen（client.go 孤立常量：流开场失败）；connect 路径直透 App、op 路径被归一成 bridge_down","faces":["direct","napi"],"status":"active","spec":"file-management"}
+{"family":"files-proto","unit":"code","value":"server_busy","note":"并发闸拒绝（FIX-36：在册流满 MaxConns）；经族⑥透传、App 走 default（带服务端 msg）","faces":["direct","napi"],"status":"active","spec":"file-management（并发闸）"}
 {"family":"speedtest-reason","unit":"reason","value":"busy","note":"","faces":["napi","cp"],"status":"active","spec":"speedtest"}
 {"family":"speedtest-reason","unit":"reason","value":"link_down","note":"","faces":["napi","cp"],"status":"active","spec":"speedtest"}
 {"family":"speedtest-reason","unit":"reason","value":"bridge_down","note":"","faces":["napi","cp"],"status":"active","spec":"speedtest"}
@@ -166,6 +167,7 @@
 {"family":"bridge-files","unit":"code","value":"is_dir","note":"④稳定码透传","faces":["napi"],"status":"active","spec":"bridge-call-layer + file-management"}
 {"family":"bridge-files","unit":"code","value":"not_found","note":"④稳定码透传","faces":["napi"],"status":"active","spec":"bridge-call-layer + file-management"}
 {"family":"bridge-files","unit":"code","value":"permission","note":"④稳定码透传","faces":["napi"],"status":"active","spec":"bridge-call-layer + file-management"}
+{"family":"bridge-files","unit":"code","value":"server_busy","note":"④稳定码透传；App 走 default（filesErrorMessage 无 case——服务端并发闸的 msg 原样展示）","faces":["napi"],"status":"active","spec":"bridge-call-layer + file-management"}
 {"family":"bridge-files","unit":"code","value":"dial_failed","note":"","faces":["napi"],"status":"legacy-unreachable","spec":"bridge-call-layer + file-management"}
 {"family":"bridge-files","unit":"code","value":"files_not_enabled","note":"","faces":["napi"],"status":"legacy-unreachable","spec":"bridge-call-layer + file-management"}
 {"family":"bridge-files","unit":"code","value":"files_other_service","note":"","faces":["napi"],"status":"legacy-unreachable","spec":"bridge-call-layer + file-management"}

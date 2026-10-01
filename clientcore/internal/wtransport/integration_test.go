@@ -894,8 +894,8 @@ func TestIntegrationFilesOverTunnel(t *testing.T) {
 	if err != nil {
 		t.Fatalf("files 问候失败：%v", err)
 	}
-	if sess.Root != root || sess.Ver != files.Version || sess.ReadOnly {
-		t.Fatalf("问候字段不符：root=%q ver=%d ro=%v", sess.Root, sess.Ver, sess.ReadOnly)
+	if sess.Root != root || sess.Ver != files.Version {
+		t.Fatalf("问候字段不符：root=%q ver=%d", sess.Root, sess.Ver)
 	}
 	sess.Close()
 	ents, err := fileCli.List(ctx, ".")

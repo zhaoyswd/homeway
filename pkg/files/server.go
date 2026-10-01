@@ -2,7 +2,9 @@ package files
 
 import (
 	"bufio"
+	"crypto/rand"
 	"encoding/base64"
+	"encoding/hex"
 	"errors"
 	"io"
 	"net"
@@ -10,6 +12,8 @@ import (
 	"path"
 	"path/filepath"
 	"strings"
+	"sync"
+	"time"
 )
 
 // 与旧 NAPI 契约对齐的默认值（app_files.go：readText 512KB / readImage 8MB）。
@@ -20,6 +24,20 @@ const (
 	maxInlineRead = 16 * 1024 * 1024
 	// uploadPartSuffix 原子上传的临时后缀（死在半路只留它，绝不留正式名）。
 	uploadPartSuffix = ".tierpart"
+
+	// MaxConns 并发在册流上限（FIX-36）。此前唯一界在拦截层（64 流 / 30min 空闲，
+	// 见 pkg/intercept），files 服务自己无闸：拦截层上限一松（FIX-63 提到 512–1024）
+	// 或经本机 UDS 直连（不经拦截层）时，服务端就没有任何并发界。超限的流回
+	// busy 错误（客户端有可行动文案），不静默挂起。
+	MaxConns = 16
+
+	// IdleTimeout 每流空闲期限（FIX-36）：静默超过它即收流。与拦截层「空闲收流」
+	// 同一取向（FIX-63 目标 3–5 分钟）——两层的界要能同时成立，内层不能比外层宽。
+	IdleTimeout = 5 * time.Minute
+
+	// stalePartAge 陈旧 .tierpart 的回收阈值（FIX-36）：上传中断留下的临时文件
+	// 在下一次写同一路径时顺手清（只清超过这个年龄的，绝不碰正在用的）。
+	stalePartAge = 24 * time.Hour
 )
 
 // Server：以某个目录为根的 files 服务（根 = 后端用户主目录，恒读写）。
@@ -27,6 +45,12 @@ type Server struct {
 	root     *os.Root
 	rootPath string
 	logf     func(format string, args ...any)
+
+	// 并发闸（FIX-36）：容量 MaxConns 的信号量；满则 ServeConn 快速回 busy。
+	sem chan struct{}
+
+	// idle（FIX-36，测试可改）：0 = 用 IdleTimeout。
+	idleTimeout time.Duration
 }
 
 // Open 打开根目录（rootDir 为空 = 用户主目录）。不存在/不是目录 → 报错。
@@ -46,14 +70,49 @@ func Open(rootDir string) (*Server, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &Server{root: r, rootPath: rootDir, logf: func(string, ...any) {}}, nil
+	return &Server{
+		root: r, rootPath: rootDir, logf: func(string, ...any) {},
+		sem: make(chan struct{}, MaxConns), idleTimeout: IdleTimeout,
+	}, nil
 }
 
 // SetLogger 注入日志。
-func (s *Server) SetLogger(logf func(format string, args ...any)) {
+func (s *Server) SetLogger(logf func(string, ...any)) {
 	if logf != nil {
 		s.logf = logf
 	}
+}
+
+// SetIdleTimeout 改每流空闲期限（测试/配置面；<=0 = 保持现值）。
+func (s *Server) SetIdleTimeout(d time.Duration) {
+	if d > 0 {
+		s.idleTimeout = d
+	}
+}
+
+// bufPool 帧缓冲池（FIX-36）：MaxChunk 缓冲按流申请/归还，避免每流一次 64KiB 分配。
+var bufPool = sync.Pool{
+	New: func() any { b := make([]byte, MaxChunk); return &b },
+}
+
+func getBuf() *[]byte  { return bufPool.Get().(*[]byte) }
+func putBuf(b *[]byte) { bufPool.Put(b) }
+
+// idleConn 空闲期限包装（FIX-36）：每次成功读写把期限推后 idleTimeout——
+// 「有流量就不收、静默超时即收」。SetDeadline 下沉到 net.Conn，对上层透明。
+type idleConn struct {
+	net.Conn
+	idle time.Duration
+}
+
+func (c *idleConn) Read(p []byte) (int, error) {
+	_ = c.Conn.SetReadDeadline(time.Now().Add(c.idle))
+	return c.Conn.Read(p)
+}
+
+func (c *idleConn) Write(p []byte) (int, error) {
+	_ = c.Conn.SetWriteDeadline(time.Now().Add(c.idle))
+	return c.Conn.Write(p)
 }
 
 // RootDir 根目录路径（问候帧 root 字段；供 ArkTS 的 hostPathOf 图标匹配）。
@@ -74,11 +133,34 @@ func (s *Server) Serve(ln net.Listener) error {
 }
 
 // ServeConn 处理一条内部流：问候帧 → 一条命令（大文件传输在本流内完成）。
+//
+// 并发闸（FIX-36）：在册流满 MaxConns 时**读完请求行**再回 busy——协议面是
+// 「问候 → 请求 → 响应」，不回请求行而直接断会让客户端只看到流消失（归不了因）。
 func (s *Server) ServeConn(conn net.Conn) {
+	select {
+	case s.sem <- struct{}{}:
+		defer func() { <-s.sem }()
+	default:
+		defer conn.Close()
+		br := bufio.NewReader(conn)
+		if err := WriteLine(conn, Greeting{Ok: true, Root: s.rootPath, Ver: Version}); err != nil {
+			return
+		}
+		if _, rerr := ReadRequest(br); rerr != nil {
+			_ = WriteLine(conn, errorResponse(rerr))
+			return
+		}
+		_ = WriteLine(conn, Errf(CodeServerBusy, "服务端并发流已满（%d），请稍后重试", MaxConns).response())
+		s.logf("files: 并发流已满（%d）——回 busy 拒入", MaxConns)
+		return
+	}
 	defer conn.Close()
+	if s.idleTimeout > 0 {
+		conn = &idleConn{Conn: conn, idle: s.idleTimeout}
+	}
 	br := bufio.NewReader(conn)
 	// 问候帧恒第一个发（即使请求行非法，客户端也能先拿到 root/ver）。
-	if err := WriteLine(conn, Greeting{Ok: true, Root: s.rootPath, Ver: Version, RW: true}); err != nil {
+	if err := WriteLine(conn, Greeting{Ok: true, Root: s.rootPath, Ver: Version}); err != nil {
 		return
 	}
 	req, err := ReadRequest(br)
@@ -320,7 +402,9 @@ func (s *Server) download(w io.Writer, req *Request) *Error {
 	if err := WriteLine(w, Response{Ok: true, Size: fi.Size()}); err != nil {
 		return Errf(CodeOpFailed, "写响应失败：%v", err)
 	}
-	buf := make([]byte, MaxChunk)
+	bufp := getBuf()
+	defer putBuf(bufp)
+	buf := *bufp
 	for {
 		n, rerr := f.Read(buf)
 		if n > 0 {
@@ -341,6 +425,55 @@ func (s *Server) download(w io.Writer, req *Request) *Error {
 	return nil
 }
 
+// partName 生成本次上传的临时文件名：<名字>.tierpart.<8 随机 hex>（FIX-37）。
+//
+// 原实现是固定名 `<名字>.tierpart` + O_TRUNC——并发写同一路径会互踩（两个上传同一
+// 临时文件，后提交者把先提交者的 rename 结果覆盖 / 一个取消把另一个的在途内容删掉），
+// 还会**毁掉用户自己**恰好叫这个名字的文件（O_TRUNC 直接清空）。随机名 + 只删自己
+// 创建的那个 = 两个问题一起消。命名保留 .tierpart 前缀（陈旧清理按它认领）。
+func partName(rel string) (string, error) {
+	var b [4]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return "", err
+	}
+	return rel + uploadPartSuffix + "." + hex.EncodeToString(b[:]), nil
+}
+
+// cleanStaleParts 顺手回收同目录下**陈旧**的残留临时文件（FIX-36）：只清
+// <目标名>.tierpart* 且 mtime 超过 stalePartAge 的（上传中断留下的；正在用的
+// 一定比这个年龄新，绝不误删）。清理失败只记日志，不影响本次上传。
+func (s *Server) cleanStaleParts(rel string) {
+	dir := path.Dir(rel)
+	base := path.Base(rel)
+	d, oerr := s.root.Open(dir)
+	if oerr != nil {
+		return
+	}
+	defer d.Close()
+	ents, rerr := d.ReadDir(-1)
+	if rerr != nil {
+		return
+	}
+	cutoff := time.Now().Add(-stalePartAge)
+	for _, de := range ents {
+		name := de.Name()
+		if !strings.HasPrefix(name, base+uploadPartSuffix+".") {
+			continue
+		}
+		fi, ierr := de.Info()
+		if ierr != nil || fi.ModTime().After(cutoff) {
+			continue
+		}
+		p := name
+		if dir != "." {
+			p = path.Join(dir, name)
+		}
+		if rerr := s.root.Remove(p); rerr == nil {
+			s.logf("files: 回收陈旧临时文件 %s（超 %v 未提交）", p, stalePartAge)
+		}
+	}
+}
+
 // write：请求行已读 → 回 {"ok":true} 表示备好 .tierpart → 收帧 → 终止帧提交（rename）。
 // 提前关流/出错 ⇒ 删 .tierpart，目标文件保持原样（原子上传，绝不留半截正式文件）。
 func (s *Server) write(w io.Writer, br *bufio.Reader, req *Request) *Error {
@@ -351,7 +484,11 @@ func (s *Server) write(w io.Writer, br *bufio.Reader, req *Request) *Error {
 	if rel == "." {
 		return Errf(CodeInvalidName, "不能写入根目录本身")
 	}
-	part := rel + uploadPartSuffix
+	s.cleanStaleParts(rel) // 顺手清同路径的陈旧残留（FIX-36）
+	part, perr := partName(rel)
+	if perr != nil {
+		return mapOSErr("write", req.Path, perr)
+	}
 	f, oerr := s.root.OpenFile(part, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o644)
 	if oerr != nil {
 		return mapOSErr("write", req.Path, oerr)
@@ -360,13 +497,15 @@ func (s *Server) write(w io.Writer, br *bufio.Reader, req *Request) *Error {
 	defer func() {
 		if !committed {
 			f.Close()
-			_ = s.root.Remove(part) // 取消/中断：不留半截
+			_ = s.root.Remove(part) // 取消/中断：只删自己创建的临时文件（FIX-37）
 		}
 	}()
 	if err := WriteLine(w, Response{Ok: true}); err != nil {
 		return nil // 对端已断：静默走清理
 	}
-	buf := make([]byte, MaxChunk)
+	bufp := getBuf()
+	defer putBuf(bufp)
+	buf := *bufp
 	var total int64
 	for {
 		n, rerr := ReadFrame(br, buf)

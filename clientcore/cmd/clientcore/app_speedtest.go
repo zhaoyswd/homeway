@@ -94,7 +94,7 @@ func speedStart(raw string) map[string]any {
 		return speedFail(speedtest.ReasonInvalidArg, err.Error())
 	}
 	res := speed.Start(context.Background(), func(ctx context.Context) (net.Conn, error) {
-		return speedDial(p.Auth, p.Sock)
+		return speedDial(ctx, p.Auth, p.Sock) // ctx 透传（FIX-39：取消/超时要能打断在途拨号）
 	}, params)
 	return speedResultJSON(res)
 }
@@ -105,8 +105,11 @@ func speedStart(raw string) map[string]any {
 //
 // busy/link_down/not_supported 不在这层产生：去问候帧后它们由引擎在请求-应答相位
 // 按三条判据归因（report 帧 / 零字节 EOF / 非 data/report 帧）。
-func speedDial(authHex, sock string) (net.Conn, error) {
-	conn, err := net.Dial("unix", sock)
+func speedDial(ctx context.Context, authHex, sock string) (net.Conn, error) {
+	// 拨号吃 ctx（FIX-39）：引擎的拨号预算/取消经这个 ctx 到达；原实现的
+	// net.Dial 完全不看它（超时/取消只能等内核返回）。
+	var d net.Dialer
+	conn, err := d.DialContext(ctx, "unix", sock)
 	if err != nil {
 		return nil, speedtest.DialErrf(speedtest.ReasonBridgeDown, "测速通道暂时不可用（桥未就绪或正在恢复）：%v", err)
 	}

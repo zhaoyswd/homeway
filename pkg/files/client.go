@@ -25,11 +25,10 @@ type Client struct {
 
 // Session 一条已建立（问候帧已读）的流。
 type Session struct {
-	conn     net.Conn
-	br       *bufio.Reader
-	Root     string
-	Ver      int
-	ReadOnly bool // 恒为 false（协议固定读写）；保留字段供未来/诊断
+	conn net.Conn
+	br   *bufio.Reader
+	Root string
+	Ver  int
 }
 
 // Open 起一条流并读问候帧。
@@ -68,7 +67,7 @@ func (c *Client) Open(ctx context.Context) (*Session, error) {
 		conn.Close()
 		return nil, Errf(CodeStreamOpen, "问候帧失败")
 	}
-	return &Session{conn: conn, br: br, Root: g.Root, Ver: g.Ver, ReadOnly: !g.RW}, nil
+	return &Session{conn: conn, br: br, Root: g.Root, Ver: g.Ver}, nil
 }
 
 // Close 关闭本命令的流。
@@ -192,6 +191,13 @@ func (c *Client) DownloadTo(ctx context.Context, path string, w io.Writer, onSiz
 			return total, Errw(CodeOpFailed, err, "下载中断：%v", err)
 		}
 		if n == 0 {
+			// 终止帧 = 服务端认为传完了。**对照响应行声明的大小**（FIX-40）：少收一律
+			// 报错——提前终止帧（对端 bug / 中间层截流）此前会被静默当成功，落一个
+			// 半截文件。多收容忍：文件在下载途中被追加是合法形态（声明值只是取快照
+			// 那一刻的大小），把它当错误会误伤「下载正在生长中的日志」这类用法。
+			if resp.Size > 0 && total < resp.Size {
+				return total, Errf(CodeOpFailed, "下载不完整：服务端声明 %d 字节，实收 %d", resp.Size, total)
+			}
 			return total, nil
 		}
 		if _, err := w.Write(buf[:n]); err != nil {

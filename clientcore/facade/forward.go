@@ -17,6 +17,7 @@ import (
 	"errors"
 	"fmt"
 	"github.com/zhaoyswd/homeway/pkg/netpipe"
+	"github.com/zhaoyswd/homeway/pkg/portfwd"
 	"net"
 	"net/netip"
 	"os"
@@ -31,8 +32,9 @@ const forwardsFileName = "forwards.json"
 
 // forward 校验边界（镜像手机 spec + 桌面全局唯一差异，D1）。
 const (
-	forwardMinPort    = 1024
-	forwardMaxPort    = 65535
+	// 值域真源在 pkg/portfwd（FIX-43：四处重写已漂移，统一到共享包）。
+	forwardMinPort    = portfwd.MinPort
+	forwardMaxPort    = portfwd.MaxPort
 	forwardMaxPerHost = 8
 	// forwardMaxConns 每监听并发连接上限（exec-r1 B3-b：spec「每监听 SHALL 有并发
 	// 连接上限（超限拒绝并计数）」——与 pkg/socks 的 MaxConns 同值 256；无上限时
@@ -46,8 +48,8 @@ const (
 
 // 管理器哨兵（绑定层映射 bad_request / no_host 族；§3 接线）。
 var (
-	// ErrPortRange 监听端口值域外。
-	ErrPortRange = errors.New("监听端口须在 1024–65535")
+	// ErrPortRange 监听端口值域外（= portfwd.ErrRange，同一哨兵）。
+	ErrPortRange = portfwd.ErrRange
 	// ErrPortTaken 监听端口全局占用（含占用方说明的包装形态）。
 	ErrPortTaken = errors.New("监听端口已被占用（全局唯一）")
 	// ErrTooManyRules 每主机规则上限。
@@ -127,8 +129,8 @@ func openForwardManager(stateDir string, dial carrierDial, logf, warnf func(stri
 // （失败 = 错误返回、不入表——「failed 软状态」只留重启重建路径，r1 低-7）→ 落盘 →
 // 入表。调用方（Carriers）已做跨 socks 的全局端口检查。
 func (m *ForwardManager) Add(rule ForwardRule) error {
-	if rule.Listen < forwardMinPort || rule.Listen > forwardMaxPort {
-		return fmt.Errorf("%w：%d", ErrPortRange, rule.Listen)
+	if err := portfwd.ValidateListen(rule.Listen); err != nil {
+		return err
 	}
 	if rule.TargetIP != "" {
 		ip, err := netip.ParseAddr(rule.TargetIP)
@@ -136,9 +138,11 @@ func (m *ForwardManager) Add(rule ForwardRule) error {
 			return fmt.Errorf("%w：%s", ErrBadTarget, rule.TargetIP)
 		}
 	}
-	if rule.TargetPort != 0 && (rule.TargetPort < forwardMinPort || rule.TargetPort > forwardMaxPort) {
-		return fmt.Errorf("%w：目标端口 %d", ErrPortRange, rule.TargetPort)
+	if err := portfwd.ValidateTarget(rule.TargetIP, rule.TargetPort); err != nil {
+		return err
 	}
+	// 目标端口不限下界（spec 的「配置校验」只约束监听端口；目标端口是出口去拨的，
+	// 不做 bind——转发到出口自己的 :22/:80 合法，FIX-43 起与 App 同口径）。
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	perHost := 0
@@ -381,6 +385,14 @@ func loadForwardRules(path string, warnf func(string, ...any)) ([]ForwardRule, e
 		return nil, nil
 	}
 	return recs, nil
+}
+
+// DescribeForwardTarget 转发目标的**呈现文案**（出口自己 / 出口自己:N / ip:N；
+// port 0 = 同监听端口 ⇒ 落成 listen）。语义唯一源（FIX-46）：CLI 表格、日志与
+// 手机 status 面此前各写一遍，手机面把 0 原样呈现成「1.2.3.4:0」（用户看不出
+// 到底转发到哪）；以后新增呈现面一律走这里。
+func DescribeForwardTarget(ip string, port, listen uint16) string {
+	return portfwd.DescribeTarget(ip, port, listen)
 }
 
 // describeTarget 规则目标的日志文案。

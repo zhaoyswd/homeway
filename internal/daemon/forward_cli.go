@@ -24,6 +24,7 @@ import (
 	"github.com/zhaoyswd/homeway/clientcore/facade"
 	"github.com/zhaoyswd/homeway/internal/cliopts"
 	"github.com/zhaoyswd/homeway/internal/control"
+	"github.com/zhaoyswd/homeway/pkg/portfwd"
 )
 
 // carrierFlagBools forward/socks/speedtest 命令面的布尔 flag 集（flagsFirst 用）。
@@ -135,12 +136,13 @@ func parseForwardTarget(s string) (ip string, port uint16, err error) {
 		return "", uint16(p), nil
 	}
 	ip = s[:i]
-	if net.ParseIP(ip) == nil || !isIPv4Literal(ip) {
-		return "", 0, fmt.Errorf("--target 目标 %q 须为 IPv4 字面量（隧道只承载 IPv4）", ip)
-	}
 	p, perr := strconv.ParseUint(s[i+1:], 10, 16)
 	if perr != nil {
 		return "", 0, fmt.Errorf("--target 端口 %q 非法：%v", s[i+1:], perr)
+	}
+	// 目标语义真源 = pkg/portfwd（FIX-43：v4 字面量 + 端口值域）。
+	if err := portfwd.ValidateTarget(ip, uint16(p)); err != nil {
+		return "", 0, fmt.Errorf("--target %q 非法：%v", s, err)
 	}
 	return ip, uint16(p), nil
 }
@@ -180,8 +182,9 @@ func forwardAddCLI(args []string, version string, w io.Writer) error {
 	if *listen == 0 {
 		return errors.New("forward add 需要 --listen <端口>（1024–65535）")
 	}
-	if *listen < 1024 || *listen > 65535 {
-		return fmt.Errorf("--listen %d 越界（监听端口须在 1024–65535）", *listen)
+	// 值域真源 = pkg/portfwd（FIX-43）。
+	if err := portfwd.ValidateListen(uint16(*listen)); err != nil {
+		return fmt.Errorf("--listen %d 越界（%v）", *listen, err)
 	}
 	targetIP, targetPort, err := parseForwardTarget(*target)
 	if err != nil {
@@ -214,22 +217,8 @@ func forwardAddCLI(args []string, version string, w io.Writer) error {
 		return fmt.Errorf("forward.add 载荷解析失败：%w", err)
 	}
 	fmt.Fprintf(w, "已建转发 %s 127.0.0.1:%d → %s（%s，目标经 %s 出网）\n",
-		dname, res.Rule.Listen, describeForwardTarget(targetIP, targetPort, uint16(*listen)), res.Rule.State, dname)
+		dname, res.Rule.Listen, facade.DescribeForwardTarget(targetIP, targetPort, uint16(*listen)), res.Rule.State, dname)
 	return nil
-}
-
-// describeForwardTarget 目标文案（与手机口径一致的两形态）。
-func describeForwardTarget(ip string, port, listen uint16) string {
-	if ip == "" {
-		if port == 0 {
-			return "出口自己（同端口）"
-		}
-		return fmt.Sprintf("出口自己:%d", port)
-	}
-	if port == 0 {
-		port = listen
-	}
-	return fmt.Sprintf("%s:%d", ip, port)
 }
 
 // forwardAddErr bad_request 的现场诊断：复查 forward.list + socks.status 找占用方
@@ -362,7 +351,7 @@ func forwardListCLI(args []string, version string, w io.Writer) error {
 		}
 		fmt.Fprintf(w, "%-12s %-7d %-24s %-10s %-6s %s\n",
 			truncRunes(nameOfHost(hosts, r.Host), 12), r.Listen,
-			truncRunes(describeForwardTarget(r.TargetIP, r.TargetPort, r.Listen), 24),
+			truncRunes(facade.DescribeForwardTarget(r.TargetIP, r.TargetPort, r.Listen), 24),
 			st, conns, e)
 	}
 	return nil

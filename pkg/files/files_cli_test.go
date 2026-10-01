@@ -336,7 +336,7 @@ func TestFilesCLIWatchdogNoOverrunBeyondFirstResponse(t *testing.T) {
 		c1, c2 := net.Pipe()
 		go func() {
 			defer c2.Close()
-			_ = WriteLine(c2, Greeting{Ok: true, Root: "/", Ver: Version, RW: true})
+			_ = WriteLine(c2, Greeting{Ok: true, Root: "/", Ver: Version})
 			line, err := readTestLine(c2)
 			if err != nil {
 				return
@@ -540,7 +540,7 @@ func TestFilesCLIGetInterruptNoResidue(t *testing.T) {
 		c1, c2 := net.Pipe()
 		go func() {
 			defer c2.Close() // 只发一帧即关（EOF 未带终止帧 = 中途断流）
-			_ = WriteLine(c2, Greeting{Ok: true, Root: "/", Ver: Version, RW: true})
+			_ = WriteLine(c2, Greeting{Ok: true, Root: "/", Ver: Version})
 			line, err := readTestLine(c2)
 			if err != nil {
 				return
@@ -567,8 +567,8 @@ func TestFilesCLIGetInterruptNoResidue(t *testing.T) {
 	if rerr != nil || string(got) != "old" {
 		t.Fatalf("中断后目标应保持原样：%v %q", rerr, got)
 	}
-	if _, serr := os.Stat(target + uploadPartSuffix); !os.IsNotExist(serr) {
-		t.Fatalf("中断后不应残留 .tierpart：%v", serr)
+	if parts := cliLocalParts(target); len(parts) != 0 {
+		t.Fatalf("中断后不应残留 .tierpart：%v", parts)
 	}
 	// 重试走默认拒路径：目标在、与残留无关（残留被删——默认拒不被残留顶撞）。
 	if err := CLI([]string{"get", "half.bin", "-o", target, "--host", "mac", "--quiet"}, f); err == nil ||
@@ -594,7 +594,7 @@ func TestFilesCLIPutCancelCleansRemote(t *testing.T) {
 		c1, c2 := net.Pipe()
 		go func() {
 			defer c2.Close()
-			_ = WriteLine(c2, Greeting{Ok: true, Root: "/", Ver: Version, RW: true})
+			_ = WriteLine(c2, Greeting{Ok: true, Root: "/", Ver: Version})
 			line, err := readTestLine(c2)
 			if err != nil {
 				return
@@ -628,7 +628,7 @@ func TestFilesCLIPutCancelCleansRemote(t *testing.T) {
 	// 服务端清理是异步的（客户端关流 → 服务端读 EOF → 清理）：短轮询窗口。
 	deadline := time.Now().Add(3 * time.Second)
 	for {
-		if _, serr := os.Stat(filepath.Join(root, "keep.bin"+uploadPartSuffix)); os.IsNotExist(serr) {
+		if parts := cliRemoteParts(root, "keep.bin"); len(parts) == 0 {
 			break
 		}
 		if time.Now().After(deadline) {
@@ -653,7 +653,7 @@ func TestFilesCLIStreamEndReadDirection(t *testing.T) {
 		w := newErrInjRW(c1)
 		go func() {
 			defer c2.Close()
-			_ = WriteLine(c2, Greeting{Ok: true, Root: "/", Ver: Version, RW: true})
+			_ = WriteLine(c2, Greeting{Ok: true, Root: "/", Ver: Version})
 			line, err := readTestLine(c2)
 			if err != nil {
 				return
@@ -692,8 +692,8 @@ func TestFilesCLIStreamEndReadDirection(t *testing.T) {
 	if !strings.Contains(cerr.Error(), "已收 ") || !strings.Contains(cerr.Error(), "B") {
 		t.Fatalf("已收字节应进文案：%v", cerr)
 	}
-	if _, serr := os.Stat(target + uploadPartSuffix); !os.IsNotExist(serr) {
-		t.Fatalf("get 中途本地无残留：%v", serr)
+	if parts := cliLocalParts(target); len(parts) != 0 {
+		t.Fatalf("get 中途本地无残留：%v", parts)
 	}
 }
 
@@ -706,7 +706,7 @@ func TestFilesCLIStreamEndWriteDirection(t *testing.T) {
 		c1, c2 := net.Pipe()
 		go func() {
 			defer c2.Close()
-			_ = WriteLine(c2, Greeting{Ok: true, Root: "/", Ver: Version, RW: true})
+			_ = WriteLine(c2, Greeting{Ok: true, Root: "/", Ver: Version})
 			line, err := readTestLine(c2)
 			if err != nil {
 				return
@@ -1014,4 +1014,35 @@ func readTestLine(r io.Reader) ([]byte, error) {
 			return buf, err
 		}
 	}
+}
+
+// cliLocalParts / cliRemoteParts：临时残留按**前缀**找（FIX-37 起临时名带随机后缀，
+// 固定名断言会恒真 = 失去判据）。
+func cliLocalParts(target string) []string {
+	ents, err := os.ReadDir(filepath.Dir(target))
+	if err != nil {
+		return nil
+	}
+	base := filepath.Base(target)
+	var out []string
+	for _, e := range ents {
+		if strings.HasPrefix(e.Name(), base+uploadPartSuffix) {
+			out = append(out, e.Name())
+		}
+	}
+	return out
+}
+
+func cliRemoteParts(root, name string) []string {
+	ents, err := os.ReadDir(root)
+	if err != nil {
+		return nil
+	}
+	var out []string
+	for _, e := range ents {
+		if strings.HasPrefix(e.Name(), name+uploadPartSuffix) {
+			out = append(out, e.Name())
+		}
+	}
+	return out
 }

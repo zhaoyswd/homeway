@@ -443,3 +443,43 @@ func TestEngineUncomparableConn(t *testing.T) {
 		t.Fatalf("不可比较 conn 的全轮应成功（修复前 = panic hash of unhashable type）：reason=%s msg=%s", res.Reason, res.Msg)
 	}
 }
+
+// TestCancelActiveDoesNotOverrideFinished（FIX-44）：落在「结果已定、Start 尚未收尾」
+// 窗口里的迟到取消，绝不能把 done 覆盖成 cancelled——原实现在锁外 setPhase，UI 会显示
+// 「已取消」而调用方拿到 OK 结果（同一轮两种真相）。
+// 构造：直接复现那一拍的引擎状态（runRound 已 finishOK、running 仍 true）。
+func TestCancelActiveDoesNotOverrideFinished(t *testing.T) {
+	e := NewEngine(nil)
+	e.mu.Lock()
+	e.gen++
+	r := newRun(e.gen)
+	e.run, e.running, e.phase = r, true, PhaseConnecting
+	e.mu.Unlock()
+
+	e.finishOK(r.gen, 1000, 100) // 结果落定（phase=done），但 Start 还没把 running 置 false
+	if got := e.Snapshot().Phase; got != string(PhaseDone) {
+		t.Fatalf("前置：相位应为 done，实际 %q", got)
+	}
+	e.CancelActive() // 迟到取消：必须 no-op
+	snap := e.Snapshot()
+	if snap.Phase != string(PhaseDone) {
+		t.Fatalf("迟到取消覆盖了已落定的相位：got %q want %q", snap.Phase, PhaseDone)
+	}
+	if r.cancelled.Load() {
+		t.Fatal("迟到取消还给已落定的一轮打了 cancel 旗标（会污染该轮结果归因）")
+	}
+
+	// 在跑的轮照常可取消（正路径不受影响）。
+	e.mu.Lock()
+	e.gen++
+	r2 := newRun(e.gen)
+	e.run, e.running, e.phase = r2, true, PhaseDown
+	e.mu.Unlock()
+	e.CancelActive()
+	if !r2.cancelled.Load() {
+		t.Fatal("在跑的一轮应可取消")
+	}
+	if got := e.Snapshot().Phase; got != string(PhaseCancelled) {
+		t.Fatalf("取消后相位应为 cancelled，实际 %q", got)
+	}
+}

@@ -3,7 +3,7 @@
 // 承载：隧道内 TCP 流上**每命令一条流**（拨隧道 IP 同端口，出口豁免转投）。线上格式：
 //
 //	服务端 → 客户端（流的第一个东西，恒有）：
-//	  {"ok":true,"root":"/Users/xx","ver":1,"rw":true}\n      ← 问候帧
+//	  {"ok":true,"root":"/Users/xx","ver":1}\n               ← 问候帧
 //	客户端 → 服务端（一行 JSON 请求，≤64KB）：
 //	  {"op":"list","path":"photos"}\n
 //	服务端 → 客户端（一行 JSON 响应）：
@@ -53,6 +53,10 @@ const (
 	CodeAlreadyExists = "already_exists"
 	CodeOpFailed      = "op_failed"
 	CodeCanceled      = "canceled"
+	// CodeServerBusy 并发闸拒绝（FIX-36 新增）：服务端在册流满 MaxConns 时的明确拒绝。
+	// 与桥层的 `busy`（App 自己的「已有传输进行中」）**不是一回事**——不复用那个值，
+	// 免得 App 把它讲成本地有传输在跑。经族⑥透传、App 走 default（带服务端 msg）。
+	CodeServerBusy = "server_busy"
 )
 
 // Request 一条命令的请求。
@@ -78,7 +82,6 @@ type Greeting struct {
 	Ok   bool   `json:"ok"`
 	Root string `json:"root"`
 	Ver  int    `json:"ver"`
-	RW   bool   `json:"rw"`
 }
 
 // Response 统一响应（ok=false 时给 code/msg）。

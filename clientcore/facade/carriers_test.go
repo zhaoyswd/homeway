@@ -129,11 +129,18 @@ func TestForwardRuleValidation(t *testing.T) {
 		{"端口保留段", ForwardRule{Host: hostA, Listen: 1023}, ErrPortRange},
 		{"目标非 IPv4", ForwardRule{Host: hostA, Listen: 2000, TargetIP: "example.com"}, ErrBadTarget},
 		{"目标是 v6", ForwardRule{Host: hostA, Listen: 2000, TargetIP: "::1"}, ErrBadTarget},
-		{"目标端口越界", ForwardRule{Host: hostA, Listen: 2000, TargetPort: 80}, ErrPortRange},
+		{"目标端口无下界", ForwardRule{Host: hostB, Listen: 2000, TargetPort: 80}, nil}, // 用 hostB：成功用例会占该主机配额
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			if err := c.AddForward(tc.rule); !errors.Is(err, tc.want) {
+			err := c.AddForward(tc.rule)
+			if tc.want == nil {
+				if err != nil {
+					t.Fatalf("应合法（目标端口无 1024 下界），got %v", err)
+				}
+				return
+			}
+			if !errors.Is(err, tc.want) {
 				t.Fatalf("err = %v，期望 %v", err, tc.want)
 			}
 		})
@@ -1196,5 +1203,74 @@ func TestCarriersAddRejectsRemovedHost(t *testing.T) {
 	}
 	if _, err := c.SocksOn(host, 0); !errors.Is(err, ErrNoHost) {
 		t.Fatalf("已摘除主机开 socks 应 ErrNoHost，实得 %v", err)
+	}
+}
+
+// TestSocksOnFailKeepsPortMemory（FIX-38）：`on --listen <被占端口>` 失败后
+// ①记忆保持上一次成功的端口（落盘也未被改写）；②在役监听照常在役（先算后写）；
+// ③随后 on 缺省仍落到记忆端口。
+func TestSocksOnFailKeepsPortMemory(t *testing.T) {
+	c := openTestCarriers(t, &fakeDial{})
+	host := strings.Repeat("aa", 32)
+
+	mem := freePort(t)
+	if p, err := c.SocksOn(host, mem); err != nil || p != mem {
+		t.Fatalf("先 on 记忆端口：%d %v", p, err)
+	}
+	// 拿一个确定被占的端口：外部监听占住。
+	occ, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer occ.Close()
+	busy := uint16(occ.Addr().(*net.TCPAddr).Port)
+
+	if _, err := c.SocksOn(host, busy); err == nil {
+		t.Fatalf("绑被占端口应失败")
+	}
+	// ① 记忆未被改写（status 面 + 缺省解析面）。
+	if st := c.SocksStates(); len(st) != 1 || !st[0].On || st[0].Listen != mem {
+		t.Fatalf("失败后记忆/在役态被改写：%v（应仍为 on=%v listen=%d）", st, true, mem)
+	}
+	if got := c.Sks.DefaultListen(host); got != mem {
+		t.Fatalf("失败后缺省解析应仍是记忆端口 %d，got %d", mem, got)
+	}
+	// ② 旧监听仍在役（可连）。
+	if conn, derr := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", mem), time.Second); derr != nil {
+		t.Fatalf("失败路径不得拆掉在役监听：%v", derr)
+	} else {
+		_ = conn.Close()
+	}
+	// ③ 换一个空闲端口再 on：成功并改写记忆（正常路径不受影响）。
+	free := freePort(t)
+	if p, err := c.SocksOn(host, free); err != nil || p != free {
+		t.Fatalf("另选端口应成功：%d %v", p, err)
+	}
+	if got := c.Sks.DefaultListen(host); got != free {
+		t.Fatalf("成功路径应更新记忆为 %d，got %d", free, got)
+	}
+}
+
+// TestForwardPortRangeSharedWithPhone（FIX-43）：值域真源 = pkg/portfwd——桌面与手机核
+// 同一条规则（此前手机核只查非 0：80 在 App 能过、CLI 被拒）。这里钉桌面侧仍按共享包判。
+func TestForwardPortRangeSharedWithPhone(t *testing.T) {
+	c := openTestCarriers(t, &fakeDial{})
+	host := strings.Repeat("aa", 32)
+	// 低于 1024 的监听端口被拒。
+	if err := c.AddForward(ForwardRule{Host: host, Listen: 80}); !errors.Is(err, ErrPortRange) {
+		t.Fatalf("listen=80 应 ErrPortRange，got %v", err)
+	}
+	// 目标端口**不设 1024 下限**（FIX-43：spec 只约束监听端口；出口是"拨"目标端口，
+	// 不 bind——桌面原先多这条限制，与 App 漂移）。
+	if err := c.AddForward(ForwardRule{Host: host, Listen: freePort(t), TargetIP: "1.2.3.4", TargetPort: 22}); err != nil {
+		t.Fatalf("targetPort=22 应合法（出口去拨，不 bind）：%v", err)
+	}
+	// 目标地址非法仍拒。
+	if err := c.AddForward(ForwardRule{Host: host, Listen: freePort(t), TargetIP: "example.com", TargetPort: 8080}); err == nil {
+		t.Fatalf("目标非 IPv4 字面量应被拒")
+	}
+	// 合法值域通过。
+	if err := c.AddForward(ForwardRule{Host: host, Listen: freePort(t), TargetIP: "1.2.3.4", TargetPort: 8080}); err != nil {
+		t.Fatalf("合法规则应通过：%v", err)
 	}
 }

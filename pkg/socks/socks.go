@@ -326,7 +326,10 @@ func (s *Server) resolveTargets(conn net.Conn, atyp byte, host string) ([]netip.
 		}
 		return []netip.Addr{ip}, nil
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), s.cfg.ResolveBudget)
+	// 预算挂服务端生命周期 ctx（s.base）：off/Close 之后在途解析要**当场收**
+	// （FIX-45）——原实现挂 context.Background()，off 只能等 ResolveBudget 烧满，
+	// 期间解析腿的回包无人消费（悬挂）。上游拨号腿早已是 s.base（见 dialAny）。
+	ctx, cancel := context.WithTimeout(s.base, s.cfg.ResolveBudget)
 	defer cancel()
 	addrs, err := s.cfg.Resolver(ctx, host)
 	if err != nil {

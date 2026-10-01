@@ -25,9 +25,13 @@ package files
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/zhaoyswd/homeway/internal/cliopts"
+	"github.com/zhaoyswd/homeway/pkg/streamend"
 	"io"
 	"io/fs"
 	"net"
@@ -40,10 +44,6 @@ import (
 	"sync/atomic"
 	"syscall"
 	"time"
-
-	"github.com/zhaoyswd/homeway/internal/cliopts"
-
-	"github.com/zhaoyswd/homeway/pkg/streamend"
 )
 
 // DefaultStateDir 本地面的 state 目录默认值（= 出口 state，与 term 面一致）。
@@ -726,8 +726,23 @@ func cliFilesGet(ctx context.Context, args []string, remote RemoteFiles) error {
 // getDir 下载方向的错误归因附注（mapErr 用）。
 const getDir = "get"
 
+// localPartName 本地下载的临时文件名：<目标>.tierpart.<8 随机 hex>（FIX-37）。
+// 与 pkg/files 服务端的 partName 同口径（前缀 = uploadPartSuffix，便于识别残留）。
+func localPartName(target string) (string, error) {
+	var b [4]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return "", err
+	}
+	return target + uploadPartSuffix + "." + hex.EncodeToString(b[:]), nil
+}
+
 func (e *cliEnv) get(o getOpts, target string) error {
-	tmp := target + uploadPartSuffix // 与远端上传临时文件同款命名
+	// 本地临时名同样带随机后缀（FIX-37）：与远端上传同款命名约定。固定名会让**并发**
+	// 下载同一目标（或与另一个进程的残留）互踩；随机名 + 只删自己创建的那个即消。
+	tmp, terr := localPartName(target)
+	if terr != nil {
+		return fmt.Errorf("生成临时文件名：%w", terr)
+	}
 	f, err := os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o644)
 	if err != nil {
 		return fmt.Errorf("写本地临时文件 %s：%w", tmp, err)
@@ -739,9 +754,9 @@ func (e *cliEnv) get(o getOpts, target string) error {
 	var received int64
 	pr := &progress{w: os.Stderr, quiet: o.quiet}
 	cw := &countingWriter{f: f, n: &received, p: pr}
-	n, derr := e.client().DownloadTo(e.cmdCtx, o.remote, cw, func(size int64) { pr.setTotal(size) })
+	_, derr := e.client().DownloadTo(e.cmdCtx, o.remote, cw, func(size int64) { pr.setTotal(size) })
 	if derr != nil {
-		cleanup()
+		cleanup() // 含「服务端声明 vs 实收」不符（pkg/files 侧的截断防护，FIX-40）
 		return e.mapErr(derr, getDir, received)
 	}
 	if err := f.Close(); err != nil {
@@ -754,7 +769,6 @@ func (e *cliEnv) get(o getOpts, target string) error {
 	}
 	pr.done("下载")
 	fmt.Fprintf(os.Stderr, "已下载 %s → %s\n", o.remote, target)
-	_ = n
 	return nil
 }
 
