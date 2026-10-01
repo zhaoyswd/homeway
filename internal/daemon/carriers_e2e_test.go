@@ -228,7 +228,7 @@ func TestCarriersE2ESocksPortRangeServerSide(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer c.Close()
-	if _, err := c.Request(ctx, facade.OpSocksOn, control.SocksOnArgs{Host: ali, Listen: 80}); err == nil || string(err.(control.CodeError)) != facade.CodeBadRequest {
+	if _, err := c.Request(ctx, facade.OpSocksOn, control.SocksOnArgs{Host: ali, Listen: 80}); err == nil || errCodeOf(err) != facade.CodeBadRequest {
 		t.Fatalf("端口 80 应被守护侧值域闸拒（bad_request）：%v", err)
 	}
 }
@@ -345,4 +345,14 @@ func TestCarriersE2ESocksOnDefaultMemory(t *testing.T) {
 		_ = conn.Close()
 	}
 	_ = ali
+}
+
+// errCodeOf 取错误的稳定码（FIX-50 起控制面错误可能是 *control.OpError（带 detail）
+// 或 control.CodeError）。
+func errCodeOf(err error) string {
+	code, _, ok := control.CodeDetailOf(err)
+	if !ok {
+		return ""
+	}
+	return string(code)
 }

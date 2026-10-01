@@ -23,6 +23,63 @@ type CodeError string
 
 func (e CodeError) Error() string { return string(e) }
 
+// OpError 控制面错误：稳定码 + 服务端可行动归因（FIX-50 只增面）。errors.Is 对
+// CodeError 仍成立（既有映射零改）。
+type OpError struct {
+	Code   CodeError
+	Detail string
+}
+
+func (e *OpError) Error() string {
+	if e.Detail != "" {
+		return string(e.Code) + ": " + e.Detail
+	}
+	return string(e.Code)
+}
+
+// As 让 errors.As(err, &code)（code 为 CodeError）成立——既有「按码分支」的调用面
+// （host_cli/files_remote/term_remote/socks_cli…）零改。
+func (e *OpError) As(target any) bool {
+	if p, ok := target.(*CodeError); ok {
+		*p = e.Code
+		return true
+	}
+	return false
+}
+
+// Is 让 errors.Is(err, CodeError(x)) 成立（码比较与既有语义一致）。
+func (e *OpError) Is(target error) bool {
+	switch t := target.(type) {
+	case CodeError:
+		return e.Code == t
+	case *OpError:
+		return e.Code == t.Code
+	}
+	return false
+}
+
+// errFromRsp 响应错误 → 错误值：有 detail 用 OpError（可行动归因随行），无则原样
+// CodeError（零 detail 的旧服务端/断连路径回落既有类型）。
+func errFromRsp(rsp ResponseBody) error {
+	if rsp.Detail == "" {
+		return CodeError(rsp.Error)
+	}
+	return &OpError{Code: CodeError(rsp.Error), Detail: rsp.Detail}
+}
+
+// CodeDetailOf 取错误里的稳定码与可行动归因（非控制面错误返回 ok=false）。
+func CodeDetailOf(err error) (CodeError, string, bool) {
+	var oe *OpError
+	if errors.As(err, &oe) {
+		return oe.Code, oe.Detail, true
+	}
+	var ce CodeError
+	if errors.As(err, &ce) {
+		return ce, "", true
+	}
+	return "", "", false
+}
+
 // ErrConnClosed 客户端连接已断（等待响应期间对端关闭/告别）。
 var ErrConnClosed = errors.New("控制面连接已关闭")
 
@@ -200,7 +257,7 @@ func (c *Client) Request(ctx context.Context, op string, args any) (json.RawMess
 	select {
 	case rsp := <-ch:
 		if !rsp.Ok {
-			return nil, CodeError(rsp.Error)
+			return nil, errFromRsp(rsp)
 		}
 		return rsp.Result, nil
 	case <-ctx.Done():
@@ -210,7 +267,9 @@ func (c *Client) Request(ctx context.Context, op string, args any) (json.RawMess
 	}
 }
 
-// Subscribe 订阅事件（游标续播；view 只回显；generation = 游标所属代际——
+// Subscribe 订阅事件（游标续播；view 声明**参与服务端需求合成**并在确认/快照里回显，
+// FIX-53：此前注释写「只回显」与 spec（facade 期起 view 参与需求合成）相反；
+// generation = 游标所属代际——
 // 非空且失配时服务端回 cursor_stale）。订阅确认后回放事件先于在线事件进入
 // Events()（服务端写出次序保证）。
 func (c *Client) Subscribe(ctx context.Context, domains []string, cursor *uint64, view, generation string) (SubscribeResult, error) {
@@ -233,9 +292,6 @@ func (c *Client) Unsubscribe(ctx context.Context, domains []string) error {
 
 // Events 事件流（含订阅回放）。
 func (c *Client) Events() <-chan EventBody { return c.eventsC }
-
-// Resync 服务端主动重同步信号（v1 服务端无发射场景；客户端路径就绪）。
-func (c *Client) Resync() <-chan ResyncBody { return c.resyncC }
 
 // Goodbye 服务端告别（overrun/bad_frame/bad_json/shutting_down…）。
 func (c *Client) Goodbye() <-chan GoodbyeBody { return c.goodbyeC }
@@ -265,7 +321,7 @@ func (c *Client) OpenStream(ctx context.Context, kind, host string) (*ClientStre
 	select {
 	case rsp := <-ch:
 		if !rsp.Ok {
-			return nil, CodeError(rsp.Error)
+			return nil, errFromRsp(rsp)
 		}
 		raw = rsp.Result
 	case <-ctx.Done():

@@ -31,6 +31,7 @@ import (
 	"errors"
 	"fmt"
 	"github.com/zhaoyswd/homeway/internal/cliopts"
+	"github.com/zhaoyswd/homeway/internal/cliutil"
 	"github.com/zhaoyswd/homeway/pkg/streamend"
 	"io"
 	"io/fs"
@@ -47,12 +48,7 @@ import (
 )
 
 // DefaultStateDir 本地面的 state 目录默认值（= 出口 state，与 term 面一致）。
-func DefaultStateDir() string {
-	if home, err := os.UserHomeDir(); err == nil {
-		return filepath.Join(home, ".config", "homeway")
-	}
-	return ""
-}
+func DefaultStateDir() string { return cliutil.DefaultStateDir() } // 单实现在 internal/cliutil（FIX-57）
 
 // RemoteFiles —— `--host` 模式的远程接入缝（与 term.RemoteTerm 同款注入模式；
 // 实现落 internal/daemon/files_remote.go，测试注假实现）。

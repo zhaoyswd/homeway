@@ -14,18 +14,13 @@ package daemon
 
 import (
 	"fmt"
-	"os"
-	"path/filepath"
-	"time"
-
+	"github.com/zhaoyswd/homeway/internal/cliutil"
 	"github.com/zhaoyswd/homeway/internal/logfile"
+	"os"
+	"time"
 )
 
 const (
-	// hostsFileName 主机表持久化文件名（facade table.go 的既有约定；此处不再
-	// 预建——表自管存在性，仅为文档锚点保留）。
-	hostsFileName = "hosts.json"
-
 	// 日志分级与轮转沿出口口径（internal/server/logging.go 同款参数）。
 	eventsMaxBytes = 2 << 20 // 2MB
 	eventsBackups  = 3
@@ -38,11 +33,10 @@ const (
 // DefaultStateDir 默认 state 目录（统一 state 根；role-management D1：daemon 旧默认
 // ~/.config/homeway/daemon 随单进程合并退役，客户端域命令的 --state 默认值随之统一）。
 func DefaultStateDir() string {
-	home, err := os.UserHomeDir()
-	if err != nil || home == "" {
-		return "homeway-state" // 兜底相对路径（无 HOME 的测试环境；实际部署都有）
+	if d := cliutil.DefaultStateDir(); d != "" {
+		return d
 	}
-	return filepath.Join(home, ".config", "homeway")
+	return "homeway-state" // 兜底相对路径（无 HOME 的测试环境；实际部署都有）
 }
 
 // DaemonState 守护侧日志句柄（cache/daemon-{events,debug}.log）。

@@ -128,7 +128,7 @@ func assembleUnified(parent context.Context, version, stateDir string, verbose b
 
 	// ① 单实例锁（与前台单角色共用 <state>/lock；角色名归一为 homeway——锁内
 	// 持有者信息不再区分形态）。
-	lock, err := nodestate.AcquireInstanceLock(stateDir, "homeway")
+	lock, err := nodestate.AcquireInstanceLock(stateDir, "unified")
 	if err != nil {
 		cancel()
 		return nil, err

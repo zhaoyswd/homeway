@@ -166,7 +166,7 @@ func TestSpawnLockHeldStartupWindowConverges(t *testing.T) {
 // （持有者卡死/异常）——有界等后按「不可达」报可行动错误（预算注入缩短），零拉起。
 func TestSpawnLockHeldNoSocketBoundedError(t *testing.T) {
 	dir := spawnTestState(t)
-	lock, err := nodestate.AcquireInstanceLock(dir, "homeway")
+	lock, err := nodestate.AcquireInstanceLock(dir, "unified")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -176,8 +176,13 @@ func TestSpawnLockHeldNoSocketBoundedError(t *testing.T) {
 
 	before := spawnAttemptedForTest
 	_, err = dialControlSpawn(context.Background(), dir, "t", "cli-test")
-	if err == nil || !strings.Contains(err.Error(), "未在运行") {
-		t.Fatalf("窗口耗尽应报可行动错误：%v", err)
+	// FIX-49：锁被持有时**不得**再报「未在运行」（误导——进程明明在，只是没就绪）；
+	// 新文案说清持有者形态与 pid。
+	if err == nil || !strings.Contains(err.Error(), "正持有 state 锁") || !strings.Contains(err.Error(), "unified") {
+		t.Fatalf("窗口耗尽应报可行动错误（带持有者形态）：%v", err)
+	}
+	if strings.Contains(err.Error(), "未在运行") {
+		t.Fatalf("锁被持有却报「未在运行」＝误导：%v", err)
 	}
 	if got := spawnAttemptedForTest - before; got != 0 {
 		t.Fatalf("锁被持有时不得拉起第二个进程（拉起计数 +%d）", got)

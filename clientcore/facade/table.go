@@ -22,8 +22,11 @@ import (
 	"github.com/zhaoyswd/homeway/pkg/proto"
 )
 
-// hostsFileName 主机表持久化文件（0600）。
-const hostsFileName = "hosts.json"
+// HostsFileName 主机表持久化文件（0600；FIX-57：daemon 侧曾另立同名常量——收一份）。
+const HostsFileName = "hosts.json"
+
+// hostsFileName 包内旧名（既有引用不动）。
+const hostsFileName = HostsFileName
 
 // 表/操作面哨兵错误（绑定层映射到错误码表：ErrHostExists → host_exists、
 // ErrBadToken → bad_token、ErrNoHost → no_host、ErrHostUnreachable →

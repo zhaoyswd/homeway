@@ -94,10 +94,10 @@ func TestRoleOpsServeRelayDispatch(t *testing.T) {
 func TestRoleOpsRestartStoppedIsBadRequest(t *testing.T) {
 	ts := startTestServer(t, facade.BusConfig{})
 	c, _ := dialTest(t, ts)
-	if _, err := c.Request(context.Background(), facade.OpServeRestart, nil); err == nil || string(err.(CodeError)) != facade.CodeBadRequest {
+	if _, err := c.Request(context.Background(), facade.OpServeRestart, nil); err == nil || errCodeOf(err) != facade.CodeBadRequest {
 		t.Fatalf("restart 无对象应 bad_request：%v", err)
 	}
-	if _, err := c.Request(context.Background(), facade.OpRelayRestart, nil); err == nil || string(err.(CodeError)) != facade.CodeBadRequest {
+	if _, err := c.Request(context.Background(), facade.OpRelayRestart, nil); err == nil || errCodeOf(err) != facade.CodeBadRequest {
 		t.Fatalf("relay.restart 无对象应 bad_request：%v", err)
 	}
 }

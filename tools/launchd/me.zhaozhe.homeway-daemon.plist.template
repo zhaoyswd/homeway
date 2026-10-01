@@ -4,9 +4,12 @@
        __HOMEWAY_BIN__  homeway 可执行文件绝对路径（如 /usr/local/bin/homeway）
        __STATE_DIR__    统一 state 根绝对路径（如 /Users/you/.config/homeway——
                         三层布局：config.toml 期望态 + serve/relay/client + cache/）
-     ⚠️ ProgramArguments 只剩二进制路径（零参）：统一进程按 config 期望态装配全部
-     启用角色（serve/relay + 恒开的 client/control）；角色参数写 config 或用
+     ⚠️ ProgramArguments = 二进制 + `--state __STATE_DIR__`：统一进程按 config 期望态
+     装配全部启用角色（serve/relay + 恒开的 client/control）；角色参数写 config 或用
      `homeway serve|relay …` 命令组，**不进命令行**（token 不再出现在 ps 里）。
+     ⚠️ FIX-58：`--state` 必须显式给——原模板只靠 WorkingDirectory 表达 state 根，
+     而进程**不读 cwd**（state 根来自默认值或 --state）：非默认 state 的安装会静默
+     用 ~/.config/homeway，与模板里的 StandardOutPath/预期完全错位。
      KeepAlive + RunAtLoad：进程死了自动重拉、按期望态恢复（含机器重启自恢复）。
      安装与验证步骤见同目录 README.md（模板必须经 launchctl load 实测）。 -->
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -17,11 +20,14 @@
 	<key>ProgramArguments</key>
 	<array>
 		<string>__HOMEWAY_BIN__</string>
+		<string>--state</string>
+		<string>__STATE_DIR__</string>
 	</array>
 	<key>RunAtLoad</key>
 	<true/>
 	<key>KeepAlive</key>
 	<true/>
+	<!-- 进程不读 cwd（state 根 = --state 或默认值）；此键只为日志/相对路径兜底。 -->
 	<key>WorkingDirectory</key>
 	<string>__STATE_DIR__</string>
 	<key>StandardOutPath</key>

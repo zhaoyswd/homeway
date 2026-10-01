@@ -27,10 +27,9 @@ import (
 	"github.com/zhaoyswd/homeway/pkg/portfwd"
 )
 
-// carrierFlagBools forward/socks/speedtest 命令面的布尔 flag 集（flagsFirst 用）。
-var carrierFlagBools = map[string]bool{
-	"json": true, "quiet": true, "help": true, "h": true,
-}
+// carrierFlagBools forward/socks/speedtest 命令面的布尔 flag 集（= 共享表，见 host_cli.go
+// 的 cliBoolFlags；FIX-57：此前 host 面与承载面各一张、且都漏 no-spawn）。
+var carrierFlagBools = cliBoolFlags
 
 // dialCarrierCLI 连 control.sock（承载面命令共用的前端标识；role-management 4.1
 // 起 = 按需拉起的统一注入缝：未运行时拉起统一进程并重拨，--no-spawn 经 ctx 的
@@ -224,18 +223,24 @@ func forwardAddCLI(args []string, version string, w io.Writer) error {
 // forwardAddErr bad_request 的现场诊断：复查 forward.list + socks.status 找占用方
 // （文案指明全局唯一与占用者）；两表都无 → 本机探听（守护外进程占用）；再无 → 通用。
 func forwardAddErr(ctx context.Context, c *control.Client, hosts []control.HostState, a control.ForwardAddArgs, err error) error {
-	var code control.CodeError
-	if !errors.As(err, &code) || string(code) != facade.CodeBadRequest {
+	code, detail, ok := control.CodeDetailOf(err)
+	if !ok || string(code) != facade.CodeBadRequest {
 		return carrierOpErr("forward.add", err)
 	}
+	// ① 本地现场诊断优先（能指名占用方，最具体）。
 	if owner, found := findPortOwner(ctx, c, hosts, a.Listen, ""); found {
 		return fmt.Errorf("监听端口 %d 已被 %s 占用（forward/socks 全局唯一，非每主机）——可用 --listen 另选", a.Listen, owner)
 	}
-	// 守护进程外占用探测：短暂在本机回环试听同端口（立即关闭；不做任何物理接口监听）。
+	// ② 守护进程外占用探测：短暂在本机回环试听同端口（立即关闭；不做任何物理接口监听）。
 	if ln, lerr := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", a.Listen)); lerr != nil {
 		return fmt.Errorf("监听 127.0.0.1:%d 失败（bad_request；端口像是被守护进程外的本机进程占用：%v）——换端口或释放后重试，规则未入表", a.Listen, lerr)
 	} else {
 		_ = ln.Close()
+	}
+	// ③ FIX-50：服务端 detail（可行动归因原文）优于自建的通用兜底——到达这里说明
+	// 本机没有可指名的占用方，拒绝原因多半在参数面（目标形态/值域），直接转述服务端原文。
+	if detail != "" {
+		return fmt.Errorf("forward.add 被拒：%s\n（监听端口 1024–65535 且与全部规则/socks 全局唯一；规则未入表）", detail)
 	}
 	return errors.New("forward.add 被拒（bad_request；参数值域/监听失败）——核对 --listen（1024–65535，全局唯一）与 --target 形态后重试")
 }

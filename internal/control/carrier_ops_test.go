@@ -8,6 +8,7 @@ package control
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"testing"
 
 	"github.com/zhaoyswd/homeway/clientcore/facade"
@@ -46,15 +47,15 @@ func TestCarrierForwardOps(t *testing.T) {
 	}
 
 	// add 冲突（全局端口唯一）：bad_request。
-	if _, err := c.Request(ctx, facade.OpForwardAdd, ForwardAddArgs{Host: b, Listen: 8080}); err == nil || string(err.(CodeError)) != facade.CodeBadRequest {
+	if _, err := c.Request(ctx, facade.OpForwardAdd, ForwardAddArgs{Host: b, Listen: 8080}); err == nil || errCodeOf(err) != facade.CodeBadRequest {
 		t.Fatalf("端口冲突应 bad_request：%v", err)
 	}
 	// add 值域外（端口 0）：bad_request。
-	if _, err := c.Request(ctx, facade.OpForwardAdd, ForwardAddArgs{Host: a, Listen: 0}); err == nil || string(err.(CodeError)) != facade.CodeBadRequest {
+	if _, err := c.Request(ctx, facade.OpForwardAdd, ForwardAddArgs{Host: a, Listen: 0}); err == nil || errCodeOf(err) != facade.CodeBadRequest {
 		t.Fatalf("端口 0 应 bad_request：%v", err)
 	}
 	// add 无主机：no_host。
-	if _, err := c.Request(ctx, facade.OpForwardAdd, ForwardAddArgs{Host: "cc00", Listen: 9090}); err == nil || string(err.(CodeError)) != facade.CodeNoHost {
+	if _, err := c.Request(ctx, facade.OpForwardAdd, ForwardAddArgs{Host: "cc00", Listen: 9090}); err == nil || errCodeOf(err) != facade.CodeNoHost {
 		t.Fatalf("不在表主机应 no_host：%v", err)
 	}
 
@@ -86,10 +87,10 @@ func TestCarrierForwardOps(t *testing.T) {
 	if _, err := c.Request(ctx, facade.OpForwardRemove, ForwardRemoveArgs{Host: a, Listen: 8080}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := c.Request(ctx, facade.OpForwardRemove, ForwardRemoveArgs{Host: a, Listen: 8080}); err == nil || string(err.(CodeError)) != facade.CodeBadRequest {
+	if _, err := c.Request(ctx, facade.OpForwardRemove, ForwardRemoveArgs{Host: a, Listen: 8080}); err == nil || errCodeOf(err) != facade.CodeBadRequest {
 		t.Fatalf("规则不存在应 bad_request：%v", err)
 	}
-	if _, err := c.Request(ctx, facade.OpForwardRemove, ForwardRemoveArgs{Host: "cc00", Listen: 8080}); err == nil || string(err.(CodeError)) != facade.CodeNoHost {
+	if _, err := c.Request(ctx, facade.OpForwardRemove, ForwardRemoveArgs{Host: "cc00", Listen: 8080}); err == nil || errCodeOf(err) != facade.CodeNoHost {
 		t.Fatalf("无主机应 no_host：%v", err)
 	}
 }
@@ -118,7 +119,7 @@ func TestCarrierSocksOps(t *testing.T) {
 	}
 
 	// 第二主机抢 1080：bad_request（FS Scenario「第二主机需另选端口」）。
-	if _, err := c.Request(ctx, facade.OpSocksOn, SocksOnArgs{Host: b}); err == nil || string(err.(CodeError)) != facade.CodeBadRequest {
+	if _, err := c.Request(ctx, facade.OpSocksOn, SocksOnArgs{Host: b}); err == nil || errCodeOf(err) != facade.CodeBadRequest {
 		t.Fatalf("跨主机端口冲突应 bad_request：%v", err)
 	}
 	// --listen 1081 则成功（换端口语义）。
@@ -126,11 +127,11 @@ func TestCarrierSocksOps(t *testing.T) {
 		t.Fatal(err)
 	}
 	// 值域外（80）：bad_request——与 forward 同一条值域。
-	if _, err := c.Request(ctx, facade.OpSocksOn, SocksOnArgs{Host: b, Listen: 80}); err == nil || string(err.(CodeError)) != facade.CodeBadRequest {
+	if _, err := c.Request(ctx, facade.OpSocksOn, SocksOnArgs{Host: b, Listen: 80}); err == nil || errCodeOf(err) != facade.CodeBadRequest {
 		t.Fatalf("端口 80 应 bad_request：%v", err)
 	}
 	// 无主机：no_host。
-	if _, err := c.Request(ctx, facade.OpSocksOn, SocksOnArgs{Host: "cc00"}); err == nil || string(err.(CodeError)) != facade.CodeNoHost {
+	if _, err := c.Request(ctx, facade.OpSocksOn, SocksOnArgs{Host: "cc00"}); err == nil || errCodeOf(err) != facade.CodeNoHost {
 		t.Fatalf("无主机应 no_host：%v", err)
 	}
 
@@ -220,7 +221,7 @@ func TestCarrierSpeedtestOps(t *testing.T) {
 
 	// 无主机：start/status/cancel 均 no_host。
 	for _, op := range []string{facade.OpSpeedtestStart, facade.OpSpeedtestStatus, facade.OpSpeedtestCancel} {
-		if _, err := c.Request(ctx, op, map[string]string{"host": "cc00"}); err == nil || string(err.(CodeError)) != facade.CodeNoHost {
+		if _, err := c.Request(ctx, op, map[string]string{"host": "cc00"}); err == nil || errCodeOf(err) != facade.CodeNoHost {
 			t.Fatalf("%s 无主机应 no_host：%v", op, err)
 		}
 	}
@@ -251,7 +252,7 @@ func TestCarrierNotReadyGate(t *testing.T) {
 		{facade.OpSpeedtestCancel, SpeedtestCancelArgs{Host: a}},
 	}
 	for _, tc := range ops {
-		if _, err := c.Request(ctx, tc.op, tc.args); err == nil || string(err.(CodeError)) != facade.CodeNotReady {
+		if _, err := c.Request(ctx, tc.op, tc.args); err == nil || errCodeOf(err) != facade.CodeNotReady {
 			t.Fatalf("%s 未就绪应 not_ready：%v", tc.op, err)
 		}
 	}
@@ -274,5 +275,48 @@ func TestCarrierUnknownFieldsIgnored(t *testing.T) {
 	var add ForwardAddResult
 	if err := json.Unmarshal(raw, &add); err != nil || add.Rule.Listen != 7070 {
 		t.Fatalf("解码结果异常：%+v %v", add, err)
+	}
+}
+
+// errCodeOf 取错误的稳定码（FIX-50 起错误可能是 *OpError（带 detail）或 CodeError）。
+func errCodeOf(err error) string {
+	code, _, ok := CodeDetailOf(err)
+	if !ok {
+		return ""
+	}
+	return string(code)
+}
+
+// TestCarrierErrDetailCarried（FIX-50）：可行动归因随错误一起到 CLI——稳定码保持
+// 窄值域（bad_request），具体原因（「已被 X 占用」）走 detail，不再被吞成三个字。
+// 变异自证：去掉 reply 里的 rsp.Detail 赋值 ⇒ 本用例红（detail 空）。
+func TestCarrierErrDetailCarried(t *testing.T) {
+	ts := startTestServer(t, facade.BusConfig{})
+	c, _ := dialTest(t, ts)
+	ctx := context.Background()
+	a := regCarrierHost(t, ts, carrierHostA, "ali")
+	b := regCarrierHost(t, ts, carrierHostB, "mac")
+	if _, err := c.Request(ctx, facade.OpForwardAdd, ForwardAddArgs{Host: a, Listen: 8080}); err != nil {
+		t.Fatal(err)
+	}
+	// 端口冲突（跨主机）：真实错误文本应完整到达（含端口号与占用者）。
+	_, err := c.Request(ctx, facade.OpForwardAdd, ForwardAddArgs{Host: b, Listen: 8080})
+	if err == nil {
+		t.Fatal("应冲突")
+	}
+	code, detail, ok := CodeDetailOf(err)
+	if !ok || code != facade.CodeBadRequest {
+		t.Fatalf("码应为 bad_request（窄值域），got %v/%v", code, ok)
+	}
+	if detail == "" {
+		t.Fatal("detail 应携带服务端可行动归因（FIX-50）")
+	}
+	// 既有断言面不受影响：errors.Is / errors.As 对 CodeError 仍成立。
+	if !errors.Is(err, CodeError(facade.CodeBadRequest)) {
+		t.Fatal("errors.Is(err, CodeError) 应成立")
+	}
+	var ce CodeError
+	if !errors.As(err, &ce) || string(ce) != facade.CodeBadRequest {
+		t.Fatalf("errors.As 应取到码：%v", err)
 	}
 }

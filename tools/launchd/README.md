@@ -29,7 +29,7 @@ launchctl load ~/Library/LaunchAgents/me.zhaozhe.homeway-daemon.plist
 # 4. 验证
 launchctl list | grep homeway-daemon        # 应有一行（pid 非一、最后一列 0）
 homeway status                              # 聚合状态面：进程层 + serve/relay + client
-pgrep -fl homeway                           # 命令行只有二进制路径——无 token、无角色子命令
+pgrep -fl homeway                           # 命令行只有二进制 + --state——无 token、无角色子命令
 ```
 
 ## 卸载 / 排障
@@ -52,5 +52,7 @@ rm ~/Library/LaunchAgents/me.zhaozhe.homeway-daemon.plist
 ## 教训（为什么模板必须实测）
 
 launchd 的参数传递形态不能想当然（现役出口 plist 曾因「exit --relay」子命令形态不
-工作换过根命令形态）。本模板的零参形态已按上方安装步骤实测拉起（拉起/KeepAlive
-重拉/期望态恢复判据见 openspec 对应 change 执行报告）。
+工作换过根命令形态）。本模板已按上方安装步骤实测拉起（拉起/KeepAlive 重拉/期望态
+恢复判据见 openspec 对应 change 执行报告）。
+**FIX-58 追加教训**：`WorkingDirectory` 不构成「state 根」的表达——进程不读 cwd，
+state 根只来自 `--state` 或默认值；模板现已显式带 `--state __STATE_DIR__`。

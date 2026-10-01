@@ -16,13 +16,13 @@ import (
 
 func TestInstanceLockSecondAcquireFails(t *testing.T) {
 	dir := t.TempDir()
-	l1, err := AcquireInstanceLock(dir, "daemon")
+	l1, err := AcquireInstanceLock(dir, "relay")
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer l1.Release()
 
-	_, err = AcquireInstanceLock(dir, "daemon")
+	_, err = AcquireInstanceLock(dir, "relay")
 	if err == nil {
 		t.Fatal("二次实例应失败")
 	}
@@ -30,8 +30,10 @@ func TestInstanceLockSecondAcquireFails(t *testing.T) {
 	if !strings.Contains(msg, "已在运行") || !strings.Contains(msg, "state=") {
 		t.Fatalf("失败文案缺关键信息：%q", msg)
 	}
-	if !strings.Contains(msg, "pid ") || !strings.Contains(msg, "角色 daemon") {
-		t.Fatalf("失败文案应含持有 pid 与角色：%q", msg)
+	// FIX-49：锁里记的是**形态**（unified/serve/relay），不再把 role 归一成 homeway
+	// 后丢掉这个信息——文案带形态，冷启动窗口/冲突提示才说得清「谁占着 state」。
+	if !strings.Contains(msg, "pid ") || !strings.Contains(msg, "形态 relay") {
+		t.Fatalf("失败文案应含持有 pid 与形态：%q", msg)
 	}
 	if !strings.Contains(msg, "pid "+itoa(os.Getpid())) {
 		t.Fatalf("失败文案应含持有者 pid=%d：%q", os.Getpid(), msg)
@@ -92,7 +94,7 @@ func TestInstanceLockReleasedOnCrash(t *testing.T) {
 	}
 
 	// 持锁期间父进程取不到（互斥成立）。
-	if _, err := AcquireInstanceLock(dir, "daemon"); err == nil {
+	if _, err := AcquireInstanceLock(dir, "relay"); err == nil {
 		_ = cmd.Process.Kill()
 		t.Fatal("子进程持锁期间父进程不应取得")
 	}
@@ -102,9 +104,40 @@ func TestInstanceLockReleasedOnCrash(t *testing.T) {
 		t.Fatal(err)
 	}
 	_ = cmd.Wait()
-	l, err := AcquireInstanceLock(dir, "daemon")
+	l, err := AcquireInstanceLock(dir, "relay")
 	if err != nil {
 		t.Fatalf("崩溃释放后应可取得：%v", err)
 	}
 	defer l.Release()
+}
+
+// TestLockHolderInfoForm（FIX-49）：锁文件记录形态，LockHolderInfo 能读出——
+// CLI 的冷启动窗口提示据此说清「谁占着 state」（旧格式锁回 legacy:<role>）。
+func TestLockHolderInfoForm(t *testing.T) {
+	dir := t.TempDir()
+	l, err := AcquireInstanceLock(dir, "serve")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer l.Release()
+	held, pid, form := LockHolderInfo(dir)
+	if !held || pid != os.Getpid() || form != "serve" {
+		t.Fatalf("LockHolderInfo = (%v,%d,%q)，期望 (true,%d,serve)", held, pid, form, os.Getpid())
+	}
+	if !LockHeld(dir) {
+		t.Fatal("LockHeld 应与 LockHolderInfo 一致")
+	}
+	// 旧格式锁（只有 role=homeway，无 form）：解析回 legacy:homeway，不谎报已知形态。
+	l.Release()
+	if err := os.WriteFile(filepath.Join(dir, lockFileName), []byte("pid=1\nrole=homeway\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	f, oerr := os.Open(filepath.Join(dir, lockFileName))
+	if oerr != nil {
+		t.Fatal(oerr)
+	}
+	defer f.Close()
+	if pid, form := readLockHolder(f); pid != 1 || form != "legacy:homeway" {
+		t.Fatalf("旧格式锁解析 = (%d,%q)，期望 (1,legacy:homeway)", pid, form)
+	}
 }

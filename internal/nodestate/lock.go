@@ -21,20 +21,22 @@ import (
 	"strings"
 )
 
-// lockFileName 单实例锁文件名（内容 = "pid=<n>\nrole=<role>\n"）。
+// lockFileName 单实例锁文件名（内容 = "pid=<n>\nrole=homeway\nform=<形态>\n"）。
 const lockFileName = "lock"
 
 // InstanceLock 一个 state 目录的单实例锁句柄。
 type InstanceLock struct {
 	f    *os.File
 	path string
-	role string
+	form string
 }
 
-// AcquireInstanceLock 取 <state>/lock 的排他非阻塞锁；成功写 pid+角色，失败读出
-// 持有者并报错（错误文案带角色与 state 路径——exit 与 daemon 同目录并存时能看出
-// 是谁占的，D2 组合处置）。
-func AcquireInstanceLock(stateDir, role string) (*InstanceLock, error) { // role：诊断用持有者名（统一进程/前台单角色都写 homeway——归一）
+// AcquireInstanceLock 取 <state>/lock 的排他非阻塞锁；成功写 pid + 归一角色（恒
+// homeway）+ **形态**（unified/serve/relay），失败读出持有者并报错（错误文案带形态与
+// state 路径——能看出是谁占的，D2 组合处置）。形态只作**诊断/文案**（FIX-49：单实例
+// 互斥判定不看它，role 曾归一成 homeway ⇒ 锁被持有时 CLI 分不清是统一进程还是前台
+// 单角色，冷启动窗口只能给误导性提示 + 白等）。
+func AcquireInstanceLock(stateDir, form string) (*InstanceLock, error) {
 	if err := os.MkdirAll(stateDir, 0o700); err != nil {
 		return nil, fmt.Errorf("单实例锁：建 state 目录 %s 失败：%w", stateDir, err)
 	}
@@ -44,16 +46,17 @@ func AcquireInstanceLock(stateDir, role string) (*InstanceLock, error) { // role
 		return nil, fmt.Errorf("单实例锁：打开 %s 失败：%w", path, err)
 	}
 	if err := lockFile(int(f.Fd())); err != nil {
-		pid, hrole := readLockHolder(f)
+		pid, _ := readLockHolder(f)
+		_, _, hform := LockHolderInfo(stateDir)
 		_ = f.Close()
-		return nil, fmt.Errorf("homeway %s 已在运行（pid %d，角色 %s，state=%s）——拒绝二次启动",
-			role, pid, hrole, stateDir)
+		return nil, fmt.Errorf("homeway 已在运行（pid %d，形态 %s，state=%s）——拒绝二次启动",
+			pid, formOr(hform), stateDir)
 	}
 	// 写持有者信息（截断重写：崩溃残留的旧内容不该存活）。
 	if err := f.Truncate(0); err == nil {
-		_, _ = f.WriteAt([]byte(fmt.Sprintf("pid=%d\nrole=%s\n", os.Getpid(), role)), 0)
+		_, _ = f.WriteAt([]byte(fmt.Sprintf("pid=%d\nrole=homeway\nform=%s\n", os.Getpid(), form)), 0)
 	}
-	return &InstanceLock{f: f, path: path, role: role}, nil
+	return &InstanceLock{f: f, path: path, form: form}, nil
 }
 
 // Release 主动释放（进程退出时内核也会自动释放；幂等）。
@@ -66,25 +69,54 @@ func (l *InstanceLock) Release() {
 	l.f = nil
 }
 
-// readLockHolder 从锁文件读持有者 pid/角色（读不到 = pid 0 / 角色 "?"）。
+// readLockHolder 从锁文件读持有者 pid/形态（读不到 = pid 0 / 形态 "?"）。第二个
+// 返回值是形态（旧字段名 role——历史内容归一为 homeway）。
 func readLockHolder(f *os.File) (int, string) {
 	b := make([]byte, 128)
 	n, err := f.ReadAt(b, 0)
 	if err != nil && n == 0 {
 		return 0, "?"
 	}
-	pid, role := 0, "?"
+	pid, form := 0, "?"
 	for _, line := range strings.Split(string(b[:n]), "\n") {
 		if v, ok := strings.CutPrefix(line, "pid="); ok {
 			if p, err := strconv.Atoi(strings.TrimSpace(v)); err == nil {
 				pid = p
 			}
 		}
-		if v, ok := strings.CutPrefix(line, "role="); ok {
-			role = strings.TrimSpace(v)
+		if v, ok := strings.CutPrefix(line, "form="); ok {
+			form = strings.TrimSpace(v)
+		}
+		if v, ok := strings.CutPrefix(line, "role="); ok && form == "?" {
+			// 旧格式（role 归一为 homeway）——形态未知。
+			form = "legacy:" + strings.TrimSpace(v)
 		}
 	}
-	return pid, role
+	return pid, form
+}
+
+func formOr(form string) string {
+	if form == "" || form == "?" {
+		return "未知（旧格式锁或读不到）"
+	}
+	return form
+}
+
+// LockHolderInfo 锁持有者的形态与 pid（FIX-49：CLI 的冷启动窗口/不可达提示要能说清
+// 「谁占着 state」）。held = 有活进程持锁（flock 试探同 LockHeld）。
+func LockHolderInfo(stateDir string) (held bool, pid int, form string) {
+	path := filepath.Join(stateDir, lockFileName)
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		return false, 0, ""
+	}
+	defer f.Close()
+	if err := lockFile(int(f.Fd())); err != nil {
+		pid, form = readLockHolder(f)
+		return true, pid, form
+	}
+	_ = unlockFile(int(f.Fd()))
+	return false, 0, ""
 }
 
 // LockHeld 活进程持锁探测（role-management 4.1「未运行判定」的读半边，r1 低-3）：
@@ -94,15 +126,6 @@ func readLockHolder(f *os.File) (int, string) {
 // 探活」（lock.go 头注已否决的竞态判定）。非 unix（lockFile 恒成功桩）恒 false
 // （= 按「未运行」处理——Windows 拉起 = 可行动错误，方向不变）。
 func LockHeld(stateDir string) bool {
-	path := filepath.Join(stateDir, lockFileName)
-	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o600)
-	if err != nil {
-		return false // 打不开（含目录不存在）= 无从谈持锁，按未运行处理
-	}
-	defer f.Close()
-	if err := lockFile(int(f.Fd())); err != nil {
-		return true // 拿不到 = 有活进程持有
-	}
-	_ = unlockFile(int(f.Fd()))
-	return false
+	held, _, _ := LockHolderInfo(stateDir)
+	return held
 }

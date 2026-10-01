@@ -412,13 +412,3 @@ func atomicWrite(path string, data []byte) error {
 	}
 	return nil
 }
-
-// Override 覆盖序 helper：flag 显式设值（set=true）优先，否则 config 值生效
-// （内置默认已由 Load 折进 cfg 值——「flag > config > 默认」三层由此收拢）。
-// Go flag 不自带「是否显式设过」，调用方用 fs.Visit 登记后传入 set。
-func Override[T any](set bool, flagVal, cfgVal T) T {
-	if set {
-		return flagVal
-	}
-	return cfgVal
-}

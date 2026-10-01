@@ -142,19 +142,24 @@ func roleStartCLI(role string, args []string, version string, w io.Writer) error
 	if fs.NArg() > 0 {
 		return fmt.Errorf("%s start 不接受位置参数（got %q）", role, fs.Args())
 	}
-	ctx, cancel := context.WithTimeout(cliopts.With(context.Background(), cliopts.Opts{NoSpawn: *g.noSpawn, Out: w}), *g.timeout)
+	// 不显式给 Out：拉起提示走默认（stderr）——stdout 留给命令输出/--json（FIX-48）。
+	ctx, cancel := context.WithTimeout(cliopts.With(context.Background(), cliopts.Opts{NoSpawn: *g.noSpawn}), *g.timeout)
 	defer cancel()
 
 	// 未跑：CLI 直改 config（enabled=true）再拉起——进程起来按期望态装配（D3：
 	// 进程在跑时改写只经控制面〔进程内写〕，CLI 直改文件只在未跑时发生）。
-	// 先**裸拨**判在跑（不经拉起缝——拉起/不拉起的决策在本动词自己的手里）。
+	// 「未运行判定 + 启动窗口等待」走唯一注入缝 probeControl（FIX-49：此前这里裸拨
+	// 一份，两个 CLI 同时冷启动时缺启动窗口的等待，会立刻误报不可达）。
 	sock := controlSockOf(*g.stateDir)
-	if c, _, derr := control.Dial(ctx, sock, control.FrontendInfo{Kind: "cli", Name: "homeway-" + role, Version: version}); derr == nil {
+	c, perr := probeControl(ctx, *g.stateDir, version, "homeway-"+role)
+	if perr != nil {
+		return perr
+	}
+	if c != nil {
 		defer c.Close()
 		return serveStartViaControl(ctx, c, role, w)
-	} else if !notRunningDial(derr, *g.stateDir) {
-		return controlDialErr(*g.stateDir, sock, derr)
-	} else if *g.noSpawn {
+	}
+	if *g.noSpawn {
 		return fmt.Errorf("守护进程未运行且 --no-spawn 已给定（不拉起）\nsock=%s\n先手动启动：homeway --state %s", sock, *g.stateDir)
 	}
 	if err := nodeconfig.Update(nodeconfig.Path(*g.stateDir), func(c *nodeconfig.Config) error {

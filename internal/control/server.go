@@ -24,6 +24,7 @@ package control
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"github.com/zhaoyswd/homeway/clientcore/facade"
 	"net"
 	"os"
@@ -493,11 +494,26 @@ func (c *conn) handleHello(body []byte) bool {
 // ---------- 请求/响应与错误码映射 ----------
 
 // opError 操作错误（code = 错误码表稳定字符串）。
-type opError struct{ code string }
+// opError 码 + 可行动归因（FIX-50：detail 随行走 wire，CLI 不必吞成 bad_request
+// 或自己再猜一次原因）。
+type opError struct {
+	code   string
+	detail string
+}
 
-func (e *opError) Error() string { return e.code }
+func (e *opError) Error() string {
+	if e.detail != "" {
+		return e.code + ": " + e.detail
+	}
+	return e.code
+}
 
 func errCode(code string) error { return &opError{code: code} }
+
+// opErrf 带归因的码错误（映射层用：把 facade 层的可行动文案带给 CLI）。
+func opErrf(code, format string, args ...any) error {
+	return &opError{code: code, detail: fmt.Sprintf(format, args...)}
+}
 
 // handleRequestFrame 解请求帧：控制类 body 非法 JSON → bad_json 断连；合法 →
 // 入每连接有界请求队列（非阻塞；慢操作不阻塞读循环——spec「三类流量同连接
@@ -534,8 +550,10 @@ func (c *conn) reply(corr uint64, result any, err error) {
 		var oe *opError
 		if errors.As(err, &oe) {
 			rsp.Error = oe.code
+			rsp.Detail = oe.detail // FIX-50：可行动归因随行（码窄、detail 自由文本）
 		} else {
 			rsp.Error = facade.CodeBadRequest // 非映射错误统一落 bad_request（防御）
+			rsp.Detail = errText(err)
 		}
 	} else {
 		rsp.Ok = true
@@ -561,8 +579,10 @@ func (c *conn) replyConfirm(corr uint64, result any, err error) {
 		var oe *opError
 		if errors.As(err, &oe) {
 			rsp.Error = oe.code
+			rsp.Detail = oe.detail
 		} else {
 			rsp.Error = facade.CodeBadRequest
+			rsp.Detail = errText(err)
 		}
 	} else {
 		rsp.Ok = true
@@ -763,7 +783,8 @@ func (c *conn) opSnapshotGet(corr uint64, _ json.RawMessage) {
 // opSubscribe 订阅：游标检查（cursor_stale/bad_request）、幂等（同域重复订阅 =
 // 成功，语义 = **替换**：该连接的订阅域集合整体换为新载荷的 domains——
 // daemon-control-plane delta 3b 钉死，非并集；实现 = bus.Subscribe 的
-// sub.domains = dm 整体赋值）、view 回显。「确认 → 回放 → 在线」三段次序 =
+// sub.domains = dm 整体赋值）、view 回显（**并且**自 facade 期起参与需求合成——
+// 见 facade/demand.go ParseView；spec「门控信号词表」）。「确认 → 回放 → 在线」三段次序 =
 // B3 订阅原子交付：回放拷入订阅者 pending 段在总线锁内原子完成（见
 // facade.Bus.Subscribe），绑定侧以「订阅确认在途」门闩（复检暂存）保证——门闩
 // 在 Bus.Subscribe **前**置位（注册后投递的在线事件被取到时门闩必已置位），
@@ -801,7 +822,7 @@ func (c *conn) opSubscribe(corr uint64, args json.RawMessage) {
 	c.replyConfirm(corr, SubscribeResult{
 		Domains:    a.Domains, // 替换语义下生效集合恰 = 本次声明（回显即生效域集合，spec「重复订阅替换而非并集」）
 		Cursor:     c.s.cfg.Bus.CurrentSeq(),
-		View:       a.View, // 只回显（spec：不参与需求判定——信号源归 facade 期）
+		View:       a.View, // 回显 + 参与需求合成（facade 期起；spec「门控信号词表」）
 		Generation: c.s.Generation(),
 	}, nil)
 }
@@ -835,10 +856,13 @@ func mapCarrierErr(err error) error {
 	if err == nil {
 		return nil
 	}
+	code := facade.CodeBadRequest
 	if errors.Is(err, ErrBackendNoHost) {
-		return errCode(facade.CodeNoHost)
+		code = facade.CodeNoHost
 	}
-	return errCode(facade.CodeBadRequest)
+	// FIX-50：底层可行动归因随行（「端口 1080 已被 xx 的 socks 监听占用」这类原文
+	// 不再被吞成 bad_request 三个字——CLI 侧据此直接给结论，不必再自建「现场诊断」）。
+	return &opError{code: code, detail: err.Error()}
 }
 
 func (c *conn) opForwardAdd(corr uint64, args json.RawMessage) {
@@ -1262,4 +1286,12 @@ func (c *conn) writeStreamItem(st *stream, it streamItem) bool {
 		return true
 	}
 	return c.writeFrame(EncodeFrame(OpStreamData, EncodeStreamBody(st.id, it.data)))
+}
+
+// errText 错误原文（detail 字段用；nil 空串）。
+func errText(err error) string {
+	if err == nil {
+		return ""
+	}
+	return err.Error()
 }

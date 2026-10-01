@@ -48,7 +48,7 @@ func CLI(args []string) error {
 
 	// 单实例锁（role-management 2.3：统一进程与前台单角色共用 <state>/lock——
 	// 角色名归一 homeway）。
-	lock, err := nodestate.AcquireInstanceLock(*state, "homeway")
+	lock, err := nodestate.AcquireInstanceLock(*state, "relay")
 	if err != nil {
 		return err
 	}

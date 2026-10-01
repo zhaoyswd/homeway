@@ -64,7 +64,7 @@ func CLI(args []string) error {
 
 	// 单实例锁（role-management 2.3：统一进程与前台单角色共用 <state>/lock——
 	// 角色名归一 homeway；同 state 双进程互斥）。装配最早处取，进程退出释放。
-	lock, err := nodestate.AcquireInstanceLock(*stateDir, "homeway")
+	lock, err := nodestate.AcquireInstanceLock(*stateDir, "serve")
 	if err != nil {
 		return err
 	}

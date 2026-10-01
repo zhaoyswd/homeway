@@ -263,16 +263,3 @@ func TestUpdateModifyAndWrite(t *testing.T) {
 		t.Fatal("fn 失败不应写回")
 	}
 }
-
-func TestOverrideHelper(t *testing.T) {
-	// 覆盖序：flag 显式设值 > config > 默认（默认已折进 cfgVal）。
-	if got := Override(true, uint16(4242), uint16(41641)); got != 4242 {
-		t.Fatalf("flag 显式应优先：%d", got)
-	}
-	if got := Override(false, uint16(4242), uint16(41641)); got != 41641 {
-		t.Fatalf("flag 省略应回落 config：%d", got)
-	}
-	if got := Override(false, true, false); got != false {
-		t.Fatalf("bool 同理：%v", got)
-	}
-}

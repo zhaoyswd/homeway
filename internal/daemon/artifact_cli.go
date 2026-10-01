@@ -49,7 +49,7 @@ func ImportCLI(args []string, w io.Writer) error {
 	fs := flag.NewFlagSet("homeway import", flag.ContinueOnError)
 	fs.SetOutput(w)
 	stateDir := fs.String("state", DefaultStateDir(), "统一 state 根（落位目标；进程必须在停）")
-	if err := fs.Parse(flagsFirst(args, map[string]bool{"help": true, "h": true})); err != nil {
+	if err := fs.Parse(flagsFirst(args, cliBoolFlags)); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
 			return nil
 		}

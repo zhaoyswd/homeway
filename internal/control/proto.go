@@ -13,7 +13,7 @@ import "encoding/json"
 // ---------- 握手与生命周期（D5 生命周期） ----------
 
 // FrontendInfo 前端标识（hello 携带；kind 为自由字符串——spec 未冻结前端 kind 词表，
-// 服务端只回显进日志，不校验值域）。
+// 见 facade/demand.go 与 spec「门控信号词表」；服务端不校验值域）。
 type FrontendInfo struct {
 	Kind    string `json:"kind"`
 	Name    string `json:"name"`
@@ -71,9 +71,13 @@ type RequestBody struct {
 // Ok=true 时 Result 为操作各自的载荷。Ok=false 不代表连接有问题——错误码表里
 // 只有 bad_json/bad_frame 断连，其余均不断连。
 type ResponseBody struct {
-	Corr   uint64          `json:"corr"`
-	Ok     bool            `json:"ok"`
-	Error  string          `json:"error,omitempty"`
+	Corr  uint64 `json:"corr"`
+	Ok    bool   `json:"ok"`
+	Error string `json:"error,omitempty"`
+	// Detail 可行动归因原文（FIX-50，只增字段）：稳定错误码保持窄值域，具体的
+	// 「谁占着端口/为什么拒绝」以原文随行——否则 CLI 只能吞成 bad_request 文案，
+	// 或自己去猜（forward add 的「现场诊断」正是这个缺口的下游产物）。
+	Detail string          `json:"detail,omitempty"`
 	Result json.RawMessage `json:"result,omitempty"`
 }
 
@@ -132,7 +136,7 @@ type HostBrief struct {
 	AddedAt int64  `json:"addedAt"`
 }
 
-// SubscribeArgs events.subscribe 载荷。View = 前端订阅视图声明，本期只回显
+// SubscribeArgs events.subscribe 载荷。View = 前端订阅视图声明（回显 + 参与需求合成，
 // （随订阅确认/快照可见），MUST NOT 参与需求判定——信号源归 facade 期（spec
 // 「门控信号词表与策略边界」）。Cursor = 上次收到的游标（缺省 = 纯在线订阅，
 // 前端标准流程是 snapshot.get 后带 cursor 订阅以补齐快照与订阅之间的缝隙）。

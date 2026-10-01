@@ -68,25 +68,15 @@ var (
 // 预算；ctx 已被调用方 cancel 时放弃）。--no-spawn / Windows / 进程在跑但不可达 =
 // 可行动错误。
 func dialControlSpawn(ctx context.Context, stateDir, version, name string) (*control.Client, error) {
+	c, err := probeControl(ctx, stateDir, version, name)
+	if err != nil {
+		return nil, err
+	}
+	if c != nil {
+		return c, nil // 在跑可用
+	}
+	// c == nil, err == nil：未运行（判定+启动窗口等待已由 probeControl 收口）。
 	sock := controlSockOf(stateDir)
-	c, _, err := control.Dial(ctx, sock, control.FrontendInfo{Kind: "cli", Name: name, Version: version})
-	if err == nil {
-		return c, nil
-	}
-	if !notRunningDial(err, stateDir) {
-		// 进程在跑但不可达（锁被持有 / 非 ENOENT·ECONNREFUSED 族）——不拉第二个。
-		// 其中「未运行族错误 + 锁被持有」= 另一进程刚取锁、control.sock 尚未就绪的
-		// **启动窗口**（两个 CLI 同时冷启动的竞态：第二个进入者此时不该立刻报错，
-		// 5.1 门禁批整面负载下实测撞出）——有界等就绪后重拨复用；等不到（或本就
-		// 非未运行族：超时/权限/协议）才按原错误报可行动文案。
-		if notRunningFamily(err) && waitControlReady(stateDir, spawnReadyTimeout) {
-			if c2, _, derr := control.Dial(ctx, sock, control.FrontendInfo{Kind: "cli", Name: name, Version: version}); derr == nil {
-				return c2, nil
-			}
-		}
-		return nil, controlDialErr(stateDir, sock, err)
-	}
-
 	opts := cliopts.From(ctx)
 	if opts.NoSpawn {
 		return nil, fmt.Errorf("守护进程未运行且 --no-spawn 已给定（不拉起）\nsock=%s\n先手动启动：homeway --state %s（零参统一进程；Ctrl-C 收工）", sock, stateDir)
@@ -106,6 +96,43 @@ func dialControlSpawn(ctx context.Context, stateDir, version, name string) (*con
 		return nil, controlDialErr(stateDir, sock, derr)
 	}
 	return c2, nil
+}
+
+// probeControl 「未运行判定 + 启动窗口等待」的**唯一注入缝**（FIX-49：此前 role
+// start 自己裸拨一份、dialControlSpawn 一份，启动窗口的等待只在后者有——两个 CLI
+// 同时冷启动时，走 role start 的那个会立刻按「不可达」报错）。
+//
+// 返回：
+//   - (client, nil)：在跑可用（含等启动窗口就绪后的重拨成功）；
+//   - (nil, nil)  ：判定**未运行**（ENOENT/ECONNREFUSED 族 + flock 试探拿得到）——
+//     调用方按自身策略拉起；
+//   - (nil, err)  ：其它可行动错误（含「锁被持有但 control.sock 长期不就绪」——提示
+//     带持有者形态与 pid，不再误报「未在运行」）。
+func probeControl(ctx context.Context, stateDir, version, name string) (*control.Client, error) {
+	sock := controlSockOf(stateDir)
+	info := control.FrontendInfo{Kind: "cli", Name: name, Version: version}
+	c, _, err := control.Dial(ctx, sock, info)
+	if err == nil {
+		return c, nil
+	}
+	if notRunningDial(err, stateDir) {
+		return nil, nil // 未运行：可拉起
+	}
+	// 「未运行族错误 + 锁被持有」= 另一进程刚取锁、control.sock 尚未就绪的**启动窗口**
+	// （两个 CLI 同时冷启动的竞态：第二个进入者此时不该立刻报错，5.1 门禁批整面负载下
+	// 实测撞出）——有界等就绪后重拨复用。等不到：提示说清是被谁占着（形态+pid）。
+	if notRunningFamily(err) {
+		if waitControlReady(stateDir, spawnReadyTimeout) {
+			if c2, _, derr := control.Dial(ctx, sock, info); derr == nil {
+				return c2, nil
+			}
+		}
+		held, pid, form := nodestate.LockHolderInfo(stateDir)
+		if held {
+			return nil, fmt.Errorf("另一 homeway 进程（pid %d，形态 %s）正持有 state 锁，但控制面 %v 内未就绪（该进程可能正在启动或卡住）\nstate=%s\n可稍后重试；卡住时先停该进程再试", pid, form, spawnReadyTimeout, stateDir)
+		}
+	}
+	return nil, controlDialErr(stateDir, sock, err)
 }
 
 // ensureRunning 拉起统一进程并等 control.sock 就绪（10s 上限）。

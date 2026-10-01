@@ -506,7 +506,16 @@ func flagsFirst(args []string, boolFlags map[string]bool) []string {
 	return append(flags, pos...)
 }
 
-// hostFlagBools host 命令面的布尔 flag 集（flagsFirst 用）。
-var hostFlagBools = map[string]bool{
+// cliBoolFlags CLI 全命令面**布尔 flag 全集**（flagsFirst 用；FIX-57 收一份）：
+// host/forward/socks/speedtest/artifact 各面共用一张表。此前两张分表且都漏
+// `no-spawn`（它定义在各命令的 fs.Bool 里）——`--no-spawn` 被 flagsFirst 当成
+// 「吃后一个 token 的值 flag」，会把紧随其后的 flag/位置参数错位吞掉。
+// 并集用法安全：flagsFirst 只做重排，真正的 flag 定义仍由各命令的 FlagSet 判定
+// （未定义的 flag 照旧报错）。
+var cliBoolFlags = map[string]bool{
 	"force": true, "json": true, "yes": true, "help": true, "h": true,
+	"no-spawn": true, "quiet": true, "verbose": true, "watch": true, "stdin": true,
 }
+
+// hostFlagBools host 命令面的布尔 flag 集（= 共享表）。
+var hostFlagBools = cliBoolFlags

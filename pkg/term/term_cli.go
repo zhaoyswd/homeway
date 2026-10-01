@@ -30,6 +30,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/zhaoyswd/homeway/internal/cliopts"
+	"github.com/zhaoyswd/homeway/internal/cliutil"
+	"github.com/zhaoyswd/homeway/pkg/term/manifest"
 	"io"
 	"io/fs"
 	"net"
@@ -38,18 +41,10 @@ import (
 	"strings"
 	"syscall"
 	"time"
-
-	"github.com/zhaoyswd/homeway/internal/cliopts"
-	"github.com/zhaoyswd/homeway/pkg/term/manifest"
 )
 
 // DefaultStateDir 是 state 目录默认值（与出口一致：~/.config/homeway）。
-func DefaultStateDir() string {
-	if home, err := os.UserHomeDir(); err == nil {
-		return filepath.Join(home, ".config", "homeway")
-	}
-	return ""
-}
+func DefaultStateDir() string { return cliutil.DefaultStateDir() } // 单实现在 internal/cliutil（FIX-57）
 
 // CLI 是 `homeway term` 的入口（remote = `--host` 模式的注入缝；nil = 仅本地面）。
 func CLI(args []string, remote RemoteTerm) error {
