@@ -13,12 +13,15 @@ import (
 	"github.com/zhaoyswd/homeway/pkg/proto"
 )
 
-// buildToken：把中继地址（--advertise 优先，否则本机物理网卡地址）+ 端口 + 鉴权密钥编成 rl1 token。
+// BuildToken：把中继地址（advertise 优先，否则本机物理网卡地址）+ 端口 + 鉴权密钥编成
+// rl1 token。**导出面 = role-management 3.3 的 D8a 离线推算**（`relay token` 未跑路径
+// 复刻在跑铸造规则：advertise 非空用 advertise、为空复刻公网地址探测——同前缀去重、
+// 只取公网地址；固定 advertise 时跑/停两路径逐字一致）；在跑路径与 CLI 共用本函数。
 //
-// 端口以**实际监听口**为准：--advertise 只给 host 时补上实际端口；给了不同端口则按它写
+// 端口以**实际监听口**为准：advertise 只给 host 时补上实际端口；给了不同端口则按它写
 // （NAT 场景下外部口可以不同），但打一行告警 —— token 里的端口必须真的能连到我们。
 // 告警走 ulogf：它属于「token 里的端口信息」且只在配置错误时出现一次。
-func buildToken(secret [32]byte, advertise string, port uint16) (string, []string, error) {
+func BuildToken(secret [32]byte, advertise string, port uint16) (string, []string, error) {
 	var eps []proto.Endpoint
 	var addrs []string
 	for _, a := range splitList(advertise) {

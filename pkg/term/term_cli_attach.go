@@ -50,13 +50,14 @@ type attachOpts struct {
 	autoNamed bool   // new 省略名字：host-<4hex> + already_exists 重试
 	detachKey string // --detach-key 原始参数（^x / 单字符 / none）
 	hostRef   string // --host：远程模式（term-remote 1.2）
+	noSpawn   bool   // --no-spawn：守护进程未运行不按需拉起（role-management 4.1）
 	timeout   time.Duration
 	remote    RemoteTerm // CLI 入口注入
 }
 
 // target 构造本命令的拨号目标（newTermTarget 的缺省决策）。
 func (o attachOpts) target() *termTarget {
-	return newTermTarget(o.remote, o.stateDir, o.hostRef, o.timeout)
+	return newTermTarget(o.remote, o.stateDir, o.hostRef, o.timeout, o.noSpawn)
 }
 
 // parseAttachArgs 解析 attach 参数（--flag value 与 --flag=value 两种形态都支持，
@@ -68,6 +69,8 @@ func parseAttachArgs(args []string) (attachOpts, error) {
 		switch {
 		case a == "-d":
 			o.takeover = true
+		case a == "--no-spawn":
+			o.noSpawn = true
 		case a == "--state":
 			if err := applyCommon(&o.stateDir, args, &i); err != nil {
 				return o, err

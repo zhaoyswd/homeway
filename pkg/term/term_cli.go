@@ -39,6 +39,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/zhaoyswd/homeway/internal/cliopts"
 	"github.com/zhaoyswd/homeway/pkg/term/manifest"
 )
 
@@ -109,11 +110,12 @@ type termCommon struct {
 	stateDir string
 	hostRef  string
 	timeout  time.Duration
+	noSpawn  bool // --no-spawn：守护进程未运行时不按需拉起（role-management 4.1；随 ctx 传给远程缝）
 }
 
 // target 构造拨号目标（见 newTermTarget 的缺省决策）。
 func (c termCommon) target(remote RemoteTerm) *termTarget {
-	return newTermTarget(remote, c.stateDir, c.hostRef, c.timeout)
+	return newTermTarget(remote, c.stateDir, c.hostRef, c.timeout, c.noSpawn)
 }
 
 // defaultRemoteTimeout 远程「解析」与「连接 + stream.open」各一次的预算缺省
@@ -132,13 +134,14 @@ type termTarget struct {
 	hostRef  string        // --host 原始 ref
 	hostID   string        // 远程已解析 hex（拨号复用）
 	timeout  time.Duration // 远程解析/打开各一次预算（默认各 10s、最坏相加 20s，仅 --host 可用）
+	noSpawn  bool          // --no-spawn：未运行不按需拉起（cliopts 随 ctx 下传远程缝）
 }
 
 // newTermTarget 按参数构造目标：远程模式 timeout 缺省补 defaultRemoteTimeout、
 // stateDir 留空交给实现侧默认（用户显式给 --state 才透传）；本地面 stateDir 缺省
 // 补 DefaultStateDir()（现状语义）。
-func newTermTarget(remote RemoteTerm, stateDir, hostRef string, timeout time.Duration) *termTarget {
-	t := &termTarget{stateDir: stateDir, remote: remote, hostRef: hostRef, timeout: timeout}
+func newTermTarget(remote RemoteTerm, stateDir, hostRef string, timeout time.Duration, noSpawn bool) *termTarget {
+	t := &termTarget{stateDir: stateDir, remote: remote, hostRef: hostRef, timeout: timeout, noSpawn: noSpawn}
 	if hostRef != "" {
 		if t.timeout <= 0 {
 			t.timeout = defaultRemoteTimeout
@@ -243,8 +246,9 @@ func cliDialTerm(t *termTarget) (io.ReadWriteCloser, error) {
 	if t.remoteMode() {
 		// 远程：解析（幂等缓存）→ 拨号；两步各用一次 --timeout 预算（默认各 10s，
 		// 最坏相加 20s——exec-r1 L1）。
+		base := cliopts.With(context.Background(), cliopts.Opts{NoSpawn: t.noSpawn})
 		if t.hostID == "" {
-			rctx, rcancel := context.WithTimeout(context.Background(), t.timeout)
+			rctx, rcancel := context.WithTimeout(base, t.timeout)
 			id, _, rerr := t.remote.ResolveHostRef(rctx, t.stateDir, t.hostRef)
 			rcancel()
 			if rerr != nil {
@@ -252,7 +256,7 @@ func cliDialTerm(t *termTarget) (io.ReadWriteCloser, error) {
 			}
 			t.hostID = id
 		}
-		ctx, cancel := context.WithTimeout(context.Background(), t.timeout)
+		ctx, cancel := context.WithTimeout(base, t.timeout)
 		defer cancel()
 		var err error
 		conn, err = t.remote.DialTerm(ctx, t.stateDir, t.hostID)
@@ -349,6 +353,10 @@ func cliList(args []string, remote RemoteTerm) error {
 		switch {
 		case a == "--json":
 			jsonOut = true
+		case a == "--no-spawn":
+			c.noSpawn = true
+		case a == "--no-spawn":
+			c.noSpawn = true
 		case a == "--state":
 			if err := applyCommon(&c.stateDir, args, &i); err != nil {
 				return err
@@ -362,7 +370,7 @@ func cliList(args []string, remote RemoteTerm) error {
 				return err
 			}
 		case strings.HasPrefix(a, "-"):
-			return fmt.Errorf("不认识的参数 %q（可用：--json、--state <dir>、--host <name|id>、--timeout <时长>）", a)
+			return fmt.Errorf("不认识的参数 %q（可用：--json、--state <dir>、--host <name|id>、--timeout <时长>、--no-spawn）", a)
 		default:
 			return fmt.Errorf("list 不接受会话名（%q）；省略名字接入最近活跃会话请用 attach", a)
 		}
@@ -459,6 +467,7 @@ type newOpts struct {
 	hostRef   string        // --host
 	timeout   time.Duration // --timeout
 	autoNamed bool          // 省略名字：host-<4hex> + 重名重试
+	noSpawn   bool          // --no-spawn（role-management 4.1）
 }
 
 func parseNewArgs(args []string) (newOpts, error) {
@@ -523,7 +532,7 @@ func cliNewDetached(o newOpts, remote RemoteTerm) error {
 	if o.reuse {
 		flags |= createFlagReuseIfExists
 	}
-	t := newTermTarget(remote, o.stateDir, o.hostRef, o.timeout)
+	t := newTermTarget(remote, o.stateDir, o.hostRef, o.timeout, o.noSpawn)
 	if o.autoNamed {
 		// 自动命名不置 reuse-if-exists（置位会静默复用既有会话）：靠 already_exists 重试。
 		for i := 0; i < 8; i++ {
@@ -569,6 +578,8 @@ func cliDelete(args []string, remote RemoteTerm) error {
 	for i := 0; i < len(args); i++ {
 		a := args[i]
 		switch {
+		case a == "--no-spawn":
+			c.noSpawn = true
 		case a == "--state":
 			if err := applyCommon(&c.stateDir, args, &i); err != nil {
 				return err
@@ -667,6 +678,7 @@ type explainOpts struct {
 	json     bool
 	hostRef  string        // 在线模式 --host（远程）
 	timeout  time.Duration // 远程解析/打开各一次预算（默认各 10s、最坏相加 20s，仅 --host 可用）
+	noSpawn  bool          // --no-spawn（role-management 4.1）
 }
 
 func parseExplainArgs(args []string) (explainOpts, error) {
@@ -686,6 +698,8 @@ func parseExplainArgs(args []string) (explainOpts, error) {
 			o.file, err = next()
 		case a == "--agent":
 			o.agent, err = next()
+		case a == "--no-spawn":
+			o.noSpawn = true
 		case a == "--state":
 			o.stateDir, err = next()
 		case a == "--host":
@@ -775,7 +789,7 @@ func explainFile(o explainOpts) (explainOutput, error) {
 // 实时判定——EXPLAIN 一锤子往返零 wire 改动（1.4：原自带 net.Dial 的独立拨号点
 // 已并入 cliDialTerm，r2 低⑥）。
 func explainSession(o explainOpts, remote RemoteTerm) (explainOutput, error) {
-	t := newTermTarget(remote, o.stateDir, o.hostRef, o.timeout)
+	t := newTermTarget(remote, o.stateDir, o.hostRef, o.timeout, o.noSpawn)
 	conn, err := cliDialTerm(t)
 	if err != nil {
 		return explainOutput{}, err

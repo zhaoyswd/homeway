@@ -16,10 +16,16 @@ import (
 	"time"
 
 	"github.com/zhaoyswd/homeway/clientcore/facade"
+	"github.com/zhaoyswd/homeway/internal/cliopts"
 	"github.com/zhaoyswd/homeway/internal/control"
 )
 
 // socksCLI socks 子命令入口（cmd/homeway 转发）。
+// SocksCLI socks 命令面入口（cmd/homeway 顶层名词直连）。
+func SocksCLI(args []string, version string, w io.Writer) error {
+	return socksCLI(args, version, w)
+}
+
 func socksCLI(args []string, version string, w io.Writer) error {
 	if len(args) == 0 {
 		usageSocks(w)
@@ -54,7 +60,8 @@ func usageSocks(w io.Writer) {
 func socksOnCLI(args []string, version string, w io.Writer) error {
 	fs := flag.NewFlagSet("homeway socks on", flag.ContinueOnError)
 	fs.SetOutput(w)
-	stateDir := fs.String("state", DefaultStateDir(), "守护进程 state 目录（从中找 control.sock）")
+	stateDir := fs.String("state", DefaultStateDir(), "统一 state 根（从中找 control.sock）")
+	noSpawn := fs.Bool("no-spawn", false, "守护进程未运行时不按需拉起（直接报可行动错误；脚本友好）")
 	hostRef := fs.String("host", "", "主机（名称/完整 ID/无歧义短前缀，同 host delete）")
 	listen := fs.Uint("listen", 0, "监听端口（缺省 = 沿用该主机上次端口，无记忆则 1080；1024–65535）")
 	timeout := fs.Duration("timeout", 10*time.Second, "连接与请求的总预算")
@@ -74,7 +81,7 @@ func socksOnCLI(args []string, version string, w io.Writer) error {
 		return fmt.Errorf("--listen %d 越界（监听端口须在 1024–65535，与 forward 同一条）", *listen)
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), *timeout)
+	ctx, cancel := context.WithTimeout(cliopts.With(context.Background(), cliopts.Opts{NoSpawn: *noSpawn}), *timeout)
 	defer cancel()
 	c, err := dialCarrierCLI(ctx, *stateDir, version, "homeway-socks")
 	if err != nil {
@@ -138,7 +145,8 @@ func rememberedSocksPort(ctx context.Context, c *control.Client, host string) ui
 func socksOffCLI(args []string, version string, w io.Writer) error {
 	fs := flag.NewFlagSet("homeway socks off", flag.ContinueOnError)
 	fs.SetOutput(w)
-	stateDir := fs.String("state", DefaultStateDir(), "守护进程 state 目录（从中找 control.sock）")
+	stateDir := fs.String("state", DefaultStateDir(), "统一 state 根（从中找 control.sock）")
+	noSpawn := fs.Bool("no-spawn", false, "守护进程未运行时不按需拉起（直接报可行动错误；脚本友好）")
 	hostRef := fs.String("host", "", "主机（名称/完整 ID/无歧义短前缀，同 host delete）")
 	timeout := fs.Duration("timeout", 10*time.Second, "连接与请求的总预算")
 	if err := fs.Parse(flagsFirst(args, carrierFlagBools)); err != nil {
@@ -154,7 +162,7 @@ func socksOffCLI(args []string, version string, w io.Writer) error {
 		return errors.New("socks off 需要 --host <ref>（homeway socks status 查看）")
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), *timeout)
+	ctx, cancel := context.WithTimeout(cliopts.With(context.Background(), cliopts.Opts{NoSpawn: *noSpawn}), *timeout)
 	defer cancel()
 	c, err := dialCarrierCLI(ctx, *stateDir, version, "homeway-socks")
 	if err != nil {
@@ -191,7 +199,8 @@ func socksOffCLI(args []string, version string, w io.Writer) error {
 func socksStatusCLI(args []string, version string, w io.Writer) error {
 	fs := flag.NewFlagSet("homeway socks status", flag.ContinueOnError)
 	fs.SetOutput(w)
-	stateDir := fs.String("state", DefaultStateDir(), "守护进程 state 目录（从中找 control.sock）")
+	stateDir := fs.String("state", DefaultStateDir(), "统一 state 根（从中找 control.sock）")
+	noSpawn := fs.Bool("no-spawn", false, "守护进程未运行时不按需拉起（直接报可行动错误；脚本友好）")
 	jsonOut := fs.Bool("json", false, "机器可读 JSON（含 off 但记住的端口）")
 	timeout := fs.Duration("timeout", 5*time.Second, "连接与请求的总预算")
 	if err := fs.Parse(flagsFirst(args, carrierFlagBools)); err != nil {
@@ -204,7 +213,7 @@ func socksStatusCLI(args []string, version string, w io.Writer) error {
 		return fmt.Errorf("socks status 不接受位置参数（got %q）", fs.Args())
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), *timeout)
+	ctx, cancel := context.WithTimeout(cliopts.With(context.Background(), cliopts.Opts{NoSpawn: *noSpawn}), *timeout)
 	defer cancel()
 	c, err := dialCarrierCLI(ctx, *stateDir, version, "homeway-socks")
 	if err != nil {

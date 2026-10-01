@@ -169,11 +169,11 @@ func TestCLIAttachHostArgsParse(t *testing.T) {
 	}
 	// timeout 缺省补默认 10s / stateDir 留空（newTermTarget 决策）；本地缺省补
 	// DefaultStateDir（现状语义）。
-	tgt := newTermTarget(&fakeRemoteTerm{}, "", "mac", 0)
+	tgt := newTermTarget(&fakeRemoteTerm{}, "", "mac", 0, false)
 	if tgt.timeout != defaultRemoteTimeout || tgt.stateDir != "" {
 		t.Fatalf("远程缺省：timeout 应 10s、stateDir 留空（daemon 侧默认）：%+v", tgt)
 	}
-	lt := newTermTarget(nil, "", "", 0)
+	lt := newTermTarget(nil, "", "", 0, false)
 	if lt.stateDir != DefaultStateDir() {
 		t.Fatalf("本地缺省 stateDir：%q", lt.stateDir)
 	}

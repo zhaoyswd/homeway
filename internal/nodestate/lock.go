@@ -86,3 +86,23 @@ func readLockHolder(f *os.File) (int, string) {
 	}
 	return pid, role
 }
+
+// LockHeld 活进程持锁探测（role-management 4.1「未运行判定」的读半边，r1 低-3）：
+// 对 <state>/lock 做与 AcquireInstanceLock 同口径的 flock(LOCK_EX|LOCK_NB) **试探**——
+// 拿得到 = 无活进程（残留锁文件不算持锁，flock 随进程死亡由内核释放），拿不到 =
+// 进程在跑。CLI 侧的按需拉起据此判定「未运行可拉起」；不引入「pid 文件 + kill -0
+// 探活」（lock.go 头注已否决的竞态判定）。非 unix（lockFile 恒成功桩）恒 false
+// （= 按「未运行」处理——Windows 拉起 = 可行动错误，方向不变）。
+func LockHeld(stateDir string) bool {
+	path := filepath.Join(stateDir, lockFileName)
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		return false // 打不开（含目录不存在）= 无从谈持锁，按未运行处理
+	}
+	defer f.Close()
+	if err := lockFile(int(f.Fd())); err != nil {
+		return true // 拿不到 = 有活进程持有
+	}
+	_ = unlockFile(int(f.Fd()))
+	return false
+}

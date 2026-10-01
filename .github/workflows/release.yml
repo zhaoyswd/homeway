@@ -81,7 +81,7 @@ jobs:
       - run: bash tools/gen-third-party-notices.sh --check
 
   # clientcore 面（core-homeway-merge 2.4）：-tags cshared 构建测试；与无 tag 面互斥共存。
-  # 不发 dylib 发行产物——桌面消费形态是守护进程直接 import 包（思路 B），darwin 的
+  # 不发 dylib 发行产物——桌面消费形态是统一进程直接 import 包（思路 B），darwin 的
   # c-shared 构建只是「//export 面可编可见」的冒烟。
   clientcore:
     strategy:
@@ -180,7 +180,7 @@ jobs:
           # windows 的 -o 不会自动补 .exe，显式带上（否则打包时找不到文件）
           EXT=""
           [ "${GOOS}" = "windows" ] && EXT=".exe"
-          # 单二进制（exit / relay / term 按子命令区分）。产物直接放包根：解出来就是可执行文件，
+          # 单二进制（serve / relay / term 等按子命令区分）。产物直接放包根：解出来就是可执行文件，
           # 用户不用先 cd 进子目录。
           mkdir -p dist
           go build -trimpath -ldflags "${LDFLAGS}" -o "dist/homeway${EXT}" ./cmd/homeway
@@ -238,7 +238,7 @@ jobs:
           ./homeway --version | grep -q '^homeway '
           ./homeway relay --version | grep -q '^homeway '
           ./homeway --help >/dev/null 2>&1 || true
-          ./homeway exit --help >/dev/null 2>&1 || true
+          ./homeway serve --help >/dev/null 2>&1 || true
           ./homeway relay --help >/dev/null 2>&1 || true
 
   release:

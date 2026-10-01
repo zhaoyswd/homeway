@@ -41,10 +41,12 @@ func streamServicePort(kind string) (uint16, error) {
 	return 0, fmt.Errorf("未知流 kind %q", kind)
 }
 
-// controlBackend control.Backend 的 daemon 实现（纯绑定：逐方法委托 facade）。
+// controlBackend control.Backend 的 daemon 实现（纯绑定：逐方法委托 facade；
+// serve/relay 角色管理十方法委托 roleOps——语义在角色接口与 nodeconfig）。
 type controlBackend struct {
 	d       *facade.Daemon
 	sup     *supervisor
+	roles   *roleOps
 	version string
 }
 
@@ -389,6 +391,80 @@ func (b *controlBackend) DemandStatus() []control.HostDemandBrief {
 	return out
 }
 
+// ---------- serve/relay 角色管理绑定（role-management 4.2：逐方法委托 roleOps） ----------
+
+// roles == nil = 未装配 roleOps 的测试形态（startControlPlane 传 nil 的既有用例）——
+// 状态面给空形状、启停/token 走 ErrBackendRoleStopped 的可判定错误（不 panic）。
+func (b *controlBackend) ServeStart() (control.RoleActionResult, error) {
+	if b.roles == nil {
+		return control.RoleActionResult{}, control.ErrBackendRoleStopped
+	}
+	return b.roles.ServeStart()
+}
+
+func (b *controlBackend) ServeStop() (control.RoleActionResult, error) {
+	if b.roles == nil {
+		return control.RoleActionResult{}, control.ErrBackendRoleStopped
+	}
+	return b.roles.ServeStop()
+}
+
+func (b *controlBackend) ServeRestart() (control.RoleActionResult, error) {
+	if b.roles == nil {
+		return control.RoleActionResult{}, control.ErrBackendRoleStopped
+	}
+	return b.roles.ServeRestart()
+}
+
+func (b *controlBackend) ServeStatus() control.ServeStatusResult {
+	if b.roles == nil {
+		return control.ServeStatusResult{State: "absent", Peers: []control.ServePeerBrief{}}
+	}
+	return b.roles.ServeStatus()
+}
+
+func (b *controlBackend) ServeToken() (control.ServeTokenResult, error) {
+	if b.roles == nil {
+		return control.ServeTokenResult{}, control.ErrBackendRoleStopped
+	}
+	return b.roles.ServeToken()
+}
+
+func (b *controlBackend) RelayStart() (control.RoleActionResult, error) {
+	if b.roles == nil {
+		return control.RoleActionResult{}, control.ErrBackendRoleStopped
+	}
+	return b.roles.RelayStart()
+}
+
+func (b *controlBackend) RelayStop() (control.RoleActionResult, error) {
+	if b.roles == nil {
+		return control.RoleActionResult{}, control.ErrBackendRoleStopped
+	}
+	return b.roles.RelayStop()
+}
+
+func (b *controlBackend) RelayRestart() (control.RoleActionResult, error) {
+	if b.roles == nil {
+		return control.RoleActionResult{}, control.ErrBackendRoleStopped
+	}
+	return b.roles.RelayRestart()
+}
+
+func (b *controlBackend) RelayStatus() control.RelayStatusResult {
+	if b.roles == nil {
+		return control.RelayStatusResult{State: "absent", Backends: []control.RelayBackendBrief{}}
+	}
+	return b.roles.RelayStatus()
+}
+
+func (b *controlBackend) RelayToken() (control.RelayTokenResult, error) {
+	if b.roles == nil {
+		return control.RelayTokenResult{}, control.ErrBackendRoleStopped
+	}
+	return b.roles.RelayToken()
+}
+
 var _ control.Backend = (*controlBackend)(nil)
 
 // controlRole control 角色（4a §5.2，D4/L3——r1 高-3）：控制面监听与 Serve 循环
@@ -404,6 +480,7 @@ type controlRole struct {
 	stateDir string
 	sup      *supervisor
 	d        *facade.Daemon
+	roles    *roleOps
 	eventf   func(format string, args ...any)
 
 	// 首启注入（一次性——Run 取走后置 nil；重建轮次走 Run 内重 Listen）。
@@ -432,7 +509,7 @@ func (r *controlRole) Run(ctx context.Context) error {
 		srv = control.NewServer(control.ServerConfig{
 			ServerVersion: r.version,
 			Bus:           r.d.Bus(),
-			Backend:       &controlBackend{d: r.d, sup: r.sup, version: r.version},
+			Backend:       &controlBackend{d: r.d, sup: r.sup, roles: r.roles, version: r.version},
 		})
 	}
 	// r2 新-4：角色失败上抛前先收工旧 Server/listener（关 listener + 断在途
@@ -462,24 +539,24 @@ func (r *controlRole) Run(ctx context.Context) error {
 // 退出更糟）→ server + listener 注入 control 角色交 supervisor 托管（角色化只改
 // **运行中失败**的恢复路径：瞬态 accept 错误 Serve 内重试、永久错误退避重建 =
 // 重新 Listen+Serve）。总线与代际随进程唯一不变（4.4 同判据）。
-func startControlPlane(ctx context.Context, version string, stateDir string, sup *supervisor, d *facade.Daemon, eventf func(string, ...any)) error {
+func startControlPlane(ctx context.Context, version string, stateDir string, sup *supervisor, d *facade.Daemon, roles *roleOps, eventf func(string, ...any)) error {
 	srv := control.NewServer(control.ServerConfig{
 		ServerVersion: version,
 		Bus:           d.Bus(),
-		Backend:       &controlBackend{d: d, sup: sup, version: version},
+		Backend:       &controlBackend{d: d, sup: sup, roles: roles, version: version},
 	})
 	sock, ln, err := control.ListenControl(stateDir)
 	if err != nil {
 		return fmt.Errorf("控制面监听失败：%w", err)
 	}
-	first := &controlRole{version: version, stateDir: stateDir, sup: sup, d: d, eventf: eventf, srv: srv, ln: ln, sock: sock}
+	first := &controlRole{version: version, stateDir: stateDir, sup: sup, d: d, roles: roles, eventf: eventf, srv: srv, ln: ln, sock: sock}
 	sup.Start("control", func() Role {
 		r := first
 		if r != nil {
 			first = nil // 首启注入只此一次；重建轮次走 Run 内重 Listen
 			return r
 		}
-		return &controlRole{version: version, stateDir: stateDir, sup: sup, d: d, eventf: eventf}
+		return &controlRole{version: version, stateDir: stateDir, sup: sup, d: d, roles: roles, eventf: eventf}
 	}, nil)
 	eventf("control: 控制面就绪（sock=%s，0600）", sock)
 	return nil

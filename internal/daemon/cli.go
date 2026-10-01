@@ -1,37 +1,15 @@
 package daemon
 
-// cli.go — 守护域命令的分发面（role-management 2.3 起：`homeway daemon` 本体已随
-// 统一进程退役——进程入口 = `homeway` 零参，见 unified.go；本文件只保留经
-// cmd/homeway 转发的客户端域子命令：status / host / forward / socks / speedtest。
-// `homeway daemon` 裸调与 `exit` 同款迁移提示（非零码））。
+// cli.go — client 角色宿主（role-management 3.4 起：`homeway daemon` 命令面已删除
+// ——status 由聚合 `homeway status`（status_cli.go）承载、host/forward/socks/
+// speedtest 由 cmd/homeway 以顶层名词直连各 CLI；旧名词的迁移提示在 cmd/homeway。
+// 本文件只剩 client 角色本体（原守护域分发面退役）。
 
 import (
 	"context"
-	"fmt"
-	"os"
 
 	"github.com/zhaoyswd/homeway/clientcore/facade"
 )
-
-// CLI daemon 域子命令入口（cmd/homeway 转发；version 随构建注入）。
-func CLI(args []string, version string) error {
-	if len(args) > 0 {
-		switch args[0] {
-		case "status":
-			return statusCLI(args[1:], version, os.Stdout)
-		case "host":
-			return hostCLI(args[1:], version, os.Stdout)
-		case "forward":
-			return forwardCLI(args[1:], version, os.Stdout)
-		case "socks":
-			return socksCLI(args[1:], version, os.Stdout)
-		case "speedtest":
-			return speedtestCLI(args[1:], version, os.Stdout, os.Stderr)
-		}
-	}
-	// 裸 `homeway daemon`：旧守护进程形态已并入统一进程（role-management D1）。
-	return fmt.Errorf("homeway daemon 已并入统一进程——直接 `homeway`（零参前台；按 config 期望态装配全部角色）；状态看 `homeway daemon status`（随后版本将平移为 `homeway status`）")
-}
 
 // clientRole client 角色：主机表的生命周期宿主（r1 高-2 两层拆分——角色级
 // Attach/Detach）：attach → 等待 ctx → detach；失败/panic 由 supervisor 退避

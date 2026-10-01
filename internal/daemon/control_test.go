@@ -51,7 +51,7 @@ func startDaemonForTest(t *testing.T, probe func(ctx context.Context, token stri
 	sup := newSupervisor(ctx, st.Eventf, st.Debugf)
 	role := newClientRole(dir, st, d)
 	sup.Start("client", func() Role { return role }, nil)
-	if err := startControlPlane(ctx, "test-daemon", dir, sup, d, st.Eventf); err != nil {
+	if err := startControlPlane(ctx, "test-daemon", dir, sup, d, nil, st.Eventf); err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { cancel(); sup.Close() }) // 控制面随角色收口（conn 收尾）后停角色
@@ -216,7 +216,7 @@ func TestControlPlaneNotReadyWhenRoleDisabled(t *testing.T) {
 	t.Cleanup(d.Close) // 不挂角色（表未 attach = NotReady）
 	ctlCtx, ctlCancel := context.WithCancel(context.Background())
 	sup := newSupervisor(ctlCtx, st.Eventf, st.Debugf)
-	if err := startControlPlane(ctlCtx, "test-daemon", dir, sup, d, st.Eventf); err != nil {
+	if err := startControlPlane(ctlCtx, "test-daemon", dir, sup, d, nil, st.Eventf); err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { ctlCancel(); sup.Close() })

@@ -1,9 +1,14 @@
 # AGENTS.md（homeway）
 
-单二进制 `homeway`（`cmd/homeway`）：零参数/`exit` = 出口（WG 端点 + 拦截层 + files/term/端口转发）、
-`relay` = 中继、`daemon` = 桌面守护进程（多主机会话注册表 + 控制面 UDS；`daemon status` 状态面）、
-`host add/list/status/delete` = 主机表管理命令面（host-cli 起：守护托管，`host add` 服务端
-做有界连通性验证——探测核 `pkg/probe.Reach` 与手机 App 同调一份）、
+单二进制 `homeway`（`cmd/homeway`），`homeway <谁> <干什么>` 命令体系：**零参 = 统一进程前台**
+（按 `<state>/config.toml` 期望态装配 serve 出口角色〔原 `exit`，已更名〕/ relay 中继角色，
+client 与控制面恒开；三层 state 布局 L1 config.toml / L2 serve·relay·client / L3 cache，
+默认 `~/.config/homeway`）、`serve|relay <动词>` = 角色命令组（start/stop/restart/status
+[--json]/token；serve 另有 `relay set|clear`〔上游中继 token 写 config〕与
+`ddns add|delete|list`）、`status [--json|--watch]` = 聚合状态面（吸收旧 daemon status）、
+`export|import|reset cache` = 状态工件、`host add/list/status/delete` = 主机表管理命令面
+（host-cli 起：守护托管，`host add` 服务端做有界连通性验证——探测核 `pkg/probe.Reach`
+与手机 App 同调一份）、
 `term … --host <name|id>` = 远程终端命令面（term-remote 起：经 daemon 控制面
 `stream.open{kind:term}` 过隧道接指定后端主机的 term 服务，寻址与 host 面同源；v0.11.0 起
 LIST/CLI 状态单轨 stateV2，旧 `state` 键退役）、
@@ -20,6 +25,9 @@ RST 在世连接且端口记忆保留）、`speedtest` = 隧道测速 CLI（守�
 `--host` 缺省 = 全主机顺序轮流、Ctrl-C 先 cancel 当前主机再退出；**连接表不假设
 net.Conn 可比**〔v0.13.1：值类型 conn 做 map 键首拨即 panic 的发版窗口修复〕；
 详见 README 三节）；
+term/files 的 `--host` 远程面与 forward/socks/speedtest = 守护托管/控制面转发——统一进程
+未运行时**按需拉起**（`internal/daemon/spawn.go`：flock 试探判未跑 + launchd 托管形态先等
+KeepAlive 重拉 + self-exec setsid；`--no-spawn` = 可行动错误；纯读命令不拉起）。
 `clientcore/` = 手机核
 （tier App 经其仓库的 submodule 钉定检出消费，产物 `libclientcore.so`）。本文件只放跨会话
 都要知道的硬规则；工程细节看本仓 `README.md` 与 tier 仓（`github.com/zhaoyswd/tier`）的

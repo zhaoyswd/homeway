@@ -96,7 +96,7 @@ func TestReattachKeepsGenerationAndCursor(t *testing.T) {
 	sup := newSupervisor(ctx, st.Eventf, st.Debugf)
 	sup.Start("client", func() Role { return role }, []time.Duration{50 * time.Millisecond})
 
-	if err := startControlPlane(ctx, "reattach-test", dir, sup, d, st.Eventf); err != nil {
+	if err := startControlPlane(ctx, "reattach-test", dir, sup, d, nil, st.Eventf); err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { cancel(); sup.Close() })

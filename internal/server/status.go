@@ -5,8 +5,11 @@ package server
 // （reveal 纪律：完整 token 只经 `serve token`）。
 
 import (
+	"encoding/base64"
+	"fmt"
 	"strconv"
 
+	"github.com/zhaoyswd/homeway/pkg/proto"
 	"github.com/zhaoyswd/homeway/pkg/servercore"
 )
 
@@ -84,4 +87,72 @@ func maskToken(tok string) string {
 		return tok[:4] + "…"
 	}
 	return tok[:12] + "…（" + strconv.Itoa(len(tok)) + " 字符）"
+}
+
+// MaskToken hmw1… 掩码的导出面（daemon 绑定层对台账末行的降级掩码用——与包内
+// maskToken 同一实现；reveal 纪律：status 族只见掩码）。
+func MaskToken(tok string) string { return maskToken(tok) }
+
+// CurrentToken 当前在用 token 全文（reveal 纪律的运行态真源——只经 `serve token`
+// 呈现；tokMu 内读）。空 = 本轮尚未铸出（探测未完成/中继腿未并入——serve.token
+// 的调用方以此回落台账末行）。
+func (s *Server) CurrentToken() string {
+	if s == nil {
+		return ""
+	}
+	s.tokMu.Lock()
+	defer s.tokMu.Unlock()
+	return s.lastToken
+}
+
+// LastToken 台账末行重铸（role-management 3.2/3.4：`serve token` 未跑直读与
+// status 掩码的降级数据源——台账写入纪律下末行 = 最近在用 token）。第二返回值
+// false = 台账为空（全新 state 未预热）。重铸 = 末行 secret + endpoints + 本身份
+// 公钥（与铸出路径同一 EncodeToken，逐字一致由批 2 的台账端到端判据守）。
+func (s *State) LastToken() (proto.Token, bool, error) {
+	rec, err := s.lastRecord()
+	if err != nil || rec == nil {
+		return proto.Token{}, false, err
+	}
+	priv, err := s.PrivateKey()
+	if err != nil {
+		return proto.Token{}, false, err
+	}
+	var secret [32]byte
+	raw, derr := base64.RawURLEncoding.DecodeString(rec.Secret)
+	if derr != nil || len(raw) != 32 {
+		return proto.Token{}, false, fmt.Errorf("state: 台账末行 secret 非法")
+	}
+	copy(secret[:], raw)
+	var tok proto.Token
+	pub := priv.PublicKey()
+	copy(tok.PeerID[:], pub[:])
+	tok.Secret = secret
+	tok.Endpoints = rec.Endpoints
+	return tok, true, nil
+}
+
+// RevealLastToken 便捷读半边：开 <serveDir> 的 State 并取台账末行 token 全文
+// （daemon 绑定层与 CLI 的 `serve token` 未跑直读共用；dir = <state>/serve）。
+func RevealLastToken(serveDir string) (string, []string, bool, error) {
+	st, err := OpenState(serveDir)
+	if err != nil {
+		return "", nil, false, err
+	}
+	tok, ok, err := st.LastToken()
+	if err != nil {
+		return "", nil, false, err
+	}
+	if !ok {
+		return "", nil, false, nil
+	}
+	eps := make([]string, 0, len(tok.Endpoints))
+	for _, e := range tok.Endpoints {
+		eps = append(eps, e.Addr)
+	}
+	s, err := proto.EncodeToken(tok)
+	if err != nil {
+		return "", nil, false, err
+	}
+	return s, eps, true, nil
 }

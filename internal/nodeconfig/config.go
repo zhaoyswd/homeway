@@ -296,6 +296,13 @@ func validateBindInterface(path, v string) error {
 	return nil
 }
 
+// ValidateRelayArg relay 取值的 CLI 侧形态校验（role-management 3.2：`serve relay
+// set` 写前的就地报错——空 = 不用中继；rl1 前缀 = 必须能解码；其余 = 裸 IP:port
+// 开放模式。与 config 校验同一口径）。
+func ValidateRelayArg(v string) error {
+	return validateRelayToken("cli", "serve.relay", v)
+}
+
 // validateRelayToken：空 = 不用中继；rl1 前缀 = 必须能解码；其余 = 裸 IP:port
 // 开放模式（ParseRelayArg 同口径——域名不支持，先拿带 IP 的 token）。
 func validateRelayToken(path, field, v string) error {

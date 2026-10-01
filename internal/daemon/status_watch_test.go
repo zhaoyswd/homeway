@@ -78,7 +78,7 @@ func TestDaemonStatusWatchEndToEnd(t *testing.T) {
 		done <- statusWatch(wctx, sock, "cli-test", st.Dir, 5*time.Second, out)
 	}()
 	// 首帧：骨架 + 空表 + 观测副作用注记（usage 注记的渲染面锚点）。
-	watchUntil(t, out, "homeway daemon watch", 5*time.Second)
+	watchUntil(t, out, "homeway watch", 5*time.Second)
 	watchUntil(t, out, "主机： 无", 5*time.Second)
 	watchUntil(t, out, "退出后贡献消失", 5*time.Second)
 
@@ -130,7 +130,7 @@ func TestDaemonStatusWatchDaemonExit(t *testing.T) {
 	go func() {
 		done <- statusWatch(wctx, filepath.Join(dir, control.ControlSockName), "cli-test", dir, 5*time.Second, out)
 	}()
-	watchUntil(t, out, "homeway daemon watch", 5*time.Second)
+	watchUntil(t, out, "homeway watch", 5*time.Second)
 
 	stop() // 守护进程收工：控制面 goodbye(shutting_down) + 连接关闭
 	select {
@@ -156,7 +156,7 @@ func TestDaemonStatusWatchNotRunning(t *testing.T) {
 		t.Fatal("未运行时应报错")
 	}
 	msg := err.Error()
-	for _, want := range []string{"homeway daemon 未在运行", "control.sock", "homeway --state"} {
+	for _, want := range []string{"homeway 未在运行", "control.sock", "homeway --state"} {
 		if !bytes.Contains([]byte(msg), []byte(want)) {
 			t.Fatalf("可行动错误缺 %q：%s", want, msg)
 		}
@@ -165,7 +165,7 @@ func TestDaemonStatusWatchNotRunning(t *testing.T) {
 
 func TestDaemonStatusWatchUsageAndMutex(t *testing.T) {
 	var buf bytes.Buffer
-	if err := statusCLI([]string{"--help"}, "cli-test", &buf); err != nil {
+	if err := StatusCLI([]string{"--help"}, "cli-test", &buf); err != nil {
 		t.Fatalf("--help 不应报错：%v", err)
 	}
 	out := buf.String()
@@ -174,7 +174,7 @@ func TestDaemonStatusWatchUsageAndMutex(t *testing.T) {
 			t.Fatalf("usage 缺 %q（观测副作用注记）：\n%s", want, out)
 		}
 	}
-	if err := statusCLI([]string{"--watch", "--json"}, "cli-test", &buf); err == nil {
+	if err := StatusCLI([]string{"--watch", "--json"}, "cli-test", &buf); err == nil {
 		t.Fatal("--watch 与 --json 应互斥报错")
 	}
 }
@@ -191,7 +191,7 @@ func startWatchableDaemon(t *testing.T) (*facade.Daemon, string, func()) {
 	sup := newSupervisor(ctx, st.Eventf, st.Debugf)
 	role := newClientRole(dir, st, d)
 	sup.Start("client", func() Role { return role }, nil)
-	if err := startControlPlane(ctx, "test-daemon", dir, sup, d, st.Eventf); err != nil {
+	if err := startControlPlane(ctx, "test-daemon", dir, sup, d, nil, st.Eventf); err != nil {
 		cancel()
 		t.Fatal(err)
 	}

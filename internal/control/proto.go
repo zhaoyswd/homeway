@@ -332,6 +332,100 @@ type SpeedtestCancelResult struct {
 	Cancelled bool `json:"cancelled"`
 }
 
+// ---------- serve / relay 角色管理（3f 只增 10 op，role-management） ----------
+//
+// 幂等语义在成功载荷呈现（Action ∈ started|already / stopped|already / restarted），
+// 不借道错误码；restart 无重建对象（角色停/未装配）= ErrBackendRoleStopped → CLI 侧
+// 预检兜住（serve.status 先看状态），wire 理论不可达——错误码零新增。
+// token 响应含完整凭证（socket 属主即凭证的既有边界内，CLI 侧 reveal 呈现）；
+// status 面一律掩码（reveal 纪律）。
+
+// RoleActionResult serve/relay start/stop/restart 的成功载荷（幂等 = 动作有无）。
+type RoleActionResult struct {
+	Action string `json:"action"` // started | already | stopped | already | restarted
+}
+
+// ServeStatusResult serve.status 成功载荷：期望态 + 运行态 + 领域观测面（peer 表 =
+// 连接的 APP 设备；掩码纪律——TokenMask 只给指纹）。
+type ServeStatusResult struct {
+	Enabled    bool               `json:"enabled"` // 期望态（config serve.enabled）
+	State      string             `json:"state"`   // running|stopping|stopped|failed|absent
+	Reason     string             `json:"reason,omitempty"`
+	ListenPort uint16             `json:"listenPort,omitempty"` // 实际监听口（含退让后真值）
+	Published  []string           `json:"published,omitempty"`  // 最近一轮已公布公网端点
+	TokenMask  string             `json:"tokenMask,omitempty"`  // 台账末行/在用 token 掩码指纹
+	Endpoints  []string           `json:"endpoints,omitempty"`  // 当前 token 端点（类型标注版）
+	Peers      []ServePeerBrief   `json:"peers"`
+	DDNS       []ServeDDNSBrief   `json:"ddns,omitempty"`
+	Intercept  ServeInterceptBits `json:"intercept"`
+}
+
+// ServePeerBrief serve peer 表单条（APP 设备维度）。
+type ServePeerBrief struct {
+	Dev      string `json:"dev"`      // devTag 短指纹
+	TunnelIP string `json:"tunnelIp"` // 隧道侧 /32
+	LastReg  int64  `json:"lastReg"`  // 最近成功注册（UnixMilli）
+	IdleMs   int64  `json:"idleMs"`   // 距最近注册毫秒
+}
+
+// ServeDDNSBrief ddns 单域名解析自检状态。
+type ServeDDNSBrief struct {
+	Domain     string `json:"domain"`
+	LagStreak  int    `json:"lagStreak"`
+	WarnedLag  bool   `json:"warnedLag,omitempty"`
+	WarnedAAAA bool   `json:"warnedAAAA,omitempty"`
+}
+
+// ServeInterceptBits 过境拦截计数（真凭据判据的同源计数面）。
+type ServeInterceptBits struct {
+	DialOK   uint64 `json:"dialOk"`
+	DialFail uint64 `json:"dialFail"`
+	Reject   uint64 `json:"reject"`
+	Flows    uint64 `json:"flows"`
+}
+
+// ServeTokenResult serve.token 成功载荷（完整 hmw1 凭证——reveal 命令族）。
+// Source = runtime（控制面运行态真源）| ledger（L2 台账末行——角色未装配/未铸出时
+// 的降级路径，台账写入纪律下末行 = 最近在用 token）。
+type ServeTokenResult struct {
+	Token  string   `json:"token"`
+	Source string   `json:"source"`
+	Eps    []string `json:"endpoints,omitempty"`
+}
+
+// RelayStatusResult relay.status 成功载荷。**relay 侧看不到 APP**（在中继注册的是
+// 出口、手机流量在 WG 密文里）——Backends 是出口维度，与 serve peer 表不同维。
+type RelayStatusResult struct {
+	Enabled   bool                `json:"enabled"`
+	State     string              `json:"state"` // running|stopping|stopped|failed|absent
+	Reason    string              `json:"reason,omitempty"`
+	Listen    string              `json:"listen,omitempty"` // 实际监听地址（UDP）
+	Advertise string              `json:"advertise,omitempty"`
+	TokenMask string              `json:"tokenMask,omitempty"`
+	Open      bool                `json:"open"`     // 是否开放注册（无鉴权形态）
+	Assocs    int                 `json:"assocs"`   // 活跃客户端分配会话数
+	Backends  []RelayBackendBrief `json:"backends"` // 注册的出口列表
+}
+
+// RelayBackendBrief 注册出口单条（label 短指纹 + 源地址 + 最近活跃 + 验证态——
+// r1 低-14；中继只持 8 字节 label，看不到出口的 host 名/peerID）。
+type RelayBackendBrief struct {
+	Label       string `json:"label"`
+	Addr        string `json:"addr,omitempty"`
+	LastActive  int64  `json:"lastActive"` // UnixMilli；0 = 无记录
+	Verified    bool   `json:"verified"`
+	CtlVerified bool   `json:"ctlVerified"`
+	HasCtl      bool   `json:"hasCtl"`
+}
+
+// RelayTokenResult relay.token 成功载荷（完整 rl1 凭证；Source 同 serve.token——
+// relay 无台账，降级路径 = relay.key + config 离线推算〔D8a〕）。
+type RelayTokenResult struct {
+	Token  string   `json:"token"`
+	Source string   `json:"source"` // runtime | derived
+	Eps    []string `json:"endpoints,omitempty"`
+}
+
 // ---------- 事件流（域与 kind 词表、载荷字段表） ----------
 
 // （订阅域 Domain*/事件 kind Kind* 词表、kindDomains 归属表与 validDomains 已迁
@@ -366,6 +460,7 @@ type DaemonStatusResult struct {
 	ServerVersion string            `json:"serverVersion"`
 	Generation    string            `json:"generation"`
 	Seq           uint64            `json:"seq"`
+	Pid           int               `json:"pid,omitempty"` // 进程 pid（role-management 3f 只增：聚合 status 的进程层）
 	Roles         []RoleBrief       `json:"roles"`
 	Hosts         []HostState       `json:"hosts"`
 	Demand        []HostDemandBrief `json:"demand,omitempty"`

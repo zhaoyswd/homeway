@@ -53,6 +53,20 @@ const (
 	OpSpeedtestStart  = "speedtest.start"
 	OpSpeedtestStatus = "speedtest.status"
 	OpSpeedtestCancel = "speedtest.cancel"
+	// role-management（3f）只增 10 op：serve/relay 角色管理五件对称 ×2（启停/观测/
+	// reveal）——语义入口 = internal/server 与 internal/relay 的角色接口 +
+	// internal/nodeconfig（期望态），daemon 侧纯绑定；错误码零新增（幂等语义在成功
+	// 载荷呈现、不借道错误码——daemon-control-plane delta）。
+	OpServeStart   = "serve.start"
+	OpServeStop    = "serve.stop"
+	OpServeRestart = "serve.restart"
+	OpServeStatus  = "serve.status"
+	OpServeToken   = "serve.token"
+	OpRelayStart   = "relay.start"
+	OpRelayStop    = "relay.stop"
+	OpRelayRestart = "relay.restart"
+	OpRelayStatus  = "relay.status"
+	OpRelayToken   = "relay.token"
 )
 
 // ---------- reach.tier ----------

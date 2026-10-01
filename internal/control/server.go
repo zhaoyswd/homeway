@@ -26,6 +26,7 @@ import (
 	"errors"
 	"github.com/zhaoyswd/homeway/clientcore/facade"
 	"net"
+	"os"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -620,6 +621,29 @@ func (c *conn) handlerFor(op string) opHandler {
 		return c.opSpeedtestStatus
 	case facade.OpSpeedtestCancel:
 		return c.opSpeedtestCancel
+	// serve/relay 角色管理 10 op（3f，role-management）：守护托管——语义在角色
+	// 接口与 nodeconfig，本层只解析与回送；幂等语义在成功载荷呈现（错误码零新增，
+	// spec 场景「serve/relay 启停幂等不借道错误码」）。
+	case facade.OpServeStart:
+		return c.opServeStart
+	case facade.OpServeStop:
+		return c.opServeStop
+	case facade.OpServeRestart:
+		return c.opServeRestart
+	case facade.OpServeStatus:
+		return c.opServeStatus
+	case facade.OpServeToken:
+		return c.opServeToken
+	case facade.OpRelayStart:
+		return c.opRelayStart
+	case facade.OpRelayStop:
+		return c.opRelayStop
+	case facade.OpRelayRestart:
+		return c.opRelayRestart
+	case facade.OpRelayStatus:
+		return c.opRelayStatus
+	case facade.OpRelayToken:
+		return c.opRelayToken
 	}
 	return nil
 }
@@ -642,6 +666,7 @@ func (c *conn) opDaemonStatus(corr uint64, _ json.RawMessage) {
 		ServerVersion: c.s.cfg.ServerVersion,
 		Generation:    c.s.Generation(),
 		Seq:           c.s.cfg.Bus.CurrentSeq(),
+		Pid:           os.Getpid(),
 		Roles:         c.s.cfg.Backend.RolesStatus(),
 		Hosts:         c.s.cfg.Backend.HostStates(),
 		Demand:        c.s.cfg.Backend.DemandStatus(),
@@ -968,6 +993,70 @@ func (c *conn) opSpeedtestCancel(corr uint64, args json.RawMessage) {
 		return
 	}
 	c.reply(corr, SpeedtestCancelResult{Cancelled: true}, nil)
+}
+
+// ---------- serve/relay 角色管理 op（3f，role-management） ----------
+//
+// 全部无载荷（{}）；不受 not_ready 挡（角色管理是进程层面，与 client 注册表
+// 就绪无关——同 daemon.status 口径）。restart 无重建对象 = 宿主哨兵
+// ErrBackendRoleStopped → bad_request（CLI 预检兜住，wire 理论不可达——错误码
+// 零新增，幂等语义不借道错误码）。
+
+func mapRoleErr(err error) error {
+	if err == nil {
+		return nil
+	}
+	// ErrBackendRoleStopped（restart 无对象）与其余宿主错误统一落 bad_request——
+	// 错误码零新增；幂等语义不借道错误码（在成功载荷呈现）。
+	return errCode(facade.CodeBadRequest)
+}
+
+func (c *conn) opServeStart(corr uint64, _ json.RawMessage) {
+	res, err := c.s.cfg.Backend.ServeStart()
+	c.reply(corr, res, mapRoleErr(err))
+}
+
+func (c *conn) opServeStop(corr uint64, _ json.RawMessage) {
+	res, err := c.s.cfg.Backend.ServeStop()
+	c.reply(corr, res, mapRoleErr(err))
+}
+
+func (c *conn) opServeRestart(corr uint64, _ json.RawMessage) {
+	res, err := c.s.cfg.Backend.ServeRestart()
+	c.reply(corr, res, mapRoleErr(err))
+}
+
+func (c *conn) opServeStatus(corr uint64, _ json.RawMessage) {
+	c.reply(corr, c.s.cfg.Backend.ServeStatus(), nil)
+}
+
+func (c *conn) opServeToken(corr uint64, _ json.RawMessage) {
+	res, err := c.s.cfg.Backend.ServeToken()
+	c.reply(corr, res, mapRoleErr(err))
+}
+
+func (c *conn) opRelayStart(corr uint64, _ json.RawMessage) {
+	res, err := c.s.cfg.Backend.RelayStart()
+	c.reply(corr, res, mapRoleErr(err))
+}
+
+func (c *conn) opRelayStop(corr uint64, _ json.RawMessage) {
+	res, err := c.s.cfg.Backend.RelayStop()
+	c.reply(corr, res, mapRoleErr(err))
+}
+
+func (c *conn) opRelayRestart(corr uint64, _ json.RawMessage) {
+	res, err := c.s.cfg.Backend.RelayRestart()
+	c.reply(corr, res, mapRoleErr(err))
+}
+
+func (c *conn) opRelayStatus(corr uint64, _ json.RawMessage) {
+	c.reply(corr, c.s.cfg.Backend.RelayStatus(), nil)
+}
+
+func (c *conn) opRelayToken(corr uint64, _ json.RawMessage) {
+	res, err := c.s.cfg.Backend.RelayToken()
+	c.reply(corr, res, mapRoleErr(err))
 }
 
 // ---------- writer：唯一 socket 写者（优先级排空） ----------

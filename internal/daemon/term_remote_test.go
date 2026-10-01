@@ -125,6 +125,39 @@ func (b *remoteTestBackend) SpeedtestStatus(host string) (control.SpeedtestStatu
 }
 func (b *remoteTestBackend) SpeedtestCancel(host string) error { return control.ErrBackendNoHost }
 
+// serve/relay 角色管理十方法的最小桩（role-management 3f——真实绑定 = roleOps，
+// 经 assembleUnified 的进程级用例覆盖；本桩仅供控制面连接复用）。
+func (b *remoteTestBackend) ServeStart() (control.RoleActionResult, error) {
+	return control.RoleActionResult{Action: "started"}, nil
+}
+func (b *remoteTestBackend) ServeStop() (control.RoleActionResult, error) {
+	return control.RoleActionResult{Action: "stopped"}, nil
+}
+func (b *remoteTestBackend) ServeRestart() (control.RoleActionResult, error) {
+	return control.RoleActionResult{}, control.ErrBackendRoleStopped
+}
+func (b *remoteTestBackend) ServeStatus() control.ServeStatusResult {
+	return control.ServeStatusResult{Peers: []control.ServePeerBrief{}}
+}
+func (b *remoteTestBackend) ServeToken() (control.ServeTokenResult, error) {
+	return control.ServeTokenResult{}, nil
+}
+func (b *remoteTestBackend) RelayStart() (control.RoleActionResult, error) {
+	return control.RoleActionResult{Action: "started"}, nil
+}
+func (b *remoteTestBackend) RelayStop() (control.RoleActionResult, error) {
+	return control.RoleActionResult{Action: "stopped"}, nil
+}
+func (b *remoteTestBackend) RelayRestart() (control.RoleActionResult, error) {
+	return control.RoleActionResult{}, control.ErrBackendRoleStopped
+}
+func (b *remoteTestBackend) RelayStatus() control.RelayStatusResult {
+	return control.RelayStatusResult{Backends: []control.RelayBackendBrief{}}
+}
+func (b *remoteTestBackend) RelayToken() (control.RelayTokenResult, error) {
+	return control.RelayTokenResult{}, nil
+}
+
 // ---- term 帧最小编解码（pkg/term 帧格式：[op:1][len:2 LE][payload]）----
 
 func encTermFrame(op byte, payload []byte) []byte {
@@ -668,8 +701,10 @@ func TestTermRemoteDialOpenErrors(t *testing.T) {
 	ctx, cancel = rtCtx(t)
 	_, err = r.DialTerm(ctx, nodir, rig.macID)
 	cancel()
-	if err == nil || !strings.Contains(err.Error(), "daemon 未在运行") || !strings.Contains(err.Error(), "--state 指统一 state 根") {
-		t.Fatalf("连接层文案（含 --state 指代提示）：%v", err)
+	// role-management 4.1：无 daemon = 按需拉起面（单测注入缝确定性报错）；连接层
+	// 的 ENOENT 文案面由 controlDialErr 单测与 --no-spawn 错误承载。
+	if err == nil || !strings.Contains(err.Error(), "拉起统一进程失败") {
+		t.Fatalf("未跑应走按需拉起面（单测桩）：%v", err)
 	}
 }
 

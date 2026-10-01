@@ -83,14 +83,11 @@ func (r *termRemote) DialTerm(ctx context.Context, stateDir, hexID string) (io.R
 	return &streamConn{c: c, st: st}, nil
 }
 
-// dialControl 连 control.sock 并翻连接层错误（层①文案，term-remote 1.3）。
+// dialControl 连 control.sock（term-remote 1.3 的层①；role-management 4.1 起 =
+// 按需拉起的统一注入缝 dialControlSpawn：未运行时拉起统一进程并重拨，--no-spawn
+// 经 ctx 的 cliopts 挂载〔pkg/term CLI 解析后传入〕）。
 func dialControl(ctx context.Context, stateDir, version string) (*control.Client, error) {
-	sock := filepath.Join(stateDir, control.ControlSockName)
-	c, _, err := control.Dial(ctx, sock, control.FrontendInfo{Kind: "cli", Name: "homeway-term", Version: version})
-	if err == nil {
-		return c, nil
-	}
-	return nil, controlDialErr(stateDir, sock, err)
+	return dialControlSpawn(ctx, stateDir, version, "homeway-term")
 }
 
 // controlDialErr 控制面连接层错误 → 可行动文案（层①，design D4：ENOENT 带出

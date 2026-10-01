@@ -24,8 +24,44 @@ import (
 	"time"
 )
 
+// roleOpsStub serve/relay 角色管理十方法的最小桩（role-management 3f——真实宿主
+// 绑定在 internal/daemon 的 roleOps；本包测试只关心 dispatch 形状）。
+type roleOpsStub struct{}
+
+func (roleOpsStub) ServeStart() (RoleActionResult, error) {
+	return RoleActionResult{Action: "started"}, nil
+}
+func (roleOpsStub) ServeStop() (RoleActionResult, error) {
+	return RoleActionResult{Action: "stopped"}, nil
+}
+func (roleOpsStub) ServeRestart() (RoleActionResult, error) {
+	return RoleActionResult{}, ErrBackendRoleStopped
+}
+func (roleOpsStub) ServeStatus() ServeStatusResult {
+	return ServeStatusResult{Peers: []ServePeerBrief{}}
+}
+func (roleOpsStub) ServeToken() (ServeTokenResult, error) {
+	return ServeTokenResult{Token: "hmw1stub", Source: "runtime"}, nil
+}
+func (roleOpsStub) RelayStart() (RoleActionResult, error) {
+	return RoleActionResult{Action: "started"}, nil
+}
+func (roleOpsStub) RelayStop() (RoleActionResult, error) {
+	return RoleActionResult{Action: "stopped"}, nil
+}
+func (roleOpsStub) RelayRestart() (RoleActionResult, error) {
+	return RoleActionResult{}, ErrBackendRoleStopped
+}
+func (roleOpsStub) RelayStatus() RelayStatusResult {
+	return RelayStatusResult{Backends: []RelayBackendBrief{}}
+}
+func (roleOpsStub) RelayToken() (RelayTokenResult, error) {
+	return RelayTokenResult{Token: "rl1stub", Source: "runtime"}, nil
+}
+
 // fakeBackend 假宿主（§3 测试用）。
 type fakeBackend struct {
+	roleOpsStub
 	mu       sync.Mutex
 	notReady bool
 	briefs   []HostBrief

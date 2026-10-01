@@ -41,6 +41,8 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/zhaoyswd/homeway/internal/cliopts"
+
 	"github.com/zhaoyswd/homeway/pkg/streamend"
 )
 
@@ -362,11 +364,14 @@ type filesCommon struct {
 	stateDir string
 	hostRef  string
 	timeout  time.Duration
+	noSpawn  bool // --no-spawn：守护进程未运行时不按需拉起（role-management 4.1）
 }
 
-// applyFilesCommon 处理 --state/--host/--timeout 三个公共 flag（值形态）。
+// applyFilesCommon 处理 --state/--host/--timeout/--no-spawn 四个公共 flag（值形态）。
 func applyFilesCommon(c *filesCommon, args []string, i *int, flag string) error {
 	switch flag {
+	case "--no-spawn":
+		c.noSpawn = true
 	case "--state":
 		v, err := nextFilesArg(args, i, flag)
 		if err != nil {
@@ -405,7 +410,9 @@ func nextFilesArg(args []string, i *int, flag string) (string, error) {
 }
 
 func (c filesCommon) env(ctx context.Context, remote RemoteFiles) *cliEnv {
-	return &cliEnv{t: newFilesTarget(remote, c.stateDir, c.hostRef, c.timeout), cmdCtx: ctx, phase: newDialPhase()}
+	// 远程面把 --no-spawn 随 ctx 下传（按需拉起的统一注入缝在 daemon 侧拨号处）。
+	base := cliopts.With(ctx, cliopts.Opts{NoSpawn: c.noSpawn && c.hostRef != ""})
+	return &cliEnv{t: newFilesTarget(remote, c.stateDir, c.hostRef, c.timeout), cmdCtx: base, phase: newDialPhase()}
 }
 
 // unknownFlagErr 统一的未知 flag 报错（子命令各自给可用集）。
@@ -466,7 +473,7 @@ func cliFilesList(ctx context.Context, args []string, remote RemoteFiles) error 
 		switch {
 		case a == "--json":
 			jsonOut = true
-		case a == "--state" || a == "--host" || a == "--timeout":
+		case a == "--state" || a == "--host" || a == "--timeout" || a == "--no-spawn":
 			if err := applyFilesCommon(&c, args, &i, a); err != nil {
 				return err
 			}
@@ -499,7 +506,7 @@ func cliFilesStat(ctx context.Context, args []string, remote RemoteFiles) error 
 		switch {
 		case a == "--json":
 			jsonOut = true
-		case a == "--state" || a == "--host" || a == "--timeout":
+		case a == "--state" || a == "--host" || a == "--timeout" || a == "--no-spawn":
 			if err := applyFilesCommon(&c, args, &i, a); err != nil {
 				return err
 			}
@@ -576,7 +583,7 @@ func cliFilesMkdir(ctx context.Context, args []string, remote RemoteFiles) error
 	for i := 0; i < len(args); i++ {
 		a := args[i]
 		switch {
-		case a == "--state" || a == "--host" || a == "--timeout":
+		case a == "--state" || a == "--host" || a == "--timeout" || a == "--no-spawn":
 			if err := applyFilesCommon(&c, args, &i, a); err != nil {
 				return err
 			}
@@ -619,7 +626,7 @@ func cliFilesRead(ctx context.Context, args []string, remote RemoteFiles) error 
 				return fmt.Errorf("--max %q 不是合法正整数（字节数）", v)
 			}
 			maxBytes = n
-		case a == "--state" || a == "--host" || a == "--timeout":
+		case a == "--state" || a == "--host" || a == "--timeout" || a == "--no-spawn":
 			if err := applyFilesCommon(&c, args, &i, a); err != nil {
 				return err
 			}
@@ -681,7 +688,7 @@ func cliFilesGet(ctx context.Context, args []string, remote RemoteFiles) error {
 			o.force = true
 		case a == "--quiet":
 			o.quiet = true
-		case a == "--state" || a == "--host" || a == "--timeout":
+		case a == "--state" || a == "--host" || a == "--timeout" || a == "--no-spawn":
 			if err := applyFilesCommon(&o.common, args, &i, a); err != nil {
 				return err
 			}
@@ -794,7 +801,7 @@ func cliFilesPut(ctx context.Context, args []string, remote RemoteFiles) error {
 			o.rateLimit = n
 		case a == "--quiet":
 			o.quiet = true
-		case a == "--state" || a == "--host" || a == "--timeout":
+		case a == "--state" || a == "--host" || a == "--timeout" || a == "--no-spawn":
 			if err := applyFilesCommon(&o.common, args, &i, a); err != nil {
 				return err
 			}

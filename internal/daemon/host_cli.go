@@ -20,15 +20,20 @@ import (
 	"github.com/zhaoyswd/homeway/clientcore/facade"
 	"io"
 	"os"
-	"path/filepath"
 	"strings"
 	"time"
 
+	"github.com/zhaoyswd/homeway/internal/cliopts"
 	"github.com/zhaoyswd/homeway/internal/control"
 	"github.com/zhaoyswd/homeway/pkg/proto"
 )
 
-// hostCLI host 子命令入口（cmd/homeway 转发；输出写 w 便于测试）。
+// HostCLI host 命令面入口（cmd/homeway 顶层名词直连；输出写 w 便于测试）。
+func HostCLI(args []string, version string, w io.Writer) error {
+	return hostCLI(args, version, w)
+}
+
+// hostCLI host 子命令入口（内部实现）。
 func hostCLI(args []string, version string, w io.Writer) error {
 	if len(args) == 0 {
 		usageHost(w)
@@ -62,7 +67,8 @@ func usageHost(w io.Writer) {
 func hostAddCLI(args []string, version string, w io.Writer) error {
 	fs := flag.NewFlagSet("homeway host add", flag.ContinueOnError)
 	fs.SetOutput(w)
-	stateDir := fs.String("state", DefaultStateDir(), "守护进程 state 目录（从中找 control.sock）")
+	stateDir := fs.String("state", DefaultStateDir(), "统一 state 根（从中找 control.sock）")
+	noSpawn := fs.Bool("no-spawn", false, "守护进程未运行时不按需拉起（直接报可行动错误；脚本友好）")
 	name := fs.String("name", "", "主机显示名（可空 = 不命名）")
 	force := fs.Bool("force", false, "仍然添加：跳过服务端连通性验证直接入表（端点未实测）")
 	timeout := fs.Duration("timeout", 10*time.Second, "连接与请求的总预算（默认 10s > 3.5s 探测 + 余量）")
@@ -88,13 +94,13 @@ func hostAddCLI(args []string, version string, w io.Writer) error {
 		fmt.Fprintf(w, "  警告：--timeout=%s 低于 5s——超时先退时主机或已入表（核对：homeway host list）\n", *timeout)
 	}
 
-	// ②守护托管：结论（三档 + 实测端点）以 host.add 响应载荷只增字段返回。
-	sock := filepath.Join(*stateDir, control.ControlSockName)
-	ctx, cancel := context.WithTimeout(context.Background(), *timeout)
+	// ②守护托管：结论（三档 + 实测端点）以 host.add 响应载荷只增字段返回；
+	// 连接层（含未运行按需拉起）由统一缝给可行动错误。
+	ctx, cancel := context.WithTimeout(cliopts.With(context.Background(), cliopts.Opts{NoSpawn: *noSpawn}), *timeout)
 	defer cancel()
-	c, _, err := control.Dial(ctx, sock, control.FrontendInfo{Kind: "cli", Name: "homeway-host", Version: version})
+	c, err := dialControlSpawn(ctx, *stateDir, version, "homeway-host")
 	if err != nil {
-		return fmt.Errorf("homeway daemon 未在运行（sock=%s：%v）\n先启动：homeway --state %s（零参统一进程）", sock, err, *stateDir)
+		return err
 	}
 	defer c.Close()
 	raw, err := c.Request(ctx, facade.OpHostAdd, control.HostAddArgs{Name: *name, Token: token, Force: *force})
@@ -158,7 +164,8 @@ func printHostAdded(w io.Writer, res *control.HostAddResult) {
 func hostListCLI(args []string, version string, w io.Writer) error {
 	fs := flag.NewFlagSet("homeway host list", flag.ContinueOnError)
 	fs.SetOutput(w)
-	stateDir := fs.String("state", DefaultStateDir(), "守护进程 state 目录（从中找 control.sock）")
+	stateDir := fs.String("state", DefaultStateDir(), "统一 state 根（从中找 control.sock）")
+	noSpawn := fs.Bool("no-spawn", false, "守护进程未运行时不按需拉起（直接报可行动错误；脚本友好）")
 	jsonOut := fs.Bool("json", false, "机器可读 JSON = 控制面快照的 hosts 数组原样（stdout 一行，无包裹对象）")
 	timeout := fs.Duration("timeout", 5*time.Second, "连接与请求的总预算")
 	if err := fs.Parse(args); err != nil {
@@ -170,7 +177,7 @@ func hostListCLI(args []string, version string, w io.Writer) error {
 	if fs.NArg() != 0 {
 		return fmt.Errorf("host list 不接受位置参数（got %q）", fs.Args())
 	}
-	hosts, closeC, err := fetchHosts(*stateDir, *timeout, version)
+	hosts, closeC, err := fetchHosts(*stateDir, *timeout, version, *noSpawn)
 	if err != nil {
 		return err
 	}
@@ -187,14 +194,14 @@ func hostListCLI(args []string, version string, w io.Writer) error {
 	return nil
 }
 
-// fetchHosts 一次 daemon.status 拿主机动态面（list/status/delete 共用投影真源）。
-func fetchHosts(stateDir string, timeout time.Duration, version string) ([]control.HostState, func(), error) {
-	sock := filepath.Join(stateDir, control.ControlSockName)
-	ctx, cancel := context.WithTimeout(context.Background(), timeout)
-	c, _, err := control.Dial(ctx, sock, control.FrontendInfo{Kind: "cli", Name: "homeway-host", Version: version})
+// fetchHosts 一次 daemon.status 拿主机动态面（list/status/delete 共用投影真源；
+// role-management 4.1 起经按需拉起的统一注入缝——noSpawn 由各命令 flag 集传入）。
+func fetchHosts(stateDir string, timeout time.Duration, version string, noSpawn bool) ([]control.HostState, func(), error) {
+	ctx, cancel := context.WithTimeout(cliopts.With(context.Background(), cliopts.Opts{NoSpawn: noSpawn}), timeout)
+	c, err := dialControlSpawn(ctx, stateDir, version, "homeway-host")
 	if err != nil {
 		cancel()
-		return nil, nil, fmt.Errorf("homeway daemon 未在运行（sock=%s：%v）\n先启动：homeway --state %s（零参统一进程）", sock, err, stateDir)
+		return nil, nil, err
 	}
 	closeC := func() { c.Close(); cancel() }
 	raw, err := c.Request(ctx, facade.OpDaemonStatus, nil)
@@ -254,7 +261,8 @@ func truncRunes(s string, max int) string {
 func hostStatusCLI(args []string, version string, w io.Writer) error {
 	fs := flag.NewFlagSet("homeway host status", flag.ContinueOnError)
 	fs.SetOutput(w)
-	stateDir := fs.String("state", DefaultStateDir(), "守护进程 state 目录（从中找 control.sock）")
+	stateDir := fs.String("state", DefaultStateDir(), "统一 state 根（从中找 control.sock）")
+	noSpawn := fs.Bool("no-spawn", false, "守护进程未运行时不按需拉起（直接报可行动错误；脚本友好）")
 	jsonOut := fs.Bool("json", false, "机器可读 JSON = hosts 数组原样（status <name> = 单元素数组）")
 	timeout := fs.Duration("timeout", 5*time.Second, "连接与请求的总预算")
 	if err := fs.Parse(flagsFirst(args, hostFlagBools)); err != nil {
@@ -266,7 +274,7 @@ func hostStatusCLI(args []string, version string, w io.Writer) error {
 	if fs.NArg() > 1 {
 		return fmt.Errorf("host status 至多一个位置参数（主机名），got %q", fs.Args())
 	}
-	hosts, closeC, err := fetchHosts(*stateDir, *timeout, version)
+	hosts, closeC, err := fetchHosts(*stateDir, *timeout, version, *noSpawn)
 	if err != nil {
 		return err
 	}
@@ -338,7 +346,8 @@ func printHostDetail(w io.Writer, h *control.HostState) {
 func hostDeleteCLI(args []string, version string, w io.Writer) error {
 	fs := flag.NewFlagSet("homeway host delete", flag.ContinueOnError)
 	fs.SetOutput(w)
-	stateDir := fs.String("state", DefaultStateDir(), "守护进程 state 目录（从中找 control.sock）")
+	stateDir := fs.String("state", DefaultStateDir(), "统一 state 根（从中找 control.sock）")
+	noSpawn := fs.Bool("no-spawn", false, "守护进程未运行时不按需拉起（直接报可行动错误；脚本友好）")
 	yes := fs.Bool("yes", false, "跳过交互确认（非终端 stdin 必须）")
 	timeout := fs.Duration("timeout", 5*time.Second, "连接与请求的总预算")
 	if err := fs.Parse(flagsFirst(args, hostFlagBools)); err != nil {
@@ -351,7 +360,7 @@ func hostDeleteCLI(args []string, version string, w io.Writer) error {
 		return errors.New("host delete 需要 <name|id>（homeway host list 查看）")
 	}
 	target := fs.Arg(0)
-	hosts, closeC, err := fetchHosts(*stateDir, *timeout, version)
+	hosts, closeC, err := fetchHosts(*stateDir, *timeout, version, *noSpawn)
 	if err != nil {
 		return err
 	}
@@ -376,12 +385,11 @@ func hostDeleteCLI(args []string, version string, w io.Writer) error {
 		}
 	}
 
-	sock := filepath.Join(*stateDir, control.ControlSockName)
-	ctx, cancel := context.WithTimeout(context.Background(), *timeout)
+	ctx, cancel := context.WithTimeout(cliopts.With(context.Background(), cliopts.Opts{NoSpawn: *noSpawn}), *timeout)
 	defer cancel()
-	c, _, err := control.Dial(ctx, sock, control.FrontendInfo{Kind: "cli", Name: "homeway-host", Version: version})
+	c, err := dialControlSpawn(ctx, *stateDir, version, "homeway-host")
 	if err != nil {
-		return fmt.Errorf("homeway daemon 未在运行（sock=%s：%v）\n先启动：homeway --state %s（零参统一进程）", sock, err, *stateDir)
+		return err // 统一缝的可行动错误（未运行拉起/--no-spawn/不可达分型）
 	}
 	defer c.Close()
 	var code control.CodeError

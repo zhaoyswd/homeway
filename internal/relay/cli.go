@@ -8,11 +8,14 @@ package relay
 import (
 	"context"
 	"crypto/rand"
+	"errors"
 	"flag"
 	"fmt"
+	"net"
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strconv"
 	"syscall"
 
 	"github.com/zhaoyswd/homeway/internal/nodeconfig"
@@ -91,6 +94,50 @@ func defaultStateDir() string {
 		return "./homeway-state"
 	}
 	return filepath.Join(home, ".config", "homeway")
+}
+
+// ReadSecret 只读 relay.key（不生成——role-management 3.3 的 D8a 离线推算用：
+// `relay token` 未跑路径不得有「顺手造一个新钥」的副作用；不存在 = ok=false）。
+func ReadSecret(stateDir string) ([32]byte, bool, error) {
+	var secret [32]byte
+	b, err := os.ReadFile(filepath.Join(stateDir, "relay.key"))
+	if errors.Is(err, os.ErrNotExist) {
+		return secret, false, nil
+	}
+	if err != nil {
+		return secret, false, err
+	}
+	if len(b) != 32 {
+		return secret, false, fmt.Errorf("relay.key 长度 %d 非法", len(b))
+	}
+	copy(secret[:], b)
+	return secret, true, nil
+}
+
+// ListenPortOf 监听地址串的端口半边（":41741"/"0.0.0.0:41741"/"host:port"——
+// D8a 推算用 config 端口；无端口形态 = 可判定错误）。
+func ListenPortOf(addr string) (uint16, error) {
+	_, p, err := net.SplitHostPort(addr)
+	if err != nil {
+		return 0, err
+	}
+	n, err := strconv.ParseUint(p, 10, 16)
+	if err != nil || n == 0 {
+		return 0, fmt.Errorf("端口 %q 非法", p)
+	}
+	return uint16(n), nil
+}
+
+// MaskToken rl1… 掩码（reveal 纪律：relay status 只见掩码，完整 token 只经
+// relay token——与 server.MaskToken 同形）。
+func MaskToken(tok string) string {
+	if tok == "" {
+		return ""
+	}
+	if len(tok) <= 12 {
+		return tok[:4] + "…"
+	}
+	return tok[:12] + "…（" + strconv.Itoa(len(tok)) + " 字符）"
 }
 
 // loadSecret：从 state 目录加载中继鉴权密钥；没有就生成一个（0600）。

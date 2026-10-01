@@ -27,8 +27,6 @@ import (
 	"github.com/zhaoyswd/homeway/clientcore/facade"
 	"github.com/zhaoyswd/homeway/internal/nodeconfig"
 	"github.com/zhaoyswd/homeway/internal/nodestate"
-	"github.com/zhaoyswd/homeway/internal/relay"
-	"github.com/zhaoyswd/homeway/internal/server"
 	"github.com/zhaoyswd/homeway/pkg/probe"
 )
 
@@ -106,7 +104,8 @@ type unifiedProc struct {
 	sup     *supervisor
 	d       *facade.Daemon
 	dl      *DaemonState
-	cfg     *nodeconfig.Config
+	cfg     *nodeconfig.Config // 装配期快照（角色工厂每轮重读文件——测试断言用）
+	roles   *roleOps
 	release func() // 单实例锁释放
 }
 
@@ -169,24 +168,29 @@ func assembleUnified(parent context.Context, version, stateDir string, verbose b
 	sup := newSupervisor(ctx, dl.Eventf, dl.Debugf)
 	proc.d, proc.dl, proc.sup, proc.cfg = d, dl, sup, cfg
 
+	// serve/relay 角色管理面（role-management 4.2：控制面 serve.*/relay.* 的宿主
+	// 绑定；工厂每轮重读 config——文件即单一真源）。
+	ro := &roleOps{stateDir: stateDir, cacheDir: cacheDir, version: version, verbose: verbose, sup: sup}
+	proc.roles = ro
+
 	// ⑤ client 角色恒开（HD delta：期望态并入 config，client/control 无开关）。
 	sup.Start("client", func() Role { return newClientRole(filepath.Join(stateDir, "client"), dl, d) }, nil)
 
 	// ⑥ control 角色恒开（首启 Listen fail-fast：监听失败 = 报错退出——控制面是
 	// 统一进程的用户面，静默缺失无从排查）。
-	if err := startControlPlane(ctx, version, stateDir, sup, d, dl.Eventf); err != nil {
+	if err := startControlPlane(ctx, version, stateDir, sup, d, ro, dl.Eventf); err != nil {
 		proc.Close()
 		return nil, err
 	}
 
 	// ⑦ serve/relay 按期望态（config enabled；重启机器照此恢复）。
 	if cfg.Serve.Enabled {
-		sup.StartRole("serve", makeServeRole(stateDir, cacheDir, cfg, version, verbose), nil)
+		sup.StartRole("serve", ro.makeServeFactory(), nil)
 	} else {
 		dl.Eventf("serve: 期望停用（config serve.enabled=false）——不装配")
 	}
 	if cfg.Relay.Enabled {
-		sup.StartRole("relay", makeRelayRole(stateDir, cacheDir, cfg, version), nil)
+		sup.StartRole("relay", ro.makeRelayFactory(), nil)
 	} else {
 		dl.Eventf("relay: 期望停用（config relay.enabled=false）——不装配")
 	}
@@ -195,52 +199,6 @@ func assembleUnified(parent context.Context, version, stateDir string, verbose b
 		stateDir, cfg.Serve.Enabled, cfg.Relay.Enabled, version)
 	// 全停 = client/control 仍在、进程常驻不退出（D9）——收工由句柄 Close/信号驱动。
 	return proc, nil
-}
-
-// makeServeRole serve 角色工厂（D3 拆分表注入；每次重建重新构造——角色对象不跨重建复用）。
-func makeServeRole(stateDir, cacheDir string, cfg *nodeconfig.Config, version string, verbose bool) func() Role {
-	return func() Role {
-		sc := &cfg.Serve
-		bindAddr, bindIf, bindMode, err := server.ResolveBind(sc.BindInterface)
-		if err != nil {
-			// resolve 失败按角色失败处理（退避重建）。
-			return failedRole{name: "serve", err: err}
-		}
-		return server.NewRole(server.ServeConfig{
-			StateDir:    filepath.Join(stateDir, "serve"), // L2
-			LogDir:      cacheDir,                         // L3（events/debug 日志）
-			PortFileDir: cacheDir,                         // L3（listen_port/public_endpoint）
-			SockDir:     stateDir,                         // 瞬态（files/term/speedtest.sock）
-			ListenPort:  sc.Listen,
-			BindAddr:    bindAddr,
-			BindIface:   bindIf,
-			BindMode:    bindMode,
-			UPnP:        sc.UPnP,
-			STUN:        sc.STUN,
-			STUN6:       sc.STUN6,
-			DDNS:        sc.DDNS,
-			Relay:       sc.Relay,
-			MaxDevices:  sc.MaxPeers,
-			PeerTTL:     sc.PeerTTL,
-			DNSPort:     sc.DNSPort,
-			FilesRoot:   sc.FilesRoot,
-			BuildTag:    version,
-			Verbose:     verbose,
-		})
-	}
-}
-
-// makeRelayRole relay 角色工厂（同表注入）。
-func makeRelayRole(stateDir, cacheDir string, cfg *nodeconfig.Config, version string) func() Role {
-	return func() Role {
-		return relay.NewRole(relay.RoleConfig{
-			Addr:      cfg.Relay.Listen,
-			Advertise: cfg.Relay.Advertise,
-			StateDir:  filepath.Join(stateDir, "relay"), // L2（relay.key）
-			LogDir:    cacheDir,                         // L3（relay.log）
-			Build:     version,
-		})
-	}
 }
 
 // failedRole 构造期失败的角色包装（Run 恒返回该错误——交 supervisor 退避重建，

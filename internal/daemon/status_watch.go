@@ -1,6 +1,7 @@
 package daemon
 
-// status_watch.go — homeway daemon status --watch（4a §7.1，D7 只读消费者）：
+// status_watch.go — homeway status --watch（4a §7.1，D7 只读消费者；role-management
+// 3.4 自 `daemon status --watch` 平移——观测即需求语义不变）：
 // 快照 + 订阅续播的 live 渲染——一次 Dial → snapshot.get → events.subscribe
 // （link+session 域，view=当前列表视图〔启动时主机集合〕，cursor=快照序号）→
 // 终端原地渲染（state/reason/via/rtt 随事件刷新，Ctrl-C 退出）。
@@ -16,7 +17,7 @@ package daemon
 // 新增/移除的主机照常渲染、不追溯进视图声明（重启 watch 刷新）。
 //
 // 命名（design D7）：不叫 `homeway status --watch`——3f 已规划 `homeway status`
-// 聚合命令（吸收 daemon status），沿既有 daemon status 扩 flag，3f 吸收时随迁移。
+// 聚合命令（role-management 3.4 已吸收，入口 = homeway status --watch）。
 
 import (
 	"context"
@@ -55,7 +56,7 @@ func statusWatch(ctx context.Context, sock, version, stateDir string, timeout ti
 	c, _, err := control.Dial(dctx, sock, control.FrontendInfo{Kind: "cli", Name: "homeway-watch", Version: version})
 	if err != nil {
 		// 可行动错误与 statusCLI 同款（守护托管读面：未运行是常态，给启动命令）。
-		return fmt.Errorf("homeway daemon 未在运行（sock=%s：%v）\n先启动：homeway --state %s（零参统一进程）", sock, err, stateDir)
+		return fmt.Errorf("homeway 未在运行（sock=%s：%v）\n--watch 需进程在位（纯读不拉起）；先启动：homeway --state %s（零参统一进程）", sock, err, stateDir)
 	}
 	defer c.Close()
 	raw, err := c.Request(dctx, facade.OpSnapshotGet, nil)
@@ -88,7 +89,7 @@ func statusWatch(ctx context.Context, sock, version, stateDir string, timeout ti
 	if _, err := c.Subscribe(dctx, []string{facade.DomainLink, facade.DomainSession}, &snap.Seq, vb.String(), snap.Generation); err != nil {
 		if errors.Is(err, control.CodeError(facade.CodeCursorStale)) {
 			// 一次性命令的前端重连三层口径最小形态：重跑 = 从全量快照重来。
-			return fmt.Errorf("订阅游标失效（cursor_stale：守护进程已重启或事件窗过旧）——重新运行一次 homeway daemon status --watch 即从全量快照开始：%w", err)
+			return fmt.Errorf("订阅游标失效（cursor_stale：守护进程已重启或事件窗过旧）——重新运行一次 homeway status --watch 即从全量快照开始：%w", err)
 		}
 		return fmt.Errorf("events.subscribe 失败：%w", err)
 	}
@@ -101,9 +102,9 @@ func statusWatch(ctx context.Context, sock, version, stateDir string, timeout ti
 			// → 该视图的需求贡献消失——CP「门控信号词表」场景）。
 			return nil
 		case g := <-c.Goodbye():
-			return fmt.Errorf("守护进程已断开（goodbye=%s）——检查守护进程（homeway daemon status）后重新运行本命令", g.Reason)
+			return fmt.Errorf("守护进程已断开（goodbye=%s）——检查守护进程（homeway status）后重新运行本命令", g.Reason)
 		case <-c.Closed():
-			return fmt.Errorf("守护进程连接已断开——守护进程可能已退出（homeway daemon status 确认后重新运行本命令）")
+			return fmt.Errorf("守护进程连接已断开——守护进程可能已退出（homeway status 确认后重新运行本命令）")
 		case ev := <-c.Events():
 			applyWatchEvent(hosts, ev)
 			renderWatch(w, snap.Generation, stateDir, hosts)
@@ -153,7 +154,7 @@ func applyWatchEvent(hosts map[string]*watchHost, ev control.EventBody) {
 func renderWatch(w io.Writer, gen, stateDir string, hosts map[string]*watchHost) {
 	var b strings.Builder
 	b.WriteString("\x1b[H\x1b[2J") // 清屏 + 光标归位（原地刷新）
-	fmt.Fprintf(&b, "homeway daemon watch（Ctrl-C 退出）\n  代际： %s\n  state： %s\n", gen, stateDir)
+	fmt.Fprintf(&b, "homeway watch（Ctrl-C 退出）\n  代际： %s\n  state： %s\n", gen, stateDir)
 	b.WriteString("  ⚠️ 观测副作用：被显示主机（启动时列表）在 watch 期间视为有需求；退出后贡献消失\n")
 	if len(hosts) == 0 {
 		b.WriteString("  主机： 无\n")

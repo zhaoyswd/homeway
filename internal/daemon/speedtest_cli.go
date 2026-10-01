@@ -23,15 +23,22 @@ import (
 	"time"
 
 	"github.com/zhaoyswd/homeway/clientcore/facade"
+	"github.com/zhaoyswd/homeway/internal/cliopts"
 	"github.com/zhaoyswd/homeway/internal/control"
 	"github.com/zhaoyswd/homeway/pkg/speedtest"
 )
 
 // speedtestCLI speedtest 子命令入口（stdout 写 w、过程提示写 errW 便于测试）。
+// SpeedtestCLI speedtest 命令面入口（cmd/homeway 顶层名词直连）。
+func SpeedtestCLI(args []string, version string, w, errW io.Writer) error {
+	return speedtestCLI(args, version, w, errW)
+}
+
 func speedtestCLI(args []string, version string, w, errW io.Writer) error {
 	fs := flag.NewFlagSet("homeway speedtest", flag.ContinueOnError)
 	fs.SetOutput(w)
-	stateDir := fs.String("state", DefaultStateDir(), "守护进程 state 目录（从中找 control.sock）")
+	stateDir := fs.String("state", DefaultStateDir(), "统一 state 根（从中找 control.sock）")
+	noSpawn := fs.Bool("no-spawn", false, "守护进程未运行时不按需拉起（直接报可行动错误；脚本友好）")
 	hostRef := fs.String("host", "", "指定主机（缺省 = 主机表内全部主机顺序轮流）")
 	jsonOut := fs.Bool("json", false, "机器可读 JSON（逐主机结果对象，stdout 一行）")
 	down := fs.Duration("down", 10*time.Second, "下行窗口（≤15s）")
@@ -60,7 +67,7 @@ func speedtestCLI(args []string, version string, w, errW io.Writer) error {
 		return fmt.Errorf("--wait %s 为负", *wait)
 	}
 
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(cliopts.With(context.Background(), cliopts.Opts{NoSpawn: *noSpawn}))
 	defer cancel()
 	c, err := dialCarrierCLI(ctx, *stateDir, version, "homeway-speedtest")
 	if err != nil {

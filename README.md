@@ -4,13 +4,19 @@
 （应用名「Homeway」，手机端仓库私有）把手机的全部 IPv4 流量经 WireGuard 隧道送到这台机器出网 ——
 在家外访问家里的网络与服务，公网上看到的 IP 也是这台机器的。
 
-同一个二进制承载两个角色，按运行方式区分：
+一个二进制、**一个统一进程**承载全部角色：`homeway` 零参前台运行，按
+`<state>/config.toml` 的期望态装配启用角色（serve 出口 / relay 中继，client 与
+控制面恒开）；命令面 `homeway <谁> <干什么>`。
 
-- **出口**（`./homeway`，默认角色）：WireGuard 端点 + token 签发 + 过境流量拦截（TCP 重拨、
+- **出口**（serve 角色）：WireGuard 端点 + token 签发 + 过境流量拦截（TCP 重拨、
   UDP 长会话），并附带 files（文件管理）、终端（远程 shell）两个本地服务 —— 都只经隧道可达，
   不暴露公网端口。
-- **中继**（`./homeway relay`）：给 NAT 后的出口兜底 —— 打洞与流量的公共会合点，
-  跑在有公网 IP 的机器上。
+- **中继**（relay 角色）：给 NAT 后的出口兜底 —— 打洞与流量的公共会合点，
+  跑在有公网 IP 的机器上；`homeway relay` 前台单跑（调试形态）或 config 启用。
+- **统一进程**（桌面常驻形态）：serve/relay 按期望态 + 多主机客户端注册表（host/term/
+  files/forward/socks/speedtest 命令面的宿主）+ 本机控制面（`<state>/control.sock`）。
+  归属守护托管的命令在进程未运行时**自动拉起**（打印一行「守护进程未运行，已启动
+  pid=N」；`--no-spawn` 关闭）。
 
 能力速览：
 
@@ -50,12 +56,30 @@ https://github.com/zhaoyswd/homeway/releases
 重启不变、token 里的地址也不会变。
 
 ```bash
-# 进入所在目录直接执行，默认端口 UDP 41641
+# 进入所在目录直接执行，默认端口 UDP 41641（serve.enabled 默认 true——零参即出口）
 ./homeway
-# 无法直连成功时，配置中继（见下一节）
-./homeway --relay '中继token'
-# 指定主机 DDNS 域名（家宽重拨端点漂移后无需重取 token）
-./homeway --ddns 'home.example.com'
+```
+
+角色参数写 `<state>/config.toml`（默认 `~/.config/homeway`，缺失自动生成默认；
+三层布局：L1 config.toml / L2 凭证〔serve/、relay/、client/〕/ L3 可弃缓存
+〔cache/〕）。改角色参数用命令面或手编后重启：
+
+```bash
+# 无法直连成功时，配置上游中继（见下一节；--stdin 从 stdin 读，不落 shell history）
+homeway serve relay set '中继token'          # 或：homeway serve relay set --stdin
+homeway serve restart                        # 纯配置写不热更——重启生效
+
+# 指定主机 DDNS 域名（可多条；家宽重拨端点漂移后无需重取 token）
+homeway serve ddns add 'home.example.com'
+homeway serve ddns list
+homeway serve restart
+
+# 启停与观测（守护托管：未跑则自动拉起统一进程）
+homeway serve start | stop | restart | status [--json]
+homeway serve token                          # 完整 hmw1 凭证（在跑控制面 / 未跑读台账末行）
+
+# 一次性前台调试形态（不改期望态；flag 一次性覆盖 config）
+homeway serve --listen 41641
 ```
 
 **3. 配置 App**
@@ -80,12 +104,15 @@ hmw1GiFSJPXiArlX…        ← 复制冒号后面这一整串
 机器只有内网 IP 时用 `--advertise` 显式指定。
 
 ```bash
-# 运行中继，获取中继 token，默认端口 TCP/UDP 41641
-./homeway relay
-# 指定端口
-./homeway relay --listen :41741
-# 显式指定中继公网 IP
-./homeway relay --listen :41741 --advertise 1.2.3.4:41741
+# 前台只跑中继（调试形态；默认端口 TCP/UDP :41741），启动日志打印中继 token（rl1…）
+homeway relay
+# 指定端口 / 显式指定中继公网 IP（前台一次性覆盖）
+homeway relay --listen :41741 --advertise 1.2.3.4:41741
+# 常驻形态：config 启用 + 命令组管理（与 serve 同一统一进程，默认端口不冲突）
+homeway relay start                          # config 写 relay.enabled=true + 拉起统一进程
+homeway relay status [--json]                # 期望+运行态+注册出口列表（中继看不到 APP）
+homeway relay token                          # 完整 rl1 凭证（在跑控制面 / 未跑 relay.key+config 离线推算）
+homeway relay stop | restart
 ```
 
 **2. 使用中继**
@@ -94,8 +121,9 @@ hmw1GiFSJPXiArlX…        ← 复制冒号后面这一整串
 直连优先，直连全部失败时才走中继、恢复后自动升回直连。
 
 ```bash
-# 启动出口时指定中继服务器
-./homeway --relay '中继token'
+# 出口侧配置上游中继（写入 config 的 serve.relay；重启出口生效）
+homeway serve relay set '中继token'
+homeway serve restart
 ```
 
 > 云服务器要在安全组/防火墙放行 UDP/TCP 端口。中继同时承担打洞与流量转发职责，直连优先。
@@ -117,13 +145,13 @@ homeway term attach --host mac    #（名称精确 / peerID 全长 hex / 无歧�
 homeway term explain <会话名> --host mac   # 在线 explain 远程往返（--file 离线模式仍是本地面）
 ```
 
-- **远程模式（`--host`）**：命令经本机 daemon 的控制面（`stream.open{kind:term}` 纯透传）
+- **远程模式（`--host`）**：命令经本机统一进程的控制面（`stream.open{kind:term}` 纯透传）
   过隧道到达目标主机的 term 服务——与手机 surface 腿同挂一条会话、互不顶替。
-  ⚠️ **`--state` 的指代随 `--host` 切换**：远程模式下指 daemon state 目录
-  （control.sock 所在，默认 `~/.config/homeway/daemon`），不再是出口 state；
+  ⚠️ **`--state` 的指代随 `--host` 切换**：远程模式下指统一 state 根
+  （control.sock 所在，默认 `~/.config/homeway`），不再是出口 state；
   `--timeout` 为解析与打开**各**一次的预算（默认各 10s、最坏相加 20s，仅 `--host`
   模式可用——本地面给出即报错；attach 流本身不设 deadline）。
-  daemon 未运行 = 可行动错误（提示先启动 `homeway daemon`）。
+  统一进程未运行 = **自动拉起**（打印启动行后重试；`--no-spawn` = 可行动错误）。
 - **接入形态**：本地终端被置为 raw 双向透传，本地终端自己就是仿真器（raw 字节模式）。
   窗口尺寸变化自动同步（SIGWINCH → RESIZE）；会话级尺寸/主题以**最近活动的腿**为准。
 - **分离键**：默认 `Ctrl-b` 前缀——`d` 分离（会话继续在出口跑）、`Ctrl-b Ctrl-b` 送字面量、
@@ -177,14 +205,14 @@ homeway files put <本地> <远端> [--rate-limit N] [--quiet]
 homeway files list --host mac        # --host <ref>：与 host delete/status / term 同一寻址规则
 ```
 
-- **远程模式（`--host`）**：命令经本机 daemon 控制面（`stream.open{kind:files}` 纯透传）
-  过隧道到达目标主机的 files 服务。daemon 未运行 = 可行动错误（提示先启动
-  `homeway daemon`）；守护进程代际过旧不识 files 流时按 `bad_request` 给出
-  「请同批升级 daemon」提示（锁步哲学：同批发版同二进制天然同升）。
+- **远程模式（`--host`）**：命令经本机统一进程的控制面（`stream.open{kind:files}` 纯透传）
+  过隧道到达目标主机的 files 服务。统一进程未运行 = **自动拉起**（`--no-spawn` =
+  可行动错误）；守护进程代际过旧不识 files 流时按 `bad_request` 给出
+  「请同批升级」提示（锁步哲学：同批发版同二进制天然同升）。
 - ⚠️ **`--state` 的指代随 `--host` 切换**（term 面同款重载语义，非互斥）：无 `--host`
   = 本地面，一次性直连 `<state>/files.sock`（默认**出口 state** `~/.config/homeway`，
-  不要求 daemon 在位）；`--host <ref>` = 远程面，`--state` 指**守护进程 state 目录**
-  （control.sock 所在，默认 `~/.config/homeway/daemon`）。
+  不要求统一进程在位）；`--host <ref>` = 远程面，`--state` 指**统一 state 根**
+  （control.sock 所在，默认同 `~/.config/homeway`）。
 - **`--timeout`**：解析 / 连接+打开 / 首响应（问候帧）三段各一次的预算（默认各 10s、
   最坏相加 30s；**两面均可用**——term 面本地面不接受）；传输本身不设 deadline，
   超预算/取消的文案按 CLI 自己的阶段归因，不呈现成连接态。
@@ -195,48 +223,61 @@ homeway files list --host mac        # --host <ref>：与 host delete/status / t
 - **退出码**：成功 = 0；连接 / 协议 / 超时 / 取消 = 1；未知 files 子命令 = 1、
   顶层未知角色 = 2。
 
-### 桌面守护进程（`homeway daemon`，多主机客户端常驻）
+### 统一进程与聚合状态（`homeway status`）
 
-除手机 App 外的第二种客户端形态：桌面（Mac/Linux）上常驻一个守护进程，把**多台出口
-主机**的客户端会话同时拉起来（经 `clientcore/facade` 单入口消费——与手机 cshared
-包装共用同一份会话状态机与测试，行为零漂移）。
+桌面（Mac/Linux）常驻形态：一个统一进程同时承载 serve/relay（按 config 期望态）与
+**多台出口主机**的客户端会话（经 `clientcore/facade` 单入口消费——与手机 cshared
+包装共用同一份会话状态机与测试，行为零漂移）。`homeway` 零参前台运行；
+launchd/systemd/nohup 常驻皆可（macOS 模板见 `tools/launchd/`）。
 
 ```bash
-homeway daemon [--state DIR]   # 启动守护进程（默认 state ~/.config/homeway/daemon；
-                               # ⚠️ 与出口 state 禁止同目录——两角色组合未定义）
-homeway daemon status [--json] # 状态面（版本/代际/角色/主机+链路态；--json = 机器可读
-                               # 全量快照，供脚本与未来 Mac APP 消费）
-homeway daemon status --watch  # live 渲染：快照 + 订阅续播（state/reason/via/rtt 随事件
-                               # 刷新，Ctrl-C 退出）。⚠️ 观测副作用：view 参与需求合成
-                               # ——watch 期间被显示主机（启动时列表）视为有需求（门控
-                               # 不压制其巡检证据），退出后贡献消失。视图声明 = 启动时
-                               # 列表（期间增删的主机照常渲染、不追溯进视图声明）。
-                               # daemon 角色重建（detach/attach）时补发的 session.added
-                               # 仅恢复登记面（host/name），state/link 待后续事件或前端
-                               # 重快照（exec-r2 新-2 口径）。
-                               # （不叫 homeway status --watch——3f 的 homeway status
-                               # 聚合命令落地时按其同升清单吸收迁移。）
+homeway status [--json]        # 聚合状态面：进程层 + serve + relay + client 四域
+                               # （进程未运行时读 config 报期望态，纯读不拉起；
+                               #   --json = 机器可读，供脚本与未来 Mac APP 消费）
+homeway status --watch         # client 域 live 渲染：快照 + 订阅续播（state/reason/
+                               # via/rtt 随事件刷新，Ctrl-C 退出）。⚠️ 观测副作用：
+                               # view 参与需求合成——watch 期间被显示主机（启动时
+                               # 列表）视为有需求（门控不压制其巡检证据），退出后
+                               # 贡献消失。视图声明 = 启动时列表；进程角色重建
+                               # （detach/attach）时补发的 session.added 仅恢复登记面
+                               # （host/name），state/link 待后续事件或前端重快照。
+                               # --watch 需进程在位（未跑 = 可行动错误，不拉起）；
+                               # serve/relay 域暂不进 watch 流（事件总线无该域，
+                               # 后续按只增补）。
 ```
 
-- **控制面**：守护进程在 `<state>/control.sock`（Unix socket，0600；目录 0700）上提供
-  本地控制协议——快照/事件流（带游标续播）/term 字节流透传。**持有该 socket 的访问权 =
-  拥有这些主机会话的控制权**（与 term.sock 同口径），协议内无 token 类凭证。
-  契约真源 = 手机仓 openspec `daemon-control-plane` 能力域的 spec + 语言无关 fixtures
-  （`internal/control/testdata/fixtures/v1/`，含独立解码对拍脚本 `decode_check.py`——
-  非 Go 消费者可仅凭 spec + fixtures 实现对拍）。
-- **桌面消费形态**：CLI/未来 Mac APP 是控制面的薄前端——`daemon status --json` 与
-  `host list --json`（见下）是协议级机器可读消费路径的实证；`daemon status --watch`
+- **期望态与开关**：`serve/relay start|stop|restart` 即改 config 的 enabled 字段并
+  装配/停角色（机器重启后照期望态恢复；全停后进程常驻不退出——client/control 是
+  统一进程本职）。事实约束：**中继侧看不到 APP**（在中继注册的是出口、手机流量在
+  WG 密文里）——APP 维度只从 `serve status` 的 peer 表看。
+- **按需拉起**：归属守护托管/控制面转发的命令（host/forward/socks/speedtest、
+  term/files `--host`、`serve|relay start`）在统一进程未运行时自动拉起（非静默
+  打印一行启动提示；launchd 托管形态先等 KeepAlive 重拉）；`--no-spawn` =
+  可行动错误（脚本友好）。纯读命令（status 族）不拉起。
+- **控制面**：统一进程在 `<state>/control.sock`（Unix socket，0600；目录 0700）上提供
+  本地控制协议——快照/事件流（带游标续播）/term 字节流透传/serve·relay 角色管理。
+  **持有该 socket 的访问权 = 拥有这些主机会话的控制权**（与 term.sock 同口径），协议内
+  无 token 类凭证。契约真源 = 手机仓 openspec `daemon-control-plane` 能力域的 spec +
+  语言无关 fixtures（`internal/control/testdata/fixtures/v1/`，含独立解码对拍脚本
+  `decode_check.py`——非 Go 消费者可仅凭 spec + fixtures 实现对拍）。
+- **桌面消费形态**：CLI/未来 Mac APP 是控制面的薄前端——`homeway status --json` 与
+  `host list --json`（见下）是协议级机器可读消费路径的实证；`status --watch`
   是订阅面（快照 + 游标续播）的第一个真实只读消费者，纯绑定落地（零 facade 语义
   改动——「新只读消费者只加绑定」的实证）。
-- **需求门控与诊因**（4a 起）：守护进程的会话恢复按需求门控——三源保守或合成（出站
+- **需求门控与诊因**（4a 起）：会话恢复按需求门控——三源保守或合成（出站
   流量增量 / 在场消费连接 / 订阅视图覆盖），无需求期的巡检失败不计恢复证据（手机 App
   路径不受影响）；恢复被门控/限频/探测窗口拦下时发 `session.diag` 诊因事件
   （reason = gated/budget/probe_window——「为什么没在恢复」在事件面可观测）。
+- **状态工件**：`homeway export [--state D] [dest.tar]`（不变量四件 = config.toml +
+  serve/ + relay/ + client/，0600 未压缩 tar）/ `homeway import <file>`（布局校验 +
+  安全解包 + 落位回滚；目标进程必须在停）/ `homeway reset cache`（清可弃层 cache/）。
+- **单实例**：state 目录 flock 排他锁（统一进程与前台单角色共用 `<state>/lock`），
+  二次启动报「已在运行（pid N）」；进程死亡锁自动释放。
 
 ### 主机表管理（`homeway host`，守护托管命令面）
 
-管理守护进程注册表里的多台主机——全部经控制面 UDS 操作守护进程（不直读/直写
-hosts.json；守护进程未运行时报可行动错误，无降级直读模式）：
+管理统一进程注册表里的多台主机——全部经控制面 UDS 操作（不直读/直写
+hosts.json；统一进程未运行时自动拉起，`--no-spawn` = 可行动错误）：
 
 ```bash
 homeway host add [--name N] [--force] <token>
@@ -254,21 +295,19 @@ homeway host status [name] [--json]
 homeway host delete <name|id> [--yes]
     # 删除：停会话、出表、落盘。按名称/完整 ID/无歧义短前缀寻址；交互确认默认 N，
     # 非终端 stdin 未给 --yes 时拒绝（防脚本误删）；目标不存在报错非零（不静默成功）。
-# 全部子命令支持 --state DIR（同 daemon status）与 --timeout；add 默认 10s，其余 5s。
+# 全部子命令支持 --state DIR（统一 state 根）与 --timeout / --no-spawn；add 默认 10s，其余 5s。
 ```
 
 验证实现一份：手机 App（cshared `ClientCoreProbeReach`）与 daemon `host.add` 服务端
 同调 `pkg/probe.Reach`（decode → 端点解析（并行，计入同一预算）/去重 → 并发参照点
 探测）；探测为纯旁路（独立临时 UDP socket、无身份、不碰任何在跑会话）。
-- **launchd 守护化**（macOS）：模板与安装说明见 `tools/launchd/`（RunAtLoad + KeepAlive
-  崩溃自动重拉；模板经 `launchctl load` 实测）。
-- **单实例**：state 目录 flock 排他锁，二次启动报「已在运行（pid N）」；进程死亡锁自动
-  释放。
+- **launchd 常驻**（macOS）：模板与安装说明见 `tools/launchd/`（零参统一进程单代理，
+  RunAtLoad + KeepAlive 崩溃自动重拉；模板经 `launchctl load` 实测）。
 
 ### 端口转发（`homeway forward`，守护托管命令面）
 
-桌面侧的端口转发规则——监听器在 daemon 进程内跑（127.0.0.1 仅回环，会话无关长活：
-add 即起、delete 即关、daemon 重启按持久化表重建），入站连接经 facade 拨号缝过隧道
+桌面侧的端口转发规则——监听器在统一进程内跑（127.0.0.1 仅回环，会话无关长活：
+add 即起、delete 即关、进程重启按持久化表重建），入站连接经 facade 拨号缝过隧道
 由指定主机出口出网。与手机 App 的端口转发面（App 配置 + `ClientCoreTunSetPortForwards`）
 零耦合、互不同步（两套规则表、两套监听宿主；语义与校验口径有意镜像——用户心智一份）：
 
@@ -281,8 +320,8 @@ homeway forward list [--host <ref>] [--json]
     # 规则表 + 运行态（listening / failed+原因 / 在世连接数）。
 homeway forward delete --host <ref> --listen <P>
     # 删规则并关监听；已建立的转发连接不强关（自然收口——同手机口径）。
-# 全部子命令 --state 恒指 daemon state（默认 ~/.config/homeway/daemon，control.sock
-# 所在——本命令面无本地面）；daemon 未运行 = 可行动错误。
+# 全部子命令 --state 恒指统一 state 根（默认 ~/.config/homeway，control.sock
+# 所在——本命令面无本地面）；统一进程未运行 = 自动拉起（--no-spawn 关闭）。
 ```
 
 规则校验：监听端口 1024–65535、目标须为空（出口自己）或 IPv4 字面量、每主机 ≤8 条；
@@ -290,7 +329,7 @@ homeway forward delete --host <ref> --listen <P>
 回环命名空间——与手机「每主机唯一」的桌面差异）。add 当场监听失败（如端口被守护进程
 外进程占用）= 错误、规则不入表（「failed 软状态」只出现在运行态失败路径——daemon
 重启重建时的端口被占，与运行期 accept 连续失败烧尽——监听失效如实呈现）。规则
-持久化于 `<daemon-state>/forwards.json`（0600、原子写、损坏按空表重建）；删除主机时其
+持久化于 `<state>/client/forwards.json`（0600、原子写、损坏按空表重建）；删除主机时其
 全部规则与监听级联消失（不复活）。
 
 ### SOCKS5 承载面（`homeway socks`，按主机开关）
@@ -309,7 +348,7 @@ homeway socks status [--json]
     # 每主机开关态 + 端口（--json 含 off 但记住的端口）+ 在世连接数 + 链路态 via/rtt。
 ```
 
-**域名目标的解析在出口侧远程完成**（MUST NOT 本地解析）：CONNECT 带主机名时 daemon
+**域名目标的解析在出口侧远程完成**（MUST NOT 本地解析）：CONNECT 带主机名时统一进程
 经隧道拨该主机出口的 DNS 代答（TCP 查询 → `Host.DialPort(5300)` → 出口
 `127.0.0.1:5300`）发 A 查询，以应答 IPv4 拨隧道——fake-ip/内网 DNS/geo 场景下解析权
 跟着指定出口走（`curl --socks5-hostname` 强制域名形态）。解析结果按应答 TTL 缓存
@@ -335,42 +374,44 @@ homeway speedtest [--host <ref>] [--json] [--down 10s] [--up 10s] [--warmup 2s]
     # Ctrl-C 终止整个轮转：先 speedtest.cancel 当前主机、未测主机不再测量，退出码非零。
 ```
 
-守护托管：引擎在 daemon 进程内跑（测速数据腿直连隧道，MUST NOT 经控制面流承载——
+守护托管：引擎在统一进程内跑（测速数据腿直连隧道，MUST NOT 经控制面流承载——
 流通道的有界上行缓冲与全速泵送矛盾）；同主机单飞（在跑时重复 start 报 busy）；记账
-差异如实声明——daemon 侧测速拨号照常计入该主机的需求合成（前台显式动作 = 真实需求；
+差异如实声明——统一进程侧测速拨号照常计入该主机的需求合成（前台显式动作 = 真实需求；
 手机侧的豁免口径不适用）。退出码：全部主机失败或 Ctrl-C = 非零，至少一台成功 = 0。
 
 ## 运行细节
 
-### 多实例
+### 多实例与多角色
 
-一台机器上可以同时跑多个进程（例如一个出口 + 一个中继）：各进程用 `--state` 区分身份、
-用 `--listen` 区分端口（被占用会自动退让并打印实际端口）。同一角色也能起多份（不同 `--state`）。
+双角色同机是**统一进程的常态**（config 同时 `serve.enabled=true` + `relay.enabled=true`，
+默认端口 41641 / :41741 已错开）。要再开一套独立身份：换个 `--state` 目录即可（统一
+进程与前台单角色共用 `<state>/lock` 单实例锁，同 state 互斥）。
 
 ```bash
-# 同机：一个出口 + 一个中继（互不干扰）
-./homeway exit  --state ~/.config/homeway-exit  --listen 41641
-./homeway relay --state ~/.config/homeway-relay --listen :41741
+# 同机双角色：一个统一进程（config 期望态装配）
+homeway --state ~/.config/homeway            # serve + relay + client/control
+
+# 第二套独立身份（调试或隔离）
+homeway serve --state ~/.config/homeway-b --listen 41642   # 前台单角色
 ```
 
-身份密钥、token 台账、实际端口、已公布公网端点都在 `--state` 目录里（默认出口
-`~/.config/homeway` / 中继 `~/.config/homeway-relay`）。`--state` 指到哪儿就是哪套身份 ——
-想在同一台机器上再开一个独立出口，换个目录即可。
+身份密钥、token 台账、实际端口、已公布公网端点都在 `--state` 的三层布局里
+（serve/relay/client 各一层凭证 + config.toml 意图 + cache/ 可弃层）。
 
 ### 日志
 
 终端（stdout）只输出启动时的 token 与端点清单，以及之后 IP/端口变化时的重打；其余全部进文件
-（都按大小轮转、总占用有上界）：
+（都按大小轮转、总占用有上界；三层布局下日志都在 `<state>/cache/`）：
 
 | 角色 | 文件 | 内容 |
 |---|---|---|
-| 出口 | `<state>/events.log`（2MB×3） | 摘要：绑卡/换卡、UPnP、STUN、公网端点公布、服务就绪、运行告警、token 行 |
-| 出口 | `<state>/debug.log`（8MB×2） | 细节：peer 表流水、入站新源、周期观测、会话/流量过程 |
-| 中继 | `<state>/relay.log`（2MB×3） | 全部运行日志：注册腿/会话/回收/分钟统计/告警 |
-| 守护进程 | `<state>/events.log`（2MB×3）+ `debug.log`（8MB×2）+ `launchd.log` | 摘要（就绪/角色/控制面/主机增删）+ 细节（各主机会话过程）+ launchd 的 stdout/stderr |
+| serve | `<state>/cache/events.log`（2MB×3） | 摘要：绑卡/换卡、UPnP、STUN、公网端点公布、服务就绪、运行告警、token 行 |
+| serve | `<state>/cache/debug.log`（8MB×2） | 细节：peer 表流水、入站新源、周期观测、会话/流量过程 |
+| relay | `<state>/cache/relay.log`（2MB×3） | 全部运行日志：注册腿/会话/回收/分钟统计/告警 |
+| 统一进程 | `<state>/cache/daemon-events.log` + `daemon-debug.log` + `spawn.log` | 守护侧摘要（就绪/角色/控制面/主机增删）+ 细节（各主机会话过程）+ 按需拉起子进程的 stdout/stderr |
 
 `./homeway --verbose` 把摘要+细节同时回显终端（现场排障用）。取最新 token：
-`grep 客户端 token <state>/events.log | tail -1`。
+`homeway serve token`（未跑时直读台账末行，与在跑值一致——台账写入纪律）。
 
 ### macOS 安装（Gatekeeper 实情）
 
@@ -393,11 +434,13 @@ darwin 产物带 **ad-hoc 签名**（`codesign -dv` 显示 `Signature=adhoc`、`
 ## 布局与开发
 
 ```
-cmd/homeway         单入口：按角色（exit / relay）分发
-internal/server     出口（WG 端点 + 拦截层 + 本机服务 + 设备表）与它的 CLI
-internal/relay      中继（注册腿 + per-client 转发 + hint）与它的 CLI
+cmd/homeway         单入口：`homeway <谁> <干什么>` 分发（角色 serve/relay、客户端域、跨域 status）
+internal/server     出口角色（WG 端点 + 拦截层 + 本机服务 + 设备表）与前台 CLI
+internal/relay      中继角色（注册腿 + per-client 转发 + hint）与前台 CLI
+internal/nodeconfig config.toml（L1 意图层）读改写内核
+internal/nodestate  三层 state 布局 + 同根自动迁移 + export/import + 单实例锁
+internal/daemon     统一进程装配（supervisor + 控制面 + 按需拉起 + 命令组 CLI——经 facade 单入口消费）
 clientcore/facade   客户端会话面的唯一语义真源（词汇/版本台账/事件总线/主机表/Host 对象）
-internal/daemon     桌面守护进程（角色子系统 + 控制面装配——经 facade 单入口消费）
 internal/control    控制面 wire 绑定（UDS/帧/握手；词汇与总线真源在 clientcore/facade）
 pkg/proto           线上契约：token（hmw1 格式）/ reg 报文 / 中继帧 + golden vectors
 ```

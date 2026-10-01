@@ -17,12 +17,12 @@ import (
 	"fmt"
 	"io"
 	"net"
-	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/zhaoyswd/homeway/clientcore/facade"
+	"github.com/zhaoyswd/homeway/internal/cliopts"
 	"github.com/zhaoyswd/homeway/internal/control"
 )
 
@@ -31,14 +31,11 @@ var carrierFlagBools = map[string]bool{
 	"json": true, "quiet": true, "help": true, "h": true,
 }
 
-// dialCarrierCLI 连 control.sock（承载面命令共用的前端标识）。
+// dialCarrierCLI 连 control.sock（承载面命令共用的前端标识；role-management 4.1
+// 起 = 按需拉起的统一注入缝：未运行时拉起统一进程并重拨，--no-spawn 经 ctx 的
+// cliopts 挂载〔forward/socks/speedtest 的 flag 集解析后传入〕）。
 func dialCarrierCLI(ctx context.Context, stateDir, version, name string) (*control.Client, error) {
-	sock := filepath.Join(stateDir, control.ControlSockName)
-	c, _, err := control.Dial(ctx, sock, control.FrontendInfo{Kind: "cli", Name: name, Version: version})
-	if err != nil {
-		return nil, controlDialErr(stateDir, sock, err)
-	}
-	return c, nil
+	return dialControlSpawn(ctx, stateDir, version, name)
 }
 
 // hostsOnConn 经已建连接拉主机表（寻址/名称映射/链路态标签共用）。
@@ -84,6 +81,11 @@ func carrierOpErr(op string, err error) error {
 }
 
 // forwardCLI forward 子命令入口（cmd/homeway 转发；输出写 w 便于测试）。
+// ForwardCLI forward 命令面入口（cmd/homeway 顶层名词直连）。
+func ForwardCLI(args []string, version string, w io.Writer) error {
+	return forwardCLI(args, version, w)
+}
+
 func forwardCLI(args []string, version string, w io.Writer) error {
 	if len(args) == 0 {
 		usageForward(w)
@@ -157,7 +159,8 @@ func isIPv4Literal(s string) bool {
 func forwardAddCLI(args []string, version string, w io.Writer) error {
 	fs := flag.NewFlagSet("homeway forward add", flag.ContinueOnError)
 	fs.SetOutput(w)
-	stateDir := fs.String("state", DefaultStateDir(), "守护进程 state 目录（从中找 control.sock）")
+	stateDir := fs.String("state", DefaultStateDir(), "统一 state 根（从中找 control.sock）")
+	noSpawn := fs.Bool("no-spawn", false, "守护进程未运行时不按需拉起（直接报可行动错误；脚本友好）")
 	hostRef := fs.String("host", "", "主机（名称/完整 ID/无歧义短前缀，同 host delete）")
 	listen := fs.Uint("listen", 0, "本机回环监听端口（1024–65535）")
 	target := fs.String("target", "", "目标：<ip:port>（出口可达的任意 IPv4）| :<port>（出口自己指定端口）| 缺省 = 出口自己同端口")
@@ -185,7 +188,7 @@ func forwardAddCLI(args []string, version string, w io.Writer) error {
 		return err
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), *timeout)
+	ctx, cancel := context.WithTimeout(cliopts.With(context.Background(), cliopts.Opts{NoSpawn: *noSpawn}), *timeout)
 	defer cancel()
 	c, err := dialCarrierCLI(ctx, *stateDir, version, "homeway-forward")
 	if err != nil {
@@ -287,7 +290,8 @@ func findPortOwner(ctx context.Context, c *control.Client, hosts []control.HostS
 func forwardListCLI(args []string, version string, w io.Writer) error {
 	fs := flag.NewFlagSet("homeway forward list", flag.ContinueOnError)
 	fs.SetOutput(w)
-	stateDir := fs.String("state", DefaultStateDir(), "守护进程 state 目录（从中找 control.sock）")
+	stateDir := fs.String("state", DefaultStateDir(), "统一 state 根（从中找 control.sock）")
+	noSpawn := fs.Bool("no-spawn", false, "守护进程未运行时不按需拉起（直接报可行动错误；脚本友好）")
 	hostRef := fs.String("host", "", "只列该主机（名称/完整 ID/无歧义短前缀）")
 	jsonOut := fs.Bool("json", false, "机器可读 JSON（规则对象数组，stdout 一行）")
 	timeout := fs.Duration("timeout", 5*time.Second, "连接与请求的总预算")
@@ -300,7 +304,7 @@ func forwardListCLI(args []string, version string, w io.Writer) error {
 	if fs.NArg() != 0 {
 		return fmt.Errorf("forward list 不接受位置参数（got %q）", fs.Args())
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), *timeout)
+	ctx, cancel := context.WithTimeout(cliopts.With(context.Background(), cliopts.Opts{NoSpawn: *noSpawn}), *timeout)
 	defer cancel()
 	c, err := dialCarrierCLI(ctx, *stateDir, version, "homeway-forward")
 	if err != nil {
@@ -368,7 +372,8 @@ func forwardListCLI(args []string, version string, w io.Writer) error {
 func forwardDeleteCLI(args []string, version string, w io.Writer) error {
 	fs := flag.NewFlagSet("homeway forward delete", flag.ContinueOnError)
 	fs.SetOutput(w)
-	stateDir := fs.String("state", DefaultStateDir(), "守护进程 state 目录（从中找 control.sock）")
+	stateDir := fs.String("state", DefaultStateDir(), "统一 state 根（从中找 control.sock）")
+	noSpawn := fs.Bool("no-spawn", false, "守护进程未运行时不按需拉起（直接报可行动错误；脚本友好）")
 	hostRef := fs.String("host", "", "主机（名称/完整 ID/无歧义短前缀，同 host delete）")
 	listen := fs.Uint("listen", 0, "要删的监听端口")
 	timeout := fs.Duration("timeout", 5*time.Second, "连接与请求的总预算")
@@ -388,7 +393,7 @@ func forwardDeleteCLI(args []string, version string, w io.Writer) error {
 		return errors.New("forward delete 需要 --listen <端口>（homeway forward list 查看）")
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), *timeout)
+	ctx, cancel := context.WithTimeout(cliopts.With(context.Background(), cliopts.Opts{NoSpawn: *noSpawn}), *timeout)
 	defer cancel()
 	c, err := dialCarrierCLI(ctx, *stateDir, version, "homeway-forward")
 	if err != nil {

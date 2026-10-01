@@ -23,6 +23,9 @@ var (
 	// ErrBackendNoSession 主机在表但会话不在（收工/重建窗口/未就绪）——流打开
 	// 被拒（stream_refused）。
 	ErrBackendNoSession = errors.New("会话不在（收工/重建窗口）")
+	// ErrBackendRoleStopped serve/relay restart 无重建对象（角色停/未装配——
+	// role-management 3f；CLI 侧预检兜住，wire 理论不可达，防御落 bad_request）。
+	ErrBackendRoleStopped = errors.New("角色未在运行（先 start）")
 )
 
 // Backend 控制面服务器的宿主面（daemon 装配时实现；全部方法必须可并发调用）。
@@ -81,4 +84,32 @@ type Backend interface {
 	SpeedtestStatus(host string) (SpeedtestStatusResult, error)
 	// SpeedtestCancel 取消该主机当前轮（幂等；host 不在表 = ErrBackendNoHost）。
 	SpeedtestCancel(host string) error
+
+	// ---------- serve/relay 角色管理（3f 只增 10 op 的宿主面） ----------
+	//
+	// 语义在 internal/server / internal/relay 的角色接口与 internal/nodeconfig
+	//（期望态）；本面只字段映射。幂等 = 成功载荷呈现动作有无（不借道错误码）；
+	// restart 无重建对象 = ErrBackendRoleStopped（CLI 预检兜住，wire 理论不可达）。
+	// token 方法返回完整凭证（reveal 族——socket 属主即凭证的既有边界内）。
+
+	// ServeStart enabled=true 写 config + 确保角色装配（幂等）。
+	ServeStart() (RoleActionResult, error)
+	// ServeStop enabled=false 写 config + 取消角色 ctx 立即应答（收尾异步）。
+	ServeStop() (RoleActionResult, error)
+	// ServeRestart 角色进程内重建（期望态不变；未在跑 = ErrBackendRoleStopped）。
+	ServeRestart() (RoleActionResult, error)
+	// ServeStatus 期望态 + 运行态 + 领域观测面（掩码纪律）。
+	ServeStatus() ServeStatusResult
+	// ServeToken 完整 hmw1 凭证（runtime 优先，降级 = 台账末行）。
+	ServeToken() (ServeTokenResult, error)
+	// RelayStart 同 ServeStart（relay 角色）。
+	RelayStart() (RoleActionResult, error)
+	// RelayStop 同 ServeStop。
+	RelayStop() (RoleActionResult, error)
+	// RelayRestart 同 ServeRestart。
+	RelayRestart() (RoleActionResult, error)
+	// RelayStatus 期望态 + 运行态 + 注册出口列表（无 APP 维度）。
+	RelayStatus() RelayStatusResult
+	// RelayToken 完整 rl1 凭证（runtime 优先，降级 = relay.key+config 离线推算）。
+	RelayToken() (RelayTokenResult, error)
 }

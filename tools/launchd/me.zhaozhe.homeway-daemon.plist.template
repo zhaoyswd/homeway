@@ -1,17 +1,14 @@
 <?xml version="1.0" encoding="UTF-8"?>
-<!-- homeway 桌面守护进程 launchd 用户代理模板（host-registry-daemon 4.2，HD「launchd 守护化」）。
+<!-- homeway 统一进程 launchd 用户代理模板（role-management 3f/4.4，HD「launchd 守护化」）。
      安装前替换两处占位：
        __HOMEWAY_BIN__  homeway 可执行文件绝对路径（如 /usr/local/bin/homeway）
-       __STATE_DIR__    守护进程 state 目录绝对路径（如 /Users/you/.config/homeway/daemon）
-     ⚠️ ⚠️ exit 与 daemon 禁止共用同一 state 目录（共写日志轮转互踩、共享
-     identity 目录；角色合并归后续能力域 3f）。daemon 侧硬拦：state 下存在
-     tokens.jsonl（出口身份特征）即拒启；exit/relay 侧不检测（单实例锁只约束
-     daemon），反向指过去只能靠人工避免。检查：state 目录不得与任何
-     `homeway exit --state`/`homeway relay --state` 在役部署相同；本模板默认子目录
-     ~/.config/homeway/daemon 与在役出口 ~/.config/homeway 天然不同目录，可并存
-     （不同 label：me.zhaozhe.homeway-exit / me.zhaozhe.homeway-daemon）。
-     安装与验证步骤见同目录 README.md（模板必须经 launchctl load 实测——现役 exit
-     plist 的「exit --relay 子命令形态」之坑的教训）。 -->
+       __STATE_DIR__    统一 state 根绝对路径（如 /Users/you/.config/homeway——
+                        三层布局：config.toml 期望态 + serve/relay/client + cache/）
+     ⚠️ ProgramArguments 只剩二进制路径（零参）：统一进程按 config 期望态装配全部
+     启用角色（serve/relay + 恒开的 client/control）；角色参数写 config 或用
+     `homeway serve|relay …` 命令组，**不进命令行**（token 不再出现在 ps 里）。
+     KeepAlive + RunAtLoad：进程死了自动重拉、按期望态恢复（含机器重启自恢复）。
+     安装与验证步骤见同目录 README.md（模板必须经 launchctl load 实测）。 -->
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
@@ -20,9 +17,6 @@
 	<key>ProgramArguments</key>
 	<array>
 		<string>__HOMEWAY_BIN__</string>
-		<string>daemon</string>
-		<string>--state</string>
-		<string>__STATE_DIR__</string>
 	</array>
 	<key>RunAtLoad</key>
 	<true/>
@@ -31,8 +25,8 @@
 	<key>WorkingDirectory</key>
 	<string>__STATE_DIR__</string>
 	<key>StandardOutPath</key>
-	<string>__STATE_DIR__/launchd.log</string>
+	<string>__STATE_DIR__/cache/launchd.log</string>
 	<key>StandardErrorPath</key>
-	<string>__STATE_DIR__/launchd.log</string>
+	<string>__STATE_DIR__/cache/launchd.log</string>
 </dict>
 </plist>

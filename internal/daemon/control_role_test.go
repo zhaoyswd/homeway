@@ -100,8 +100,9 @@ func roleStats(sup *supervisor, name string) (state string, restarts int) {
 	return "", 0
 }
 
-// waitControlReady 等 control.sock 可拨（重建/重听完成判据）。
-func waitControlReady(t *testing.T, dir string) string {
+// waitControlReadyDial 等 control.sock 可拨（重建/重听完成判据；与 spawn.go 的
+// waitControlReady 同义但返回路径——测试本地薄壳）。
+func waitControlReadyDial(t *testing.T, dir string) string {
 	t.Helper()
 	sock := filepath.Join(dir, control.ControlSockName)
 	deadline := time.Now().Add(5 * time.Second)
@@ -144,7 +145,7 @@ func TestControlRolePermanentErrorRebuilds(t *testing.T) {
 	if !ln.isClosed() {
 		t.Fatal("角色失败上抛前应收工旧 listener（r2 新-4 判据）")
 	}
-	sock := waitControlReady(t, dir)
+	sock := waitControlReadyDial(t, dir)
 	_, restarts := roleStats(sup, "control")
 	if restarts < 1 {
 		t.Fatalf("永久错误应触发角色重建（restarts=%d）", restarts)
@@ -176,7 +177,7 @@ func TestControlRoleTransientErrorRetries(t *testing.T) {
 	}}
 	_, sup := startRoleDaemon(t, dir, ln, []time.Duration{50 * time.Millisecond})
 
-	sock := waitControlReady(t, dir)
+	sock := waitControlReadyDial(t, dir)
 	cctx, ccancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer ccancel()
 	c, _, err := control.Dial(cctx, sock, control.FrontendInfo{Kind: "cli", Name: "tr", Version: "0"})
@@ -274,6 +275,38 @@ func (b *noopBackend) SpeedtestStatus(host string) (control.SpeedtestStatusResul
 }
 func (b *noopBackend) SpeedtestCancel(host string) error { return control.ErrBackendNoHost }
 
+// serve/relay 角色管理十方法桩（role-management 3f；真实绑定 = roleOps）。
+func (b *noopBackend) ServeStart() (control.RoleActionResult, error) {
+	return control.RoleActionResult{Action: "started"}, nil
+}
+func (b *noopBackend) ServeStop() (control.RoleActionResult, error) {
+	return control.RoleActionResult{Action: "stopped"}, nil
+}
+func (b *noopBackend) ServeRestart() (control.RoleActionResult, error) {
+	return control.RoleActionResult{}, control.ErrBackendRoleStopped
+}
+func (b *noopBackend) ServeStatus() control.ServeStatusResult {
+	return control.ServeStatusResult{Peers: []control.ServePeerBrief{}}
+}
+func (b *noopBackend) ServeToken() (control.ServeTokenResult, error) {
+	return control.ServeTokenResult{}, nil
+}
+func (b *noopBackend) RelayStart() (control.RoleActionResult, error) {
+	return control.RoleActionResult{Action: "started"}, nil
+}
+func (b *noopBackend) RelayStop() (control.RoleActionResult, error) {
+	return control.RoleActionResult{Action: "stopped"}, nil
+}
+func (b *noopBackend) RelayRestart() (control.RoleActionResult, error) {
+	return control.RoleActionResult{}, control.ErrBackendRoleStopped
+}
+func (b *noopBackend) RelayStatus() control.RelayStatusResult {
+	return control.RelayStatusResult{Backends: []control.RelayBackendBrief{}}
+}
+func (b *noopBackend) RelayToken() (control.RelayTokenResult, error) {
+	return control.RelayTokenResult{}, nil
+}
+
 // TestControlRoleAlwaysOnAssembled（role-management 2.3）：roles.json 退役后
 // client/control **恒开**（期望态并入 config，无开关）——roles 面可见二者、
 // control=running、控制面可拨（v1 roles.json「未登记默认 on」用例的观测面平移）。
@@ -289,12 +322,14 @@ func TestControlRoleAlwaysOnAssembled(t *testing.T) {
 		cancel()
 		sup.Close()
 	})
-	// unified.go 同款装配：client/control 恒开。
+	// unified.go 同款装配：client/control 恒开（roles = 最小 roleOps——本用例不触
+	// serve/relay 面）。
 	sup.Start("client", func() Role { return newClientRole(dir, st, d) }, nil)
-	if err := startControlPlane(ctx, "always-on-test", dir, sup, d, st.Eventf); err != nil {
+	ro := &roleOps{stateDir: dir, cacheDir: filepath.Join(dir, "cache"), version: "always-on-test", sup: sup}
+	if err := startControlPlane(ctx, "always-on-test", dir, sup, d, ro, st.Eventf); err != nil {
 		t.Fatal(err)
 	}
-	sock := waitControlReady(t, dir)
+	sock := waitControlReadyDial(t, dir)
 	cctx, ccancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer ccancel()
 	c, _, err := control.Dial(cctx, sock, control.FrontendInfo{Kind: "cli", Name: "always-on", Version: "0"})
@@ -352,7 +387,7 @@ func TestControlPlaneFirstListenFailFast(t *testing.T) {
 		cancel()
 		sup.Close()
 	})
-	err = startControlPlane(ctx, "failfast-test", dir, sup, d, discardLog)
+	err = startControlPlane(ctx, "failfast-test", dir, sup, d, nil, discardLog)
 	if err == nil {
 		t.Fatal("sock 被占用时 startControlPlane 应报错（首启 fail-fast）")
 	}

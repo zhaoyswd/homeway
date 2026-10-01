@@ -660,36 +660,51 @@ func TestCarrierCLIsNoDaemonActionableError(t *testing.T) {
 		fn   func(args []string, version string, w io.Writer) error
 		args []string
 	}{
+		// role-management 4.1：无 daemon = 按需拉起（单测注入缝 = 确定性「拉起失败」
+		// 错误）；--no-spawn = 可行动错误（sock 路径 + 启动命令）。
 		{"forward list", forwardCLI, []string{"list", "--state", dir}},
 		{"socks status", socksCLI, []string{"status", "--state", dir}},
 	}
 	for _, tc := range cases {
 		var buf bytes.Buffer
-		if err := tc.fn(tc.args, "t", &buf); err == nil {
+		err := tc.fn(tc.args, "t", &buf)
+		if err == nil {
 			t.Fatalf("%s：无 daemon 应报错", tc.name)
-		} else {
-			for _, want := range []string{"homeway daemon 未在运行", "control.sock", "homeway --state"} {
-				if !strings.Contains(err.Error(), want) {
-					t.Fatalf("%s：可行动错误缺 %q：%s", tc.name, want, err)
-				}
+		}
+		if !strings.Contains(err.Error(), "拉起统一进程失败") {
+			t.Fatalf("%s：未跑应走按需拉起面（单测桩错误）：%s", tc.name, err)
+		}
+		var buf2 bytes.Buffer
+		noSpawnArgs := append([]string{tc.args[0]}, append([]string{"--no-spawn"}, tc.args[1:]...)...)
+		err2 := tc.fn(noSpawnArgs, "t", &buf2)
+		if err2 == nil {
+			t.Fatalf("%s：--no-spawn 应报错", tc.name)
+		}
+		for _, want := range []string{"--no-spawn", "control.sock", "先手动启动"} {
+			if !strings.Contains(err2.Error(), want) {
+				t.Fatalf("%s：--no-spawn 可行动错误缺 %q：%s", tc.name, want, err2)
 			}
 		}
 	}
 	var out, errOut bytes.Buffer
-	if err := speedtestCLI([]string{"--host", "ali", "--state", dir}, "t", &out, &errOut); err == nil || !strings.Contains(err.Error(), "homeway daemon 未在运行") {
-		t.Fatalf("speedtest 无 daemon 应可行动报错：%v", err)
+	if err := speedtestCLI([]string{"--host", "ali", "--state", dir}, "t", &out, &errOut); err == nil || !strings.Contains(err.Error(), "拉起统一进程失败") {
+		t.Fatalf("speedtest 无 daemon 应走拉起面（单测桩）：%v", err)
 	}
 }
 
 func TestDaemonCLIDispatchCarrierFaces(t *testing.T) {
-	// daemon.CLI 分发：三命令面挂接（forward/socks/speedtest）；未知子命令可行动报错。
-	if err := CLI([]string{"forward", "bogus"}, "t"); err == nil || !strings.Contains(err.Error(), "forward 不认识的子命令") {
+	// role-management 3.4 起 daemon.CLI 分发面已退役（host/forward/socks/speedtest
+	// 由 cmd/homeway 顶层名词直连各 CLI）——命令面的未知子命令/裸调/参数边界行为
+	// 在各 CLI 函数上保持不变，这里直连断言。
+	var out bytes.Buffer
+	if err := forwardCLI([]string{"bogus"}, "t", &out); err == nil || !strings.Contains(err.Error(), "forward 不认识的子命令") {
 		t.Fatalf("forward 未知子命令：%v", err)
 	}
-	if err := CLI([]string{"socks"}, "t"); err == nil || !strings.Contains(err.Error(), "socks 需要子命令") {
+	if err := socksCLI([]string{}, "t", &out); err == nil || !strings.Contains(err.Error(), "socks 需要子命令") {
 		t.Fatalf("socks 裸调可行动报错：%v", err)
 	}
-	if err := CLI([]string{"speedtest", "--streams", "9"}, "t"); err == nil || !strings.Contains(err.Error(), "越界") {
+	var out2 bytes.Buffer
+	if err := speedtestCLI([]string{"--streams", "9"}, "t", &out2, io.Discard); err == nil || !strings.Contains(err.Error(), "越界") {
 		t.Fatalf("speedtest 参数边界（本地前置，不连 daemon）：%v", err)
 	}
 }

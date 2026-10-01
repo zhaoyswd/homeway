@@ -602,7 +602,7 @@ func TestTermSockPermissionBlocksConnect(t *testing.T) {
 	if err := os.Chmod(sock, 0o0000); err != nil {
 		t.Fatal(err)
 	}
-	_, derr := cliDialTerm(newTermTarget(nil, dir, "", 0))
+	_, derr := cliDialTerm(newTermTarget(nil, dir, "", 0, false))
 	if derr == nil {
 		t.Fatal("chmod 0000 后本地面拨号应报错")
 	}

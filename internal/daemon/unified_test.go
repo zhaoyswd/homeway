@@ -331,7 +331,7 @@ func TestUnifiedServeStopStartPortStable(t *testing.T) {
 	// stop：立即应答；stopped 后立即 start——实际端口必须仍是配置口。
 	proc.sup.StopRole("serve")
 	waitRoleState(t, proc.sup, "serve", roleStateStopped, 20*time.Second)
-	proc.sup.StartRole("serve", makeServeRole(dir, filepath.Join(dir, "cache"), proc.cfg, "port-test", false), nil)
+	proc.sup.StartRole("serve", proc.roles.makeServeFactory(), nil)
 	waitRoleState(t, proc.sup, "serve", roleStateRunning, 20*time.Second)
 	waitPortFile(t, portFile, port, 20*time.Second)
 
@@ -369,7 +369,7 @@ func TestUnifiedAllStoppedStaysResident(t *testing.T) {
 	// client/control 存活断言 + 进程面可再启 serve（常驻进程的恢复能力）。
 	waitRoleState(t, proc.sup, "control", roleStateRunning, 5*time.Second)
 	waitRoleState(t, proc.sup, "client", roleStateRunning, 5*time.Second)
-	proc.sup.StartRole("serve", makeServeRole(dir, filepath.Join(dir, "cache"), proc.cfg, "resident-test", false), nil)
+	proc.sup.StartRole("serve", proc.roles.makeServeFactory(), nil)
 	waitRoleState(t, proc.sup, "serve", roleStateRunning, 20*time.Second)
 }
 

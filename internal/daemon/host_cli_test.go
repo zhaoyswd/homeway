@@ -59,6 +59,8 @@ func hostTok(t *testing.T, peer byte, name string) string {
 func TestHostCLINoDaemonActionableError(t *testing.T) {
 	dir := shortTempDirDaemon(t)
 	var buf bytes.Buffer
+	// role-management 4.1：无 daemon = 按需拉起（单测注入缝 = 确定性「拉起失败」）；
+	// --no-spawn = 可行动错误（sock 路径 + 启动命令——旧「未在运行」文案面的承继者）。
 	for _, args := range [][]string{
 		{"list", "--state", dir},
 		{"status", "--state", dir},
@@ -67,24 +69,31 @@ func TestHostCLINoDaemonActionableError(t *testing.T) {
 		buf.Reset()
 		if err := hostCLI(args, "cli-test", &buf); err == nil {
 			t.Fatalf("%v：无 daemon 应报错", args)
-		} else {
-			msg := err.Error()
-			for _, want := range []string{"homeway daemon 未在运行", "control.sock", "homeway --state"} {
-				if !strings.Contains(msg, want) {
-					t.Fatalf("%v：可行动错误缺 %q：%s", args, want, msg)
-				}
-			}
+		} else if !strings.Contains(err.Error(), "拉起统一进程失败") {
+			t.Fatalf("%v：未跑应走按需拉起面（单测桩错误）：%s", args, err)
 		}
 		if buf.Len() != 0 {
 			t.Fatalf("失败路径不应有 stdout：%q", buf.String())
+		}
+		noSpawn := append([]string{args[0], "--no-spawn"}, args[1:]...)
+		buf.Reset()
+		if err := hostCLI(noSpawn, "cli-test", &buf); err == nil {
+			t.Fatalf("%v：--no-spawn 应报错", noSpawn)
+		} else {
+			msg := err.Error()
+			for _, want := range []string{"--no-spawn", "control.sock", "先手动启动"} {
+				if !strings.Contains(msg, want) {
+					t.Fatalf("%v：--no-spawn 可行动错误缺 %q：%s", noSpawn, want, msg)
+				}
+			}
 		}
 	}
 	// add 的无 daemon 路径（token 合法才连 daemon）。
 	tok := hostTok(t, 21, "")
 	var buf2 bytes.Buffer
 	err := hostCLI([]string{"add", "--state", dir, tok}, "cli-test", &buf2)
-	if err == nil || !strings.Contains(err.Error(), "homeway daemon 未在运行") {
-		t.Fatalf("add 无 daemon 应可行动报错：%v", err)
+	if err == nil || !strings.Contains(err.Error(), "拉起统一进程失败") {
+		t.Fatalf("add 无 daemon 应走拉起面后报错（单测桩）：%v", err)
 	}
 	if strings.Contains(err.Error(), tok) {
 		t.Fatal("错误信息不得回显 token 全文（掩码纪律）")
@@ -263,22 +272,19 @@ func TestHostCLIDeleteScenarios(t *testing.T) {
 	}
 }
 
-// TestDaemonDispatchB15 daemon 分发红绿（B15 面平移）：非子命令形态报错且不留
-// 守护进程痕迹（daemon 本体已并入统一进程——裸调/flag 形态 = 迁移提示，role-management
-// 2.3）；host 子命令经 daemon.CLI 分发可用。
+// TestDaemonDispatchB15（B15 面平移；role-management 3.4 随 daemon.CLI 退役改直连）：
+// host 面在无 daemon 的 state 上按可行动错误退出且不留进程痕迹。旧名词 `homeway
+// daemon` 的迁移提示面归 cmd/homeway（main_test 断言）。
 func TestDaemonDispatchB15(t *testing.T) {
 	dir := shortTempDirDaemon(t)
-	// 旧守护进程形态（flag/裸调）= 迁移提示报错（不取锁、不建 state 布局）。
-	err := CLI([]string{"--state", dir, "status"}, "cli-test")
-	if err == nil || !strings.Contains(err.Error(), "已并入统一进程") {
-		t.Fatalf("非子命令形态应报迁移提示（不再静默起守护进程）：%v", err)
+	var out bytes.Buffer
+	// host list 无 daemon = 可行动错误（连接层；不建 state 布局之外的痕迹）。
+	err := hostCLI([]string{"list", "--state", dir}, "cli-test", &out)
+	if err == nil {
+		t.Fatal("无 daemon 的 host list 应报错")
 	}
 	if _, serr := os.Stat(filepath.Join(dir, control.ControlSockName)); serr == nil {
-		t.Fatal("分发报错路径不得留下守护进程痕迹")
-	}
-	// host 子命令经 daemon.CLI 分发可用。
-	if err := CLI([]string{"host", "list", "--state", dir}, "cli-test"); err == nil {
-		t.Fatal("无 daemon 的 host list 应报错")
+		t.Fatal("报错路径不得留下守护进程痕迹")
 	}
 }
 
@@ -351,6 +357,39 @@ func (b *skewBackend) SpeedtestStatus(host string) (control.SpeedtestStatusResul
 	return control.SpeedtestStatusResult{}, control.ErrBackendNoHost
 }
 func (b *skewBackend) SpeedtestCancel(host string) error { return control.ErrBackendNoHost }
+
+// serve/relay 角色管理十方法（role-management 3f）：旧 daemon 语义 = unknown_op
+// 由 dispatch 兜（不会到达这里）——补齐接口面的空桩。
+func (b *skewBackend) ServeStart() (control.RoleActionResult, error) {
+	return control.RoleActionResult{}, control.ErrBackendNoHost
+}
+func (b *skewBackend) ServeStop() (control.RoleActionResult, error) {
+	return control.RoleActionResult{}, control.ErrBackendNoHost
+}
+func (b *skewBackend) ServeRestart() (control.RoleActionResult, error) {
+	return control.RoleActionResult{}, control.ErrBackendRoleStopped
+}
+func (b *skewBackend) ServeStatus() control.ServeStatusResult {
+	return control.ServeStatusResult{Peers: []control.ServePeerBrief{}}
+}
+func (b *skewBackend) ServeToken() (control.ServeTokenResult, error) {
+	return control.ServeTokenResult{}, control.ErrBackendNoHost
+}
+func (b *skewBackend) RelayStart() (control.RoleActionResult, error) {
+	return control.RoleActionResult{}, control.ErrBackendNoHost
+}
+func (b *skewBackend) RelayStop() (control.RoleActionResult, error) {
+	return control.RoleActionResult{}, control.ErrBackendNoHost
+}
+func (b *skewBackend) RelayRestart() (control.RoleActionResult, error) {
+	return control.RoleActionResult{}, control.ErrBackendRoleStopped
+}
+func (b *skewBackend) RelayStatus() control.RelayStatusResult {
+	return control.RelayStatusResult{Backends: []control.RelayBackendBrief{}}
+}
+func (b *skewBackend) RelayToken() (control.RelayTokenResult, error) {
+	return control.RelayTokenResult{}, control.ErrBackendNoHost
+}
 
 // TestHostCLIAddVersionSkewNoReach 版本偏斜（exec-r1 第 1 条，P0）：旧 daemon 的
 // host.add 响应无 reach 字段——新 CLI 不得 panic、不得静默，走降级分支提示重启

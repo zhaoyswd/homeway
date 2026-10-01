@@ -29,6 +29,10 @@ type Role struct {
 	mu      sync.Mutex
 	running bool
 	cur     *Relay // 当前运行轮（Snapshot 数据源；未跑 = nil）
+
+	tokMu     sync.Mutex
+	lastToken string   // 最近一次铸出的 rl1 token 全文（relay.token 运行态真源；未铸出 = 空）
+	lastEps   []string // 该枚 token 的端点
 }
 
 // NewRole 建角色（未启动）。
@@ -88,19 +92,30 @@ func (r *Role) Run(ctx context.Context) error {
 	r.mu.Unlock()
 	advertise := r.cfg.Advertise
 	return rl.RunWithReady(ctx, func(actual netip.AddrPort) {
-		token, eps, terr := buildToken(secret, advertise, actual.Port())
+		token, eps, terr := BuildToken(secret, advertise, actual.Port())
 		if terr != nil {
 			logf("⚠️ token 生成失败（%v）—— 后端可用裸地址走开放模式", terr)
 			return
 		}
 		ulogf("中继 token：%s", token)
 		ulogf("端点：%s", strings.Join(eps, "、"))
+		r.tokMu.Lock()
+		r.lastToken, r.lastEps = token, append([]string(nil), eps...)
+		r.tokMu.Unlock()
 		if allPrivate(eps) {
 			ulogf("⚠️ 公布的地址都在内网：公网中继请加 --advertise <公网IP:端口>")
 		}
 		// 用法提示进文件（终端不再输出）：token 里已含全部端点与密钥。
 		logf("后端这样用：homeway serve --relay '%s'", token)
 	})
+}
+
+// LastToken 最近一次铸出的 token 全文与端点（role-management 3.3：relay.token
+// 控制面路径的运行态真源；空 = 本轮 onReady 未发生——调用方回落离线推算）。
+func (r *Role) LastToken() (string, []string) {
+	r.tokMu.Lock()
+	defer r.tokMu.Unlock()
+	return r.lastToken, append([]string(nil), r.lastEps...)
 }
 
 // Snapshot 当前运行轮的状态快照（未跑 = Open=false 的空面）。
