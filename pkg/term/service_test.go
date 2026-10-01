@@ -9,8 +9,10 @@ package term
 import (
 	"encoding/binary"
 	"encoding/json"
+	"fmt"
 	"net"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -434,5 +436,41 @@ func TestTermSessionSpawnEnvAligned(t *testing.T) {
 	}
 	if want := loginShell(); !strings.Contains(out, "SHELL="+want) {
 		t.Errorf("SHELL 应为账号登录 shell %s；实际输出：\n%s", want, out)
+	}
+}
+
+// TestServiceCloseConcurrentFinish FIX-33：关停并发收工——finish 每条会话最多等子进程
+// 2s（宽限 + SIGKILL 兜底），串行收 16 条最坏 32s。这里用 4 条「不响应 master 关闭」的
+// 会话（sleep，不读 stdin）钉住并发性：并发 ≈ 1×2s，串行 ≈ 4×2s。
+// 变异红路：把 Close 的并发收工改回串行 for 循环 ⇒ 本用例超时红（~8s > 3s 界）。
+func TestServiceCloseConcurrentFinish(t *testing.T) {
+	if _, err := exec.LookPath("sleep"); err != nil {
+		t.Skipf("环境缺 sleep：%v", err)
+	}
+	svc := &termService{sessions: map[string]*termSession{}, stopCh: make(chan struct{})}
+	const n = 4
+	for i := 0; i < n; i++ {
+		cmd := exec.Command("sleep", "60")
+		if err := cmd.Start(); err != nil {
+			t.Skipf("起 sleep 失败：%v", err)
+		}
+		name := fmt.Sprintf("cc%d", i)
+		svc.sessions[name] = &termSession{
+			svc: svc, name: name, cmd: cmd,
+			created:     time.Now(),
+			surfaceStop: make(chan struct{}),
+		}
+	}
+	start := time.Now()
+	svc.Close()
+	elapsed := time.Since(start)
+	if elapsed > 3*time.Second {
+		t.Fatalf("Close 应收工并发（%d 条会话耗时 %v；串行形态 ≈ %ds）", n, elapsed, 2*n)
+	}
+	svc.mu.Lock()
+	left := len(svc.sessions)
+	svc.mu.Unlock()
+	if left != 0 {
+		t.Fatalf("收工后会话表应为空，剩 %d 条", left)
 	}
 }

@@ -441,9 +441,18 @@ func (s *termService) Close() {
 			list = append(list, ss)
 		}
 		s.mu.Unlock()
+		// FIX-33：并发收工。finish 每条会话最多等子进程 2s（宽限 + SIGKILL 兜底），
+		// 串行收 16 条最坏 32s——关停路径（进程退出/服务重配）不该被线性放大。
+		// finish 只碰自己的会话状态与 svc.remove（后者有 svc.mu 保护），互不相干。
+		var wg sync.WaitGroup
 		for _, ss := range list {
-			ss.finish(termEndServiceStopped, "service_stopped")
+			wg.Add(1)
+			go func(sess *termSession) {
+				defer wg.Done()
+				sess.finish(termEndServiceStopped, "service_stopped")
+			}(ss)
 		}
+		wg.Wait()
 	})
 }
 
