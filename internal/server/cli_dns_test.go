@@ -12,3 +12,12 @@ func TestCLIDNSPortOutOfRange(t *testing.T) {
 		t.Fatal("65536 应报错（uint16 回绕到 0）")
 	}
 }
+
+// --listen 值域（FIX-71）：>65535 会被 uint16 静默截断（70000→4464）——必须显式拒绝。
+func TestServeListenFlagRange(t *testing.T) {
+	for _, bad := range []string{"70000", "0"} {
+		if err := CLI([]string{"--listen", bad}); err == nil {
+			t.Fatalf("--listen %s 应被拒（越界）", bad)
+		}
+	}
+}

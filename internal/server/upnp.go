@@ -256,6 +256,9 @@ func (g *igd) addPortMapping(ctx context.Context, externalPort uint16, internalI
 	_, err := g.addWithLease(ctx, externalPort, internalIP, internalPort, 3600)
 	if err != nil {
 		if _, err0 := g.addWithLease(ctx, externalPort, internalIP, internalPort, 0); err0 == nil {
+			// FIX-69：注释承诺「退回 0 并留日志」，实现却静默——永久租期是路由器表
+			// 里长期残留的来源，必须出声（进程异常退出时不会有缩租路径兜）。
+			logf("UPnP：路由器不接受 1 小时租期（%v），已按**永久（0）**写入映射 外部 %d——该映射在本机异常退出后不会自动过期；正常退出会缩到 5 分钟", err, externalPort)
 			return nil
 		}
 	}

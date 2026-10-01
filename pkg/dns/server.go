@@ -5,13 +5,13 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"github.com/zhaoyswd/homeway/pkg/connreg"
+	"github.com/zhaoyswd/homeway/pkg/proto"
 	"net"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
-
-	"github.com/zhaoyswd/homeway/pkg/proto"
 )
 
 // Server：出口侧 DNS 代答（openspec dns-host-resolver）。
@@ -36,7 +36,7 @@ type Server struct {
 	// 挂连接的本地进程不能无限耗 goroutine/fd）。closeOnce 属实例（review F3）。
 	closeOnce sync.Once
 	connsMu   sync.Mutex
-	conns     map[net.Conn]bool
+	conns     connreg.Registry // 按 id 记账（FIX-73）
 
 	q, qtcp, resp, filtered, trunc, fallback, fail, dropped, malformed, aaaaMixed atomic.Uint64
 }
@@ -122,7 +122,7 @@ func Listen(cfg Config) (*Server, error) {
 		udp.Close()
 		return nil, err
 	}
-	s := &Server{cfg: cfg, ups: ups, udp: udp, tcp: tcp, closed: make(chan struct{}), conns: make(map[net.Conn]bool)}
+	s := &Server{cfg: cfg, ups: ups, udp: udp, tcp: tcp, closed: make(chan struct{})}
 	go s.serveUDP()
 	go s.serveTCP()
 	go s.statsLoop()
@@ -142,11 +142,7 @@ func (s *Server) Close() error {
 		close(s.closed)
 		s.tcp.Close()
 		s.udp.Close()
-		s.connsMu.Lock()
-		for c := range s.conns {
-			c.Close()
-		}
-		s.connsMu.Unlock()
+		s.conns.CloseAll(nil)
 	})
 	return nil
 }
@@ -265,20 +261,17 @@ func (s *Server) serveTCP() {
 			continue
 		default:
 		}
-		if len(s.conns) >= s.cfg.MaxTCPConns { // 本机可达面也要有闸（review M5；可注入）
-			s.connsMu.Unlock()
+		id, ok := s.conns.Add(conn, s.cfg.MaxTCPConns) // 本机可达面也要有闸（review M5；可注入）
+		s.connsMu.Unlock()
+		if !ok {
 			conn.Close()
 			s.dropped.Add(1)
 			continue
 		}
-		s.conns[conn] = true
-		s.connsMu.Unlock()
-		go func(conn net.Conn) {
+		go func(conn net.Conn, id uint64) {
 			defer func() {
 				conn.Close()
-				s.connsMu.Lock()
-				delete(s.conns, conn)
-				s.connsMu.Unlock()
+				s.conns.Remove(id)
 			}()
 			for {
 				// 每条消息一个空闲期限：挂住不发的本地进程不能无限占 goroutine/fd。
@@ -307,7 +300,7 @@ func (s *Server) serveTCP() {
 					return
 				}
 			}
-		}(conn)
+		}(conn, id)
 	}
 }
 

@@ -88,6 +88,9 @@ func CLI(args []string) error {
 	fs.Visit(func(f *flag.Flag) { explicit[f.Name] = true })
 	sc := cfgFile.Serve
 	listenPort := sc.Listen
+	if explicit["listen"] && (*listen < 1 || *listen > 65535) {
+		return fmt.Errorf("--listen %d 越界（监听端口须在 1–65535）", *listen)
+	}
 	if explicit["listen"] {
 		listenPort = uint16(*listen)
 	}

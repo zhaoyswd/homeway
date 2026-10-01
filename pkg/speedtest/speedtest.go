@@ -17,6 +17,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/zhaoyswd/homeway/pkg/connreg"
 	"hash/crc32"
 	"io"
 	"net"
@@ -109,9 +110,9 @@ type Server struct {
 	lim  Limits
 
 	mu       sync.Mutex
-	conns    map[net.Conn]struct{}
-	total    int // 已受理会话数（判据行 #N 的来源）
-	rejected int // 超限拒绝数
+	conns    connreg.Registry // 按 id 记账（FIX-73）
+	total    int              // 已受理会话数（判据行 #N 的来源）
+	rejected int              // 超限拒绝数
 }
 
 // NewServer 建服务（默认限额，可用 SetLimits 覆盖）。
@@ -119,7 +120,7 @@ func NewServer(logf func(format string, args ...any)) *Server {
 	if logf == nil {
 		logf = func(string, ...any) {}
 	}
-	return &Server{logf: logf, lim: Limits{}.withDefaults(), conns: map[net.Conn]struct{}{}}
+	return &Server{logf: logf, lim: Limits{}.withDefaults()}
 }
 
 // SetLimits 覆盖限额（Serve 之前调用）。
@@ -134,16 +135,7 @@ func (s *Server) Stats() (total, rejected int) {
 
 // Close 断开全部在跑会话并停止受理（listener 由持有方关）。
 func (s *Server) Close() error {
-	s.mu.Lock()
-	conns := make([]net.Conn, 0, len(s.conns))
-	for c := range s.conns {
-		conns = append(conns, c)
-	}
-	s.conns = map[net.Conn]struct{}{}
-	s.mu.Unlock()
-	for _, c := range conns {
-		c.Close()
-	}
+	s.conns.CloseAll(nil)
 	return nil
 }
 
@@ -161,24 +153,23 @@ func (s *Server) Serve(ln net.Listener) error {
 func (s *Server) serveConn(conn net.Conn) {
 	br := bufio.NewReader(conn)
 	bw := bufio.NewWriter(conn)
-	s.mu.Lock()
-	if len(s.conns) >= s.lim.MaxConns {
+	// 上限判定与登记在同一临界区（connreg）；拒绝路径先有界读掉请求帧再回帧
+	//（r1 中-1②）：去问候帧后客户端先写请求，回帧后立刻关会走 RST 路径、已发出的
+	// report 可能被对端丢弃。受理计数只在登记成功时 +1（被拒不计入总量）。
+	connID, ok := s.conns.Add(conn, s.lim.MaxConns)
+	if !ok {
+		s.mu.Lock()
 		s.rejected++
 		s.mu.Unlock()
 		s.logf("speedtest: 会话拒绝（并发上限 %d）", s.lim.MaxConns)
-		// 先有界读掉请求帧再回帧（r1 中-1②）：去问候帧后客户端先写请求，回帧后立刻关
-		// 会走 RST 路径、已发出的 report 可能被对端丢弃。
 		ReplyThenClose(conn, br, Report{Error: "busy"})
 		return
 	}
+	s.mu.Lock()
 	s.total++
-	id := s.total
-	s.conns[conn] = struct{}{}
 	s.mu.Unlock()
 	defer func() {
-		s.mu.Lock()
-		delete(s.conns, conn)
-		s.mu.Unlock()
+		s.conns.Remove(connID)
 		conn.Close()
 	}()
 
@@ -215,13 +206,13 @@ func (s *Server) serveConn(conn net.Conn) {
 		return
 	}
 
-	s.logf("speedtest: 会话 #%d role=%s warmup=%s window=%s", id, req.Role, warmup, window)
+	s.logf("speedtest: 会话 #%d role=%s warmup=%s window=%s", connID, req.Role, warmup, window)
 
 	if req.Role == RoleRecv {
-		s.serveRecv(id, bw, warmup, window)
+		s.serveRecv(int(connID), bw, warmup, window)
 		return
 	}
-	s.serveSend(id, br, bw, s.lim.MaxBlock)
+	s.serveSend(int(connID), br, bw, s.lim.MaxBlock)
 }
 
 // serveRecv role=recv：预热发 → 窗口发 → report。发送侧按接收方 TCP 背压自然限速。

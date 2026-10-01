@@ -379,7 +379,10 @@ func (in *Interceptor) serveTCP(r *tcp.ForwarderRequest, dst, src netip.AddrPort
 func (in *Interceptor) handleUDPPacket(id stack.TransportEndpointID, pkt *stack.PacketBuffer) bool {
 	select {
 	case <-in.closed:
-		return true
+		// 停服/收工中：**不吞包**（FIX-70）——返回 false 让 netstack 回 ICMP 不可达，
+		// 客户端快速失败；原实现 return true（当作已处理）= 静默丢弃，与注释/spec 的
+		// 「RST/ICMP 不可达」承诺相反（TCP 侧停新流是 RST，UDP 侧应对等）。
+		return false
 	default:
 	}
 	key := fmt.Sprintf("%s:%d→%s:%d", id.RemoteAddress, id.RemotePort, id.LocalAddress, id.LocalPort)

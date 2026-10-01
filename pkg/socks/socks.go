@@ -20,13 +20,13 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"github.com/zhaoyswd/homeway/pkg/connreg"
+	"github.com/zhaoyswd/homeway/pkg/netpipe"
 	"io"
 	"net"
 	"net/netip"
 	"sync"
 	"time"
-
-	"github.com/zhaoyswd/homeway/pkg/netpipe"
 )
 
 // Resolver 域名解析注入缝：返回按优先级排序的 IPv4 候选列表（按序拨，r2 新-1）。
@@ -78,7 +78,7 @@ type Server struct {
 	baseCancel context.CancelFunc
 
 	mu    sync.Mutex
-	conns map[net.Conn]struct{}
+	conns connreg.Registry // 按 id 记账（FIX-73：不拿 net.Conn 当 map 键）
 }
 
 // New 建服务端。
@@ -95,7 +95,7 @@ func New(cfg ServerConfig) *Server {
 	if cfg.Logf == nil {
 		cfg.Logf = func(string, ...any) {}
 	}
-	s := &Server{cfg: cfg, conns: map[net.Conn]struct{}{}}
+	s := &Server{cfg: cfg}
 	s.base, s.baseCancel = context.WithCancel(context.Background())
 	return s
 }
@@ -109,24 +109,19 @@ func (s *Server) Serve(ln net.Listener) error {
 		conn, err := ln.Accept()
 		if err == nil {
 			backoff = 0
-			s.mu.Lock()
-			if len(s.conns) >= s.cfg.MaxConns {
-				s.mu.Unlock()
+			id, ok := s.conns.Add(conn, s.cfg.MaxConns)
+			if !ok {
 				s.cfg.Logf("socks: 连接拒绝（并发上限 %d）", s.cfg.MaxConns)
 				_ = conn.Close()
 				continue
 			}
-			s.conns[conn] = struct{}{}
-			s.mu.Unlock()
-			go func(conn net.Conn) {
+			go func(conn net.Conn, id uint64) {
 				defer func() {
-					s.mu.Lock()
-					delete(s.conns, conn)
-					s.mu.Unlock()
+					s.conns.Remove(id)
 					_ = conn.Close()
 				}()
 				s.serveConn(conn)
-			}(conn)
+			}(conn, id)
 			continue
 		}
 		if errors.Is(err, net.ErrClosed) {
@@ -141,28 +136,18 @@ func (s *Server) Serve(ln net.Listener) error {
 }
 
 // Conns 当前在世连接数（status 面可观察）。
-func (s *Server) Conns() int {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return len(s.conns)
-}
+func (s *Server) Conns() int { return s.conns.Len() }
 
 // Close 显式关全部在世连接（RST 收口——SetLinger(0)：优雅 FIN 会让浏览器 keep-alive
 // 静默挂住；「off」之后不得仍有代理流量经隧道跑）。同时断服务端生命周期 ctx——
 // 在途的上游拨号/解析预算随之收口（L7/exec-r1）。
+
 func (s *Server) Close() {
-	s.baseCancel()
 	s.mu.Lock()
-	cs := make([]net.Conn, 0, len(s.conns))
-	for c := range s.conns {
-		cs = append(cs, c)
-	}
-	s.conns = map[net.Conn]struct{}{}
-	s.mu.Unlock()
-	for _, c := range cs {
-		rstClose(c)
-		_ = c.Close()
-	}
+	defer s.mu.Unlock()
+	s.baseCancel()
+	// RST 收口全部在世连接（优雅 FIN 会让浏览器 keep-alive 挂住）。
+	s.conns.CloseAll(rstClose)
 }
 
 // rstClose 置 RST 收口（尽力而为——按接口断言：非 TCP 形态〔含包装连接〕静默忽略）。
