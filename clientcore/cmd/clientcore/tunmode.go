@@ -13,7 +13,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"net"
 	"net/netip"
 	"os"
@@ -30,6 +29,7 @@ import (
 	"golang.org/x/sys/unix"
 
 	"github.com/zhaoyswd/homeway/clientcore/hostsession"
+	"github.com/zhaoyswd/homeway/pkg/netpipe"
 )
 
 // tunConfig 已随迁 hostsession.Config（host-registry-daemon D1：本文件经
@@ -1257,29 +1257,12 @@ func tunStopWait() int {
 	}
 }
 
-// pipeBoth 双向转发并做半关闭：上游/应用任一方向 EOF 只关对应写方向，
-// 让 FIN 语义能穿透（HTTP/1.0 响应靠 FIN 结尾，直接双向收口会截断响应）。
+// pipeBoth 双向转发并做半关闭（语义单实现迁 pkg/netpipe，FIX-35）：上游/应用任一方向
+// EOF 只关对应写方向，让 FIN 语义能穿透（HTTP/1.0 响应靠 FIN 结尾，直接双向收口会
+// 截断响应）。桌面 socks/端口转发曾各有一份「任一向结束即双向收口」的实现——那两份
+// 已统一到同一包（本函数保留为手机面调用点的薄壳）。
 func pipeBoth(logf Logf, a, b net.Conn) {
-	type closeWriter interface{ CloseWrite() error }
-	cp := func(dst, src net.Conn, done chan<- struct{}) {
-		n, err := io.Copy(dst, src)
-		if err != nil && !errors.Is(err, io.EOF) && !errors.Is(err, net.ErrClosed) {
-			logf("pipe %v→%v: %v after %dB", src.RemoteAddr(), dst.RemoteAddr(), err, n)
-		}
-		if hc, ok := dst.(closeWriter); ok {
-			_ = hc.CloseWrite()
-		} else {
-			_ = dst.Close()
-		}
-		done <- struct{}{}
-	}
-	done := make(chan struct{}, 2)
-	go cp(a, b, done)
-	go cp(b, a, done)
-	<-done
-	<-done
-	_ = a.Close()
-	_ = b.Close()
+	netpipe.Both(netpipe.Logf(logf), a, b)
 }
 
 // tunAttachSurface L3 attach 面（wgcore.Core 的能力，经 newSession 透出）。

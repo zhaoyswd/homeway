@@ -16,7 +16,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
+	"github.com/zhaoyswd/homeway/pkg/netpipe"
 	"net"
 	"net/netip"
 	"os"
@@ -333,7 +333,9 @@ func (m *ForwardManager) serveConn(e *forwardEntry, conn net.Conn) {
 		return
 	}
 	defer upstream.Close()
-	pipeConns(conn, upstream)
+	// 半关闭透传（FIX-35）：任一向 EOF 只收该向写端，不再双向收口——原实现把
+	// 「客户端关写等响应」的响应当场截断（与手机面 pipeBoth 语义相悖）。
+	netpipe.Both(m.logf, conn, upstream)
 }
 
 // ---------- 持久化 ----------
@@ -405,20 +407,4 @@ func rstCloseConn(c net.Conn) {
 	if l, ok := c.(interface{ SetLinger(int) error }); ok {
 		_ = l.SetLinger(0)
 	}
-}
-
-// pipeConns 双向透传（无期限；任一向结束即双向收口）。
-func pipeConns(a, b net.Conn) {
-	done := make(chan struct{}, 2)
-	go func() {
-		_, _ = io.Copy(b, a)
-		done <- struct{}{}
-	}()
-	go func() {
-		_, _ = io.Copy(a, b)
-		done <- struct{}{}
-	}()
-	<-done
-	_ = a.Close()
-	_ = b.Close()
 }

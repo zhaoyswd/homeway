@@ -25,6 +25,8 @@ import (
 	"net/netip"
 	"sync"
 	"time"
+
+	"github.com/zhaoyswd/homeway/pkg/netpipe"
 )
 
 // Resolver 域名解析注入缝：返回按优先级排序的 IPv4 候选列表（按序拨，r2 新-1）。
@@ -209,7 +211,9 @@ func (s *Server) serveConn(conn net.Conn) {
 	if err := s.replyRep(conn, repSucceeded); err != nil {
 		return
 	}
-	pipeBoth(conn, upstream)
+	// 半关闭透传（FIX-35）：任一向 EOF 只收该向写端——原先「任一向结束即双向
+	// RST+Close」会把半关闭客户端（先关写再读响应）的响应当场截断。RST 只留失败路径。
+	netpipe.Both(s.cfg.Logf, conn, upstream)
 }
 
 // negotiate 方法协商：只接受 no-auth（客户端须提供 method 0x00，否则回 0xFF 关）。
@@ -367,22 +371,4 @@ func (s *Server) dialAny(addrs []netip.Addr, port uint16) (net.Conn, error) {
 		lastErr = errors.New("无候选")
 	}
 	return nil, lastErr
-}
-
-// pipeBoth 双向透传（不设 deadline——长连接语义；任一向结束即双向收口）。
-func pipeBoth(a, b net.Conn) {
-	done := make(chan struct{}, 2)
-	go func() {
-		_, _ = io.Copy(b, a)
-		done <- struct{}{}
-	}()
-	go func() {
-		_, _ = io.Copy(a, b)
-		done <- struct{}{}
-	}()
-	<-done
-	rstClose(a)
-	rstClose(b)
-	_ = a.Close()
-	_ = b.Close()
 }
