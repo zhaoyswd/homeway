@@ -175,7 +175,11 @@ bool readRow(Reader& r, int cols, Row& out, std::string& error) {
                 return false;
             }
             c.attr = static_cast<uint16_t>(lo | (hi << 8));
-            c.width = (c.symbol.empty() && c.skip) ? 0 : (c.skip ? 0 : 1);
+            // 宽度推导与服务端 vt.decodeCell 同口径（FIX-30 的样式向量首跑抓出的漂移）：
+            // **无字素 ⇒ 0（不画字形）、有字素 ⇒ 1**；skip 走自己的位，不参与宽度推导。
+            // 原实现「无字素且非 skip ⇒ 1」与服务端不符——渲染桥会把 width 归一到 1/2，
+            // 所以像素上看不出，但两端解出的格值不一致（样式向量/行比较这类消费面会踩）。
+            c.width = c.symbol.empty() ? 0 : 1;
             out.cells.push_back(c);
             prev = c;
             havePrev = true;

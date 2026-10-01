@@ -40,6 +40,36 @@ uint32_t readU32(const uint8_t* p) {
     return static_cast<uint32_t>(p[0] | (p[1] << 8) | (p[2] << 16) | (p[3] << 24));
 }
 
+// styleDigest：样式向量的规范文本摘要（FIX-30），与服务端 goldenStyleText 逐字符一致——
+// 逐行逐格固定 26 个十六进制字符（fg 5B · bg 5B · attr 2B · flags 1B），行尾 \n；
+// 行不足 cols 的缺格按空白格（width=1）补，与服务端编码的 blankRun 语义对齐。
+// flags = skip(bit0) | width<<1。
+std::string styleDigest(const tierterm::CellGrid& grid) {
+    const uint16_t cols = grid.geometry().cols;
+    std::string text;
+    char buf[16]; // 单个颜色块 = 10 字符 + NUL；8 字节会静默截断（首跑红过）
+    for (const auto& r : grid.rows()) {
+        for (uint16_t x = 0; x < cols; x++) {
+            tierterm::Cell blank;
+            blank.width = 1;
+            const tierterm::Cell& c = x < r.cells.size() ? r.cells[x] : blank;
+            const unsigned flags = (c.skip ? 1u : 0u) | (static_cast<unsigned>(c.width) << 1);
+            std::snprintf(buf, sizeof(buf), "%02x%02x%02x%02x%02x",
+                          static_cast<unsigned>(c.fg.kind), c.fg.index, c.fg.r, c.fg.g, c.fg.b);
+            text += buf;
+            std::snprintf(buf, sizeof(buf), "%02x%02x%02x%02x%02x",
+                          static_cast<unsigned>(c.bg.kind), c.bg.index, c.bg.r, c.bg.g, c.bg.b);
+            text += buf;
+            std::snprintf(buf, sizeof(buf), "%04x", c.attr);
+            text += buf;
+            std::snprintf(buf, sizeof(buf), "%02x", flags);
+            text += buf;
+        }
+        text += '\n';
+    }
+    return digestHex(fnv1a64(text));
+}
+
 struct Sample {
     std::string name;
     uint8_t op = 0;
@@ -53,6 +83,9 @@ struct Sample {
     // 样例回滚条（任务 3.3 新增的 manifest 列）：total/offset/len 必须与出口侧一致。
     long long total = -1, offset = -1;
     int slen = -1;
+    // 样式向量摘要 + 模式位（FIX-30 新增的末两列）：每格 fg/bg/attr/宽度与模式位也跨仓钉住。
+    std::string style;
+    long long modes = -1;
 };
 
 std::vector<Sample> readManifest(const std::string& path, bool& ok) {
@@ -67,7 +100,7 @@ std::vector<Sample> readManifest(const std::string& path, bool& ok) {
         if (line.empty()) continue;
         std::istringstream ss(line);
         std::string name, opHex, cols, rows, rev, digest, title, frames;
-        std::string cx, cy, cflags, cshape, total, offset, slen;
+        std::string cx, cy, cflags, cshape, total, offset, slen, style, modes;
         std::getline(ss, name, '\t');
         std::getline(ss, opHex, '\t');
         std::getline(ss, cols, '\t');
@@ -83,6 +116,8 @@ std::vector<Sample> readManifest(const std::string& path, bool& ok) {
         std::getline(ss, total, '\t');
         std::getline(ss, offset, '\t');
         std::getline(ss, slen, '\t');
+        std::getline(ss, style, '\t');
+        std::getline(ss, modes, '\t');
         Sample s;
         s.name = name;
         s.op = static_cast<uint8_t>(std::strtoul(opHex.c_str(), nullptr, 16));
@@ -98,6 +133,8 @@ std::vector<Sample> readManifest(const std::string& path, bool& ok) {
         if (!total.empty()) s.total = std::atoll(total.c_str());
         if (!offset.empty()) s.offset = std::atoll(offset.c_str());
         if (!slen.empty()) s.slen = std::atoi(slen.c_str());
+        s.style = style;
+        if (!modes.empty()) s.modes = std::atoll(modes.c_str());
         out.push_back(std::move(s));
     }
     ok = true;
@@ -226,11 +263,17 @@ int main(int argc, char** argv) {
                               (static_cast<long long>(sb.total) == s.total &&
                                static_cast<long long>(sb.offset) == s.offset &&
                                static_cast<int>(sb.len) == s.slen);
-        if (!geomOk || !revOk || !digestOk || !cursorOk || !scrollOk) {
+        // 样式向量 + 模式位（FIX-30）：颜色/属性/宽度与模式位布局漂移的自证面——此前只有文本
+        // 摘要，两端把 attr 位序/颜色 kind 值改错（只有一端改）也照样双绿。
+        const std::string style = styleDigest(sess.grid());
+        const bool styleOk = s.style.empty() || style == s.style;
+        const bool modesOk = s.modes < 0 || static_cast<long long>(sess.grid().modes()) == s.modes;
+        if (!geomOk || !revOk || !digestOk || !cursorOk || !scrollOk || !styleOk || !modesOk) {
             failures++;
             std::cerr << "[FAIL] " << s.name << "：" << (geomOk ? "" : "几何不符 ")
                       << (revOk ? "" : "revision 不符 ") << (digestOk ? "" : "摘要不符 ")
-                      << (cursorOk ? "" : "光标不符 ") << (scrollOk ? "" : "回滚条不符 ") << "\n"
+                      << (cursorOk ? "" : "光标不符 ") << (scrollOk ? "" : "回滚条不符 ")
+                      << (styleOk ? "" : "样式向量不符 ") << (modesOk ? "" : "模式位不符 ") << "\n"
                       << "       几何 " << sess.grid().geometry().cols << "x" << sess.grid().geometry().rows
                       << "（期望 " << s.cols << "x" << s.rows << "）rev=" << sess.grid().geometry().revision
                       << "（期望 " << s.rev << "）\n"
@@ -240,6 +283,8 @@ int main(int argc, char** argv) {
                       << s.cflags << "," << s.cshape << "）\n"
                       << "       回滚条 (" << sb.total << "," << sb.offset << "," << static_cast<int>(sb.len)
                       << ")（期望 " << s.total << "," << s.offset << "," << s.slen << "）\n"
+                      << "       样式向量 " << style << "（期望 " << s.style << "）模式位 "
+                      << sess.grid().modes() << "（期望 " << s.modes << "）\n"
                       << "       文本前 120 字节：" << text.substr(0, 120) << "\n";
             {
                 std::ofstream dump("/tmp/surface-" + s.name + ".cpp.txt", std::ios::binary);
