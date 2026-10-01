@@ -5,11 +5,12 @@ package wgcore
 // 于是 tunmode 换代只需要换「t.cl 的构造与类型」，调用点不用动。
 //
 // 接线（tasks 2.5/3.6 的消费端 + endpoint-freshness §3）：
-//   - hint → 端点学习缓存（Bind.OnHint → ObserveAndSave(SourceHint)，触发 punch 盲打）；
-//   - 探测线索 → 学习缓存（Bind.OnProbed → ObserveAndSave(SourceProbe)，**不**触发 punch——
+//   - hint → 端点学习缓存（Bind.OnHint → Observe(SourceHint)，触发 punch 盲打）；
+//   - 探测线索 → 学习缓存（Bind.OnProbed → Observe(SourceProbe)，**不**触发 punch——
 //     探测列表没有「对端在等我打洞」的语义；旁路探测 ProbeCandidates 是生产者）；
 //   - 真实往返 → 已验证（MarkRoundTrip：拨号成功 / PathProbe 判活 / 阶梯验证探测通过，
 //     按地址去重——旧 sessionMarked 布尔漏掉「会话中途路径切换」与「R3 救回后闲置」）；
+//   - 以上三类落盘统一走去抖 goroutine（FIX-16）：回调（收包/探测路径）只改内存表；
 //   - 域名重解析（Rearm 时并发、不占恢复阶梯动作预算，结果补投进赛跑/t.static）；
 //   - 三档归因：Probe 用参照点探测（pkg/probe）测「本机网络到该地址」是否通。
 
@@ -70,6 +71,13 @@ type Transport struct {
 	lastMarked   netip.AddrPort // 已验证标记按地址去重（替代旧 sessionMarked 布尔）
 	lastMarkedAt time.Time      // 同地址的复标节流（长连路径每小时刷新一次 VerifiedAt）
 	lastPunchAt  time.Time
+
+	// 落盘去抖（FIX-16）：hint/探测/往返标记的回调只改缓存内存表 + 投递合并信号，
+	// 磁盘写由 saveLoop 独立合并执行——回调挂在收包/探测 goroutine 上，此前每次
+	// 观察都同步 Save（持锁读盘合并 + 写 + rename），数据面收包被磁盘阻塞。
+	saveSig   chan struct{} // cap=1：已有待写信号时再投递即合并
+	saveDone  chan struct{} // Close 关闭以收口 saveLoop
+	closeOnce sync.Once     // saveDone 只关一次（会话重建路径可能重复 Close）
 }
 
 // NewTransport 建门面并把学习缓存/候选接上。
@@ -90,14 +98,18 @@ func NewTransport(cfg TransportConfig) (*Transport, error) {
 	}
 	bind := cfg.Core.Bind()
 	if cfg.Cache != nil {
+		t.saveSig = make(chan struct{}, 1)
+		t.saveDone = make(chan struct{})
+		go t.saveLoop()
 		// hint（中继观察）→ 学习缓存（非认证线索，最新鲜）。
 		bind.SetOnHint(func(addr string) {
 			ap, err := netip.ParseAddrPort(addr)
 			if err != nil {
 				return
 			}
-			cfg.Cache.ObserveAndSave(ap, wtransport.SourceHint, time.Now())
+			cfg.Cache.Observe(ap, wtransport.SourceHint, time.Now())
 			bind.SetCandidates(cfg.Cache.Merge(t.static(), time.Now()))
+			t.scheduleSave()
 			t.punchTo(ap)
 		})
 		// 探测线索（旁路探测应答的端点列表）→ 学习缓存（endpoint-freshness）。
@@ -108,8 +120,9 @@ func NewTransport(cfg TransportConfig) (*Transport, error) {
 			if err != nil || !probeAddrAcceptable(ap.Addr()) {
 				return
 			}
-			cfg.Cache.ObserveAndSave(ap, wtransport.SourceProbe, time.Now())
+			cfg.Cache.Observe(ap, wtransport.SourceProbe, time.Now())
 			bind.SetCandidates(cfg.Cache.Merge(t.static(), time.Now()))
+			t.scheduleSave()
 		})
 		bind.SetCandidates(cfg.Cache.Merge(t.static(), time.Now()))
 	}
@@ -346,16 +359,6 @@ func (t *Transport) ResetPeerSession() error {
 	return t.core.ResetPeerSession()
 }
 
-// forceRehandshake 丢弃本地会话并重新武装候选赛跑（= 清采纳 + 丢会话）：下一发出站包
-// 会立刻发起全新握手（而不是等客户端自己的 rekey 计时，最长 ~2 分钟）。
-// 用于「出口重启 / 本设备记录被回收」：对端已经没有这段会话，本地却还以为它是好的。
-func (t *Transport) forceRehandshake() {
-	t.core.Bind().Rearm()
-	if err := t.ResetPeerSession(); err != nil {
-		t.logf("丢弃本地会话失败（%v）—— 继续按原会话重试", err)
-	}
-}
-
 // Identity 本世代的设备身份（状态/诊断暴露短指纹；私钥不外出）。
 func (t *Transport) Identity() *wtransport.Identity { return t.core.Identity() }
 
@@ -412,7 +415,8 @@ func (t *Transport) MarkRoundTrip(addr netip.AddrPort) {
 			break
 		}
 	}
-	t.cache.MarkVerifiedAndSave(addr, src, time.Now())
+	t.cache.MarkVerified(addr, src, time.Now())
+	t.scheduleSave()
 	t.core.Bind().SetCandidates(t.cache.Merge(t.static(), time.Now()))
 }
 
@@ -521,8 +525,67 @@ var (
 	cgnatRange  = netip.MustParsePrefix("100.64.0.0/10") // CGNAT（运营商大内网）
 )
 
-// Close 关闭会话门面（不关 Core；Core 生命周期由调用方管）。
-func (t *Transport) Close() error { return nil }
+// saveDebounce：落盘去抖窗（首个信号后等满一窗再写，窗内后续信号并进同一次写；
+// 测试调短用）。Save 自带「内容未变不写」短路，去抖只决定「什么时候碰磁盘」。
+// atomic（纳秒）：saveLoop 恒在读，测试 goroutine 会临时改写。
+var saveDebounce atomic.Int64
+
+func init() { saveDebounce.Store(int64(time.Second)) }
+
+// scheduleSave 非阻塞投递一次落盘信号（回调路径唯一出口——绝不在这里做 IO）。
+// 已有待写信号时直接合并返回。
+func (t *Transport) scheduleSave() {
+	if t.saveSig == nil {
+		return
+	}
+	select {
+	case t.saveSig <- struct{}{}:
+	default:
+	}
+}
+
+// saveLoop 独立落盘 goroutine：等信号 → 去抖窗合并 → Save。Close 收口后不再写
+// （最终一次由 Close 同步补上，见 Close）。
+func (t *Transport) saveLoop() {
+	for {
+		select {
+		case <-t.saveSig:
+		case <-t.saveDone:
+			return
+		}
+		timer := time.NewTimer(time.Duration(saveDebounce.Load()))
+	wait:
+		for {
+			select {
+			case <-t.saveSig:
+			case <-timer.C:
+				break wait
+			case <-t.saveDone:
+				timer.Stop()
+				return
+			}
+		}
+		if err := t.cache.Save(time.Now()); err != nil {
+			t.logf("端点缓存落盘失败：%v", err)
+		}
+	}
+}
+
+// Close 关闭会话门面（**不关 Core**：Core 生命周期由调用方管）——收口落盘 goroutine，
+// 并把去抖窗内可能未写的观察同步补一次盘（会话重建/停机的既有序列：service 层
+// newSession.Close = Transport.Close + Core.Close）。与 saveLoop 的 Save 并发时由
+// EndpointCache 自身锁串行化，末写者胜（写前重读合并）。
+func (t *Transport) Close() error {
+	if t.saveDone != nil {
+		t.closeOnce.Do(func() { close(t.saveDone) })
+		if t.cache != nil {
+			if err := t.cache.Save(time.Now()); err != nil {
+				t.logf("端点缓存收口落盘失败：%v", err)
+			}
+		}
+	}
+	return nil
+}
 
 func (t *Transport) noteDialResult(err error) {
 	if err == nil {

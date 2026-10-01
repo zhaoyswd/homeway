@@ -141,7 +141,10 @@ func TestRecoverAfterDeviceRecordReaped(t *testing.T) {
 	if !tr.RefreshReg() {
 		t.Fatal("RefreshReg 应已发出（已采纳路径存在）")
 	}
-	tr.forceRehandshake()
+	tr.Rearm()
+	if err := tr.ResetPeerSession(); err != nil {
+		t.Fatalf("丢弃本地会话失败：%v", err)
+	}
 	if err := dial(20 * time.Second); err != nil {
 		t.Fatalf("补注册 + 重新握手后仍拨不通：%v", err)
 	}
@@ -158,7 +161,10 @@ func TestRecoverAfterDeviceRecordReaped(t *testing.T) {
 		t.Fatalf("Rebind 失败：%v", err)
 	}
 	tr.RefreshReg()
-	tr.forceRehandshake()
+	tr.Rearm()
+	if err := tr.ResetPeerSession(); err != nil {
+		t.Fatalf("丢弃本地会话失败：%v", err)
+	}
 	if err := dial(20 * time.Second); err != nil {
 		t.Fatalf("Rebind + 补注册 + 重新握手后仍拨不通：%v", err)
 	}

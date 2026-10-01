@@ -382,16 +382,16 @@ func TestProbeCandidatesLearnsAndGuards(t *testing.T) {
 		t.Fatal("旁路探测应留一行判据日志")
 	}
 	// 4.1(b) 全链收尾：落盘可读——重开缓存仍在（真二进制外的「应答→投递→缓存落盘」闭环）。
-	t2 := wtransport.OpenEndpointCache(cacheDir2, freshPeerID)
-	foundSaved := false
-	for _, e := range t2.Entries(time.Now()) {
-		if e.Addr == good && e.Source == wtransport.SourceProbe {
-			foundSaved = true
+	// 落盘走去抖（FIX-16）：先等去抖窗满把线索写进文件，再重开缓存验证。
+	waitFor(t, 5*time.Second, func() bool {
+		t2 := wtransport.OpenEndpointCache(cacheDir2, freshPeerID)
+		for _, e := range t2.Entries(time.Now()) {
+			if e.Addr == good && e.Source == wtransport.SourceProbe {
+				return true
+			}
 		}
-	}
-	if !foundSaved {
-		t.Fatal("探测线索应已落盘（重开缓存仍在）")
-	}
+		return false
+	}, "探测线索落盘（重开缓存可见）")
 }
 
 func TestDeliverProbedWiring(t *testing.T) {

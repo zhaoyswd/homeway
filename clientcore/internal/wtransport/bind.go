@@ -102,7 +102,6 @@ type Bind struct {
 	raceStart     time.Time // 本轮赛跑开始（解锁中继的计时基准）
 	relayUnlocked bool      // 中继候选是否已解锁
 	unlockOnce    bool      // 本轮是否已安排解锁补发
-	lastMirror    []byte    // 最近一条镜像包（解锁时补发给中继候选）
 	// 过渡双发（FIX-09）：稳态下从未知来源（非候选/非中继）切采纳时，旧路径保留为
 	// 次要发送目标至 handoverUntil——出口不发无端包，「单发」会让伪造源/错投一票
 	// 改写路径后形成「出站全打给错误地址 → 出口收不到我们 → 再无纠正包」的悬崖；
@@ -674,7 +673,6 @@ func (b *Bind) Send(bufs [][]byte, ep conn.Endpoint) error {
 			b.unlockOnce = true
 		}
 		lastReg := regPkt
-		b.lastMirror = append([]byte(nil), buf...)
 		b.mu.Unlock()
 
 		sent, relaySent := 0, 0
