@@ -20,7 +20,7 @@ import (
 var stdlibWhitelist = map[string]bool{
 	"bytes": true, "compress/gzip": true, "encoding/binary": true,
 	"encoding/hex": true, "encoding/json": true, "errors": true, "fmt": true,
-	"go/parser": true, "go/token": true, "hash/fnv": true,
+	"go/ast": true, "go/parser": true, "go/token": true, "hash/fnv": true,
 	"io": true, "os": true, "path/filepath": true, "reflect": true,
 	"sort": true, "strconv": true, "strings": true, "testing": true,
 }
