@@ -27,6 +27,23 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      # 发版纪律门（FIX-100）：tag 必须打在 main 头上——「main == tag 无门（已破一次）」
+      # 的收口。tag 推送时若指向落后/超前 origin/main 的提交，产物与 main 不符且事后
+      # 难对齐；这里在全部构建之前拦下（先合 main 并推 main，再打 tag）。
+      # 非 tag 触发（workflow_dispatch）跳过本步。
+      - name: 发版纪律门：tag == origin/main 头
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          set -euo pipefail
+          git fetch --depth=1 origin main
+          main="$(git rev-parse origin/main)"
+          head="$(git rev-parse HEAD)"
+          if [ "$main" != "$head" ]; then
+            echo "error: tag $GITHUB_REF_NAME 指向 $head，而 origin/main 当前为 $main" >&2
+            echo "发版纪律：tag 必须打在 main 头上——先把要发的提交合入并推 main，再打 tag" >&2
+            exit 1
+          fi
+          echo "ok: tag 指向 origin/main 头（$head）"
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
