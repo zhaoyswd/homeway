@@ -91,7 +91,16 @@ type Interceptor struct {
 	conns atomic.Int64
 
 	closeOnce sync.Once
-	closed    chan struct{}
+	closed    chan struct{} // 停收新流（Close 与 Drain 都关；Drain 下在途 TCP 继续承载）
+	tdOnce    sync.Once
+	teardown  chan struct{} // 杀在途 TCP（仅 Close 关——Drain 不关，宽限语义靠它）
+
+	// reg：在途 TCP 过境连接登记表（role-management 2.1，r1 中-5——serve stop
+	// 的有界宽限收尾用）。Close 只是标记停收新流；Drain 在此基础上等存量
+	// 过境连接自然收销账、到期未收的按登记逐条 SetLinger(0) RST。豁免腿
+	// （files/term 的 UDS 转投）不登记——它们随本机服务收口（D5 步骤②）。
+	regMu sync.Mutex
+	reg   map[*regEntry]struct{}
 
 	// udpSess：活跃/在建 UDP 会话表（五元组键）。建端点必须在分发路径之外
 	// （同步在 demux 里建会死锁——锁重入）；**在建窗口内到达的同五元组包
@@ -100,6 +109,17 @@ type Interceptor struct {
 	udpMu   sync.Mutex
 	udpSess map[string]bool
 	udpPend map[string][][]byte
+}
+
+// regEntry 一条在途 TCP 过境连接的登记（upstream = 重拨出的本机 socket）。
+type regEntry struct {
+	conn net.Conn
+	done chan struct{} // bridgeConns 返回（自然收尾）后关闭
+}
+
+// lingerSetter 可 RST 收口的本机 socket（*net.TCPConn 与测试注入的包装 conn）。
+type lingerSetter interface {
+	SetLinger(sec int) error
 }
 
 // udpPendingMax：每五元组在建窗口的缓冲上限（超出丢最新）。
@@ -129,7 +149,7 @@ func Attach(n *wgnet.Net, cfg Config, st *Stats) (*Interceptor, error) {
 	if cfg.Logf == nil {
 		cfg.Logf = func(string, ...any) {}
 	}
-	in := &Interceptor{cfg: cfg, net: n, st: st, closed: make(chan struct{}), udpSess: make(map[string]bool), udpPend: make(map[string][][]byte)}
+	in := &Interceptor{cfg: cfg, net: n, st: st, closed: make(chan struct{}), teardown: make(chan struct{}), udpSess: make(map[string]bool), udpPend: make(map[string][][]byte), reg: make(map[*regEntry]struct{})}
 
 	stack := n.Stack()
 	// 两个开关缺一不可（tun2socks 同款）：
@@ -153,9 +173,88 @@ func Attach(n *wgnet.Net, cfg Config, st *Stats) (*Interceptor, error) {
 	return in, nil
 }
 
-// Close：停接收新会话并尽量通知存量会话收工（真正的回收由各自空闲看门狗完成）。
+// Close：停接收新会话并**通知存量会话收工**（在途 TCP 由 teardown 立即拆、
+// UDP 由各自看门狗看到 closed 后即刻终结；真正的回收由各自空闲看门狗兜底）。
+// 与 Drain 的分界：Close 是「全停即刻拆」，Drain 是「停新流 + 存量 TCP 宽限承载」。
 func (in *Interceptor) Close() {
+	in.HaltNew()
+	in.tdOnce.Do(func() { close(in.teardown) })
+}
+
+// HaltNew：只停新流（D5 步骤①——新 WG 握手/新过境流被拒，在途 TCP 不受影响）。
+// Close 与 Drain 都含这一步（幂等）。
+func (in *Interceptor) HaltNew() {
 	in.closeOnce.Do(func() { close(in.closed) })
+}
+
+// Drain：停收新流（不拆在途）+ 在途 TCP 过境连接**有界宽限**收尾（role-management
+// 2.1/2.3，design D5 / r1 中-5）：宽限内自然收尾的销账（继续承载双向数据——teardown
+// 未关，泵只认空闲与错误）；到期未收的按登记逐条 SetLinger(0) 后 Close = RST 强制关
+// （对齐 3e socks off 的教训：优雅 FIN 会让对端静默挂住）。UDP 无收尾概念、即刻终结
+// （closed 一关，各自看门狗 finish）。返回到期仍在途（被 RST）的连接数。
+func (in *Interceptor) Drain(grace time.Duration) int {
+	in.HaltNew()
+	deadline := time.Now().Add(grace)
+	for {
+		if in.regLen() == 0 {
+			return 0
+		}
+		if !time.Now().Before(deadline) {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	n := 0
+	for _, e := range in.regSnapshot() {
+		if tc, ok := e.conn.(lingerSetter); ok {
+			_ = tc.SetLinger(0) // 0 = Close 时直接 RST，不发 FIN
+		}
+		_ = e.conn.Close()
+		n++
+	}
+	// RST 触发泵退出是异步的：有界等销账完成（收尾序判据「Drain 返回 = 过境面已收」
+	// 的近似；净空窗口毫秒级）。
+	outDeadline := time.Now().Add(2 * time.Second)
+	for in.regLen() > 0 && time.Now().Before(outDeadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	in.cfg.Logf("intercept: 过境宽限收尾——到期仍 在途 %d 条过境 TCP 连接已 RST", n)
+	return n
+}
+
+// regAdd / regRemove / regSnapshot / regLen：登记表操作（serveTCP 的 transit 分支）。
+func (in *Interceptor) regAdd(c net.Conn) *regEntry {
+	e := &regEntry{conn: c, done: make(chan struct{})}
+	in.regMu.Lock()
+	in.reg[e] = struct{}{}
+	in.regMu.Unlock()
+	return e
+}
+
+func (in *Interceptor) regRemove(e *regEntry) {
+	if e == nil {
+		return
+	}
+	in.regMu.Lock()
+	delete(in.reg, e)
+	in.regMu.Unlock()
+	close(e.done) // Drain 的销账信号（幂等性由「每 entry 只 remove 一次」保证）
+}
+
+func (in *Interceptor) regSnapshot() []*regEntry {
+	in.regMu.Lock()
+	defer in.regMu.Unlock()
+	out := make([]*regEntry, 0, len(in.reg))
+	for e := range in.reg {
+		out = append(out, e)
+	}
+	return out
+}
+
+func (in *Interceptor) regLen() int {
+	in.regMu.Lock()
+	defer in.regMu.Unlock()
+	return len(in.reg)
 }
 
 // target：原始目的 → 实际重拨目标（豁免映射 + DNS 端口改写，dns-host-resolver）。
@@ -252,7 +351,13 @@ func (in *Interceptor) serveTCP(r *tcp.ForwarderRequest, dst, src netip.AddrPort
 		in.st.IncrFlow()
 	}
 	in.cfg.Logf("intercept: tcp %s %v ← %v（dialok）", kind, target, src)
-	bridgeConns(downstream, upstream, in.cfg.TCPIdle, in.closed)
+	// 过境连接登记（r1 中-5）：Drain 的宽限收尾按登记销账/RST；豁免腿不登记。
+	var ent *regEntry
+	if !exempt {
+		ent = in.regAdd(upstream)
+	}
+	bridgeConns(downstream, upstream, in.cfg.TCPIdle, in.teardown)
+	in.regRemove(ent)
 	if in.st != nil {
 		in.st.DecrFlow()
 	}
@@ -503,8 +608,9 @@ func fullAddrPort(a tcpip.FullAddress) string {
 // ---------- 双向桥（TCP）----------
 
 // bridgeConns：双向 copy；任一方 EOF/错误即双向关闭；idle 内双向无进展才回收
-// （共享活跃时间戳——防单方向静默误杀长轮询）。
-func bridgeConns(a, b net.Conn, idle time.Duration, closed <-chan struct{}) {
+// （共享活跃时间戳——防单方向静默误杀长轮询）。teardown（仅 Close 关）触发立即
+// 拆——Drain 的「停新流」不经过这里，在途连接在宽限内继续承载。
+func bridgeConns(a, b net.Conn, idle time.Duration, teardown <-chan struct{}) {
 	var last atomic.Int64
 	last.Store(time.Now().UnixNano())
 	var wg sync.WaitGroup
@@ -533,7 +639,7 @@ func bridgeConns(a, b net.Conn, idle time.Duration, closed <-chan struct{}) {
 			if err != nil {
 				if ne, ok := err.(net.Error); ok && ne.Timeout() {
 					select {
-					case <-closed:
+					case <-teardown:
 						shutdown()
 						return
 					default:
@@ -562,7 +668,7 @@ func bridgeConns(a, b net.Conn, idle time.Duration, closed <-chan struct{}) {
 		defer t.Stop()
 		for {
 			select {
-			case <-closed:
+			case <-teardown:
 				shutdown()
 				return
 			case <-done: // 泵已退（EOF/错误/对端关）：看门狗同退，别拖 wg.Wait

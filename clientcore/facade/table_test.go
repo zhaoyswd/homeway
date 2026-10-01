@@ -355,3 +355,46 @@ func TestRegistryCarriesInvalidIDEntries(t *testing.T) {
 		t.Fatalf("重启后寻址面应 2 条，实际 %d", got)
 	}
 }
+
+// L3 注入（role-management D3 拆分表 r1 高-2）：EndpointCacheDir/Out 注入时会话按
+// 注入落位；nil/空 = 现状按 stateDir 推导（旧行为零变化）。
+func TestTableL3PathInjection(t *testing.T) {
+	dir := t.TempDir()
+	cacheDir := filepath.Join(dir, "cache")
+	// 注入目录由装配层负责存在（统一进程 = OpenNodeState 建 cache/）——会话打开
+	// Out 失败只摘该会话（不致命，见 startSessionLocked），目录在才能落日志。
+	if err := os.MkdirAll(filepath.Join(cacheDir, "endpoints"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	injected := openTestTable(t, dir, tableOptions{
+		endpointCacheDir: filepath.Join(cacheDir, "endpoints"),
+		out:              filepath.Join(cacheDir, "client.log"),
+	})
+	tokA, _ := testToken(t, 9, "127.0.0.1:40009")
+	if _, err := injected.Add("注入主机", tokA); err != nil {
+		t.Fatal(err)
+	}
+	waitFileFace(t, filepath.Join(cacheDir, "client.log"))
+	if _, err := os.Stat(filepath.Join(dir, "debug.log")); !os.IsNotExist(err) {
+		t.Fatal("注入时不得在 stateDir 落 debug.log（现状推导面必须被注入覆盖）")
+	}
+	// nil/空注入 = 现状：会话日志回 stateDir/debug.log。
+	legacy := openTestTable(t, dir, tableOptions{})
+	tokB, _ := testToken(t, 10, "127.0.0.1:40010")
+	if _, err := legacy.Add("缺省主机", tokB); err != nil {
+		t.Fatal(err)
+	}
+	waitFileFace(t, filepath.Join(dir, "debug.log"))
+}
+
+func waitFileFace(t *testing.T, path string) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if _, err := os.Stat(path); err == nil {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("%s 未出现", path)
+}

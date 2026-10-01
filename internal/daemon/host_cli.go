@@ -94,7 +94,7 @@ func hostAddCLI(args []string, version string, w io.Writer) error {
 	defer cancel()
 	c, _, err := control.Dial(ctx, sock, control.FrontendInfo{Kind: "cli", Name: "homeway-host", Version: version})
 	if err != nil {
-		return fmt.Errorf("homeway daemon 未在运行（sock=%s：%v）\n先启动：homeway daemon --state %s", sock, err, *stateDir)
+		return fmt.Errorf("homeway daemon 未在运行（sock=%s：%v）\n先启动：homeway --state %s（零参统一进程）", sock, err, *stateDir)
 	}
 	defer c.Close()
 	raw, err := c.Request(ctx, facade.OpHostAdd, control.HostAddArgs{Name: *name, Token: token, Force: *force})
@@ -194,7 +194,7 @@ func fetchHosts(stateDir string, timeout time.Duration, version string) ([]contr
 	c, _, err := control.Dial(ctx, sock, control.FrontendInfo{Kind: "cli", Name: "homeway-host", Version: version})
 	if err != nil {
 		cancel()
-		return nil, nil, fmt.Errorf("homeway daemon 未在运行（sock=%s：%v）\n先启动：homeway daemon --state %s", sock, err, stateDir)
+		return nil, nil, fmt.Errorf("homeway daemon 未在运行（sock=%s：%v）\n先启动：homeway --state %s（零参统一进程）", sock, err, stateDir)
 	}
 	closeC := func() { c.Close(); cancel() }
 	raw, err := c.Request(ctx, facade.OpDaemonStatus, nil)
@@ -381,7 +381,7 @@ func hostDeleteCLI(args []string, version string, w io.Writer) error {
 	defer cancel()
 	c, _, err := control.Dial(ctx, sock, control.FrontendInfo{Kind: "cli", Name: "homeway-host", Version: version})
 	if err != nil {
-		return fmt.Errorf("homeway daemon 未在运行（sock=%s：%v）\n先启动：homeway daemon --state %s", sock, err, *stateDir)
+		return fmt.Errorf("homeway daemon 未在运行（sock=%s：%v）\n先启动：homeway --state %s（零参统一进程）", sock, err, *stateDir)
 	}
 	defer c.Close()
 	var code control.CodeError

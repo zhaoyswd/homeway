@@ -254,6 +254,64 @@ func (r *Relay) Stats() Stats {
 	return r.stats
 }
 
+// BackendBrief 注册出口列表条目（relay.status 数据源——role-management 2.2，r1 低-14：
+// label 短指纹 + 源地址 + 最近活跃 + 验证态）。
+type BackendBrief struct {
+	Label       string    // 出口中继标签（16 位 hex 短指纹）
+	Addr        string    // 注册腿源地址（后端公网映射，给客户端的 hint）
+	LastActive  time.Time // 最近一次注册/控制活动
+	Verified    bool      // UDP 注册挑战已证明持有 peerId 私钥
+	CtlVerified bool      // TCP 控制面挑战已证明
+	HasCtl      bool      // 控制通道（relay-backend-dial 拨腿模式）在世
+}
+
+// StatusSnapshot relay 状态快照（实际监听地址 + 注册出口列表）。
+// **relay 侧看不到 APP**（在中继注册的是出口、手机流量在 WG 密文里）——事实约束进
+// spec（role-management）；本结构因此只有后端维。
+type StatusSnapshot struct {
+	Listen   string         // 实际监听地址（UDP）
+	Backends []BackendBrief // 注册出口列表
+	Assocs   int            // 活跃客户端分配会话数
+	Open     bool           // 是否开放注册（Secret 零值）
+}
+
+// BackendBriefs 注册出口列表快照（锁内拷贝；未跑 = nil）。
+func (r *Relay) BackendBriefs() []BackendBrief {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	out := make([]BackendBrief, 0, len(r.legs))
+	for label, lg := range r.legs {
+		addr, last := "", time.Time{}
+		if lg != nil {
+			addr = lg.addr.String()
+			last = lg.last
+		}
+		out = append(out, BackendBrief{
+			Label:       fmt.Sprintf("%x", label),
+			Addr:        addr,
+			LastActive:  last,
+			Verified:    lg.verified,
+			CtlVerified: lg.ctlVerified,
+			HasCtl:      lg.ctl != nil,
+		})
+	}
+	return out
+}
+
+// Snapshot 状态快照（relay.status 数据源）。
+func (r *Relay) Snapshot() StatusSnapshot {
+	r.mu.Lock()
+	pc := r.pc
+	assocs := len(r.assocs)
+	open := r.cfg.Secret == ([32]byte{})
+	r.mu.Unlock()
+	snap := StatusSnapshot{Backends: r.BackendBriefs(), Assocs: assocs, Open: open}
+	if pc != nil {
+		snap.Listen = pc.LocalAddr().String()
+	}
+	return snap
+}
+
 // RunWithReady：同 Run，但绑定成功后回调一次（实际地址）—— token 必须在**实际端口**确定后生成。
 func (r *Relay) RunWithReady(ctx context.Context, onReady func(actual netip.AddrPort)) error {
 	r.onReady = onReady

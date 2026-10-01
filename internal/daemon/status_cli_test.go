@@ -50,7 +50,7 @@ func TestDaemonStatusCLINotRunning(t *testing.T) {
 		t.Fatal("未运行时应报错")
 	}
 	msg := err.Error()
-	for _, want := range []string{"homeway daemon 未在运行", "control.sock", "homeway daemon --state"} {
+	for _, want := range []string{"homeway daemon 未在运行", "control.sock", "homeway --state"} {
 		if !strings.Contains(msg, want) {
 			t.Fatalf("可行动错误缺 %q：%s", want, msg)
 		}

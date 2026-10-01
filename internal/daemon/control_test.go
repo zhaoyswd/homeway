@@ -37,10 +37,7 @@ func fakeProbeDirect(ctx context.Context, token string) (*probe.ReachReport, err
 func startDaemonForTest(t *testing.T, probe func(ctx context.Context, token string) (*probe.ReachReport, error)) (*DaemonState, string) {
 	t.Helper()
 	dir := shortTempDirDaemon(t)
-	st, err := OpenDaemonState(dir)
-	if err != nil {
-		t.Fatal(err)
-	}
+	st := OpenDaemonLogs(dir, dir) // 日志面（目录已存在即可；角色状态面的日志槽）
 	t.Cleanup(st.Close)
 	d := facade.New(facade.Options{
 		StrictIdentity: true,
@@ -49,11 +46,11 @@ func startDaemonForTest(t *testing.T, probe func(ctx context.Context, token stri
 		Probe:          probe,
 	})
 	t.Cleanup(d.Close)
-	sup := newSupervisor(st.Eventf, st.Debugf)
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
+	sup := newSupervisor(ctx, st.Eventf, st.Debugf)
 	role := newClientRole(dir, st, d)
-	sup.Start(ctx, func() Role { return role }, nil)
+	sup.Start("client", func() Role { return role }, nil)
 	if err := startControlPlane(ctx, "test-daemon", dir, sup, d, st.Eventf); err != nil {
 		t.Fatal(err)
 	}
@@ -213,15 +210,12 @@ func TestControlPlaneNotReadyWhenRoleDisabled(t *testing.T) {
 	// 角色未挂（模拟 client 角色禁用/重建窗口）：host 类操作 not_ready，控制面
 	// 本身仍应答（骨架可用）。
 	dir := shortTempDirDaemon(t)
-	st, err := OpenDaemonState(dir)
-	if err != nil {
-		t.Fatal(err)
-	}
+	st := OpenDaemonLogs(dir, dir)
 	t.Cleanup(st.Close)
 	d := facade.New(facade.Options{StrictIdentity: true, Logf: st.Debugf, Eventf: st.Eventf})
 	t.Cleanup(d.Close) // 不挂角色（表未 attach = NotReady）
-	sup := newSupervisor(st.Eventf, st.Debugf)
 	ctlCtx, ctlCancel := context.WithCancel(context.Background())
+	sup := newSupervisor(ctlCtx, st.Eventf, st.Debugf)
 	if err := startControlPlane(ctlCtx, "test-daemon", dir, sup, d, st.Eventf); err != nil {
 		t.Fatal(err)
 	}

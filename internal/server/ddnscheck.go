@@ -37,9 +37,10 @@ type ddnsCheckState struct {
 	resolveErrStreak int  // 连续解析失败（只打第一拍，防刷屏）
 }
 
-// runDDNSSelfCheck：一拍自检。published 为空（探测被关/本轮未公布）时跳过——没有观测就没有对比。
+// runDDNSSelfCheck：一拍自检（多条域名逐域各拍各的）。published 为空（探测被关/本轮
+// 未公布）时跳过——没有观测就没有对比。
 func (s *Server) runDDNSSelfCheck(opts PublicOpts) {
-	if s.cfg.DDNS == "" || s.ddns == nil {
+	if len(s.cfg.DDNS) == 0 {
 		return
 	}
 	s.tokMu.Lock()
@@ -53,20 +54,40 @@ func (s *Server) runDDNSSelfCheck(opts PublicOpts) {
 	if opts.Bind != nil {
 		ifi = opts.Bind.PinnedIface() // 双族钉卡跟随当前实际钉住的网卡（换网重钉后自动跟上）
 	}
+	if s.ddns == nil { // 防御：Start 已按域名建表；测试直构 Server 时兜底
+		s.ddns = make(map[string]*ddnsCheckState, len(s.cfg.DDNS))
+	}
+	for _, domain := range s.cfg.DDNS {
+		st := s.ddns[domain]
+		if st == nil {
+			st = &ddnsCheckState{}
+			s.ddns[domain] = st
+		}
+		s.checkOneDDNS(domain, st, published, ifi)
+	}
+}
+
+// checkOneDDNS：单域名的自检一拍（状态域专属滚动；与其它域名互不影响）。
+func (s *Server) checkOneDDNS(domain string, st *ddnsCheckState, published []string, ifi *net.Interface) {
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
-	addrs, err := resolveDDNS(ctx, s.cfg.DDNS, ifi)
+	addrs, err := resolveDDNS(ctx, domain, ifi)
+	s.ddnsMu.Lock()
 	if err != nil {
-		st := s.ddns
 		st.resolveErrStreak++
-		if st.resolveErrStreak == 1 { // 连续失败只打第一拍
-			ddnsLogf("⚠️ DDNS 自检：解析 %s 失败（%v）——本轮跳过对比", s.cfg.DDNS, err)
+		first := st.resolveErrStreak == 1 // 连续失败只打第一拍
+		s.ddnsMu.Unlock()
+		if first {
+			ddnsLogf("⚠️ DDNS 自检：解析 %s 失败（%v）——本轮跳过对比", domain, err)
 		}
 		return
 	}
-	if st := s.ddns; st.resolveErrStreak > 0 {
+	if st.resolveErrStreak > 0 {
 		st.resolveErrStreak = 0
-		ddnsLogf("DDNS 自检：解析恢复（%s → %v）", s.cfg.DDNS, addrs)
+		s.ddnsMu.Unlock()
+		ddnsLogf("DDNS 自检：解析恢复（%s → %v）", domain, addrs)
+	} else {
+		s.ddnsMu.Unlock()
 	}
 
 	// 观测侧地址集合（按地址比较，端口无关——域名端口是快照、观测端口随映射变）。
@@ -94,7 +115,8 @@ func (s *Server) runDDNSSelfCheck(opts PublicOpts) {
 		}
 	}
 
-	st := s.ddns
+	s.ddnsMu.Lock()
+	defer s.ddnsMu.Unlock()
 	if match {
 		st.mismatchStreak = 0
 		if st.warnedLag {
@@ -115,7 +137,7 @@ func (s *Server) runDDNSSelfCheck(opts PublicOpts) {
 		if !st.warnedNoAAAA {
 			st.warnedNoAAAA = true
 			ddnsLogf("⚠️ DDNS 自检：域名 %s 没有 AAAA 记录（只解析出 A）——蜂窝用户将失去 v6 直连路径；"+
-				"请让 DDNS 同时更新 AAAA", s.cfg.DDNS)
+				"请让 DDNS 同时更新 AAAA", domain)
 		}
 	} else if st.warnedNoAAAA && resolvedV6 {
 		st.warnedNoAAAA = false

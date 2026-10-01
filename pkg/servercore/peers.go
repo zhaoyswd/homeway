@@ -436,6 +436,31 @@ func (t *DeviceTable) Len() int {
 	return len(t.entries)
 }
 
+// DeviceBrief 设备表快照条目（serve.status 的 peer 表数据源，role-management 2.1/D10）。
+type DeviceBrief struct {
+	Dev      string // devTag 短指纹（hex 前 8 字节）
+	TunnelIP string // 隧道侧 /32
+	LastReg  time.Time
+	Idle     time.Duration // 距最近一次成功注册
+}
+
+// Briefs 设备表快照（serve 角色状态面；锁内拷贝）。
+func (t *DeviceTable) Briefs() []DeviceBrief {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	out := make([]DeviceBrief, 0, len(t.entries))
+	now := time.Now()
+	for _, e := range t.entries {
+		out = append(out, DeviceBrief{
+			Dev:      hex.EncodeToString(e.dev[:8]),
+			TunnelIP: e.ip.String(),
+			LastReg:  e.lastReg,
+			Idle:     now.Sub(e.lastReg),
+		})
+	}
+	return out
+}
+
 // Cap 容量。
 func (t *DeviceTable) Cap() int { return t.max }
 

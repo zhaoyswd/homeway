@@ -9,7 +9,6 @@ import (
 	"net/netip"
 	"os"
 	"path/filepath"
-	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -54,7 +53,7 @@ const (
 )
 
 type ServeConfig struct {
-	StateDir      string
+	StateDir      string // L2：<state>/serve/（key.bin / tokens.jsonl）
 	ListenPort    uint16
 	TunnelIP      netip.Addr
 	FilesPort     uint16         // files 服务在本机的监听端口（客户端经隧道 IP 豁免转投到它）
@@ -71,9 +70,38 @@ type ServeConfig struct {
 	UPnP          bool           // 启动后向路由器申请 UDP 端口映射并 30 分钟续期
 	STUN          string         // 非空 = 在监听 socket 上向该 STUN 服务器观测公网映射（如 stun.miwifi.com:3478）
 	STUN6         string         // 非空 = 用该服务器做 **IPv6** 路径校验（要有 AAAA，如 stun.cloudflare.com:3478）
-	DDNS          string         // 非空 = DDNS 域名（endpoint-freshness）：token 叠加 host:端口 条目（不解析不踢除；域名记录由用户 DDNS 设施维护）
+	DDNS          []string       // DDNS 域名（可多条，endpoint-freshness）：token 叠加 host:端口 条目（不解析不踢除；域名记录由用户 DDNS 设施维护）
 	Relay         string         // 非空 = 向该中继注册一条反向注册腿（host:port），NAT 后的出口由此可被客户端到达
 	Verbose       bool
+
+	// 三层布局路径注入（role-management 2.1，D3 拆分表——r1 高-2）：统一进程与前台
+	// 单角色两形态都由装配层按表注入；**空 = 现状单旋钮缺省**（按 StateDir 落——
+	// 仅指库/测试 API 直构配置不注入时的旧行为，r2 新-2）。
+	LogDir      string // L3：events/debug 日志落点（空 = StateDir）
+	PortFileDir string // L3：listen_port.txt / public_endpoint.txt 落点（空 = StateDir）
+	SockDir     string // 瞬态：files/term/speedtest.sock 落点（空 = StateDir）
+}
+
+// logDir / portDir / sockDir：注入项的缺省折叠（空 = StateDir——现状单旋钮）。
+func (c *ServeConfig) logDir() string {
+	if c.LogDir != "" {
+		return c.LogDir
+	}
+	return c.StateDir
+}
+
+func (c *ServeConfig) portDir() string {
+	if c.PortFileDir != "" {
+		return c.PortFileDir
+	}
+	return c.StateDir
+}
+
+func (c *ServeConfig) sockDir() string {
+	if c.SockDir != "" {
+		return c.SockDir
+	}
+	return c.StateDir
 }
 
 func (c *ServeConfig) fill() {
@@ -105,6 +133,7 @@ type Server struct {
 	cfg   ServeConfig
 	Stats *intercept.Stats // dialok / dialfail / flows 计数（拦截层唯一写入方；udpcap 读 UDP 实测位）
 	Table *servercore.DeviceTable
+	state *State // L2 台账句柄（AppendToken——台账写入纪律，role-management 2.4）
 
 	dev           *device.Device
 	bind          *servercore.ServerBind
@@ -116,11 +145,15 @@ type Server struct {
 	tokMu         sync.Mutex
 	lastToken     string   // 上次已写出的客户端 token（去重：没变就不再写；终端只认首轮）
 	lastPublished []string // 最近一轮已公布的公网端点（Run 的终端兜底带上它，别打残缺版）
-	// ddns：--ddns 自检的滚动状态（只在公网端点探测 goroutine 读写；nil = 未配置 --ddns）。
-	ddns   *ddnsCheckState
+	// ddns：--ddns 自检的滚动状态（按域名一域一份；探测 goroutine 写、状态快照读
+	// ——ddnsMu 同步，role-management 2.1 的快照接口起读方不再单线程）。
+	ddns   map[string]*ddnsCheckState
+	ddnsMu sync.Mutex
 	udpCap *udpCapState // 默认路径的 UDP 能力（周期探测；探测应答里回报）
 	// dnsSrv：DNS 代答（dns-host-resolver）；nil = 未启用（监听失败降级或配置关闭）。
 	dnsSrv *dns.Server
+	// inter：过境拦截层句柄（D5 收尾序的宽限收尾走它；收工幂等）。
+	inter *intercept.Interceptor
 	// stopIntercept：过境拦截层收工（关会话通知；栈随 tunDev 生命周期回收）。
 	stopIntercept func()
 	pubKick       chan struct{} // 公网端点探测的"立即重测"信号（换网事件踢）
@@ -145,15 +178,17 @@ type Server struct {
 	relayStart  func() // dev.Up() 之后执行（socket 已开，#9）
 }
 
-// Start 装配并启动（非阻塞）。
-func Start(cfg ServeConfig) (*Server, error) {
+// Start 装配并启动（非阻塞）。ctx = 角色生命周期（公网端点探测循环等观测面随它收工；
+// 数据面收工走 Shutdown/Close——role-management 2.1）。
+func Start(ctx context.Context, cfg ServeConfig) (*Server, error) {
 	cfg.fill()
 	st, err := OpenState(cfg.StateDir) // MkdirAll：debug.log 依赖目录先存在
 	if err != nil {
 		return nil, err
 	}
 	// 文件日志立起来（CLI 已按同目录初始化过时这里幂等跳过）：摘要 events.log + 细节 debug.log。
-	initLogs(cfg.StateDir, cfg.Verbose)
+	// 落点 = 注入的 L3 目录（D3 拆分表；空 = StateDir 现状缺省）。
+	initLogs(cfg.logDir(), cfg.Verbose)
 	priv, err := st.PrivateKey()
 	if err != nil {
 		return nil, err
@@ -200,10 +235,13 @@ func Start(cfg ServeConfig) (*Server, error) {
 			logf("绑卡：自动挑到 %s（%s）", best.Name, stateOf(best))
 		}
 	}
-	s := &Server{cfg: cfg, Stats: &intercept.Stats{}}
-	if cfg.DDNS != "" {
-		s.ddns = &ddnsCheckState{}
-		logf("DDNS：已配置 --ddns %s（token 叠加域名条目、既有端点全保留；自检随公网端点探测同拍跑）", cfg.DDNS)
+	s := &Server{cfg: cfg, Stats: &intercept.Stats{}, state: st}
+	if len(cfg.DDNS) > 0 {
+		s.ddns = make(map[string]*ddnsCheckState, len(cfg.DDNS))
+		for _, d := range cfg.DDNS {
+			s.ddns[d] = &ddnsCheckState{}
+		}
+		logf("DDNS：已配置 %d 个域名（token 叠加域名条目、既有端点全保留；自检随公网端点探测同拍跑）", len(cfg.DDNS))
 	}
 	// DNS 代答（dns-host-resolver）：任意目的 :53 的隧道查询改写进本机代答，
 	// 上游 = 主机系统解析（resolv.conf 跟随；启动时暂无上游不致命——空表周期
@@ -244,13 +282,13 @@ func Start(cfg ServeConfig) (*Server, error) {
 	// 终端会话留的（拨隧道IP:7724 的长连接，别设太短）。
 	// 本机服务承载映射（exit-service-uds）：files/term/测速 的豁免端口改投 UDS。
 	// 静态路径、建后不改——服务监听失败时条目保留，socket 文件不存在、拨号 ENOENT
-	// 快速失败回 RST（与端口没人听不可区分）。
+	// 快速失败回 RST（与端口没人听不可区分）。落点 = 注入的瞬态目录（D3 拆分表）。
 	var localSvcs map[uint16]string
-	if cfg.StateDir != "" {
+	if cfg.sockDir() != "" {
 		localSvcs = map[uint16]string{
-			cfg.FilesPort:     filepath.Join(cfg.StateDir, "files.sock"),
-			cfg.TermPort:      filepath.Join(cfg.StateDir, "term.sock"),
-			cfg.SpeedtestPort: filepath.Join(cfg.StateDir, "speedtest.sock"),
+			cfg.FilesPort:     filepath.Join(cfg.sockDir(), "files.sock"),
+			cfg.TermPort:      filepath.Join(cfg.sockDir(), "term.sock"),
+			cfg.SpeedtestPort: filepath.Join(cfg.sockDir(), "speedtest.sock"),
 		}
 	}
 	inter, ierr := intercept.Attach(ns, intercept.Config{
@@ -269,6 +307,7 @@ func Start(cfg ServeConfig) (*Server, error) {
 		return nil, ierr
 	}
 	s.stopIntercept = inter.Close
+	s.inter = inter
 	s.bindIface = resolvedIf
 	s.priv = priv
 	if len(secrets) > 0 {
@@ -335,8 +374,9 @@ func Start(cfg ServeConfig) (*Server, error) {
 
 	// 公网端点自动公布（UPnP 映射 + 同 socket STUN 观测；两条证据一致才写 public_endpoint.txt）。
 	// 必须放在 IpcSet 之后：device 到这一刻才打开 Bind（socket 有了端口，STUN 才有意义）。
-	s.StartPublicEndpoint(context.Background(), PublicOpts{
-		StateDir: cfg.StateDir, UPnP: cfg.UPnP, STUN: cfg.STUN, STUN6: cfg.STUN6, Bind: sbind,
+	// 循环挂角色 ctx（观测面随角色收工）；端口/端点文件落注入的 L3 目录。
+	s.StartPublicEndpoint(ctx, PublicOpts{
+		PortFileDir: cfg.portDir(), UPnP: cfg.UPnP, STUN: cfg.STUN, STUN6: cfg.STUN6, Bind: sbind,
 		Pinned: cfg.BindAddr.IsValid() || resolvedIf != nil, Logf: logf,
 	})
 
@@ -351,7 +391,7 @@ func Start(cfg ServeConfig) (*Server, error) {
 		logf("⚠️ files 根目录不可用（%v）—— 文件管理会报错，其余功能不受影响", err)
 	} else {
 		fsrv.SetLogger(dlogf)
-		fsock, fln, fown, lerr := listenLocalService(cfg.StateDir, "files.sock")
+		fsock, fln, fown, lerr := listenLocalService(cfg.sockDir(), "files.sock")
 		if lerr != nil {
 			fsrv.Close()
 			logf("⚠️ files 监听 %s 失败（%v）—— 文件管理会报错（state 目录异常/被其它实例占用），其余功能不受影响", fsock, lerr)
@@ -380,8 +420,10 @@ func Start(cfg ServeConfig) (*Server, error) {
 	if term.Disabled() {
 		logf("term 服务被 HOMEWAY_TERM=off 关闭")
 	} else {
-		tsrv := term.New(dlogf, cfg.StateDir)
-		tsock, tln, town, terr := listenLocalService(cfg.StateDir, "term.sock")
+		// stateDir 参数 = manifest 覆盖目录基（<dir>/agent-detection/）：取瞬态根
+		//（统一布局下 = state 根，与迁移后旧根的落点一致）。
+		tsrv := term.New(dlogf, cfg.sockDir())
+		tsock, tln, town, terr := listenLocalService(cfg.sockDir(), "term.sock")
 		if terr != nil {
 			// 与 files 同一取舍：可选服务起不来不影响隧道/转发。
 			logf("⚠️ term 监听 %s 失败（%v）—— 终端功能会报错（state 目录异常/被其它实例占用），其余功能不受影响", tsock, terr)
@@ -419,11 +461,11 @@ func Start(cfg ServeConfig) (*Server, error) {
 	// 并发 ≤8、单连接 30s 硬超时，超限拒绝并计数。
 	// StateDir 为空 = 无处放 socket，整段不启用——否则会静默退化成「回环 TCP 同端口」
 	// 语义（tunnel-speedtest design D2）。
-	if cfg.StateDir == "" {
+	if cfg.sockDir() == "" {
 		logf("speedtest 服务未启用（未配置 state 目录）")
 	} else {
 		ssrv := speedtest.NewServer(dlogf)
-		ssock, sln, sown, slerr := listenLocalService(cfg.StateDir, "speedtest.sock")
+		ssock, sln, sown, slerr := listenLocalService(cfg.sockDir(), "speedtest.sock")
 		if slerr != nil {
 			// 与 files/term 同一取舍：可选服务起不来不影响隧道/转发。
 			logf("⚠️ speedtest 监听 %s 失败（%v）—— 测速功能会报错（state 目录异常/被其它实例占用），其余功能不受影响", ssock, slerr)
@@ -531,159 +573,124 @@ func removeSockOwn(path string, own os.FileInfo) {
 	}
 }
 
-// Close 收工（幂等性由各层保证；stop 函数可重复调用部分由调用方保证单次）。
-func (s *Server) Close() {
-	if s.relayCancel != nil {
-		s.relayCancel() // 中继注册腿 + 控制客户端随服务收工（#8）
+// Shutdown 按序收工（role-management 2.1/2.3，design D5 收尾序——serve stop 的存量会话
+// 收尾定稿）。grace = 过境 TCP 存量连接的有界宽限（宽限内**继续承载**、仅拒新流；到期
+// 按登记 SetLinger(0) RST；0 = 即刻拆）。
+//
+//	① 停止接受新 WG 握手与新过境流（intercept 标记停用）
+//	② 关 LocalServices listeners（files/term/speedtest.sock——在世 UDS 腿随 socket 关自然收口）
+//	③ 过境 TCP 存量连接有界宽限（intercept.Drain：自然收销账 / 到期 RST）
+//	④ 关 WG UDP socket（UDP 会话无收尾概念，即刻终结）
+//	⑤ 停 DNS 代答与 UPnP/STUN 观测、中继注册腿注销、本机服务收工、关日志
+func (s *Server) Shutdown(grace time.Duration) {
+	// ①+③：intercept 的停新流与宽限收尾；② 夹在两者之间（listeners 先关，存量过境
+	// 连接在宽限内继续承载——「stop 后还能通最多 10s」是显式语义，r1 中-5）。
+	if s.inter != nil {
+		s.inter.HaltNew() // ① 停新流（新过境流回 RST / ICMP 不可达）
 	}
-	if s.stopIntercept != nil {
+	s.closeLocalListeners() // ②
+	if s.inter != nil {
+		s.inter.Drain(grace) // ③（幂等含 ①）
+	} else if s.stopIntercept != nil {
 		s.stopIntercept()
+	}
+	if s.dev != nil { // ④ 关 WG UDP（UDP 会话即刻终结）
+		s.dev.Close()
+	}
+	// ⑤ 中继注册腿注销 + DNS 代答 + 本机服务对象 + UPnP 缩租 + 日志。
+	if s.relayCancel != nil {
+		s.relayCancel()
 	}
 	if s.dnsSrv != nil {
 		s.dnsSrv.Close()
 	}
-	if s.dev != nil {
-		s.dev.Close()
-	}
+	s.shrinkUPnPClease()
 	if s.filesLn != nil {
 		s.filesLn.Close()
 		removeSockOwn(s.filesSock, s.filesOwn)
+		s.filesLn = nil
 	}
 	if s.files != nil {
 		s.files.Close()
+		s.files = nil
+	}
+	if s.termLn != nil {
+		s.termLn.Close()
+		removeSockOwn(s.termSock, s.termOwn)
+		s.termLn = nil
+	}
+	if s.termSrv != nil {
+		s.termSrv.Close()
+		s.termSrv = nil
+	}
+	if s.speedLn != nil {
+		s.speedLn.Close()
+		removeSockOwn(s.speedSock, s.speedOwn)
+		s.speedLn = nil
+	}
+	if s.speedSrv != nil {
+		s.speedSrv.Close() // 断开在跑的测速会话（内存态，无盘面残留）
+		s.speedSrv = nil
+	}
+	closeLogs()
+}
+
+// Close 全停收工（在途过境 TCP 即刻拆——teardown 语义；宽限收尾走 Shutdown）。
+// 兼容旧调用面（Run 失败路径/测试）：等价 Shutdown(0) + intercept teardown。
+func (s *Server) Close() {
+	if s.inter != nil {
+		s.inter.Close() // teardown：在途 TCP 立即拆（不走宽限）
+	}
+	s.Shutdown(0)
+}
+
+// closeLocalListeners：D5 步骤②——只关监听与摘 socket 文件（服务对象随后统一收，
+// 存量会话由各服务 Close 终结）。
+func (s *Server) closeLocalListeners() {
+	if s.filesLn != nil {
+		s.filesLn.Close()
+		removeSockOwn(s.filesSock, s.filesOwn)
 	}
 	if s.termLn != nil {
 		s.termLn.Close()
 		removeSockOwn(s.termSock, s.termOwn)
 	}
-	if s.termSrv != nil {
-		s.termSrv.Close()
-	}
 	if s.speedLn != nil {
 		s.speedLn.Close()
 		removeSockOwn(s.speedSock, s.speedOwn)
 	}
-	if s.speedSrv != nil {
-		s.speedSrv.Close() // 断开在跑的测速会话（内存态，无盘面残留）
-	}
-	closeLogs()
 }
 
-// Run 阻塞直到 ctx 结束。
+// shrinkUPnPClease：退出时把映射**租期缩短**（而不是删除）：路由器表就是我们"上次用的
+// 外口"的记忆——快速重启（升级/换二进制）能沿用同一个公网端口；出口真退休了，5 分钟后
+// 映射自动消失，不会像旧栈那样在路由器里留一堆永久的。异常退出（kill -9）保持原租期
+// （≤1 小时）后过期。
+func (s *Server) shrinkUPnPClease() {
+	if !s.cfg.UPnP {
+		return
+	}
+	ctx2, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+	defer cancel()
+	if g, local, err := FindIGD(ctx2); err == nil {
+		// 认领用**实际监听口**（映射的内网口是按实际口申请的——监听口被占会 +1…+9 退让）。
+		// 传配置口时自己的映射会撞上 InternalPort≠listenPort + portInUse(实际口)=自己
+		// ⇒ 判 ownerLiveSibling 认领失败 ⇒ 缩租期静默跳过（评审整改 2026-09-22）。
+		port := s.bind.LocalPort()
+		if port == 0 {
+			port = s.cfg.ListenPort // socket 从没开起来的极端形态：退回配置口（多半也认领不到）
+		}
+		if ext, internal, ok := g.FindOurMapping(ctx2, upnpMapDesc, local, port); ok {
+			if err := g.ReAddShortLease(ctx2, ext, local, internal, 300); err == nil {
+				logf("UPnP：退出前把映射 外部 %d 的租期缩到 5 分钟（快速重启仍会沿用这个端口）", ext)
+			}
+		}
+	}
+}
+
+// Run 阻塞直到 ctx 结束（前台单角色形态入口；统一进程经 Role 挂 supervisor——同一条
+// 生命周期，role-management 2.1 D3）。
 func Run(ctx context.Context, cfg ServeConfig) error {
-	s, err := Start(cfg)
-	if err != nil {
-		return err
-	}
-	// 把**实际**监听端口落盘：端口冲突会自动退让（见 ServerBind.Open），`issue` 需要知道真实端口
-	// 才能把 LAN 端点写对（不写这个文件的话，回退端口后 token 里的端口就是错的）。
-	go func() {
-		p := waitLocalPort(context.Background(), s.bind, 30*time.Second)
-		if p == 0 {
-			return
-		}
-		if p != cfg.ListenPort {
-			// 端口变了 = token 里的端口跟着变：按用户口径这属于「IP/端口变化」，走终端。
-			ulogf("⚠️ 实际监听端口 %d（配置的 %d 被占用，已自动退让）—— token 里的端口以公布/签发为准", p, cfg.ListenPort)
-		}
-		if werr := os.WriteFile(ListenPortPath(cfg.StateDir), []byte(strconv.Itoa(int(p))+"\n"), 0o600); werr != nil {
-			logf("监听端口落盘失败（%v）—— 只是少了给人看的记录，不影响隧道", werr)
-		}
-	}()
-	// 身份标签：中继日志里的「后端 <label> 注册成功」就是它（排障时对得上号）。
-	label := BackendLabel(s.priv)
-	pub6 := PubFromPriv(s.priv)
-	logf("后端身份：标签 %x ｜公钥 %x…", label, pub6[:6])
-
-	// 终端兜底：终端一辈子只打一轮 token（2026-09-21 用户口径），所以这一轮必须打
-	// 「此刻能拿到的最好版本」——等第一轮公网探测结束（成不成都算）再决定；探测被关
-	// （--upnp=false --stun=''，firstProbe==nil）时 15s 后兜底。打印仍被 relay 闸/端口闸
-	// 拦下的话每秒重试一小会儿（中继注册腿偶尔慢于探测轮，别急着放弃）。
-	go func() {
-		if s.firstProbe != nil {
-			select {
-			case <-s.firstProbe:
-			case <-ctx.Done():
-				return
-			}
-		} else {
-			select {
-			case <-ctx.Done():
-				return
-			case <-time.After(15 * time.Second):
-			}
-		}
-		for i := 0; i < 10; i++ {
-			s.tokMu.Lock()
-			printed := s.lastToken != ""
-			pub := s.lastPublished
-			s.tokMu.Unlock()
-			if printed {
-				return
-			}
-			s.printClientToken(pub)
-			s.tokMu.Lock()
-			printed = s.lastToken != ""
-			s.tokMu.Unlock()
-			if printed {
-				return
-			}
-			select {
-			case <-ctx.Done():
-				return
-			case <-time.After(1 * time.Second):
-			}
-		}
-	}()
-
-	// 默认路径能不能承载 UDP：周期探测 + 探测应答里回报（转发流量一律走默认路由，这是它的属性）。
-	s.startUDPCapProbe(ctx, dlogf)
-	// 设备表周期回收：只清「超过 TTL 没有成功注册」的失联设备（在线设备被客户端周期注册刷新，
-	// 不会误收）。10 分钟一拍、±10% 抖动；TTL<=0 时这个 goroutine 直接返回。
-	go s.Table.RunGC(ctx, 10*time.Minute)
-	// 换网自愈：绑了物理网卡时，网卡索引/地址变化后重钉 socket 并立刻重测公网端点
-	// （否则接口索引一变，socket 就钉在一个不存在的网卡上；端点也会 stale 到下一轮 10 分钟）。
-	if s.bindIface != nil && cfg.BindAddr.IsValid() == false {
-		WatchBind(ctx, BindWatchOpts{
-			Explicit: cfg.BindIface, // auto 模式传 nil（每次重新挑）
-			Repin: func(ifi *net.Interface) error {
-				if _, err := s.bind.RepinTo(ifi); err != nil {
-					return err
-				}
-				s.bindIface = ifi
-				return nil
-			},
-			OnChange: func() {
-				s.KickPublicEndpoint() // 端点要重测（可能换网/换 IP）
-				s.KickUDPCapProbe()    // UDP 能力也要重测（换了条路）
-			},
-			Logf: logf,
-		})
-	}
-	<-ctx.Done()
-	// 退出时把映射**租期缩短**（而不是删除）：路由器表就是我们"上次用的外口"的记忆 ——
-	// 快速重启（升级/换二进制）能沿用同一个公网端口；出口真退休了，5 分钟后映射自动消失，
-	// 不会像旧栈那样在路由器里留一堆永久的。异常退出（kill -9）保持原租期（≤1 小时）后过期。
-	if cfg.UPnP {
-		ctx2, cancel := context.WithTimeout(context.Background(), 8*time.Second)
-		if g, local, err := FindIGD(ctx2); err == nil {
-			// 认领用**实际监听口**（映射的内网口是按实际口申请的——监听口被占会 +1…+9 退让）。
-			// 传配置口时自己的映射会撞上 InternalPort≠listenPort + portInUse(实际口)=自己
-			// ⇒ 判 ownerLiveSibling 认领失败 ⇒ 缩租期静默跳过（评审整改 2026-09-22）。
-			port := s.bind.LocalPort()
-			if port == 0 {
-				port = cfg.ListenPort // socket 从没开起来的极端形态：退回配置口（多半也认领不到）
-			}
-			if ext, internal, ok := g.FindOurMapping(ctx2, upnpMapDesc, local, port); ok {
-				if err := g.ReAddShortLease(ctx2, ext, local, internal, 300); err == nil {
-					logf("UPnP：退出前把映射 外部 %d 的租期缩到 5 分钟（快速重启仍会沿用这个端口）", ext)
-				}
-			}
-		}
-		cancel()
-	}
-	s.Close()
-	return nil
+	return NewRole(cfg).Run(ctx)
 }
 
 // ipcConfigurer：PeerTable 表项 → device IpcSet。

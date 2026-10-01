@@ -69,7 +69,7 @@ func TestHostCLINoDaemonActionableError(t *testing.T) {
 			t.Fatalf("%v：无 daemon 应报错", args)
 		} else {
 			msg := err.Error()
-			for _, want := range []string{"homeway daemon 未在运行", "control.sock", "homeway daemon --state"} {
+			for _, want := range []string{"homeway daemon 未在运行", "control.sock", "homeway --state"} {
 				if !strings.Contains(msg, want) {
 					t.Fatalf("%v：可行动错误缺 %q：%s", args, want, msg)
 				}
@@ -263,21 +263,18 @@ func TestHostCLIDeleteScenarios(t *testing.T) {
 	}
 }
 
-// TestDaemonDispatchB15 daemon 分发红绿（B15）：`--state X status` 不再静默起
-// 守护进程（NArg 检查）+ `daemon --help` 正常化（ErrHelp→nil）。
+// TestDaemonDispatchB15 daemon 分发红绿（B15 面平移）：非子命令形态报错且不留
+// 守护进程痕迹（daemon 本体已并入统一进程——裸调/flag 形态 = 迁移提示，role-management
+// 2.3）；host 子命令经 daemon.CLI 分发可用。
 func TestDaemonDispatchB15(t *testing.T) {
 	dir := shortTempDirDaemon(t)
-	// NArg：意外位置参数报错（不取锁、不建 state 布局）。
+	// 旧守护进程形态（flag/裸调）= 迁移提示报错（不取锁、不建 state 布局）。
 	err := CLI([]string{"--state", dir, "status"}, "cli-test")
-	if err == nil || !strings.Contains(err.Error(), "不接受位置参数") {
-		t.Fatalf("--state X status 应报错（此前静默起守护进程）：%v", err)
+	if err == nil || !strings.Contains(err.Error(), "已并入统一进程") {
+		t.Fatalf("非子命令形态应报迁移提示（不再静默起守护进程）：%v", err)
 	}
 	if _, serr := os.Stat(filepath.Join(dir, control.ControlSockName)); serr == nil {
 		t.Fatal("分发报错路径不得留下守护进程痕迹")
-	}
-	// --help：exit 0（此前 flag: help requested + exit 1）。
-	if err := CLI([]string{"--help"}, "cli-test"); err != nil {
-		t.Fatalf("daemon --help 应正常退出：%v", err)
 	}
 	// host 子命令经 daemon.CLI 分发可用。
 	if err := CLI([]string{"host", "list", "--state", dir}, "cli-test"); err == nil {

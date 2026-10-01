@@ -31,6 +31,11 @@ type Options struct {
 	// pkg/probe.Reach，daemon 侧测试注入假探测的注入点，r1 低-10；nil =
 	// pkg/probe.Reach）。
 	Probe func(ctx context.Context, token string) (*probe.ReachReport, error)
+	// EndpointCacheDir / Out client 侧 L3 路径注入（role-management D3 拆分表
+	// r1 高-2：统一进程注入 <state>/cache/endpoints 与 cache 下的会话日志；**空 =
+	// 现状按 Attach 的 stateDir 推导**——手机侧（clientcore cshared 面）不传零影响）。
+	EndpointCacheDir string
+	Out              string
 }
 
 // Daemon 进程级 facade 对象：总线、代际、词汇接线都在这一层；主机表（角色级，

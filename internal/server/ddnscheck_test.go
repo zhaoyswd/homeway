@@ -25,7 +25,7 @@ func TestTokenEndpointsDDNSAppend(t *testing.T) {
 	defer b.Close()
 	listen := b.LocalPort()
 
-	s := &Server{bind: b, cfg: ServeConfig{DDNS: "home.example.com"}}
+	s := &Server{bind: b, cfg: ServeConfig{DDNS: []string{"home.example.com"}}}
 	published := []string{"203.0.113.7:41641"}
 	eps, labels := s.tokenEndpoints(published, listen)
 
@@ -52,7 +52,7 @@ func TestTokenEndpointsDDNSAppend(t *testing.T) {
 }
 
 func TestTokenEndpointsDDNSPortFallback(t *testing.T) {
-	s := &Server{cfg: ServeConfig{DDNS: "home.example.com"}}
+	s := &Server{cfg: ServeConfig{DDNS: []string{"home.example.com"}}}
 	eps, _ := s.tokenEndpoints(nil, 41643) // 无公网观测 + 监听口退让过
 	found := false
 	for _, e := range eps {
@@ -107,7 +107,7 @@ func (c *ddnsLogCapture) count(substr string) int {
 
 func newSelfCheckServer(t *testing.T, published []string) *Server {
 	t.Helper()
-	s := &Server{cfg: ServeConfig{DDNS: "home.example.com"}, ddns: &ddnsCheckState{}}
+	s := &Server{cfg: ServeConfig{DDNS: []string{"home.example.com"}}, ddns: map[string]*ddnsCheckState{"home.example.com": {}}}
 	s.tokMu.Lock()
 	s.lastPublished = published
 	s.tokMu.Unlock()
@@ -200,8 +200,8 @@ func TestDDNSSelfCheckResolveFailureLogsOnce(t *testing.T) {
 		t.Fatalf("连续解析失败只应打第一拍，日志：%v", lc.lines)
 	}
 	// 解析失败不推进 mismatchStreak（后续恢复后单拍不一致不告警）。
-	if s.ddns.mismatchStreak != 0 {
-		t.Fatalf("解析失败不应计入不一致拍数：%d", s.ddns.mismatchStreak)
+	if s.ddns["home.example.com"].mismatchStreak != 0 {
+		t.Fatalf("解析失败不应计入不一致拍数：%d", s.ddns["home.example.com"].mismatchStreak)
 	}
 }
 

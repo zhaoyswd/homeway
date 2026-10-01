@@ -35,13 +35,15 @@ const (
 	publicFile        = "public_endpoint.txt"
 )
 
-// PublicOpts 公网端点探测的开关（都来自 serve 的 flag）。
+// PublicOpts 公网端点探测的开关（都来自 serve 的 flag/config）。
 type PublicOpts struct {
-	StateDir string
-	UPnP     bool
-	STUN     string // "" = 不做 STUN 观测；否则是 host:port（IPv4 映射）
-	STUN6    string // "" = 跳过 IPv6 校验；否则是有 AAAA 的 STUN 服务器
-	Bind     *servercore.ServerBind
+	// PortFileDir：listen_port.txt / public_endpoint.txt 的落点目录（D3 拆分表的
+	// L3 注入；空 = 无处落——纯测试形态）。
+	PortFileDir string
+	UPnP        bool
+	STUN        string // "" = 不做 STUN 观测；否则是 host:port（IPv4 映射）
+	STUN6       string // "" = 跳过 IPv6 校验；否则是有 AAAA 的 STUN 服务器
+	Bind        *servercore.ServerBind
 	// Pinned：WG socket 已绑物理网卡（--bind-interface）。钉住之后 STUN 观测到的 IP 必然是
 	// 这台机器在路由器 WAN 侧的地址（不会是被代理改写过的），所以「外口 != 监听口」时也敢用
 	// STUN 的 IP + UPnP 的外口拼端点；没钉住时保守起见要求两者端口一致。
@@ -59,7 +61,7 @@ func PublicEndpointPath(stateDir string) string { return filepath.Join(stateDir,
 // StartPublicEndpoint 起后台循环（非阻塞）。--ddns 自检挂在本循环同拍（endpoint-freshness）。
 func (s *Server) StartPublicEndpoint(ctx context.Context, opts PublicOpts) {
 	if !opts.UPnP && opts.STUN == "" {
-		if s.cfg.DDNS != "" {
+		if len(s.cfg.DDNS) > 0 {
 			logf("DDNS：公网端点探测未开（--upnp=false --stun=''），自检没有观测可比对、跳过；" +
 				"token 的域名条目端口按实际监听口")
 		}
@@ -200,8 +202,8 @@ func (s *Server) refreshPublicEndpoint(ctx context.Context, opts PublicOpts) boo
 		logf("公网端点：未配置 --stun6（需要有 AAAA 的 STUN 服务器），跳过 IPv6 公布")
 	}
 
-	if err := os.WriteFile(PublicEndpointPath(opts.StateDir), []byte(strings.Join(lines, "\n")+"\n"), 0o600); err != nil {
-		logf("公网端点：写 %s 失败（%v）", PublicEndpointPath(opts.StateDir), err)
+	if err := os.WriteFile(PublicEndpointPath(opts.PortFileDir), []byte(strings.Join(lines, "\n")+"\n"), 0o600); err != nil {
+		logf("公网端点：写 %s 失败（%v）", PublicEndpointPath(opts.PortFileDir), err)
 		return false
 	}
 	logf("公网端点：已公布 %v（写进 %s；下次签发 token 会带上它）", lines, publicFile)
@@ -241,13 +243,17 @@ func (s *Server) tokenEndpoints(published []string, listenPort uint16) (eps []pr
 	for _, a := range published {
 		add(proto.Endpoint{Addr: a}, "公网")
 	}
-	if s.cfg.DDNS != "" {
+	// DDNS 域名条目（多条，叠加不踢除，B-1 拍板）：端口口径 = 已公布公网端点的外部
+	// 端口；无公网观测时回退实际监听口。
+	if len(s.cfg.DDNS) > 0 {
 		p := ddnsEntryPort(published, listenPort)
 		if p != 0 {
-			add(proto.Endpoint{Addr: net.JoinHostPort(s.cfg.DDNS, strconv.Itoa(int(p)))}, "域名")
+			for _, domain := range s.cfg.DDNS {
+				add(proto.Endpoint{Addr: net.JoinHostPort(domain, strconv.Itoa(int(p)))}, "域名")
+			}
 		} else {
 			// listenPort=0 的调用形态（探测应答的即时快照）：域名条目这轮缺席，下一轮补上。
-			dlogf("域名条目：本轮拿不到端口（socket 未开？），token/列表暂不带 --ddns 条目")
+			dlogf("域名条目：本轮拿不到端口（socket 未开？），token/列表暂不带 ddns 条目")
 		}
 	}
 	if s.relayEp.Addr != "" {
@@ -303,6 +309,14 @@ func (s *Server) printClientToken(published []string) {
 	if err != nil {
 		logf("客户端 token 生成失败（%v）", err)
 		return
+	}
+	// 台账写入纪律（role-management 2.4，r1 高-1 / r2 新-1）：每次铸出与台账末行不同的
+	// token 即追加（含启动首轮；无变化不追加——去重收在 AppendToken 内，进程内存
+	// lastToken 只管终端一轮制）。「台账末行 = 最近在用 token」由此成为不变量。
+	if s.state != nil {
+		if aerr := s.state.AppendToken(s.secret, eps); aerr != nil {
+			logf("⚠️ token 台账追加失败（%v）——台账末行可能与在用 token 短暂不一致", aerr)
+		}
 	}
 	s.tokMu.Lock()
 	if tok == s.lastToken {

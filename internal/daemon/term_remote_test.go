@@ -569,7 +569,7 @@ func TestControlDialErrStates(t *testing.T) {
 		want []string
 	}{
 		{"ENOENT", &fs.PathError{Op: "dial", Path: sock, Err: syscall.ENOENT},
-			[]string{"daemon 未在运行", "--state 指守护进程 state", "homeway daemon --state"}},
+			[]string{"daemon 未在运行", "--state 指统一 state 根", "homeway --state"}},
 		{"ECONNREFUSED", &net.OpError{Op: "dial", Err: os.NewSyscallError("connect", syscall.ECONNREFUSED)},
 			[]string{"残留 socket"}},
 		{"EACCES", &net.OpError{Op: "dial", Err: os.NewSyscallError("connect", syscall.EACCES)},
@@ -668,7 +668,7 @@ func TestTermRemoteDialOpenErrors(t *testing.T) {
 	ctx, cancel = rtCtx(t)
 	_, err = r.DialTerm(ctx, nodir, rig.macID)
 	cancel()
-	if err == nil || !strings.Contains(err.Error(), "daemon 未在运行") || !strings.Contains(err.Error(), "--state 指守护进程 state") {
+	if err == nil || !strings.Contains(err.Error(), "daemon 未在运行") || !strings.Contains(err.Error(), "--state 指统一 state 根") {
 		t.Fatalf("连接层文案（含 --state 指代提示）：%v", err)
 	}
 }

@@ -1,4 +1,4 @@
-package daemon
+package nodestate
 
 // lock_test.go — 单实例锁（host-registry-daemon 2.1，HD「守护进程单实例」两场景）：
 // 二次实例失败（文案含 pid 与角色）、模拟崩溃后 flock 自动释放（子进程持锁被 KILL，

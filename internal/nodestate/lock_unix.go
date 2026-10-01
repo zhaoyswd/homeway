@@ -1,6 +1,6 @@
 //go:build unix
 
-package daemon
+package nodestate
 
 import "golang.org/x/sys/unix"
 

@@ -115,6 +115,9 @@ type hostTable struct {
 	eventf   func(format string, args ...any)
 	events   TableEvents
 	hooks    tableHooks
+	// endpointCacheDir / out L3 注入（空 = 按 stateDir 推导）。
+	endpointCacheDir string
+	out              string
 	// carried 装载时 id 非法条目的原样携带：不启动会话、不进寻址面（Hosts/
 	// Sessions 均不含），但**落盘时随有效记录一并写回**——「条目保留」由
 	// recordsLocked 兑现（改前装载日志声称保留、下次落盘却把它写掉）。
@@ -129,6 +132,10 @@ type tableOptions struct {
 	logf   func(format string, args ...any)
 	eventf func(format string, args ...any)
 	events TableEvents
+	// endpointCacheDir / out client 侧 L3 注入（Options.EndpointCacheDir/Out；
+	// 空 = 按 stateDir 推导——现状缺省，role-management D3 拆分表 r1 高-2）。
+	endpointCacheDir string
+	out              string
 	// hooks 每主机会话的 Demand/Diag 钩子装配缝（§6.1/§6.3：注入 hostsession
 	// Options——桌面门与诊因发射的接线点；nil = 不接线）。
 	hooks tableHooks
@@ -146,13 +153,15 @@ type tableHooks func(rec HostRecord, e *hostEntry) (demand func() (bool, string)
 // （先于会话启动），防御性收尾对后续新增的失败点同样成立。
 func openTable(stateDir string, opts tableOptions) (*hostTable, error) {
 	r := &hostTable{
-		stateDir: stateDir,
-		hosts:    make(map[[32]byte]*hostEntry),
-		strict:   opts.strict,
-		logf:     opts.logf,
-		eventf:   opts.eventf,
-		events:   opts.events,
-		hooks:    opts.hooks,
+		stateDir:         stateDir,
+		hosts:            make(map[[32]byte]*hostEntry),
+		strict:           opts.strict,
+		logf:             opts.logf,
+		eventf:           opts.eventf,
+		events:           opts.events,
+		hooks:            opts.hooks,
+		endpointCacheDir: opts.endpointCacheDir,
+		out:              opts.out,
 	}
 	if r.logf == nil {
 		r.logf = func(string, ...any) {}
@@ -201,11 +210,21 @@ func newHostEntry(rec HostRecord) *hostEntry {
 // 裂成孤儿 dm；调用方持锁）。
 func (r *hostTable) startSessionLocked(e *hostEntry) {
 	rec := e.rec
+	// L3 注入（D3 拆分表）：统一进程把端点缓存/会话日志落 <state>/cache/；
+	// 空 = 现状按 stateDir 推导（identity 恒在 L2 stateDir——身份与 hosts 表是一对）。
+	endpointCacheDir := r.endpointCacheDir
+	if endpointCacheDir == "" {
+		endpointCacheDir = filepath.Join(r.stateDir, "endpoints") // 现布局天然按 peerID 分文件
+	}
+	out := r.out
+	if out == "" {
+		out = filepath.Join(r.stateDir, "debug.log") // 追加写；分级/轮转沿出口口径
+	}
 	cfg := hostsession.Config{
 		Token:            rec.Token,
-		IdentityDir:      filepath.Join(r.stateDir, "identity"),  // 复用 wtransport 机制
-		EndpointCacheDir: filepath.Join(r.stateDir, "endpoints"), // 现布局天然按 peerID 分文件
-		Out:              filepath.Join(r.stateDir, "debug.log"), // 追加写；分级/轮转沿出口口径
+		IdentityDir:      filepath.Join(r.stateDir, "identity"), // 复用 wtransport 机制
+		EndpointCacheDir: endpointCacheDir,
+		Out:              out,
 	}
 	var obs hostsession.Observer
 	if r.events != nil {
@@ -553,11 +572,13 @@ func (d *Daemon) Attach(stateDir string) error {
 		old.Close()
 	}
 	tbl, err := openTable(stateDir, tableOptions{
-		strict: d.opts.StrictIdentity,
-		logf:   d.opts.Logf,
-		eventf: d.opts.Eventf,
-		events: &busEvents{bus: d.bus}, // §3.2 事件源直发总线
-		hooks:  d.sessionHooks,         // §6：桌面门 + 诊因发射接线（Demand/Diag → hostsession Options）
+		strict:           d.opts.StrictIdentity,
+		logf:             d.opts.Logf,
+		eventf:           d.opts.Eventf,
+		events:           &busEvents{bus: d.bus}, // §3.2 事件源直发总线
+		hooks:            d.sessionHooks,         // §6：桌面门 + 诊因发射接线（Demand/Diag → hostsession Options）
+		endpointCacheDir: d.opts.EndpointCacheDir,
+		out:              d.opts.Out,
 	})
 	if err != nil {
 		// 契约②：表未挂载（d.table 保持 nil = 未 attach 态）。

@@ -56,7 +56,7 @@ func statusCLI(args []string, version string, w io.Writer) error {
 	if err != nil {
 		// 可行动错误：直跑/托管两类场景里 status 属托管——未运行是常态而非异常，
 		// 错误文案给出启动命令（spec「归属决定连接语义」场景）。
-		return fmt.Errorf("homeway daemon 未在运行（sock=%s：%v）\n先启动：homeway daemon --state %s", sock, err, *stateDir)
+		return fmt.Errorf("homeway daemon 未在运行（sock=%s：%v）\n先启动：homeway --state %s（零参统一进程）", sock, err, *stateDir)
 	}
 	defer c.Close()
 	raw, err := c.Request(ctx, facade.OpDaemonStatus, nil)

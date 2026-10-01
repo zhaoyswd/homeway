@@ -35,13 +35,14 @@ func (p *panicRole) Run(ctx context.Context) error {
 func TestRolePanicRebuildsBoundedAndStaysInProcess(t *testing.T) {
 	role := &panicRole{name: "test-role", panics: 2, ranClean: make(chan struct{})}
 	var makes atomic.Int32
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 	sup := newSupervisor(
+		ctx,
 		func(format string, args ...any) {},
 		func(format string, args ...any) {},
 	)
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	sup.Start(ctx, func() Role {
+	sup.Start("test-role", func() Role {
 		makes.Add(1)
 		return role // 同一实例继续消耗 panics 计数（等价于重建新实例）
 	}, []time.Duration{time.Millisecond, 2 * time.Millisecond})
@@ -84,10 +85,10 @@ func TestRolePanicRebuildsBoundedAndStaysInProcess(t *testing.T) {
 // 稳定失败的角色：退避表耗尽后按表尾节拍继续重建（不退出进程、不无限加密退避）。
 func TestRolePersistentFailureKeepsBoundedRebuild(t *testing.T) {
 	var runs atomic.Int32
-	sup := newSupervisor(func(string, ...any) {}, func(string, ...any) {})
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	sup.Start(ctx, func() Role {
+	sup := newSupervisor(ctx, func(string, ...any) {}, func(string, ...any) {})
+	sup.Start("always-fail", func() Role {
 		return errorRole{name: "always-fail", runs: &runs}
 	}, []time.Duration{time.Millisecond, 2 * time.Millisecond, 3 * time.Millisecond})
 

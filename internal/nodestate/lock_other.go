@@ -1,6 +1,6 @@
 //go:build !unix
 
-package daemon
+package nodestate
 
 // lockFile 非 unix 降级：恒成功（无单实例互斥；参照 pkg/egress/bind_other.go 先例，
 // host-registry-daemon 2.1/r1 A3）。生产面（macOS/Linux/OHOS）全走 unix 侧 flock；

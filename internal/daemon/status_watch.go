@@ -55,7 +55,7 @@ func statusWatch(ctx context.Context, sock, version, stateDir string, timeout ti
 	c, _, err := control.Dial(dctx, sock, control.FrontendInfo{Kind: "cli", Name: "homeway-watch", Version: version})
 	if err != nil {
 		// 可行动错误与 statusCLI 同款（守护托管读面：未运行是常态，给启动命令）。
-		return fmt.Errorf("homeway daemon 未在运行（sock=%s：%v）\n先启动：homeway daemon --state %s", sock, err, stateDir)
+		return fmt.Errorf("homeway daemon 未在运行（sock=%s：%v）\n先启动：homeway --state %s（零参统一进程）", sock, err, stateDir)
 	}
 	defer c.Close()
 	raw, err := c.Request(dctx, facade.OpSnapshotGet, nil)

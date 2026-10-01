@@ -473,7 +473,7 @@ func startControlPlane(ctx context.Context, version string, stateDir string, sup
 		return fmt.Errorf("控制面监听失败：%w", err)
 	}
 	first := &controlRole{version: version, stateDir: stateDir, sup: sup, d: d, eventf: eventf, srv: srv, ln: ln, sock: sock}
-	sup.Start(ctx, func() Role {
+	sup.Start("control", func() Role {
 		r := first
 		if r != nil {
 			first = nil // 首启注入只此一次；重建轮次走 Run 内重 Listen

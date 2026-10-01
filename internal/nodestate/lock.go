@@ -1,8 +1,10 @@
-package daemon
+package nodestate
 
-// lock.go — 守护进程单实例锁（host-registry-daemon 2.1，HD「守护进程单实例」；D3）。
+// lock.go — 单实例锁（host-registry-daemon 2.1 起；role-management 2.3 起随统一
+// state 合并**全形态共用**：统一进程与 serve/relay 前台单角色都取 <state>/lock，
+// 持有者角色名归一为 homeway——同 state 双进程在任何形态组合下互斥）。
 //
-// flock(LOCK_EX|LOCK_NB) on <state>/lock：取得后写 pid 与**角色名**；拿不到则读出
+// flock(LOCK_EX|LOCK_NB) on <state>/lock：取得后写 pid 与角色名；拿不到则读出
 // 持有 pid 报错退出（文案带角色与 state 路径）。flock 随进程死亡由内核自动释放
 //（无 stale 文件问题；备选「pid 文件 + kill -0 探活」否决：竞态窗口 + 僵尸 pid 误判）。
 // 锁在装配最早处取（先于任何 socket/会话）。
@@ -32,7 +34,7 @@ type InstanceLock struct {
 // AcquireInstanceLock 取 <state>/lock 的排他非阻塞锁；成功写 pid+角色，失败读出
 // 持有者并报错（错误文案带角色与 state 路径——exit 与 daemon 同目录并存时能看出
 // 是谁占的，D2 组合处置）。
-func AcquireInstanceLock(stateDir, role string) (*InstanceLock, error) {
+func AcquireInstanceLock(stateDir, role string) (*InstanceLock, error) { // role：诊断用持有者名（统一进程/前台单角色都写 homeway——归一）
 	if err := os.MkdirAll(stateDir, 0o700); err != nil {
 		return nil, fmt.Errorf("单实例锁：建 state 目录 %s 失败：%w", stateDir, err)
 	}

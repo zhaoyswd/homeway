@@ -109,7 +109,7 @@ func controlDialErr(stateDir, sock string, err error) error {
 			}
 		}
 		return fmt.Errorf("homeway daemon 未在运行（%s 不存在%s）\n"+
-			"--host 模式下 --state 指守护进程 state 目录（默认 ~/.config/homeway/daemon，control.sock 所在）；先启动：homeway daemon --state %s", sock, hint, stateDir)
+			"--host 模式下 --state 指统一 state 根（control.sock 所在）；先启动：homeway --state %s（零参统一进程）", sock, hint, stateDir)
 	case errors.Is(err, syscall.ECONNREFUSED):
 		return fmt.Errorf("连接被拒：%s 像是残留 socket（daemon 进程已退出）；确认 daemon 在跑，或删除该文件后重试", sock)
 	case errors.Is(err, syscall.EACCES), errors.Is(err, syscall.EPERM):

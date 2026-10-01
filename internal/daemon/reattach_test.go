@@ -68,10 +68,7 @@ func (r *reattachRole) Run(ctx context.Context) error {
 // TestReattachKeepsGenerationAndCursor 角色重挂全链（控制面 wire 面）。
 func TestReattachKeepsGenerationAndCursor(t *testing.T) {
 	dir := shortTempDirDaemon(t)
-	st, err := OpenDaemonState(dir)
-	if err != nil {
-		t.Fatal(err)
-	}
+	st := OpenDaemonLogs(dir, dir)
 	t.Cleanup(st.Close)
 	d := facade.New(facade.Options{
 		StrictIdentity: true,
@@ -85,7 +82,6 @@ func TestReattachKeepsGenerationAndCursor(t *testing.T) {
 		},
 	})
 	t.Cleanup(d.Close)
-	sup := newSupervisor(st.Eventf, st.Debugf)
 	role := &reattachRole{
 		stateDir:   dir,
 		st:         st,
@@ -97,7 +93,8 @@ func TestReattachKeepsGenerationAndCursor(t *testing.T) {
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
-	sup.Start(ctx, func() Role { return role }, []time.Duration{50 * time.Millisecond})
+	sup := newSupervisor(ctx, st.Eventf, st.Debugf)
+	sup.Start("client", func() Role { return role }, []time.Duration{50 * time.Millisecond})
 
 	if err := startControlPlane(ctx, "reattach-test", dir, sup, d, st.Eventf); err != nil {
 		t.Fatal(err)

@@ -156,7 +156,7 @@ func TestDaemonStatusWatchNotRunning(t *testing.T) {
 		t.Fatal("未运行时应报错")
 	}
 	msg := err.Error()
-	for _, want := range []string{"homeway daemon 未在运行", "control.sock", "homeway daemon --state"} {
+	for _, want := range []string{"homeway daemon 未在运行", "control.sock", "homeway --state"} {
 		if !bytes.Contains([]byte(msg), []byte(want)) {
 			t.Fatalf("可行动错误缺 %q：%s", want, msg)
 		}
@@ -185,15 +185,12 @@ func TestDaemonStatusWatchUsageAndMutex(t *testing.T) {
 func startWatchableDaemon(t *testing.T) (*facade.Daemon, string, func()) {
 	t.Helper()
 	dir := shortTempDirDaemon(t)
-	st, err := OpenDaemonState(dir)
-	if err != nil {
-		t.Fatal(err)
-	}
+	st := OpenDaemonLogs(dir, dir)
 	d := facade.New(facade.Options{StrictIdentity: true, Logf: st.Debugf, Eventf: st.Eventf, Probe: fakeProbeDirect})
-	sup := newSupervisor(st.Eventf, st.Debugf)
 	ctx, cancel := context.WithCancel(context.Background())
+	sup := newSupervisor(ctx, st.Eventf, st.Debugf)
 	role := newClientRole(dir, st, d)
-	sup.Start(ctx, func() Role { return role }, nil)
+	sup.Start("client", func() Role { return role }, nil)
 	if err := startControlPlane(ctx, "test-daemon", dir, sup, d, st.Eventf); err != nil {
 		cancel()
 		t.Fatal(err)

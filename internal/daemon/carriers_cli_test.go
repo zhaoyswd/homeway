@@ -668,7 +668,7 @@ func TestCarrierCLIsNoDaemonActionableError(t *testing.T) {
 		if err := tc.fn(tc.args, "t", &buf); err == nil {
 			t.Fatalf("%s：无 daemon 应报错", tc.name)
 		} else {
-			for _, want := range []string{"homeway daemon 未在运行", "control.sock", "homeway daemon --state"} {
+			for _, want := range []string{"homeway daemon 未在运行", "control.sock", "homeway --state"} {
 				if !strings.Contains(err.Error(), want) {
 					t.Fatalf("%s：可行动错误缺 %q：%s", tc.name, want, err)
 				}

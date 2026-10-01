@@ -72,14 +72,14 @@ func startRoleDaemon(t *testing.T, stateDir string, ln net.Listener, backoff []t
 	t.Helper()
 	d := facade.New(facade.Options{StrictIdentity: true, Logf: discardLog, Eventf: discardLog})
 	t.Cleanup(d.Close)
-	sup := newSupervisor(discardLog, discardLog)
 	ctx, cancel := context.WithCancel(context.Background())
+	sup := newSupervisor(ctx, discardLog, discardLog)
 	t.Cleanup(func() {
 		cancel()
 		sup.Close()
 	})
 	first := &controlRole{version: "role-test", stateDir: stateDir, sup: sup, d: d, eventf: discardLog, ln: ln, sock: filepath.Join(stateDir, control.ControlSockName)}
-	sup.Start(ctx, func() Role {
+	sup.Start("control", func() Role {
 		r := first
 		if r != nil {
 			first = nil
@@ -274,42 +274,30 @@ func (b *noopBackend) SpeedtestStatus(host string) (control.SpeedtestStatusResul
 }
 func (b *noopBackend) SpeedtestCancel(host string) error { return control.ErrBackendNoHost }
 
-// TestControlRoleV1RolesJsonDefaultOn ④（r2 新-2）：既有 v1 roles.json（仅 client）
-// → 未登记的 control 按默认 on 装配——roles 面可见 control=running、控制面可拨。
-func TestControlRoleV1RolesJsonDefaultOn(t *testing.T) {
+// TestControlRoleAlwaysOnAssembled（role-management 2.3）：roles.json 退役后
+// client/control **恒开**（期望态并入 config，无开关）——roles 面可见二者、
+// control=running、控制面可拨（v1 roles.json「未登记默认 on」用例的观测面平移）。
+func TestControlRoleAlwaysOnAssembled(t *testing.T) {
 	dir := shortTempDirDaemon(t)
-	if err := os.WriteFile(filepath.Join(dir, rolesFileName),
-		[]byte(`{"version":1,"roles":{"client":{"enabled":true}}}`), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	st, err := OpenDaemonState(dir)
-	if err != nil {
-		t.Fatal(err)
-	}
+	st := OpenDaemonLogs(dir, dir)
 	t.Cleanup(st.Close)
-	desired := loadDesiredState(dir, discardLog)
 	d := facade.New(facade.Options{StrictIdentity: true, Logf: st.Debugf, Eventf: st.Eventf})
 	t.Cleanup(d.Close)
-	sup := newSupervisor(st.Eventf, st.Debugf)
 	ctx, cancel := context.WithCancel(context.Background())
+	sup := newSupervisor(ctx, st.Eventf, st.Debugf)
 	t.Cleanup(func() {
 		cancel()
 		sup.Close()
 	})
-	// cli.go 同款装配：client 角色按登记 on；control 未登记 → roleEnabled 默认 on。
-	if desired.roleEnabled("client") {
-		sup.Start(ctx, func() Role { return newClientRole(dir, st, d) }, nil)
-	}
-	if !desired.roleEnabled("control") {
-		t.Fatal("v1 roles.json 未登记 control 应默认 on（r2 新-2）")
-	}
-	if err := startControlPlane(ctx, "v1-test", dir, sup, d, st.Eventf); err != nil {
+	// unified.go 同款装配：client/control 恒开。
+	sup.Start("client", func() Role { return newClientRole(dir, st, d) }, nil)
+	if err := startControlPlane(ctx, "always-on-test", dir, sup, d, st.Eventf); err != nil {
 		t.Fatal(err)
 	}
 	sock := waitControlReady(t, dir)
 	cctx, ccancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer ccancel()
-	c, _, err := control.Dial(cctx, sock, control.FrontendInfo{Kind: "cli", Name: "v1", Version: "0"})
+	c, _, err := control.Dial(cctx, sock, control.FrontendInfo{Kind: "cli", Name: "always-on", Version: "0"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -318,8 +306,7 @@ func TestControlRoleV1RolesJsonDefaultOn(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// roles 面应同时可见 client 与 control（control=running）。
-	sawControl := false
+	sawControl, sawClient := false, false
 	for _, r := range parseRolesBrief(t, raw) {
 		if r.Name == "control" {
 			sawControl = true
@@ -327,13 +314,15 @@ func TestControlRoleV1RolesJsonDefaultOn(t *testing.T) {
 				t.Fatalf("control 角色应 running：%+v", r)
 			}
 		}
+		if r.Name == "client" {
+			sawClient = true
+		}
 	}
-	if !sawControl {
-		t.Fatal("roles 面未见 control（v1 未登记默认 on 的兼容判据断）")
+	if !sawControl || !sawClient {
+		t.Fatalf("client/control 恒开：roles 面应同时可见二者（control=%v client=%v）", sawControl, sawClient)
 	}
 }
 
-// parseRolesBrief daemon.status 载荷里的 roles 面（最小解析）。
 func parseRolesBrief(t *testing.T, raw []byte) []control.RoleBrief {
 	t.Helper()
 	var st struct {
@@ -345,9 +334,6 @@ func parseRolesBrief(t *testing.T, raw []byte) []control.RoleBrief {
 	return st.Roles
 }
 
-// TestControlPlaneFirstListenFailFast ⑤（r3 低-3 / r2 新-4 拍板）：首启 Listen 失败
-// 保留 fail-fast——sock 被另一活实例占用 → startControlPlane 报错（进程错误退出
-// 语义的装配层判据；不静默、不转入「活着但无控制面」的角色重试形态）。
 func TestControlPlaneFirstListenFailFast(t *testing.T) {
 	dir := shortTempDirDaemon(t)
 	// 占用 sock：起一个活监听（connect 探测命中）。
@@ -356,15 +342,12 @@ func TestControlPlaneFirstListenFailFast(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = holdLn.Close() })
-	st, err := OpenDaemonState(dir)
-	if err != nil {
-		t.Fatal(err)
-	}
+	st := OpenDaemonLogs(dir, dir)
 	t.Cleanup(st.Close)
 	d := facade.New(facade.Options{StrictIdentity: true, Logf: discardLog, Eventf: discardLog})
 	t.Cleanup(d.Close)
-	sup := newSupervisor(discardLog, discardLog)
 	ctx, cancel := context.WithCancel(context.Background())
+	sup := newSupervisor(ctx, discardLog, discardLog)
 	t.Cleanup(func() {
 		cancel()
 		sup.Close()
