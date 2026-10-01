@@ -21,6 +21,7 @@ package daemon
 import (
 	"bufio"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -574,6 +575,16 @@ func relayStatusCLI(args []string, version string, w io.Writer) error {
 // ---- token（双路径：控制面优先 / 未跑 L2 直读） ----
 
 func serveTokenCLI(args []string, version string, w io.Writer) error {
+	// 子动词（FIX-64）：list = 台账/吊销表只读面；revoke = 吊销一枚凭证（纯文件
+	// 操作，写 revoked.jsonl；在跑出口经跟随读秒级对新注册生效，无需重启）。
+	if len(args) > 0 {
+		switch args[0] {
+		case "list":
+			return serveTokenListCLI(args[1:], w)
+		case "revoke":
+			return serveTokenRevokeCLI(args[1:], w)
+		}
+	}
 	fs := flag.NewFlagSet("homeway serve token", flag.ContinueOnError)
 	fs.SetOutput(w)
 	g := newGroupFlags(fs, false)
@@ -913,6 +924,8 @@ func usageServeGroup(w io.Writer) {
   homeway serve restart [--state D]              进程内重建（期望态不变；角色停时报错先 start）
   homeway serve status [--json] [--state D]      期望+运行态+观测面（未跑降级读 config）
   homeway serve token [--state D]                完整 hmw1 凭证（在跑控制面 / 未跑台账末行）
+  homeway serve token list [--state D]           凭证台账（id/签发/状态/端点；凭证只出掩码）
+  homeway serve token revoke <id> [--state D]    吊销一枚凭证（写吊销表；即时对新注册生效）
   homeway serve relay set <token> [--stdin]      上游中继 token 写 config（纯文件操作）
   homeway serve relay clear                      清除上游中继 token
   homeway serve ddns add|delete <domain>|list    DDNS 条目（多条目，写 config）
@@ -927,4 +940,141 @@ func usageRelayGroup(w io.Writer) {
   homeway relay status [--json] [--state D]      期望+运行态+注册出口列表（未跑降级读 config）
   homeway relay token [--state D]                完整 rl1 凭证（在跑控制面 / 未跑离线推算）
 `)
+}
+
+// ---- token list / revoke（FIX-64：凭证台账可读面 + 吊销面） ----
+
+// serveTokenListCLI：台账只读列表（id / 签发时间 / 状态 / 端点 / secret 掩码）。
+// 末行 = 最近在用 token（写入纪律）；已吊销凭证逐行标注（凭证纪律：只打掩码）。
+func serveTokenListCLI(args []string, w io.Writer) error {
+	fs := flag.NewFlagSet("homeway serve token list", flag.ContinueOnError)
+	fs.SetOutput(w)
+	stateDir := fs.String("state", DefaultStateDir(), "统一 state 根（config.toml 所在）")
+	if err := fs.Parse(flagsFirst(args, map[string]bool{"help": true, "h": true})); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			return nil
+		}
+		return err
+	}
+	st, err := server.OpenState(nodestate.ServeDir(*stateDir))
+	if err != nil {
+		return err
+	}
+	ledger, err := st.Ledger()
+	if err != nil {
+		return err
+	}
+	if len(ledger) == 0 {
+		fmt.Fprintln(w, "台账为空（出口从未铸出 token）：先 `homeway serve start`，等首轮端点探测后重试")
+		return nil
+	}
+	fmt.Fprintf(w, "%-8s  %-20s  %-14s  %s\n", "id", "签发", "状态", "端点/凭证（掩码）")
+	creds := map[string]bool{}
+	for i, e := range ledger {
+		creds[e.ID] = true
+		// 台账语义（写入纪律）：每行 = 一轮铸出；同一凭证（id 相同）可有多轮。
+		// 有效 = 该行凭证未被吊销（注册验证接受它）；末行 = 最近在用 token。
+		state := "有效"
+		if i == len(ledger)-1 {
+			state = "有效·末行(在用)"
+		}
+		if e.Revoked {
+			state = "已吊销"
+			if e.Reason != "" {
+				state = "已吊销(" + e.Reason + ")"
+			}
+		}
+		eps := "(无端点)"
+		if len(e.Endpoints) > 0 {
+			var parts []string
+			for _, ep := range e.Endpoints {
+				parts = append(parts, ep.Addr)
+			}
+			eps = strings.Join(parts, ",")
+		}
+		fmt.Fprintf(w, "%-8s  %-20s  %-10s  %s  %s\n", e.ID, e.Issued, state, maskSecretCLI(e.Secret), eps)
+	}
+	if revs, rerr := st.Revocations(); rerr == nil && len(revs) > 0 {
+		fmt.Fprintf(w, "\n吊销表（revoked.jsonl，%d 条）：\n", len(revs))
+		for _, r := range revs {
+			fmt.Fprintf(w, "  %-8s  %-20s  %s  %s\n", r.ID, r.At, maskSecretCLI(r.Secret), r.Reason)
+		}
+	}
+	fmt.Fprintf(w, "\n共 %d 行 / %d 枚凭证（id 相同 = 同一凭证的多轮铸出）\n", len(ledger), len(creds))
+	fmt.Fprintln(w, "吊销：homeway serve token revoke <id>（即时对新注册生效；已登记设备随出口重启清空）")
+	return nil
+}
+
+// serveTokenRevokeCLI：吊销指定凭证 id（纯文件操作）。被吊销的 token 立即不再能
+// 注册；出口若正跑着，已在线的设备仍连着——彻底清场走 `homeway serve restart`
+// （设备表随角色重建清空），且若吊销的是在用凭证，重启会自动铸出新凭证。
+func serveTokenRevokeCLI(args []string, w io.Writer) error {
+	fs := flag.NewFlagSet("homeway serve token revoke", flag.ContinueOnError)
+	fs.SetOutput(w)
+	stateDir := fs.String("state", DefaultStateDir(), "统一 state 根（config.toml 所在）")
+	reason := fs.String("reason", "manual", "吊销原因（进吊销表，便于日后辨认）")
+	if err := fs.Parse(flagsFirst(args, map[string]bool{"help": true, "h": true, "reason": false})); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			return nil
+		}
+		return err
+	}
+	if fs.NArg() != 1 {
+		return errors.New("serve token revoke 需要 <id>（先 `homeway serve token list` 查）")
+	}
+	id := strings.TrimSpace(fs.Arg(0))
+	st, err := server.OpenState(nodestate.ServeDir(*stateDir))
+	if err != nil {
+		return err
+	}
+	ledger, err := st.Ledger()
+	if err != nil {
+		return err
+	}
+	var target *server.TokenLedgerEntry
+	for i := range ledger {
+		if ledger[i].ID == id {
+			target = &ledger[i]
+			break
+		}
+	}
+	if target == nil {
+		return fmt.Errorf("台账里没有 id=%s 的凭证（用 `homeway serve token list` 查现有 id）", id)
+	}
+	if target.Revoked {
+		fmt.Fprintf(w, "凭证 %s 已是吊销态（幂等，无动作）\n", id)
+		return nil
+	}
+	raw, derr := base64.RawURLEncoding.DecodeString(target.Secret)
+	if derr != nil || len(raw) != 32 {
+		return errors.New("台账里的 secret 非法（台账损坏？）")
+	}
+	var secret [32]byte
+	copy(secret[:], raw)
+	already, rerr := st.Revoke(secret, *reason)
+	if rerr != nil {
+		return fmt.Errorf("写吊销表失败：%w", rerr)
+	}
+	if already {
+		fmt.Fprintf(w, "凭证 %s 已是吊销态（幂等，无动作）\n", id)
+		return nil
+	}
+	fmt.Fprintf(w, "已吊销凭证 %s（%s）——该 token 立即不能注册（在跑出口经跟随读秒级生效）\n", id, maskSecretCLI(target.Secret))
+	last := len(ledger) > 0 && ledger[len(ledger)-1].ID == id
+	if last {
+		fmt.Fprintln(w, "⚠️ 这是**在用凭证**（台账末行）：重启出口会铸出新凭证——`homeway serve restart`（随后 `homeway serve token` 取新值，客户端需重新粘贴）")
+	} else if len(ledger) > 0 && ledger[len(ledger)-1].Revoked {
+		fmt.Fprintln(w, "⚠️ 台账末行凭证也处于吊销态：出口重启会铸出新凭证（`homeway serve restart`）")
+	} else {
+		fmt.Fprintln(w, "提示：已在线的设备不受影响（吊销只挡新注册）；彻底清场 = `homeway serve restart`（设备表随角色重建清空）")
+	}
+	return nil
+}
+
+// maskSecretCLI：secret（base64）掩码——凭证纪律：CLI 列表只出掩码。
+func maskSecretCLI(sec string) string {
+	if len(sec) <= 10 {
+		return "***"
+	}
+	return sec[:6] + "…" + sec[len(sec)-4:]
 }

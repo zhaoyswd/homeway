@@ -75,6 +75,9 @@ var (
 	// 原实现退到池地址并造一条设备记录——但客户端只会用它自己派生的地址发包，池地址
 	// 永远收不到它的流：那条记录是「注定不通」的，还占了表位与 allowed_ip 名额。
 	ErrTunnelIPConflict = errors.New("peers: 派生隧道地址与在表设备冲突（请在该设备上重置本机身份后重连）")
+	// ErrTokenRevoked 凭证验通但已在吊销表内（FIX-64）：与 ErrNoToken 分开归因——
+	// 「token 已被吊销」是可行动的（重新粘贴新 token），「无匹配 token」多半是抄错。
+	ErrTokenRevoked = errors.New("peers: token 已被吊销（请向出口索取新 token 后重新粘贴）")
 )
 
 // DeviceConfig 设备表参数（零值走默认）。
@@ -82,7 +85,20 @@ type DeviceConfig struct {
 	MaxDevices int           // <=0 = 32
 	TTL        time.Duration // **0 = 关闭 TTL 回收**（缺省 7d 由 config/flag 层落值，FIX-62；<0 视同关）
 	Grace      time.Duration // <=0 = 10 分钟（表满淘汰门槛）
+	// Revoked 凭证吊销判定（FIX-64；nil = 无吊销面）。构造期 secrets 是静态集，
+	// 吊销由这个**活钩子**在每次验证时复查——出口侧接台账吊销表的跟随读
+	// （internal/server 的 revokedFollower），让「吊销」无需重启即时生效。
+	Revoked func(secret [32]byte) bool
 }
+
+// 注册拒绝归因（FIX-64：按原因计数，摘要行与细节行都带累计值——「有多少设备/
+// 哪种原因被挡在门外」不必翻日志逐条数）。
+const (
+	RejNoToken   = "no-token"    // reg 报文没有已知 token 能验通（抄错/旧凭证已换）
+	RejRevoked   = "revoked"     // 凭证验通但在吊销表内
+	RejTableFull = "table-full"  // 表满且无失格设备可淘汰（绝不淘汰在线设备）
+	RejConflict  = "ip-conflict" // 派生隧道地址与在表设备撞车
+)
 
 const (
 	defaultMaxDevices = 32
@@ -112,6 +128,15 @@ type DeviceTable struct {
 	cfg     Configurer
 	secrets [][32]byte
 	logf    func(format string, args ...any)
+	// sumf：摘要级日志（events.log）——注册拒绝是「需要人看一眼」的事件，
+	// 每类原因每进程只大声一次（其后累计值进细节行），避免凭证刷注册打爆摘要。
+	sumf    func(format string, args ...any)
+	revoked func(secret [32]byte) bool
+
+	// rejX：按原因的拒绝计数（累计；细节行与摘要行都读它）。
+	rejMu   sync.Mutex
+	rejOnce map[string]bool
+	rejCnt  map[string]uint64
 
 	max   int
 	ttl   time.Duration
@@ -221,11 +246,74 @@ func NewDeviceTable(cfg Configurer, secrets [][32]byte, opt DeviceConfig) *Devic
 		cfg:     cfg,
 		secrets: secrets,
 		logf:    logf,
+		sumf:    logf, // 未注入时与细节同口（不丢信息）
+		revoked: opt.Revoked,
+		rejOnce: map[string]bool{},
+		rejCnt:  map[string]uint64{},
 		max:     opt.MaxDevices,
 		ttl:     opt.TTL,
 		grace:   opt.Grace,
 		entries: make(map[proto.DevTag]*dentry, opt.MaxDevices),
 	}
+}
+
+// SetSummaryLogger 注入摘要级日志（events.log；FIX-64 的拒绝摘要行用）。
+func (t *DeviceTable) SetSummaryLogger(fn func(format string, args ...any)) {
+	if fn == nil {
+		return
+	}
+	t.mu.Lock()
+	t.sumf = fn
+	t.mu.Unlock()
+}
+
+// rejectCount / noteReject：按原因的累计拒绝计数与「首次大声」摘要。
+// 摘要行每类原因每进程只出一次（其后同类拒绝只进细节行，避免刷屏）；计数不受
+// 节流影响，细节行总携带最新累计值。
+func (t *DeviceTable) noteReject(reason string, format string, args ...any) {
+	// 日志口与 SetLogger/SetSummaryLogger 一样是「装配期一次设定」的既定约定
+	//（既有各 logf 调用点同样裸读），这里不额外加锁。
+	logf, sumf := t.logf, t.sumf
+	t.rejMu.Lock()
+	t.rejCnt[reason]++
+	n := t.rejCnt[reason]
+	first := !t.rejOnce[reason]
+	if first {
+		t.rejOnce[reason] = true
+	}
+	t.rejMu.Unlock()
+	if first && sumf != nil {
+		sumf("⚠️ 注册被拒（原因=%s，累计 %d）——%s", reason, n, rejectHint(reason))
+	}
+	if logf != nil {
+		logf(format+"（原因=%s，累计 %d）", append(args, reason, n)...)
+	}
+}
+
+// RejectCounts 按原因的累计拒绝数快照（诊断/测试）。
+func (t *DeviceTable) RejectCounts() map[string]uint64 {
+	t.rejMu.Lock()
+	defer t.rejMu.Unlock()
+	out := make(map[string]uint64, len(t.rejCnt))
+	for k, v := range t.rejCnt {
+		out[k] = v
+	}
+	return out
+}
+
+// rejectHint：拒绝原因的可行动提示（摘要行文案）。
+func rejectHint(reason string) string {
+	switch reason {
+	case RejRevoked:
+		return "该凭证已被吊销。向出口索取新 token（`homeway serve restart` 会铸出新凭证）后重新粘贴；旧 token 不再可用"
+	case RejNoToken:
+		return "token 抄错或来自别的出口？核对该 token 并在 App 里重新粘贴"
+	case RejTableFull:
+		return "设备表已满且在线设备不可淘汰；等待失联设备过期或调大 --max-peers"
+	case RejConflict:
+		return "派生地址与在表设备冲突；在该手机上「重置本机身份」后重连"
+	}
+	return "见细节日志"
 }
 
 // SetLogger 注入正式日志（homewayd 装配）；不注入则用包内兜底。
@@ -249,18 +337,41 @@ func (t *DeviceTable) currentSecrets() [][32]byte {
 // 单轨（D7）：未命中即 ErrNoToken——无热重读分支；重签发的 token 随出口重启
 // （或下个发版窗口的部署）进构造期集合。
 func (t *DeviceTable) verify(reg []byte, now time.Time) (pubkey [32]byte, devTag proto.DevTag, secret [32]byte, err error) {
+	revoked := t.revokedHook()
 	for _, sec := range t.currentSecrets() {
 		if pk, dt, verr := proto.VerifyReg(sec, reg, now, 0); verr == nil {
+			// 吊销复查（FIX-64）：构造期 secrets 是静态集，吊销表由活钩子带进来
+			//（出口侧 = 台账吊销表的跟随读，秒级生效、无需重启）。命中即拒——
+			// 归因与「没有已知 token」分开，便于手机端与运维分清「吊销」与「抄错」。
+			if revoked != nil && revoked(sec) {
+				return pubkey, devTag, secret, ErrTokenRevoked
+			}
 			return pk, dt, sec, nil
 		}
 	}
 	return pubkey, devTag, secret, ErrNoToken
 }
 
+// revokedHook 读吊销钩子（锁内取函数值；钩子自身线程安全）。
+func (t *DeviceTable) revokedHook() func(secret [32]byte) bool {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.revoked
+}
+
 // Register 验证 reg 报文并按设备标签登记/刷新/轮换。返回本次动作快照（日志与测试用）。
 func (t *DeviceTable) Register(reg []byte, now time.Time) (Result, error) {
 	pubkey, devTag, secret, err := t.verify(reg, now)
 	if err != nil {
+		// 失败归因进计数与摘要（FIX-64）：devTag 拿不到（验证不过），只记原因。
+		switch {
+		case errors.Is(err, ErrTokenRevoked):
+			t.noteReject(RejRevoked, "peer: ! reject reason=revoked")
+		case errors.Is(err, ErrNoToken):
+			t.noteReject(RejNoToken, "peer: ! reject reason=no-token")
+		default:
+			t.noteReject(RejNoToken, "peer: ! reject reason=verify（%v）", err)
+		}
 		return Result{}, err
 	}
 	psk := proto.DerivePSK(secret)
@@ -308,7 +419,7 @@ func (t *DeviceTable) Register(reg []byte, now time.Time) (Result, error) {
 
 	if len(t.entries) >= t.max {
 		if !t.evictStaleLocked(now) {
-			t.logf("peer: ! dev=%s reject reason=table-full n=%d/%d", devShort(devTag), len(t.entries), t.max)
+			t.noteReject(RejTableFull, "peer: ! dev=%s reject reason=table-full n=%d/%d", devShort(devTag), len(t.entries), t.max)
 			return Result{}, ErrTableFull
 		}
 	}
@@ -413,7 +524,7 @@ func (t *DeviceTable) assignIPLocked(secret [32]byte, pub [32]byte, dev proto.De
 	if t.ipHeldByPubLocked(pub, ip) {
 		return ip, nil
 	}
-	t.logf("peer: ! dev=%s reject reason=ip-conflict ip=%v（派生地址与在表设备撞车；消解 = 手机上「重置本机身份」后重连）",
+	t.noteReject(RejConflict, "peer: ! dev=%s reject reason=ip-conflict ip=%v（派生地址与在表设备撞车；消解 = 手机上「重置本机身份」后重连）",
 		devShort(dev), ip)
 	return netip.Addr{}, ErrTunnelIPConflict
 }
@@ -451,7 +562,7 @@ func (t *DeviceTable) assignTunIPLocked(secret [32]byte, pub [32]byte, dev proto
 	if t.ipHeldByPubLocked(pub, ip) { // 同公钥（克隆）：同址合法，见 assignIPLocked
 		return ip, nil
 	}
-	t.logf("peer: ! dev=%s reject reason=ip-conflict tunip=%v（应用面派生地址与在表设备撞车）", devShort(dev), ip)
+	t.noteReject(RejConflict, "peer: ! dev=%s reject reason=ip-conflict tunip=%v（应用面派生地址与在表设备撞车）", devShort(dev), ip)
 	return netip.Addr{}, ErrTunnelIPConflict
 }
 

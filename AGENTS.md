@@ -4,7 +4,7 @@
 （按 `<state>/config.toml` 期望态装配 serve 出口角色〔原 `exit`，已更名〕/ relay 中继角色，
 client 与控制面恒开；三层 state 布局 L1 config.toml / L2 serve·relay·client / L3 cache，
 默认 `~/.config/homeway`）、`serve|relay <动词>` = 角色命令组（start/stop/restart/status
-[--json]/token；serve 另有 `relay set|clear`〔上游中继 token 写 config〕与
+[--json]/token；serve 另有 `token list|revoke`〔凭证台账/吊销，FIX-64〕、`relay set|clear`〔上游中继 token 写 config〕与
 `ddns add|delete|list`）、`status [--json|--watch]` = 聚合状态面（吸收旧 daemon status）、
 `export|import|reset cache` = 状态工件、`host add/list/status/delete` = 主机表管理命令面
 （host-cli 起：守护托管，`host add` 服务端做有界连通性验证——探测核 `pkg/probe.Reach`

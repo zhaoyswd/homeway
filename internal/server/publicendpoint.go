@@ -14,6 +14,7 @@ package server
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net"
 	"net/netip"
@@ -297,6 +298,18 @@ func ddnsEntryPort(published []string, listenPort uint16) uint16 {
 // 端点变化只在摘要文件重写一份（取最新 token：grep 客户端 token events.log | tail -1）。
 // 内容 = LAN 端点 + 已公布公网端点 + --ddns 域名条目（若有）+ serve --relay 给的中继端点。
 func (s *Server) printClientToken(published []string) {
+	// 在用凭证已被吊销（FIX-64）：这枚 token 已作废——只大声提示一次并停打
+	//（继续打印旧 token 只会让人拿错），重启出口（serve restart）会铸出新凭证。
+	if s.revoked != nil && s.revoked.isRevoked(s.secret) {
+		s.tokMu.Lock()
+		first := !s.revokedLogged
+		s.revokedLogged = true
+		s.tokMu.Unlock()
+		if first {
+			logf("⚠️ 在用凭证已被吊销——**不再打印 token**（旧 token 已作废）；执行 `homeway serve restart` 铸出新凭证，客户端需重新粘贴")
+		}
+		return
+	}
 	port := s.bind.LocalPort()
 	if port == 0 {
 		// socket 还没开（device 异步拉起 Bind）：本轮不打，等下一轮——别端点端口打出 0。
@@ -334,7 +347,11 @@ func (s *Server) printClientToken(published []string) {
 	// lastToken 只管终端一轮制）。「台账末行 = 最近在用 token」由此成为不变量。
 	if s.state != nil {
 		if aerr := s.state.AppendToken(s.secret, eps); aerr != nil {
-			logf("⚠️ token 台账追加失败（%v）——台账末行可能与在用 token 短暂不一致", aerr)
+			if errors.Is(aerr, ErrSecretRevoked) {
+				logf("⚠️ 在用凭证已被吊销（%v）——本轮 token 未入台账；执行 `homeway serve restart` 铸出新凭证", aerr)
+			} else {
+				logf("⚠️ token 台账追加失败（%v）——台账末行可能与在用 token 短暂不一致", aerr)
+			}
 		}
 	}
 	s.tokMu.Lock()

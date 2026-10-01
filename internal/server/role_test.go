@@ -11,6 +11,7 @@ import (
 	"bufio"
 	"context"
 	"encoding/base64"
+	"errors"
 	"github.com/zhaoyswd/homeway/pkg/dns"
 	"github.com/zhaoyswd/homeway/pkg/intercept"
 	"github.com/zhaoyswd/homeway/pkg/proto"
@@ -416,5 +417,90 @@ func TestManualPublicEndpointIsPublished(t *testing.T) {
 	bad.fill()
 	if bad.PublicEndpoint != "" {
 		t.Fatal("非法 --public-endpoint 应被清空（按未配置处理）")
+	}
+}
+
+// TestStartMintsNewCredentialWhenAllRevoked（FIX-64）：凭证全被吊销后启动——启动
+// 路径铸出新凭证（旧 token 彻底作废），并如实打台账规模与铸新行。
+func TestStartMintsNewCredentialWhenAllRevoked(t *testing.T) {
+	dir := t.TempDir()
+	st, err := OpenState(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	old, err := st.IssueToken(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 台账里已有第二轮（同凭证、新端点）——吊销后两行都应失效。
+	if aerr := st.AppendToken(old.Secret, []proto.Endpoint{{Addr: "192.0.2.9:41641"}}); aerr != nil {
+		t.Fatal(aerr)
+	}
+	if _, rerr := st.Revoke(old.Secret, "test"); rerr != nil {
+		t.Fatal(rerr)
+	}
+	if secs, _ := st.Secrets(); len(secs) != 0 {
+		t.Fatalf("吊销后验证集应为空，got %d", len(secs))
+	}
+	s, err := Start(context.Background(), ServeConfig{StateDir: dir, UPnP: false, DNSPort: 0})
+	if err != nil {
+		t.Fatalf("Start：%v", err)
+	}
+	defer s.Close()
+	secs, err := st.Secrets()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(secs) != 1 || secs[0] == old.Secret {
+		t.Fatalf("应铸出一枚新凭证（≠被吊销的旧凭证），got %d 枚", len(secs))
+	}
+	// 摘要日志：台账规模行 + 铸新行（判据可 grep）。
+	b, rerr := os.ReadFile(filepath.Join(dir, eventsLogName))
+	if rerr != nil {
+		t.Fatalf("读 events.log：%v", rerr)
+	}
+	logs := string(b)
+	if !strings.Contains(logs, "凭证台账：") || !strings.Contains(logs, "已吊销") {
+		t.Fatalf("events.log 应有台账规模行（含已吊销计数）：\n%s", logs)
+	}
+	if !strings.Contains(logs, "已铸出新凭证") {
+		t.Fatalf("全吊销启动应有铸新行：\n%s", logs)
+	}
+}
+
+// TestStartWiresRevokedHook（FIX-64 接线判据）：装配层把吊销跟随读接进设备表——
+// 同一凭证在吊销前后分别注册，前放行后拒（ErrTokenRevoked），全程无需重启。
+func TestStartWiresRevokedHook(t *testing.T) {
+	dir := t.TempDir()
+	st, err := OpenState(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tok, err := st.IssueToken(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s, err := Start(context.Background(), ServeConfig{StateDir: dir, UPnP: false, DNSPort: 0})
+	if err != nil {
+		t.Fatalf("Start：%v", err)
+	}
+	defer s.Close()
+	pub := [32]byte{0x42}
+	dev := proto.DevTag{1, 2, 3, 4, 5, 6, 7, 8}
+	reg := proto.EncodeReg(tok.Secret, pub, dev, time.Now())
+	if _, rerr := s.Table.Register(reg, time.Now()); rerr != nil {
+		t.Fatalf("吊销前应放行：%v", rerr)
+	}
+	if _, rerr := st.Revoke(tok.Secret, "wired"); rerr != nil {
+		t.Fatal(rerr)
+	}
+	// 拨过节流窗（等价于等过 1s；测试里直接重置检查时间）。
+	s.revoked.mu.Lock()
+	s.revoked.lastCheck = time.Time{}
+	s.revoked.mu.Unlock()
+	// 换个设备标签（同凭证）：验证面必然被吊销表挡下。
+	dev2 := proto.DevTag{9, 9, 9, 9, 1, 2, 3, 4}
+	if _, rerr := s.Table.Register(proto.EncodeReg(tok.Secret, pub, dev2, time.Now()), time.Now()); !errors.Is(rerr, servercore.ErrTokenRevoked) {
+		t.Fatalf("吊销后必须 ErrTokenRevoked，got %v", rerr)
 	}
 }

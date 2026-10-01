@@ -3,7 +3,7 @@
 //
 //	<state>/
 //	├── config.toml                    L1 意图（唯一人写文件；0600——读写内核在 internal/nodeconfig）
-//	├── serve/                         L2 serve 不变量（key.bin / tokens.jsonl）
+//	├── serve/                         L2 serve 不变量（key.bin / tokens.jsonl / revoked.jsonl）
 //	├── relay/                         L2 relay 不变量（relay.key）
 //	├── client/                        L2 client 不变量（identity/ hosts.json forwards.json socks.json）
 //	├── cache/                         L3 可弃（日志 / listen_port.txt / public_endpoint.txt / endpoints/）

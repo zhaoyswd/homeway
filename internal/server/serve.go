@@ -53,7 +53,7 @@ const (
 )
 
 type ServeConfig struct {
-	StateDir      string // L2：<state>/serve/（key.bin / tokens.jsonl）
+	StateDir      string // L2：<state>/serve/（key.bin / tokens.jsonl / revoked.jsonl）
 	ListenPort    uint16
 	TunnelIP      netip.Addr
 	FilesPort     uint16        // files 服务在本机的监听端口（客户端经隧道 IP 豁免转投到它）
@@ -155,6 +155,7 @@ type Server struct {
 	relayWanted   bool           // --relay 解析成功：token 未并入中继端点前不打印（只打最终形态）
 	tokMu         sync.Mutex
 	lastToken     string   // 上次已写出的客户端 token（去重：没变就不再写；终端只认首轮）
+	revokedLogged bool     // 在用凭证已吊销的提示只大声一次（FIX-64）
 	lastPublished []string // 最近一轮已公布的公网端点（Run 的终端兜底带上它，别打残缺版）
 	// ddns：--ddns 自检的滚动状态（按域名一域一份；探测 goroutine 写、状态快照读
 	// ——ddnsMu 同步，role-management 2.1 的快照接口起读方不再单线程）。
@@ -165,6 +166,9 @@ type Server struct {
 	dnsSrv *dns.Server
 	// inter：过境拦截层句柄（D5 收尾序的宽限收尾走它；收工幂等）。
 	inter *intercept.Interceptor
+	// revoked：凭证吊销表的跟随读（FIX-64；DeviceTable 的验证钩子与
+	// printClientToken 的在用凭证检查共用同一实例）。
+	revoked *revokedFollower
 	// stopIntercept：过境拦截层收工（关会话通知；栈随 tunDev 生命周期回收）。
 	stopIntercept func()
 	pubKick       chan struct{} // 公网端点探测的"立即重测"信号（换网事件踢）
@@ -209,18 +213,31 @@ func Start(ctx context.Context, cfg ServeConfig) (*Server, error) {
 		return nil, err
 	}
 	if len(secrets) == 0 {
-		// 零参首启（全新 state 目录、没有 tokens.jsonl）：先签发一条凭证并落台账。
-		// 不然启动时打印的客户端 token 会带**全零 Secret**（出口自己的 reg 验证
-		// 也不认它——台账里根本没这条），生来无效（2026-09-20 实测踩中：裸启动
-		// 新目录后打出的 token 手机无法连接）。台账里的 endpoints 字段仅信息性，
-		// 实际验证只读 secrets；真正的客户端 token 由 printClientToken 用实时
-		// 端点 + 这把 secret 铸出。
+		// 零参首启（全新 state 目录、没有 tokens.jsonl）**或凭证全被吊销**（FIX-64：
+		// 吊销表把最后一枚也滤掉——重启即铸新，这正是「泄漏 → 吊销 → 重启」的收尾）：
+		// 先签发一条凭证并落台账。不然启动时打印的客户端 token 会带**全零 Secret**
+		//（出口自己的 reg 验证也不认它——台账里根本没这条），生来无效（2026-09-20
+		// 实测踩中：裸启动新目录后打出的 token 手机无法连接）。台账里的 endpoints
+		// 字段仅信息性，实际验证只读 secrets；真正的客户端 token 由 printClientToken
+		// 用实时端点 + 这把 secret 铸出。
 		if _, ierr := st.IssueToken(nil); ierr != nil {
 			return nil, fmt.Errorf("state: 初始凭证签发失败: %w", ierr)
 		}
+		logf("凭证：现有凭证全部不可用（首启或已吊销）——已铸出新凭证（客户端需重新粘贴新 token）")
 		if secrets, err = st.Secrets(); err != nil || len(secrets) == 0 {
 			return nil, fmt.Errorf("state: 初始凭证签发后仍读不到（%v）", err)
 		}
+	}
+	// 台账规模（FIX-64：只增不减的台账要有可读的规模面——行数/在用/已吊销）。
+	if ledger, lerr := st.Ledger(); lerr == nil {
+		revokedRows := 0
+		for _, e := range ledger {
+			if e.Revoked {
+				revokedRows++
+			}
+		}
+		logf("凭证台账：%d 行记录 / %d 枚在用凭证（其中 %d 行已吊销；吊销即时对新注册生效）",
+			len(ledger), len(secrets), revokedRows)
 	}
 
 	// 过境拦截栈（l3-exit-intercept）：HandleLocal 必须关（混杂+spoofing 的前提，
@@ -361,11 +378,18 @@ func Start(ctx context.Context, cfg ServeConfig) (*Server, error) {
 		wgLog.Verbosef = func(f string, a ...any) { dlogf("wg: "+f, a...) }
 	}
 	s.dev = device.NewDevice(tunDev, sbind, wgLog)
+	// 吊销跟随读（FIX-64）：吊销写进 revoked.jsonl 后秒级对新注册生效（无需重启）；
+	// 同一实例也被 printClientToken 用来发现「在用凭证已吊销」。
+	s.revoked = newRevokedFollower(filepath.Join(cfg.StateDir, revokedFileName))
 	s.Table = servercore.NewDeviceTable(servercore.NewIPCConfigurer(s.dev), secrets, servercore.DeviceConfig{
 		MaxDevices: cfg.MaxDevices,
 		TTL:        cfg.PeerTTL,
+		Revoked:    s.revoked.isRevoked,
 	})
 	s.Table.SetLogger(dlogf)
+	// 注册拒绝的摘要行走 events.log（FIX-64：拒绝是「需要人看一眼」的事件；每类
+	// 原因每进程只大声一次，其后累计值进细节行）。
+	s.Table.SetSummaryLogger(logf)
 	peerCap, peerTTL, peerGrace := s.Table.Limits()
 	dlogf("peer 表：设备表就绪（cap=%d，ttl=%v，grace=%v；按 devTag 记账/刷新/轮换）", peerCap, peerTTL, peerGrace)
 	sbind.Table = s.Table

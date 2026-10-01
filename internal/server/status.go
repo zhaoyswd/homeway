@@ -124,6 +124,13 @@ func (s *State) LastToken() (proto.Token, bool, error) {
 		return proto.Token{}, false, fmt.Errorf("state: 台账末行 secret 非法")
 	}
 	copy(secret[:], raw)
+	// FIX-64：末行凭证已吊销 = 这枚 token 已作废——不回一份死凭证（调用方会当
+	// 「可用凭证」呈现），给可行动错误（重启出口铸新）。
+	if revoked, rerr := readRevokedSecrets(s.revocationsPath()); rerr != nil {
+		return proto.Token{}, false, rerr
+	} else if revoked[secret] {
+		return proto.Token{}, false, fmt.Errorf("%w（末行 token 已作废；执行 `homeway serve restart` 铸出新凭证，客户端需重新粘贴）", ErrSecretRevoked)
+	}
 	var tok proto.Token
 	pub := priv.PublicKey()
 	copy(tok.PeerID[:], pub[:])

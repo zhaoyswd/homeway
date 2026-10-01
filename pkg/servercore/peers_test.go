@@ -553,3 +553,87 @@ func (b *blockingCfg) AddPeer(pc PeerConfig) error {
 	}
 	return b.fakeCfg.AddPeer(pc)
 }
+
+// ---- FIX-64：吊销钩子 + 拒绝归因计数 ----
+
+// TestVerifyRejectsRevokedCredential：验通但在吊销表内的凭证必须被拒（ErrTokenRevoked，
+// 与 ErrNoToken 分开归因）；钩子生效即计时（跟随读的语义面）。
+func TestVerifyRejectsRevokedCredential(t *testing.T) {
+	var revoked bool
+	var mu sync.Mutex
+	tbl := NewDeviceTable(newFakeCfg(), [][32]byte{testSecret}, DeviceConfig{Revoked: func(sec [32]byte) bool {
+		mu.Lock()
+		defer mu.Unlock()
+		return revoked && sec == testSecret
+	}})
+	now := time.Now()
+	if _, err := tbl.Register(regFor(pubN(1), devN(1), now), now); err != nil {
+		t.Fatalf("未吊销应放行：%v", err)
+	}
+	mu.Lock()
+	revoked = true
+	mu.Unlock()
+	if _, err := tbl.Register(regFor(pubN(2), devN(2), now), now); !errors.Is(err, ErrTokenRevoked) {
+		t.Fatalf("已吊销凭证必须 ErrTokenRevoked，got %v", err)
+	}
+	// 抄错的 token（别的 secret）：仍是 ErrNoToken（归因不混）。
+	if _, err := tbl.Register(proto.EncodeReg([32]byte{7}, pubN(3), devN(3), now), now); !errors.Is(err, ErrNoToken) {
+		t.Fatalf("未知 secret 应 ErrNoToken，got %v", err)
+	}
+	counts := tbl.RejectCounts()
+	if counts[RejRevoked] != 1 || counts[RejNoToken] != 1 {
+		t.Fatalf("按原因计数应各 1：%+v", counts)
+	}
+}
+
+// TestRejectSummaryLoggedOncePerReason：摘要行每类原因只大声一次（其后同类拒绝
+// 只进细节行），且细节行带累计值——凭证刷注册不得打爆摘要。
+func TestRejectSummaryLoggedOncePerReason(t *testing.T) {
+	var mu sync.Mutex
+	var sums, details []string
+	tbl := NewDeviceTable(newFakeCfg(), [][32]byte{testSecret}, DeviceConfig{})
+	tbl.SetLogger(func(f string, a ...any) {
+		mu.Lock()
+		details = append(details, fmt.Sprintf(f, a...))
+		mu.Unlock()
+	})
+	tbl.SetSummaryLogger(func(f string, a ...any) {
+		mu.Lock()
+		sums = append(sums, fmt.Sprintf(f, a...))
+		mu.Unlock()
+	})
+	now := time.Now()
+	for i := 0; i < 3; i++ {
+		if _, err := tbl.Register(proto.EncodeReg([32]byte{7}, pubN(byte(i)), devN(byte(i)), now), now); !errors.Is(err, ErrNoToken) {
+			t.Fatalf("应拒绝：%v", err)
+		}
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(sums) != 1 || !strings.Contains(sums[0], "no-token") || !strings.Contains(sums[0], "累计 1") {
+		t.Fatalf("摘要行应每类原因只出一次且带累计：%v", sums)
+	}
+	if len(details) != 3 {
+		t.Fatalf("细节行应逐次：%d", len(details))
+	}
+	if !strings.Contains(details[2], "累计 3") {
+		t.Fatalf("细节行应带最新累计值：%v", details[2])
+	}
+}
+
+// TestRejectCountsTableFullAndConflict：表满与地址冲突两类拒绝也进按原因计数。
+func TestRejectCountsTableFullAndConflict(t *testing.T) {
+	tbl := NewDeviceTable(newFakeCfg(), [][32]byte{testSecret}, DeviceConfig{MaxDevices: 1})
+	now := time.Now()
+	if _, err := tbl.Register(regFor(pubN(1), devN(1), now), now); err != nil {
+		t.Fatalf("第一台应放行：%v", err)
+	}
+	// 表满（另一台、宽限期内无失格设备）→ table-full。
+	if _, err := tbl.Register(regFor(pubN(2), devN(2), now), now); !errors.Is(err, ErrTableFull) {
+		t.Fatalf("表满应 ErrTableFull，got %v", err)
+	}
+	counts := tbl.RejectCounts()
+	if counts[RejTableFull] != 1 {
+		t.Fatalf("table-full 计数：%+v", counts)
+	}
+}

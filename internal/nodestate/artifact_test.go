@@ -34,6 +34,7 @@ func buildState(t *testing.T) string {
 	write("config.toml", "# 手编 config\n[serve]\nlisten = 41000\n")
 	write("serve/key.bin", "K")
 	write("serve/tokens.jsonl", "T1\nT2\n")
+	write("serve/revoked.jsonl", "R1\n")
 	write("relay/relay.key", "R")
 	write("client/hosts.json", "H")
 	write("client/forwards.json", "F")
@@ -94,7 +95,7 @@ func TestExportImportRoundTrip(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, rel := range []string{
-		"config.toml", "serve/key.bin", "serve/tokens.jsonl", "relay/relay.key",
+		"config.toml", "serve/key.bin", "serve/tokens.jsonl", "serve/revoked.jsonl", "relay/relay.key",
 		"client/hosts.json", "client/forwards.json", "client/socks.json", "client/identity/master.key",
 	} {
 		a, aerr := os.ReadFile(filepath.Join(src, rel))
@@ -275,7 +276,7 @@ func TestImportRollbackOnPlacementFailure(t *testing.T) {
 	}
 	// 回滚：旧四件归位、逐字节不变、无残留。
 	for _, rel := range []string{
-		"config.toml", "serve/key.bin", "serve/tokens.jsonl", "relay/relay.key",
+		"config.toml", "serve/key.bin", "serve/tokens.jsonl", "serve/revoked.jsonl", "relay/relay.key",
 		"client/hosts.json", "client/identity/master.key",
 	} {
 		a, _ := os.ReadFile(filepath.Join(dst, rel))

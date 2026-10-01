@@ -7,6 +7,7 @@ package daemon
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -16,6 +17,8 @@ import (
 	"time"
 
 	"github.com/zhaoyswd/homeway/internal/nodeconfig"
+	"github.com/zhaoyswd/homeway/internal/server"
+	"github.com/zhaoyswd/homeway/pkg/proto"
 )
 
 // startUnifiedForGroup 起一个真统一进程（serve 按需、relay 关）并等 serve 实际
@@ -522,4 +525,88 @@ func TestWarnNoEndpoints(t *testing.T) {
 			t.Fatalf("无端点提示应含 events.log 落点：\n%s", out.String())
 		}
 	}
+}
+
+// TestServeTokenListAndRevokeCLI（FIX-64）：list = 台账只读面（只出掩码、末行标注、
+// 行数/凭证数汇总）；revoke = 写吊销表（幂等、未知 id 可行动错误、在用凭证给重启提示）。
+func TestServeTokenListAndRevokeCLI(t *testing.T) {
+	dir := t.TempDir()
+	st, err := server.OpenState(filepath.Join(dir, "serve"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	tok, err := st.IssueToken([]proto.Endpoint{{Addr: "192.0.2.9:41641"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	full := base64.RawURLEncoding.EncodeToString(tok.Secret[:])
+	led, err := st.Ledger()
+	if err != nil || len(led) != 1 {
+		t.Fatalf("台账应 1 行：%v %+v", err, led)
+	}
+	id := led[0].ID
+
+	var out bytes.Buffer
+	if err := ServeGroupCLI([]string{"token", "list", "--state", dir}, "t", &out); err != nil {
+		t.Fatal(err)
+	}
+	s := out.String()
+	if strings.Contains(s, full) {
+		t.Fatalf("list 不得输出完整凭证（凭证纪律）：\n%s", s)
+	}
+	if !strings.Contains(s, id) || !strings.Contains(s, "末行") {
+		t.Fatalf("list 应含 id 与末行标注：\n%s", s)
+	}
+	if !strings.Contains(s, "共 1 行 / 1 枚凭证") {
+		t.Fatalf("list 应有行数/凭证数汇总：\n%s", s)
+	}
+
+	// 吊销在用凭证：写吊销表 + 给重启提示。
+	out.Reset()
+	if err := ServeGroupCLI([]string{"token", "revoke", id, "--state", dir}, "t", &out); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out.String(), "在用凭证") || !strings.Contains(out.String(), "serve restart") {
+		t.Fatalf("吊销在用凭证应给重启铁提示：\n%s", out.String())
+	}
+	if secs, _ := st.Secrets(); len(secs) != 0 {
+		t.Fatalf("吊销后验证集应为空（注册立即拒），got %d", len(secs))
+	}
+	// 幂等：重复吊销报「幂等无动作」，不再写表。
+	before := revokeLines(t, dir)
+	out.Reset()
+	if err := ServeGroupCLI([]string{"token", "revoke", id, "--state", dir}, "t", &out); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out.String(), "幂等") || revokeLines(t, dir) != before {
+		t.Fatalf("重复吊销应幂等且不追加吊销行：\n%s", out.String())
+	}
+	// list 呈现吊销态与原因。
+	out.Reset()
+	if err := ServeGroupCLI([]string{"token", "list", "--state", dir}, "t", &out); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out.String(), "已吊销(manual)") {
+		t.Fatalf("list 应标注已吊销与原因：\n%s", out.String())
+	}
+	// 未知 id：可行动错误（指路 list）。
+	out.Reset()
+	if err := ServeGroupCLI([]string{"token", "revoke", "deadbeef", "--state", dir}, "t", &out); err == nil {
+		t.Fatal("未知 id 应报错")
+	} else if !strings.Contains(err.Error(), "token list") {
+		t.Fatalf("未知 id 错误应指路 list：%v", err)
+	}
+}
+
+// revokeLines 吊销表行数（文件不存在 = 0）。
+func revokeLines(t *testing.T, dir string) int {
+	t.Helper()
+	b, err := os.ReadFile(filepath.Join(dir, "serve", "revoked.jsonl"))
+	if err != nil {
+		if os.IsNotExist(err) {
+			return 0
+		}
+		t.Fatal(err)
+	}
+	return strings.Count(strings.TrimSpace(string(b)), "\n") + 1
 }

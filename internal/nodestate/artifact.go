@@ -30,7 +30,9 @@ const exportTop = "homeway-export"
 var clientPieces = []string{"identity", "hosts.json", "forwards.json", "socks.json"}
 
 // serveAllowed / relayAllowed import 白名单（多件/异物拒的判据）。
-var serveAllowed = map[string]bool{"key.bin": true, "tokens.jsonl": true}
+// revoked.jsonl（FIX-64 凭证吊销表）随 serve/ 一起进出：漏了它 = 备份/迁移后
+// 已吊销凭证复活（安全面倒退）。
+var serveAllowed = map[string]bool{"key.bin": true, "tokens.jsonl": true, "revoked.jsonl": true}
 
 var relayAllowed = map[string]bool{"relay.key": true}
 
@@ -354,7 +356,7 @@ func validateArtifact(entries []artifactEntry) error {
 				continue
 			}
 			if len(parts) != 2 || e.dir || !serveAllowed[parts[1]] {
-				return fmt.Errorf("import: 多件/异物 %q（serve/ 只接受 key.bin / tokens.jsonl）", e.name)
+				return fmt.Errorf("import: 多件/异物 %q（serve/ 只接受 key.bin / tokens.jsonl / revoked.jsonl）", e.name)
 			}
 		case subRelay:
 			if e.dir && len(parts) == 1 {

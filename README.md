@@ -77,6 +77,8 @@ homeway serve restart
 # 启停与观测（守护托管：未跑则自动拉起统一进程）
 homeway serve start | stop | restart | status [--json]
 homeway serve token                          # 完整 hmw1 凭证（在跑控制面 / 未跑读台账末行）
+homeway serve token list                     # 凭证台账：id/签发/状态/端点（凭证只出掩码）
+homeway serve token revoke <id>              # 吊销一枚凭证（写吊销表；即时对新注册生效）
 
 # 一次性前台调试形态（不改期望态；flag 一次性覆盖 config）
 homeway serve --listen 41641
@@ -418,6 +420,9 @@ homeway serve --state ~/.config/homeway-b --listen 41642   # 前台单角色
 
 `./homeway --verbose` 把摘要+细节同时回显终端（现场排障用）。取最新 token：
 `homeway serve token`（未跑时直读台账末行，与在跑值一致——台账写入纪律）。
+凭证泄漏处置：`homeway serve token revoke <id>`（`list` 查 id）——吊销即时对新注册生效
+（吊销表 `serve/revoked.jsonl` 跟随读）；已在线的设备与在跑的 token 打印要 `serve restart`
+才清（重启会清空设备表；若吊销的是在用凭证，重启自动铸出新凭证，客户端需重新粘贴）。
 
 ### macOS 安装（Gatekeeper 实情）
 

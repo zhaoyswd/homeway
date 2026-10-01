@@ -1,8 +1,10 @@
 package server
 
 import (
+	"errors"
 	"os"
 	"testing"
+	"time"
 
 	"github.com/zhaoyswd/homeway/pkg/proto"
 )
@@ -87,5 +89,131 @@ func TestStateIssueTokenRoundTrip(t *testing.T) {
 	}
 	if len(secrets) != 2 {
 		t.Fatalf("台账条数=%d", len(secrets))
+	}
+}
+
+// ---- FIX-64：凭证 id / 吊销表 / 台账可读面 ----
+
+// TestStateCredIDStable：凭证 id = secret 的确定派生（不落额外状态；老行无字段
+// 也一致）——台账写入落字段与读取现算必须同值。
+func TestStateCredIDStable(t *testing.T) {
+	var sec [32]byte
+	for i := range sec {
+		sec[i] = byte(i)
+	}
+	id := credID(sec)
+	if len(id) != 8 {
+		t.Fatalf("id 形态（8 hex）：%q", id)
+	}
+	if id != credID(sec) {
+		t.Fatal("同一 secret 的 id 必须稳定")
+	}
+	// 台账行落字段 = 现算值（Ledger 对老行现算的兜底路径见下）。
+	dir := t.TempDir()
+	st, err := OpenState(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tok, ierr := st.IssueToken(nil)
+	if ierr != nil {
+		t.Fatal(ierr)
+	}
+	led, lerr := st.Ledger()
+	if lerr != nil {
+		t.Fatal(lerr)
+	}
+	if len(led) != 1 || led[0].ID != credID(tok.Secret) {
+		t.Fatalf("台账行的 id 应为 credID(secret)，got %+v", led)
+	}
+}
+
+// TestStateRevokeFiltersSecrets：吊销后 Secrets() 不再返回该凭证（注册验证集的
+// 唯一数据源）；吊销幂等；台账末行重铸给可行动错误（不回死凭证）。
+func TestStateRevokeFiltersSecrets(t *testing.T) {
+	dir := t.TempDir()
+	st, err := OpenState(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tok1, _ := st.IssueToken(nil)
+	tok2, _ := st.IssueToken(nil)
+	if s, _ := st.Secrets(); len(s) != 2 {
+		t.Fatalf("吊销前应有 2 枚：%d", len(s))
+	}
+	already, rerr := st.Revoke(tok1.Secret, "leaked")
+	if rerr != nil || already {
+		t.Fatalf("首次吊销应成功且非幂等命中：already=%v err=%v", already, rerr)
+	}
+	if already, _ := st.Revoke(tok1.Secret, "again"); !already {
+		t.Fatal("重复吊销应报 already（幂等无动作）")
+	}
+	secrets, err := st.Secrets()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(secrets) != 1 || secrets[0] != tok2.Secret {
+		t.Fatalf("已吊销凭证必须从验证集滤除，got %d 枚", len(secrets))
+	}
+	// 台账行仍在（append-only 纪律：吊销不改台账），状态标为已吊销。
+	led, _ := st.Ledger()
+	if len(led) != 2 || !led[0].Revoked || led[1].Revoked {
+		t.Fatalf("台账应保留 2 行且只标第一行已吊销：%+v", led)
+	}
+	if led[0].Reason != "leaked" {
+		t.Fatalf("吊销原因应进台账读面：%+v", led[0])
+	}
+	// AppendToken 拒写已吊销 secret（防「端点变化轮把死凭证写回末行」）。
+	if aerr := st.AppendToken(tok1.Secret, nil); !errors.Is(aerr, ErrSecretRevoked) {
+		t.Fatalf("已吊销 secret 的追加应被拒：%v", aerr)
+	}
+	// LastToken：末行（tok2）仍有效 → 正常返回；吊销末行 → 可行动错误。
+	if _, ok, lerr := st.LastToken(); lerr != nil || !ok {
+		t.Fatalf("末行有效时应正常 reveal：ok=%v err=%v", ok, lerr)
+	}
+	if _, rerr := st.Revoke(tok2.Secret, "also"); rerr != nil {
+		t.Fatal(rerr)
+	}
+	if _, _, lerr := st.LastToken(); !errors.Is(lerr, ErrSecretRevoked) {
+		t.Fatalf("末行已吊销时必须报 ErrSecretRevoked（MUST NOT 回死凭证），got %v", lerr)
+	}
+	// 全部吊销后 Secrets 空集 = 启动路径会铸新（serve.go 的分支）。
+	if s, _ := st.Secrets(); len(s) != 0 {
+		t.Fatalf("全吊销后应为空集，got %d", len(s))
+	}
+}
+
+// TestRevokedFollowerFollowsFile：跟随读——吊销写盘后秒级（节流窗）生效；文件
+// 消失沿用缓存（安全面宁可多拒）；nil 接收者恒 false（无吊销面）。
+func TestRevokedFollowerFollowsFile(t *testing.T) {
+	var f *revokedFollower
+	if f.isRevoked([32]byte{1}) {
+		t.Fatal("nil follower 恒 false")
+	}
+	dir := t.TempDir()
+	st, _ := OpenState(dir)
+	tok, _ := st.IssueToken(nil)
+	fol := newRevokedFollower(st.revocationsPath())
+	if fol.isRevoked(tok.Secret) {
+		t.Fatal("尚未吊销")
+	}
+	if _, err := st.Revoke(tok.Secret, "t"); err != nil {
+		t.Fatal(err)
+	}
+	// 节流窗内的判定读缓存（1s）——测试直接把 lastCheck 拨回去，等价于等过 1s。
+	fol.mu.Lock()
+	fol.lastCheck = time.Time{}
+	fol.mu.Unlock()
+	if !fol.isRevoked(tok.Secret) {
+		t.Fatal("吊销写盘后应生效（节流窗过后）")
+	}
+	// 文件消失：沿用缓存（已吊销的判定不因文件暂缺而放行）。
+	if err := os.Remove(st.revocationsPath()); err != nil {
+		t.Fatal(err)
+	}
+	fol.mu.Lock()
+	fol.lastCheck = time.Time{}
+	fol.mu.Unlock()
+	if !fol.isRevoked(tok.Secret) {
+		t.Fatal("吊销表文件消失时应沿用缓存（安全面不放行）")
 	}
 }
