@@ -22,7 +22,7 @@ import (
 
 func TestRelayLegEndToEnd(t *testing.T) {
 	// ---- 中继 ----
-	rl := relay.New(relay.Config{Addr: "127.0.0.1:0", IdleTimeout: 5 * time.Second,
+	rl := relay.New(relay.Config{Addr: "127.0.0.1:0", Open: true, IdleTimeout: 5 * time.Second,
 		Logf: func(f string, a ...any) { t.Logf("[relay] "+f, a...) }})
 	rctx, rcancel := context.WithCancel(context.Background())
 	done := make(chan struct{})

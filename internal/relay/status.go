@@ -19,7 +19,7 @@ type StatusSnapshot struct {
 	Listen   string         // 实际监听地址（UDP）
 	Backends []BackendBrief // 注册出口列表
 	Assocs   int            // 活跃客户端分配会话数
-	Open     bool           // 是否开放注册（Secret 零值）
+	Open     bool           // 是否开放注册（显式测试开关 Config.Open）
 }
 
 func (r *Relay) BackendBriefs() []BackendBrief {
@@ -48,7 +48,7 @@ func (r *Relay) Snapshot() StatusSnapshot {
 	r.mu.Lock()
 	pc := r.pc
 	assocs := len(r.assocs)
-	open := r.cfg.Secret == ([32]byte{})
+	open := r.cfg.Open
 	r.mu.Unlock()
 	snap := StatusSnapshot{Backends: r.BackendBriefs(), Assocs: assocs, Open: open}
 	if pc != nil {

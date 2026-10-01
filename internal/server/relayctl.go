@@ -29,11 +29,6 @@ const (
 	ctlKeepaliveEvery = 25 * time.Second // 与中继侧 ctlReadTimeout（3×+15s）配套
 	ctlReconnectMin   = 1 * time.Second
 	ctlReconnectMax   = 30 * time.Second
-	// #25：对端若是**没有控制面**的旧中继（v0.2.3 及更早：TCP 同号口无监听），
-	// 拨号会被立刻拒绝。按 30s 上限重试只是刷屏（环境没变、注定失败）——
-	// 连续失败超过阈值后退避上限提到分钟级，并打一次明确告警（带排查指引）。
-	ctlOldRelayFails = 6
-	ctlReconnectSlow = 5 * time.Minute
 )
 
 // startControlClient：起控制面协程（非阻塞；随 ctx 收工）。
@@ -41,9 +36,6 @@ func startControlClient(ctx context.Context, bind *servercore.ServerBind, relay 
 	priv [32]byte, pub [32]byte, relaySecret [32]byte, logf func(string, ...any)) {
 	go func() {
 		backoff := ctlReconnectMin
-		maxBackoff := ctlReconnectMax
-		consecFails := 0
-		warnedOld := false
 		for {
 			if ctx.Err() != nil {
 				return
@@ -57,22 +49,6 @@ func startControlClient(ctx context.Context, bind *servercore.ServerBind, relay 
 				// 只增不减会让长期运行后的每次断线恢复都等满 30s 上限——
 				// 中继重启的恢复被历史退避拖慢）。
 				backoff = ctlReconnectMin
-				consecFails = 0
-				maxBackoff = ctlReconnectMax
-				warnedOld = false
-			} else {
-				consecFails++
-				// #25：疑似旧版中继（无控制面 TCP）——退避上限提到分钟级，
-				// 告警只打一次（中继/后端可分别升级，升级后成功即自愈）。
-				if consecFails >= ctlOldRelayFails {
-					if !warnedOld {
-						warnedOld = true
-						logf("⚠️ 中继 %v 连续 %d 次拨不通控制面（TCP 同号口无监听？）——"+
-							"疑似旧版中继或防火墙未放行 TCP %d。退避上限提高到 %v（中继升级后自动恢复）",
-							relay, consecFails, relay.Port(), ctlReconnectSlow)
-					}
-					maxBackoff = ctlReconnectSlow
-				}
 			}
 			if err != nil {
 				logf("中继控制面断开（%v）—— %v 后重连", err, backoff)
@@ -85,8 +61,8 @@ func startControlClient(ctx context.Context, bind *servercore.ServerBind, relay 
 				return
 			}
 			backoff *= 2
-			if backoff > maxBackoff {
-				backoff = maxBackoff
+			if backoff > ctlReconnectMax {
+				backoff = ctlReconnectMax
 			}
 		}
 	}()
@@ -140,14 +116,12 @@ func runControlConn(ctx context.Context, bind *servercore.ServerBind, relay neti
 	if relaySecret != ([32]byte{}) {
 		macPSK = proto.RelayAuthMAC(relaySecret, nonce, pub)
 	}
-	// PROOF 自带协议版本（v2，#25）——中继据此启用 SESSION cookie / OK 认证 / 腿认证。
-	// v1 中继的解码器按长度判别，50B 会被当畸形拒掉（v1 中继只存在于未发版的
-	// 开发构建；v0.2.3 线上中继根本没有 TCP 控制面，走连接拒绝+慢退避路径）。
-	if err := proto.CtlWriteMsg(conn, proto.EncodeRelayProofV(nonce, dh, pub, macPSK, proto.RelayCtlVer)); err != nil {
+	// PROOF 自带协议版本（v2 = RelayCtlVer）——中继据此启用 SESSION cookie / OK 认证 /
+	// 腿认证；版本不符（老中继/未来版本）在中继侧即被拒（FIX-89 v2-only）。
+	if err := proto.CtlWriteMsg(conn, proto.EncodeRelayProof(nonce, dh, pub, macPSK, proto.RelayCtlVer)); err != nil {
 		return false, fmt.Errorf("发 PROOF: %w", err)
 	}
-	// ④ OK（v2 中继 + token 模式会带 MAC：认证中继本身，#29——伪造/劫持的 TCP
-	// 端点没有 token 密钥，算不出 HMAC(nonce)；开放模式（测试）无密钥可依，跳过）。
+	// ④ OK（恒 v2 形状：token 模式带中继身份 MAC；开放模式无密钥可算、零 MAC 占位）。
 	typ, payload, err = proto.CtlReadMsg(conn)
 	if err != nil {
 		return false, fmt.Errorf("读 OK: %w", err)
@@ -155,27 +129,23 @@ func runControlConn(ctx context.Context, bind *servercore.ServerBind, relay neti
 	if typ != proto.RelaySubOK {
 		return false, fmt.Errorf("控制面握手被拒（type=0x%02x）", typ)
 	}
+	// 形状检查统一（v2-only）：17B（子类型+MAC）；裸 1B 的历史形状 = 老中继，不再容纳。
+	mac, ok := proto.DecodeRelayOKAuth(withSubtype(typ, payload))
+	if !ok {
+		return false, errors.New("控制面 OK 形状不符（对端不是 v2 中继）")
+	}
 	// relayAuthed：控制对端是否已证明持有本 token 的密钥（= 允许它指挥拨腿）。
 	// 开放模式（无 token）没有可验材料，按"测试用途"放行；token 模式下**必须**有
-	// OK-MAC —— 此前裸 1B 的 v1 形状 OK 被无条件接受 ⇒ 能应答这条 TCP 的一方只要
-	// **省略 MAC** 就绕过了 #29 的中继身份认证，再喂 SESSION 让后端往中继主机任意
-	// 端口拨腿（端口注入 + 伪造会话）。现在未认证通道只当保活用，SESSION 一律拒绝。
+	// 有效 OK-MAC——能应答这条 TCP 的一方若算不出 MAC 就绕不过这层（#29：此前裸 1B
+	// 形状 OK 被无条件接受，可被喂假 SESSION 让后端往任意端口拨腿）。
 	relayAuthed := relaySecret == ([32]byte{})
-	if relaySecret != ([32]byte{}) {
-		if mac, v2 := proto.DecodeRelayOKAuth(withSubtype(typ, payload)); v2 {
-			want := proto.RelayOKAuthMAC(relaySecret, nonce)
-			if subtle.ConstantTimeCompare(want, mac) != 1 {
-				return false, errors.New("控制面 OK 的中继身份校验不过（MAC 不匹配：对端不持有本 token 的密钥）")
-			}
-			relayAuthed = true
-			logf("中继控制面：中继身份已认证（OK-MAC 通过）")
-		} else {
-			// v1 形状（裸 1B）：可能是未发版的旧中继（合法但没有认证材料），也可能是
-			// 中间人降级；两者都不该拿到拨腿指挥权。合法旧中继本来也不会发 SESSION
-			//（它 ctlV2=false，走 per-client 旧路径），所以拒绝 SESSION 不会破坏兼容。
-			logf("⚠️ 中继控制面：对端未提供 OK-MAC（v1 形状，可能是旧版中继或降级攻击）"+
-				"——该通道不指挥拨腿，SESSION 一律拒绝（中继 %v）", relay)
+	if !relayAuthed {
+		want := proto.RelayOKAuthMAC(relaySecret, nonce)
+		if subtle.ConstantTimeCompare(want, mac) != 1 {
+			return false, errors.New("控制面 OK 的中继身份校验不过（MAC 不匹配：对端不持有本 token 的密钥）")
 		}
+		relayAuthed = true
+		logf("中继控制面：中继身份已认证（OK-MAC 通过）")
 	}
 	// 重连对账（review B1）：旧腿全部作废——中继会立刻重放活跃会话（replaySessions），
 	// 按重放重建。中继重启场景 = 重放零条 = 干净清空。
@@ -234,20 +204,15 @@ func runControlConn(ctx context.Context, bind *servercore.ServerBind, relay neti
 				continue
 			}
 			remote := netip.AddrPortFrom(relay.Addr().Unmap(), sess.DataPort)
-			// v2 会话带 cookie：拨腿首包回 LEGUP‖cookie‖MAC（中继验过才认这条腿，
-			// #3——腿身份认证的 backend 侧）。v1 通告（无 cookie）维持纯 LEGUP 标记。
-			// SESSION 的 27B 形状本身即表明中继是 v2（v1 中继只编 11B 无 cookie 形态），
-			// 且该通道已由 OK-MAC 认证（relayAuthed）。
-			marker := []byte("LEGUP")
-			if sess.HasCookie {
-				marker = proto.LegupAuthPayload(sess.ID, sess.Cookie, legupKeyFor(relaySecret, sess.Cookie))
-			}
+			// v2 会话恒带 cookie：拨腿首包回 LEGUP‖cookie‖MAC（中继验过才认这条腿，
+			// #3——腿身份认证的 backend 侧）。27B 形状（DecodeCtlSession 只认它）
+			// 加上 OK-MAC 认证共同表明对端是 v2 中继（FIX-89 v2-only）。
+			marker := proto.LegupAuthPayload(sess.ID, sess.Cookie, legupKeyFor(relaySecret, sess.Cookie))
 			if rerr := bind.RegisterLeg(sess.ID, remote, marker); rerr != nil {
 				logf("中继控制面：会话 #%d 拨腿失败（→ %v）：%v", sess.ID, remote, rerr)
 				continue
 			}
-			logf("中继控制面：会话 #%d 已拨腿 → %v（%s）", sess.ID, remote,
-				ternary(sess.HasCookie, "认证腿", "v1 标记"))
+			logf("中继控制面：会话 #%d 已拨腿 → %v（认证腿）", sess.ID, remote)
 		case proto.RelayCtlRelease:
 			id, rerr := proto.DecodeCtlRelease(withSubtype(typ, payload))
 			if rerr != nil {
@@ -280,11 +245,4 @@ func legupKeyFor(relaySecret [32]byte, cookie [16]byte) [32]byte {
 	var k [32]byte
 	copy(k[:16], cookie[:])
 	return k
-}
-
-func ternary(b bool, a1, a2 string) string {
-	if b {
-		return a1
-	}
-	return a2
 }

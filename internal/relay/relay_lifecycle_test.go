@@ -20,7 +20,7 @@ import (
 )
 
 func TestRunReleasesListenersBeforeReturn(t *testing.T) {
-	rl := New(Config{Addr: "127.0.0.1:0"})
+	rl := New(Config{Addr: "127.0.0.1:0", Open: true})
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
 	go func() {

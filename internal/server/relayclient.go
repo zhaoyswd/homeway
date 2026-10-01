@@ -164,7 +164,7 @@ func (rc *relayClient) handleControl(src netip.AddrPort, payload []byte) {
 		if rc.secret != ([32]byte{}) {
 			psk = proto.RelayAuthMAC(rc.secret, nonce, rc.pub)
 		}
-		proof := proto.EncodeRelayProof(nonce, dh, rc.pub, psk)
+		proof := proto.EncodeRelayProof(nonce, dh, rc.pub, psk, proto.RelayCtlVer)
 		frame := proto.EncodeTagged(rc.label, proto.FrameTypeRelayReg, proof)
 		if err := rc.bind.SendRawTo(rc.relay, frame); err != nil {
 			rc.logf("中继：注册证明发送失败（%v）", err)

@@ -85,9 +85,16 @@ func RelayProofMAC(dh []byte, nonce [16]byte, pubkey [32]byte) []byte {
 	return mac.Sum(nil)[:16]
 }
 
-// EncodeRelayProof：后端回证明（macPSK 为 nil = 开放模式，填 0）。
-func EncodeRelayProof(nonce [16]byte, dh []byte, pubkey [32]byte, psk []byte) []byte {
-	out := make([]byte, 0, 1+16+16+16)
+// EncodeRelayProof：后端回证明（49B 载荷 + 1 字节协议版本 = 50B；macPSK 为
+// nil = 开放模式，填 0）。
+//
+// ⚠️ 版本治理（FIX-89，2026-10-02 起 v2-only）：CHALLENGE 形状不带版本
+// （老中继的严格解码器遇到多一个字节会当畸形断开——无法先安全地自报版本），
+// 所以由**后端在 PROOF 里自报**，中继按长度判别并拒绝 ver != RelayCtlVer 的
+// 对端。33B（只有 macDH）/49B（无版本字节）两个历史形态已随旧矩阵删除：
+// 两端必须同版本（升级注意：中继与后端是同一二进制的两个角色，同一发布内升级）。
+func EncodeRelayProof(nonce [16]byte, dh []byte, pubkey [32]byte, psk []byte, ver byte) []byte {
+	out := make([]byte, 0, 1+16+16+16+1)
 	out = append(out, RelaySubProof)
 	out = append(out, nonce[:]...)
 	out = append(out, RelayProofMAC(dh, nonce, pubkey)...)
@@ -96,36 +103,20 @@ func EncodeRelayProof(nonce [16]byte, dh []byte, pubkey [32]byte, psk []byte) []
 	} else {
 		out = append(out, make([]byte, 16)...)
 	}
-	return out
+	return append(out, ver)
 }
 
 // DecodeRelayProof：解析证明（校验留给调用方：它才知道 DH / 鉴权密钥）。
-// 兼容老的 33B 版本（只有 macDH）——老中继/老后端混跑时不至于死。
-// 50B = v2 后端（末尾 1 字节协议版本，review #25）：中继据此启用 v2 能力
-// （SESSION cookie / OK 认证 / 腿认证）。v1 后端照旧 49B/33B。
+// 只接受 50B（v2）形状；ver 由调用方与 RelayCtlVer 比对。
 func DecodeRelayProof(p []byte) (nonce [16]byte, macDH, macPSK []byte, ver byte, err error) {
-	if len(p) != 49 && len(p) != 33 && len(p) != 50 || p[0] != RelaySubProof {
+	if len(p) != 50 || p[0] != RelaySubProof {
 		return nonce, nil, nil, 0, ErrFrameMalformed
 	}
 	copy(nonce[:], p[1:17])
 	macDH = p[17:33]
-	if len(p) >= 49 {
-		macPSK = p[33:49]
-	}
-	if len(p) == 50 {
-		ver = p[49]
-	}
+	macPSK = p[33:49]
+	ver = p[49]
 	return nonce, macDH, macPSK, ver, nil
-}
-
-// EncodeRelayProofV：v2 后端的 PROOF（49B 载荷 + 1 字节协议版本）。
-// ⚠️ 版本协商的方向（review #25）：CHALLENGE 形状不动（v1 后端的严格解码器
-// 遇到多一个字节会当畸形断开——中继无法先安全地自报版本），所以由**后端在
-// PROOF 里自报**、中继按长度判别；中继回 OK 时才带 v2 能力材料。v2 后端对
-// v1 中继（只可能出现在未发版的开发构建）会被当畸形拒——部署矩阵见 change 文档。
-func EncodeRelayProofV(nonce [16]byte, dh []byte, pubkey [32]byte, psk []byte, ver byte) []byte {
-	out := EncodeRelayProof(nonce, dh, pubkey, psk)
-	return append(out, ver)
 }
 
 // RelayCtlVer：控制协议版本。

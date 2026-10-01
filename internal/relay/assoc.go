@@ -72,35 +72,32 @@ func (r *Relay) forwardUp(client netip.AddrPort, lg *leg, typ byte, payload []by
 			return
 		}
 		a = &assoc{key: key, backend: lg.addr, sock: sock, last: time.Now(), lastDown: time.Now()}
-		// relay-backend-dial：有 v2 控制连接的后端走「通告 + 等拨腿」——
+		// relay-backend-dial：有控制连接的后端走「通告 + 等拨腿」——
 		// 不主动发往 lg.addr（严格 NAT 上恒不通），首包缓冲、等后端的认证 LEGUP。
-		// v1 控制连接不走拨腿（解不开 v2 SESSION；保持 per-client 旧路径）。
 		if r.hasControlLocked(lg) {
 			r.nextSid++
 			a.sid = r.nextSid
 			a.dialUp = true
 			a.dialed = true
 			a.dialUpAt = time.Now()
-			if lg.ctlV2 {
-				// 每会话随机 cookie（review #3）：只经控制通道发给该后端，
-				// 拨腿首包必须回带 cookie+MAC 才被认作腿。
-				if _, cerr := rand.Read(a.cookie[:]); cerr != nil {
-					// 随机源失效（实践上不会发生）：**不**退化成全零 cookie 的"假 v2"
-					// （那会让 cookie 可预测、认证形同虚设）——拆掉本次会话让客户端
-					// 重试，下一次多半能拿到正常随机数。会话尚未入表，直接关 socket。
-					_ = sock.Close()
-					r.mu.Unlock()
-					r.bump(func(s *Stats) { s.Dropped++ })
-					r.cfg.Logf("⚠️ 中继：会话随机数不可用（%v）——已放弃本次会话，客户端重试即可", cerr)
-					return
-				}
-				a.authOK = false
+			// 每会话随机 cookie（review #3）：只经控制通道发给该后端，
+			// 拨腿首包必须回带 cookie+MAC 才被认作腿。
+			if _, cerr := rand.Read(a.cookie[:]); cerr != nil {
+				// 随机源失效（实践上不会发生）：**不**退化成全零 cookie 的"假认证"
+				// （那会让 cookie 可预测、认证形同虚设）——拆掉本次会话让客户端
+				// 重试，下一次多半能拿到正常随机数。会话尚未入表，直接关 socket。
+				_ = sock.Close()
+				r.mu.Unlock()
+				r.bump(func(s *Stats) { s.Dropped++ })
+				r.cfg.Logf("⚠️ 中继：会话随机数不可用（%v）——已放弃本次会话，客户端重试即可", cerr)
+				return
 			}
+			a.authOK = false
 		}
 		r.assocs[key] = a
 		r.stats.Assigned++
 		sid, dialUp := a.sid, a.dialUp
-		cookie, hasCookie := a.cookie, a.sid != 0 && lg.ctlV2
+		cookie := a.cookie
 		r.mu.Unlock()
 		go r.assocReadLoop(a)
 		// 腿建立：两端各推一次对端观察地址（不可信线索）
@@ -108,7 +105,7 @@ func (r *Relay) forwardUp(client netip.AddrPort, lg *leg, typ byte, payload []by
 		r.sendHintToBackend(a, client)
 		if dialUp {
 			port := uint16(sock.LocalAddr().(*net.UDPAddr).Port)
-			if r.announceSession(lg, proto.CtlSession{ID: sid, DataPort: port, Cookie: cookie, HasCookie: hasCookie}) {
+			if r.announceSession(lg, proto.CtlSession{ID: sid, DataPort: port, Cookie: cookie}) {
 				r.cfg.Logf("中继：客户端 %v 起会话 #%d（拨腿模式）→ 后端 %x（数据口 %v）",
 					client, sid, lg.label[:], sock.LocalAddr())
 			} else {
@@ -213,11 +210,8 @@ func (r *Relay) assocReadLoop(a *assoc) {
 			a.last, a.lastDown = now, now
 			r.mu.Unlock()
 		}
-		// LEGUP 家族吞包（判定在分支外）：首腿、重拨腿与已认证源的重复标记都不外泄
-		//（WG 层虽会丢弃 5 字节残包，但别把标记泄给对端）。
-		if proto.IsPlainLegup(pkt) {
-			continue
-		}
+		// LEGUP 认证标记吞包（判定在分支外）：首腿、重拨腿与已认证源的重复标记
+		// 都不外泄给对端（WG 层本也会丢弃，但别把标记泄出去）。
 		if _, isLegup := proto.LegupCookie(pkt); isLegup {
 			continue
 		}

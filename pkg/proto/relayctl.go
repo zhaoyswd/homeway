@@ -33,19 +33,17 @@ var ErrCtlMalformed = errors.New("proto/relayctl: 消息非法")
 // relayCtlMax：单条控制消息上限（所有子类型都 ≤64B，防恶意长度行撑爆读侧）。
 const relayCtlMax = 256
 
-// CtlSession：SESSION 通告载荷。
+// CtlSession：SESSION 通告载荷（v2 恒带 cookie，27B）。
 type CtlSession struct {
 	ID       uint64 // 中继侧会话号（RELEASE 关联用）
 	DataPort uint16 // 该客户端专属数据口（后端拨腿的目标端口）
 	// Cookie：每会话随机（review #3，腿身份认证）。只经控制通道发给**该会话所属的
 	// 后端**；后端拨腿首包必须回带 cookie + MAC，中继验过才把该源认作腿——
 	// 否则任何扫到数据口的第三方都能抢占会话（收走 WG 密文 / 黑洞上行 / 注入 hint）。
-	// HasCookie=false 时按 v1 编码（11B，不带认证——v1 后端/旧路径）。
-	Cookie    [16]byte
-	HasCookie bool
+	Cookie [16]byte
 }
 
-// EncodeCtlSession 组 SESSION 消息（HasCookie 时 27B v2，否则 11B v1）。
+// EncodeCtlSession 组 SESSION 消息（27B，恒带 cookie）。
 func EncodeCtlSession(s CtlSession) []byte {
 	out := make([]byte, 0, 1+10+16)
 	out = append(out, RelayCtlSession)
@@ -54,25 +52,20 @@ func EncodeCtlSession(s CtlSession) []byte {
 	out = append(out, b[:]...)
 	binary.BigEndian.PutUint16(b[:2], s.DataPort)
 	out = append(out, b[:2]...)
-	if s.HasCookie {
-		out = append(out, s.Cookie[:]...)
-	}
-	return out
+	return append(out, s.Cookie[:]...)
 }
 
-// DecodeCtlSession 解 SESSION 消息（11B = v1 无 cookie；27B = v2 带 cookie）。
+// DecodeCtlSession 解 SESSION 消息（只认 27B v2 形态；11B 无 cookie 的历史
+// 形态已随旧矩阵删除——中继/后端必须同版本）。
 func DecodeCtlSession(p []byte) (CtlSession, error) {
-	if len(p) != 11 && len(p) != 27 || p[0] != RelayCtlSession {
+	if len(p) != 27 || p[0] != RelayCtlSession {
 		return CtlSession{}, ErrCtlMalformed
 	}
 	s := CtlSession{
 		ID:       binary.BigEndian.Uint64(p[1:9]),
 		DataPort: binary.BigEndian.Uint16(p[9:11]),
 	}
-	if len(p) == 27 {
-		copy(s.Cookie[:], p[11:27])
-		s.HasCookie = true
-	}
+	copy(s.Cookie[:], p[11:27])
 	return s, nil
 }
 
@@ -81,7 +74,7 @@ func DecodeCtlSession(p []byte) (CtlSession, error) {
 //	拨腿首包 = "LEGUP" ‖ cookie(16) ‖ MAC(16)，MAC = HMAC(key, "legup-v2" ‖ sid(8 BE) ‖ cookie)
 //	key = token 模式 = 中继鉴权密钥（与后端共享，在线路上永不出现）；
 //	     开放模式 = cookie 本身（仅防盲攻击者——能读到线路的观察者在此模式下本就无防）。
-//	v1 腿（无 cookie 的 SESSION）回退纯 "LEGUP" 标记（5B）。
+//	v1 的纯 "LEGUP" 标记（5B）已随旧矩阵删除（FIX-89，v2-only）。
 const legupMagic = "LEGUP"
 
 // LegupAuthPayload：v2 后端拨腿首包的完整载荷。
@@ -121,11 +114,6 @@ func VerifyLegupAuth(pkt []byte, sid uint64, cookie [16]byte, key [32]byte) bool
 		return false
 	}
 	return hmac.Equal(LegupMAC(sid, cookie, key), pkt[21:37])
-}
-
-// IsPlainLegup：v1 的纯标记形态（5B）。
-func IsPlainLegup(pkt []byte) bool {
-	return len(pkt) == 5 && string(pkt) == legupMagic
 }
 
 // EncodeCtlRelease 组 RELEASE 消息。
@@ -189,13 +177,21 @@ func RelayOKAuthMAC(secret [32]byte, nonce [16]byte) []byte {
 	return mac.Sum(nil)[:16]
 }
 
-// EncodeRelayOKAuth：v2 OK（1B 子类型 + 16B MAC）。v1 OK 是裸 1B——解码按长度判别。
+// EncodeRelayOKAuth：控制面 OK（1B 子类型 + 16B MAC）。mac 不足 16B 时补零
+// （开放模式无密钥可算，占位同形状）。
 func EncodeRelayOKAuth(mac []byte) []byte {
-	return append([]byte{RelaySubOK}, mac...)
+	out := make([]byte, 0, 1+16)
+	out = append(out, RelaySubOK)
+	out = append(out, mac...)
+	for len(out) < 1+16 {
+		out = append(out, 0)
+	}
+	return out[:1+16]
 }
 
-// DecodeRelayOKAuth：解 OK。返回 (mac, v2)。v1 形状（裸 1B）mac 为 nil。
-func DecodeRelayOKAuth(p []byte) (mac []byte, v2 bool) {
+// DecodeRelayOKAuth：解控制面 OK（只认 17B 形态；裸 1B 的历史形态已随旧矩阵
+// 删除——FIX-89 v2-only）。ok=false = 形状不符（对端不是 v2 中继）。
+func DecodeRelayOKAuth(p []byte) (mac []byte, ok bool) {
 	if len(p) == 1+16 && p[0] == RelaySubOK {
 		return p[1:], true
 	}

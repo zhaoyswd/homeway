@@ -1,10 +1,10 @@
 package server
 
-// relayctl_auth_test.go — 控制面**中继身份**的对抗性回归（review 复审 #29 降级窗口）：
-// token 模式下，未提供 OK-MAC 的控制通道（裸 1B = v1 形状）不得拥有拨腿指挥权——
-// 此前它会拿到 SESSION 的指挥权，能应答 TCP 的一方只要**省略 MAC** 就能让后端往
-// 中继主机任意端口拨腿（端口注入 + 伪造会话）。合法旧中继不发 SESSION，因此
-// 「未认证通道一律拒绝 SESSION」不会破坏兼容矩阵里的 v1 中继回退。
+// relayctl_auth_test.go — 控制面**中继身份**的对抗性回归（review 复审 #29 降级窗口，
+// FIX-89 v2-only 形态）：
+//  1. 形状不符的 OK（裸 1B = 老中继形态）不再被容纳——握手直接判失败，拿不到拨腿指挥权；
+//  2. token 模式下 OK-MAC 算错（对端不持有本 token 的密钥）同样拒握手；
+//  3. 正向路径（v2 OK-MAC + 27B 带 cookie SESSION）必须能拨腿。
 
 import (
 	"context"
@@ -19,9 +19,10 @@ import (
 	"golang.org/x/crypto/curve25519"
 )
 
-// fakeControlRelay：只做控制握手（不校验 PROOF），按 withMAC 决定 OK 是否带认证材料，
+// fakeControlRelay：只做控制握手（不校验 PROOF），按 okShape 决定 OK 形态
+// （"v2" = 带正确 MAC；"badmac" = 带错误 MAC；"v1" = 裸 1B 老形状），
 // 然后通告一个 SESSION 指向 dataPort。返回被拨腿次数（= 数据口收到的包数）。
-func fakeControlRelay(t *testing.T, secret [32]byte, withMAC bool) int {
+func fakeControlRelay(t *testing.T, secret [32]byte, okShape string) int {
 	t.Helper()
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -73,15 +74,25 @@ func fakeControlRelay(t *testing.T, secret [32]byte, withMAC bool) int {
 		if typ, _, rerr := proto.CtlReadMsg(c); rerr != nil || typ != proto.RelaySubProof {
 			return
 		}
-		ok := proto.EncodeRelayOK()
-		if withMAC {
+		var ok []byte
+		switch okShape {
+		case "v2":
 			ok = proto.EncodeRelayOKAuth(proto.RelayOKAuthMAC(secret, nonce))
+		case "badmac":
+			wrong := [32]byte{0xEE}
+			ok = proto.EncodeRelayOKAuth(proto.RelayOKAuthMAC(wrong, nonce))
+		default: // "v1"：裸 1B 老形状
+			ok = proto.EncodeRelayOK()
 		}
 		if werr := proto.CtlWriteMsg(c, ok); werr != nil {
 			return
 		}
-		// SESSION 通告（v1 形状：11B 无 cookie）——未认证通道下必须被后端拒绝。
-		_ = proto.CtlWriteMsg(c, proto.EncodeCtlSession(proto.CtlSession{ID: 1, DataPort: dataPort}))
+		// SESSION 通告（v2 形状：27B 带 cookie）。形状不符的情形下后端已断开连接，
+		// 这里的通告落空，不应产生任何拨腿。
+		var cookie [16]byte
+		_, _ = rand.Read(cookie[:])
+		_ = proto.CtlWriteMsg(c, proto.EncodeCtlSession(
+			proto.CtlSession{ID: 1, DataPort: dataPort, Cookie: cookie}))
 		time.Sleep(700 * time.Millisecond) // 留给后端决定是否拨腿
 	}()
 
@@ -107,10 +118,16 @@ func fakeControlRelay(t *testing.T, secret [32]byte, withMAC bool) int {
 
 func TestControlUntrustedRelayCannotSteerLegs(t *testing.T) {
 	secret := [32]byte{0x5a}
-	if got := fakeControlRelay(t, secret, false); got != 0 {
-		t.Fatalf("未认证（无 OK-MAC）的控制通道指挥了拨腿：数据口收到 %d 个包（#29 降级回归）", got)
+	// 老形状（裸 1B OK）：v2-only 下握手直接失败，不得拨腿。
+	if got := fakeControlRelay(t, secret, "v1"); got != 0 {
+		t.Fatalf("形状不符（裸 1B OK）的控制通道指挥了拨腿：数据口收到 %d 个包（#29 降级回归）", got)
 	}
-	if got := fakeControlRelay(t, secret, true); got == 0 {
+	// MAC 算错（对端不持有本 token 密钥）：同样拒握手。
+	if got := fakeControlRelay(t, secret, "badmac"); got != 0 {
+		t.Fatalf("OK-MAC 错误的控制通道指挥了拨腿：数据口收到 %d 个包（#29 回归）", got)
+	}
+	// 正向路径（v2 OK-MAC + 27B cookie SESSION）必须能拨腿。
+	if got := fakeControlRelay(t, secret, "v2"); got == 0 {
 		t.Fatal("已认证（OK-MAC 通过）的控制通道没能拨腿——正向路径被误伤")
 	}
 }

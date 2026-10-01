@@ -56,6 +56,12 @@ func newDialBackend(t *testing.T, relayAddr netip.AddrPort, secret [32]byte) *di
 // connect：TCP 控制面握手（HELLO → CHALLENGE → PROOF → OK）。
 func (b *dialBackend) connect(t *testing.T) {
 	t.Helper()
+	b.connectWithVer(t, proto.RelayCtlVer)
+}
+
+// connectWithVer：connect 的版本可注入变体（FIX-89 控制面版本门用例）。
+func (b *dialBackend) connectWithVer(t *testing.T, ver byte) {
+	t.Helper()
 	conn, err := net.DialTimeout("tcp", b.relay.String(), 3*time.Second)
 	if err != nil {
 		t.Fatalf("拨控制面: %v", err)
@@ -81,8 +87,7 @@ func (b *dialBackend) connect(t *testing.T) {
 	if b.secret != ([32]byte{}) {
 		macPSK = proto.RelayAuthMAC(b.secret, nonce, b.pub)
 	}
-	// v2 PROOF（末尾带协议版本）——生产后端（relayctl.go）同款。
-	if err := proto.CtlWriteMsg(conn, proto.EncodeRelayProofV(nonce, dh, b.pub, macPSK, proto.RelayCtlVer)); err != nil {
+	if err := proto.CtlWriteMsg(conn, proto.EncodeRelayProof(nonce, dh, b.pub, macPSK, ver)); err != nil {
 		t.Fatalf("发 PROOF: %v", err)
 	}
 	typ, okPayload, err := proto.CtlReadMsg(conn)
@@ -91,9 +96,9 @@ func (b *dialBackend) connect(t *testing.T) {
 	}
 	// OK-MAC（token 模式）：与生产后端同款校验。
 	if b.secret != ([32]byte{}) {
-		mac, v2 := proto.DecodeRelayOKAuth(ctlWithSub(typ, okPayload))
-		if !v2 {
-			t.Fatal("token 模式的 v2 中继没在 OK 里带身份 MAC")
+		mac, ok := proto.DecodeRelayOKAuth(ctlWithSub(typ, okPayload))
+		if !ok {
+			t.Fatal("token 模式的中继没在 OK 里带身份 MAC")
 		}
 		if subtle.ConstantTimeCompare(proto.RelayOKAuthMAC(b.secret, nonce), mac) != 1 {
 			t.Fatal("OK 的中继身份 MAC 不对")
@@ -101,11 +106,8 @@ func (b *dialBackend) connect(t *testing.T) {
 	}
 }
 
-// legupMarker：拨腿首包（v2 会话带 cookie → 认证 marker；v1 纯标记）。
+// legupMarker：拨腿首包（认证 marker：LEGUP‖cookie‖MAC；FIX-89 起无 v1 纯标记形态）。
 func (b *dialBackend) legupMarker(sess proto.CtlSession) []byte {
-	if !sess.HasCookie {
-		return []byte("LEGUP")
-	}
 	var key [32]byte
 	if b.secret != ([32]byte{}) {
 		key = b.secret
@@ -312,7 +314,7 @@ func TestControlAuthRejected(t *testing.T) {
 	dh, _ := curve25519.X25519(be.priv[:], ephPub[:])
 	// 用错误 secret 的 PSK MAC —— 中继必须拒绝（连接被关，读不到 OK）
 	bad := proto.RelayAuthMAC(wrong, nonce, be.pub)
-	if err := proto.CtlWriteMsg(conn, proto.EncodeRelayProof(nonce, dh, be.pub, bad)); err != nil {
+	if err := proto.CtlWriteMsg(conn, proto.EncodeRelayProof(nonce, dh, be.pub, bad, proto.RelayCtlVer)); err != nil {
 		t.Fatal(err)
 	}
 	_ = conn.SetReadDeadline(time.Now().Add(3 * time.Second))
@@ -375,7 +377,7 @@ func TestControlReplayPromotesFallbackAssocs(t *testing.T) {
 	ephPub, nonce, _ := proto.DecodeRelayChallenge(ctlWithSub(typ, pl))
 	dh, _ := curve25519.X25519(be.priv[:], ephPub[:])
 	// v2 PROOF（开放模式无 PSK；版本字节让中继启用拨腿/提升路径）
-	if err := proto.CtlWriteMsg(conn, proto.EncodeRelayProofV(nonce, dh, be.pub, nil, proto.RelayCtlVer)); err != nil {
+	if err := proto.CtlWriteMsg(conn, proto.EncodeRelayProof(nonce, dh, be.pub, nil, proto.RelayCtlVer)); err != nil {
 		t.Fatal(err)
 	}
 	typ, _, rerr = proto.CtlReadMsg(conn)

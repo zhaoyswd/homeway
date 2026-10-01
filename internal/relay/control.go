@@ -86,7 +86,8 @@ func (r *Relay) controlConn(c net.Conn) {
 	defer c.Close()
 	_ = c.SetDeadline(time.Now().Add(10 * time.Second)) // 握手必须在 10s 内完成
 
-	// ① HELLO（带公钥；形状与 v1 完全一致——版本不自报在这里，见 EncodeRelayProofV 注释）
+	// ① HELLO（带公钥；版本不在 HELLO 自报——CHALLENGE 形状对老解码器必须不变，
+	// 协议版本由后端在 PROOF 里自报，见 proto.EncodeRelayProof 注释）
 	typ, payload, err := proto.CtlReadMsg(c)
 	if err != nil || typ != proto.RelaySubHello {
 		return
@@ -112,13 +113,18 @@ func (r *Relay) controlConn(c net.Conn) {
 	}
 
 	// ③ PROOF（校验与 UDP 注册完全一致：DH MAC + token 模式的 PSK MAC）。
-	// 末尾 1 字节 = 对端协议版本（50B = v2；49B/33B = v1，#25）。
+	// 末尾 1 字节 = 协议版本，必须等于 RelayCtlVer（FIX-89 v2-only：
+	// 老后端（33B/49B 形态）与未来版本在此一并拒绝）。
 	typ, payload, err = proto.CtlReadMsg(c)
 	if err != nil || typ != proto.RelaySubProof {
 		return
 	}
 	gotNonce, macDH, macPSK, ver, err := proto.DecodeRelayProof(withSubtype(typ, payload))
 	if err != nil || gotNonce != nonce {
+		return
+	}
+	if ver != proto.RelayCtlVer {
+		r.cfg.Logf("中继：控制面 %v 协议版本 %d 不符（需要 %d）—— 拒绝", c.RemoteAddr(), ver, proto.RelayCtlVer)
 		return
 	}
 	dh, derr := curve25519.X25519(ephPriv[:], pub[:])
@@ -130,7 +136,7 @@ func (r *Relay) controlConn(c net.Conn) {
 		r.cfg.Logf("中继：控制面 %v 的 DH 校验不过 —— 拒绝", c.RemoteAddr())
 		return
 	}
-	if r.cfg.Secret != ([32]byte{}) {
+	if !r.cfg.Open {
 		want := proto.RelayAuthMAC(r.cfg.Secret, nonce, pub)
 		if len(macPSK) != 16 || subtle.ConstantTimeCompare(want, macPSK) != 1 {
 			r.bump(func(s *Stats) { s.Forged++ })
@@ -153,13 +159,14 @@ func (r *Relay) controlConn(c net.Conn) {
 		}
 	}()
 
-	// ⑤ OK + 挂到 leg（顶掉旧连接）。v2 后端 + token 模式：OK 带 MAC 让后端
-	// 认证中继（#29——此前任何能截 TCP 的角色都能发 OK 再喂假 SESSION）。
-	okMsg := proto.EncodeRelayOK()
-	if ver >= proto.RelayCtlVer && r.cfg.Secret != ([32]byte{}) {
-		okMsg = proto.EncodeRelayOKAuth(proto.RelayOKAuthMAC(r.cfg.Secret, nonce))
+	// ⑤ OK + 挂到 leg（顶掉旧连接）。恒 v2 形状：token 模式带 MAC 让后端认证中继
+	//（#29——此前任何能截 TCP 的角色都能发 OK 再喂假 SESSION）；开放模式（测试）
+	// 无密钥可算，发零 MAC 占位（后端开放模式本就不校验）。
+	var okMAC []byte
+	if !r.cfg.Open {
+		okMAC = proto.RelayOKAuthMAC(r.cfg.Secret, nonce)
 	}
-	if err := proto.CtlWriteMsg(c, okMsg); err != nil {
+	if err := proto.CtlWriteMsg(c, proto.EncodeRelayOKAuth(okMAC)); err != nil {
 		return
 	}
 	r.ctlHandshaking.Add(-1) // 握手完成：释放并发槽（#7）
@@ -176,7 +183,6 @@ func (r *Relay) controlConn(c net.Conn) {
 	// !verified 恒假，且两种证明语义不同）。
 	r.mu.Lock()
 	lg.ctlVerified = true
-	lg.ctlV2 = ver >= proto.RelayCtlVer
 	lg.last = time.Now()
 	r.mu.Unlock()
 	cc := &ctlConn{c: c}
@@ -293,9 +299,6 @@ func (r *Relay) announceSession(lg *leg, sess proto.CtlSession) bool {
 // 回收永不触发，要等手机侧巡检 3 连败自愈（分钟级）。公共出口（旧路径本来通）
 // 的会话也被统一提升，短暂等腿（一轮通告+拨腿，几十 ms）后继续。
 func (r *Relay) replaySessions(lg *leg, cc *ctlConn) {
-	if !lg.ctlV2 {
-		return // v1 控制连接：解不开 v2 SESSION，也没有拨腿会话要重放（#25）
-	}
 	r.mu.Lock()
 	type pending struct {
 		msg   []byte
@@ -323,7 +326,7 @@ func (r *Relay) replaySessions(lg *leg, cc *ctlConn) {
 		}
 		port := uint16(a.sock.LocalAddr().(*net.UDPAddr).Port)
 		out = append(out, pending{msg: proto.EncodeCtlSession(proto.CtlSession{
-			ID: a.sid, DataPort: port, Cookie: a.cookie, HasCookie: true}), assoc: a})
+			ID: a.sid, DataPort: port, Cookie: a.cookie}), assoc: a})
 	}
 	r.mu.Unlock()
 	sent := 0

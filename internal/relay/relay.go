@@ -76,9 +76,14 @@ type Config struct {
 	DownSilent time.Duration
 	MaxPerPeer int // 每个后端的最大并发分配（0 = 默认 32）
 	RateLimit  int // 每源每秒包数上限（0 = 默认 200）
-	// Secret：中继**鉴权密钥**（非零 = token 模式：只接受持有 rl1 token 的后端）。
-	// 零值 = 开放模式（谁都能注册，仅测试用）。密钥由 cmd 从 --state 加载/生成。
+	// Secret：中继**鉴权密钥**（token 模式：只接受持有 rl1 token 的后端）。
+	// 密钥由 cmd 从 --state 加载/生成；生产恒非零。
 	Secret [32]byte
+	// Open：显式开放注册（无鉴权：任何知道本地址的后端都能用它中转）——**仅测试/本地调试**。
+	// 与 Secret 必须恰好一者有效（New 校验，违规 panic）。FIX-89：此前开放由
+	// 「Secret 为零」隐式推导——组装路径漏设密钥就静默变成无鉴权开放中继；
+	// 现在必须显式声明，生产代码永不开。
+	Open bool
 	// MaxLegs：注册腿总数上限（0 = 默认 256）—— 防"匿名 Hello 洪水"把表撑爆（腿不注册成功也占位）。
 	MaxLegs int
 	// MaxCtlConns：已建立控制连接总数上限（0 = 默认 64；review #7——此前只有
@@ -136,7 +141,16 @@ type Stats struct {
 const ctlPendMax = 16
 
 // New 建中继（不监听）。
+//
+// Secret / Open 必须恰好一者有效——不满足即 panic（构造期编程错误，不是运行期
+// 输入错误）：既拒绝「忘了设密钥」的静默开放，也拒绝「既给密钥又喊开放」的矛盾配置。
 func New(cfg Config) *Relay {
+	switch {
+	case cfg.Open && cfg.Secret != ([32]byte{}):
+		panic("relay: Open 与 Secret 不能同时设置（开放模式不设密钥）")
+	case !cfg.Open && cfg.Secret == ([32]byte{}):
+		panic("relay: Secret 为空且未显式 Open——拒绝静默开放注册（测试请置 Open: true）")
+	}
 	if cfg.IdleTimeout <= 0 {
 		cfg.IdleTimeout = defaultIdleTimeout
 	}
@@ -247,8 +261,8 @@ func (r *Relay) Run(ctx context.Context) error {
 	} else {
 		r.cfg.Logf("⚠️ 控制面 TCP %v 监听失败（%v）—— 退回纯 UDP 中继（拨腿特性缺席）", ctlAddr.String(), terr)
 	}
-	who := "⚠️ 开放注册：任何知道本地址的后端都能用它中转（正常路径下不会出现）"
-	if r.cfg.Secret != ([32]byte{}) {
+	who := "⚠️ 开放注册（测试开关 Open）：任何知道本地址的后端都能用它中转"
+	if !r.cfg.Open {
 		rid := proto.RelaySecretID(r.cfg.Secret)
 		who = fmt.Sprintf("token 模式（中继 ID %x）", rid[:6])
 	}

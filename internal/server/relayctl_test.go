@@ -21,7 +21,7 @@ import (
 
 func TestControlDialEndToEnd(t *testing.T) {
 	// ---- 中继（UDP + TCP 控制面同号）----
-	rl := relay.New(relay.Config{Addr: "127.0.0.1:0", IdleTimeout: 5 * time.Second,
+	rl := relay.New(relay.Config{Addr: "127.0.0.1:0", Open: true, IdleTimeout: 5 * time.Second,
 		Logf: func(f string, a ...any) { t.Logf("[relay] "+f, a...) }})
 	rctx, rcancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
@@ -192,7 +192,7 @@ func TestRunControlConnHandshakeSignal(t *testing.T) {
 	logf := func(f string, a ...any) { t.Logf("[ctl] "+f, a...) }
 
 	// ① 开放模式中继：握手成功 → cancel ctx 断开 → handshakeOK 必须为 true。
-	rl := relay.New(relay.Config{Addr: "127.0.0.1:0", Logf: logf})
+	rl := relay.New(relay.Config{Addr: "127.0.0.1:0", Open: true, Logf: logf})
 	rctx, rcancel := context.WithCancel(context.Background())
 	rlDone := make(chan struct{})
 	go func() { defer close(rlDone); _ = rl.Run(rctx) }()

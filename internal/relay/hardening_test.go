@@ -260,7 +260,7 @@ func TestControlLegCountGated(t *testing.T) {
 	}
 	ephPub, nonce, _ := proto.DecodeRelayChallenge(ctlWithSub(typ, pl))
 	dh, _ := curve25519.X25519(be3.priv[:], ephPub[:])
-	if err := proto.CtlWriteMsg(conn, proto.EncodeRelayProofV(nonce, dh, be3.pub, nil, proto.RelayCtlVer)); err != nil {
+	if err := proto.CtlWriteMsg(conn, proto.EncodeRelayProof(nonce, dh, be3.pub, nil, proto.RelayCtlVer)); err != nil {
 		t.Fatal(err)
 	}
 	_ = conn.SetReadDeadline(time.Now().Add(time.Second))
@@ -290,8 +290,8 @@ func TestRelayOKAuthMACProto(t *testing.T) {
 	good := proto.RelayOKAuthMAC(secret, nonce)
 	bad := proto.RelayOKAuthMAC(wrong, nonce)
 	enc := proto.EncodeRelayOKAuth(good)
-	mac, v2 := proto.DecodeRelayOKAuth(enc)
-	if !v2 || len(mac) != 16 {
+	mac, ok := proto.DecodeRelayOKAuth(enc)
+	if !ok || len(mac) != 16 {
 		t.Fatal("v2 OK 解码失败")
 	}
 	if string(mac) == string(bad) {

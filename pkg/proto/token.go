@@ -111,7 +111,9 @@ func DecodeToken(s string) (Token, error) {
 }
 
 func decodePrefixed(prefix, s string) (Token, error) {
-	raw, err := base64.RawURLEncoding.DecodeString(strings.TrimRight(s[len(prefix):], "="))
+	// 严格 RawURLEncoding（无填充）：容忍 "=" 尾缀的历史兼容已删（FIX-89，
+	// 编码侧本就恒无填充——容忍只会掩盖转贴损坏）。
+	raw, err := base64.RawURLEncoding.DecodeString(s[len(prefix):])
 	if err != nil {
 		return Token{}, fmt.Errorf("%w: %v", ErrMalformed, err)
 	}

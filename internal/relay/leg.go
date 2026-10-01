@@ -25,11 +25,8 @@ type leg struct {
 	ctlVerified bool
 	// ctl：控制通道（relay-backend-dial）。非 nil 时客户端到达走「通告+等后端拨腿」，
 	// 而不是 per-client socket 主动发往 lg.addr（那条路在严格 NAT 上恒不通）。
+	// FIX-89 起控制面恒为 v2（版本不符已在握手期拒绝）——不再有 ctlV2 判定。
 	ctl *ctlConn
-	// ctlV2：控制对端跑的是 v2 协议（PROOF 带版本，review #25）。只有 v2 后端才
-	// 走拨腿模式（SESSION 带 cookie、腿要认证）；v1 控制连接保持 per-client 旧路径
-	// ——它解不开 v2 SESSION，硬通告只会让它反复拨失败。
-	ctlV2 bool
 }
 
 type assocKey struct {
@@ -88,9 +85,16 @@ func (r *Relay) handleControl(src netip.AddrPort, label [8]byte, lg *leg, payloa
 			r.bump(func(s *Stats) { s.Forged++ })
 			return
 		}
-		gotNonce, macDH, macPSK, _, err := proto.DecodeRelayProof(payload)
+		gotNonce, macDH, macPSK, ver, err := proto.DecodeRelayProof(payload)
 		if err != nil {
 			r.bump(func(s *Stats) { s.Forged++ })
+			return
+		}
+		// 协议版本门（FIX-89，v2-only）：UDP 注册腿与 TCP 控制面同版本判定，
+		// 版本不符即拒（老后端/未来版本都不再被静默容纳）。
+		if ver != proto.RelayCtlVer {
+			r.bump(func(s *Stats) { s.Forged++ })
+			r.cfg.Logf("中继：后端 %x 注册证明协议版本 %d 不符（需要 %d）—— 拒绝", label[:], ver, proto.RelayCtlVer)
 			return
 		}
 		r.mu.Lock()
@@ -106,7 +110,7 @@ func (r *Relay) handleControl(src netip.AddrPort, label [8]byte, lg *leg, payloa
 			return
 		}
 		var dh []byte
-		if r.cfg.Secret == ([32]byte{}) {
+		if r.cfg.Open {
 			dh, err = curve25519.X25519(lg.ephPriv[:], lg.pubkey[:])
 			if err != nil {
 				r.mu.Unlock()
@@ -115,7 +119,7 @@ func (r *Relay) handleControl(src netip.AddrPort, label [8]byte, lg *leg, payloa
 			}
 		}
 		// token 模式只认鉴权 MAC（DH 谁都算得出来，不能当准入）；开放模式看 DH。
-		if r.cfg.Secret != ([32]byte{}) {
+		if !r.cfg.Open {
 			want := proto.RelayAuthMAC(r.cfg.Secret, lg.nonce, lg.pubkey)
 			if len(macPSK) != 16 || subtle.ConstantTimeCompare(want, macPSK) != 1 {
 				r.mu.Unlock()
@@ -198,11 +202,11 @@ func (r *Relay) handleControl(src netip.AddrPort, label [8]byte, lg *leg, payloa
 }
 
 func (r *Relay) hasControlLocked(lg *leg) bool {
-	return lg != nil && lg.ctl != nil && lg.ctlV2
+	return lg != nil && lg.ctl != nil
 }
 
 func (r *Relay) legMACKey(cookie [16]byte) [32]byte {
-	if r.cfg.Secret != ([32]byte{}) {
+	if !r.cfg.Open {
 		return r.cfg.Secret
 	}
 	var k [32]byte

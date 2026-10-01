@@ -49,6 +49,12 @@ func newFakeBackend(t *testing.T, relayAddr netip.AddrPort) *fakeBackend {
 // register 走完 Hello → Challenge → Proof → OK，返回是否成功。
 func (b *fakeBackend) register() bool {
 	b.t.Helper()
+	return b.registerWithVer(proto.RelayCtlVer)
+}
+
+// registerWithVer：register 的版本可注入变体（FIX-89 版本门用例）。
+func (b *fakeBackend) registerWithVer(ver byte) bool {
+	b.t.Helper()
 	_, _ = b.pc.WriteToUDPAddrPort(proto.EncodeTagged(b.label, proto.FrameTypeRelayReg,
 		proto.EncodeRelayHello(b.pub)), b.relay)
 	buf := make([]byte, 2048)
@@ -70,7 +76,7 @@ func (b *fakeBackend) register() bool {
 		return false
 	}
 	_, _ = b.pc.WriteToUDPAddrPort(proto.EncodeTagged(b.label, proto.FrameTypeRelayReg,
-		proto.EncodeRelayProof(nonce, dh, b.pub, b.pskF(nonce))), b.relay)
+		proto.EncodeRelayProof(nonce, dh, b.pub, b.pskF(nonce), ver)), b.relay)
 	n, _, err = b.pc.ReadFromUDPAddrPort(buf)
 	if err != nil {
 		return false
@@ -168,6 +174,10 @@ func (c *fakeClient) readHint(d time.Duration) (string, bool) {
 func startRelay(t *testing.T, cfg Config) *Relay {
 	t.Helper()
 	cfg.Addr = "127.0.0.1:0"
+	if cfg.Secret == ([32]byte{}) {
+		// 测试夹具层面显式声明开放（Config.Open 是唯一开放入口；生产路径恒设 Secret）。
+		cfg.Open = true
+	}
 	if cfg.Logf == nil {
 		cfg.Logf = func(f string, a ...any) { t.Logf("[relay] "+f, a...) }
 	}
