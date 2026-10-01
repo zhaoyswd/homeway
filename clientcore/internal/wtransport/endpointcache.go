@@ -169,7 +169,14 @@ func (c *EndpointCache) valid(e LearnedEndpoint, now time.Time) bool {
 	if !e.Addr.IsValid() || e.LearnedAt <= 0 {
 		return false
 	}
-	return now.Sub(time.UnixMilli(e.LearnedAt)) <= c.ttl
+	// 新鲜度 = max(学习, 验证)（FIX-11）：持续被验证（每轮往返 MarkRoundTrip 复标
+	// VerifiedAt）的长连端点在「学习时刻」满 TTL 时**不得**被静默删除——那删掉的
+	// 正是出口漂移场景里唯一的救命记录（它还在被用着）。
+	last := e.LearnedAt
+	if e.VerifiedAt > last {
+		last = e.VerifiedAt
+	}
+	return now.Sub(time.UnixMilli(last)) <= c.ttl
 }
 
 func markTS(t time.Time) int64 { return t.UnixMilli() }
@@ -258,8 +265,9 @@ func (c *EndpointCache) Save(now time.Time) error {
 	}
 	// 全程持锁（真机 2026-09-22：锁外 tmp+rename 的并发保存竞态——后到者 rename 报
 	// ENOENT，失败路径的 os.Remove(tmp) 还会误删第三个并发者刚写的 tmp，连环失败每
-	// 巡检拍刷 2-3 条「落盘失败」）。Save 是低频路径（巡检/探测拍），毫秒级文件 IO
-	// 持锁不伤并发；换唯一 tmp 名不解决 Remove 误删，串行化是正解。
+	// 巡检拍刷 2-3 条「落盘失败」）。实例锁只护本实例；**跨实例**（隧道/服务两份缓存，
+	// 或重建窗口新旧实例并存）由唯一 tmp 名兜底（FIX-12）：各自写各自 tmp、rename 原子、
+	// 末写者胜（写前重读合并保证对方已知条目不丢），失败清理只删自己的 tmp。
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.mergeDiskLocked()
@@ -278,12 +286,12 @@ func (c *EndpointCache) Save(now time.Time) error {
 	if err := os.MkdirAll(c.dir, 0o700); err != nil {
 		return fmt.Errorf("wtransport: 建端点缓存目录失败: %w", err)
 	}
-	tmp := c.Path() + ".tmp"
+	tmp := fmt.Sprintf("%s.tmp.%d.%d", c.Path(), os.Getpid(), time.Now().UnixNano())
 	if err := os.WriteFile(tmp, raw, 0o600); err != nil {
 		return fmt.Errorf("wtransport: 写端点缓存失败: %w", err)
 	}
 	if err := os.Rename(tmp, c.Path()); err != nil {
-		os.Remove(tmp)
+		_ = os.Remove(tmp) // 只删自己写的 tmp（名字唯一，误删他人 tmp 的形态已消）
 		return fmt.Errorf("wtransport: 端点缓存改名失败: %w", err)
 	}
 	c.lastRaw = string(raw)

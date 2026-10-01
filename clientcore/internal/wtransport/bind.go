@@ -34,6 +34,24 @@ type Candidate struct {
 	Relay bool
 }
 
+// handoverGrace 过渡双发宽限（FIX-09）：切到未知来源后旧路径保活时长——覆盖「出口
+// 收一发回一发」的单次往返（真漂移时新路径即通，宽限后旧路径淡出；伪造源时旧路径
+// 回包把采纳纠回）。
+const handoverGrace = 10 * time.Second
+
+// candidateKnownLocked src 是否属于候选/中继表（b.mu 内调用）。
+func (b *Bind) candidateKnownLocked(src netip.AddrPort) bool {
+	if _, ok := b.relayEps[src]; ok {
+		return true
+	}
+	for _, c := range b.cfg.Candidates {
+		if c.Addr == src {
+			return true
+		}
+	}
+	return false
+}
+
 // HintHandler 收到不可信地址线索（中继 hint）。回调里不得阻塞。
 type HintHandler func(addr string)
 
@@ -85,6 +103,13 @@ type Bind struct {
 	relayUnlocked bool      // 中继候选是否已解锁
 	unlockOnce    bool      // 本轮是否已安排解锁补发
 	lastMirror    []byte    // 最近一条镜像包（解锁时补发给中继候选）
+	// 过渡双发（FIX-09）：稳态下从未知来源（非候选/非中继）切采纳时，旧路径保留为
+	// 次要发送目标至 handoverUntil——出口不发无端包，「单发」会让伪造源/错投一票
+	// 改写路径后形成「出站全打给错误地址 → 出口收不到我们 → 再无纠正包」的悬崖；
+	// 双发下旧路径的回包会把采纳纠回（真漂移则新路径正常，宽限后自然淡出）。
+	handoverTo    netip.AddrPort
+	handoverRelay bool
+	handoverUntil time.Time
 	lastPathLogAt time.Time // 上一条「路径确立/切换」日志时刻（两条路同时有回包时限流）
 	// recvErrAt：接收读错误的限流（每 5s 一行）——冻结唤醒后 OS 作废 socket 会持续报错。
 	recvErrAt time.Time
@@ -154,12 +179,14 @@ func sameCandidates(a, c []Candidate) bool {
 	if len(a) != len(c) {
 		return false
 	}
+	// Relay 位参与比较（FIX-14 同源修正）：腿类型变化也是「集合变了」。
 	seen := make(map[netip.AddrPort]bool, len(a))
 	for _, x := range a {
-		seen[x.Addr] = true
+		seen[x.Addr] = x.Relay
 	}
 	for _, x := range c {
-		if !seen[x.Addr] {
+		relay, ok := seen[x.Addr]
+		if !ok || relay != x.Relay {
 			return false
 		}
 	}
@@ -459,6 +486,14 @@ func (b *Bind) Open(port uint16) ([]conn.ReceiveFunc, uint16, error) {
 			prevWasRelay := b.valid && b.adoptedIsRelay
 			prevAdopted, wasValid := b.adopted, b.valid
 			b.adopted, b.adoptedIsRelay, b.valid = src, isRelayEp, true
+			// 过渡双发登记（FIX-09）：稳态下切到「未知来源」= 保留旧路径宽限双发；
+			// 切到候选/中继（hint/probe 学习路径）或首次采纳 = 清过渡（无需保旧）。
+			if wasValid && prevAdopted != src && !isRelayEp && !b.candidateKnownLocked(src) {
+				b.handoverTo, b.handoverRelay = prevAdopted, prevWasRelay
+				b.handoverUntil = now.Add(handoverGrace)
+			} else if prevAdopted != src {
+				b.handoverTo, b.handoverUntil = netip.AddrPort{}, time.Time{}
+			}
 			// 已知限制（demand-driven-recovery 评审）：lastRecvAt 在帧解码前刷新——任意
 			// 来源的包（含中继 hint/控制帧与未知来源）都会重置待发包判据的 90s 静默，
 			// 下推器由此退化为巡检兜底（不产生错误状态）。收紧到「数据帧/候选来源」
@@ -584,6 +619,8 @@ func (b *Bind) Send(bufs [][]byte, ep conn.Endpoint) error {
 
 	b.mu.Lock()
 	valid, adopted, adoptedIsRelay := b.valid, b.adopted, b.adoptedIsRelay
+	handover, handoverRelay := b.handoverTo, b.handoverRelay
+	handoverOn := handover.IsValid() && time.Now().Before(b.handoverUntil)
 	var regPkt []byte
 	if b.regArmed && b.cfg.Identity != nil {
 		regPkt = b.cfg.Identity.Reg(b.cfg.Secret)
@@ -593,16 +630,15 @@ func (b *Bind) Send(bufs [][]byte, ep conn.Endpoint) error {
 
 	for _, buf := range bufs {
 		if valid {
-			var err error
-			if adoptedIsRelay {
-				err = b.writeUDP(c, proto.EncodeTagged(b.relayID, proto.FrameTypeData, buf), adopted)
-			} else {
-				err = b.writeUDP(c, buf, adopted)
-			}
+			err := b.sendTo(c, adopted, adoptedIsRelay, buf)
 			if err != nil {
 				b.noteSendErr(adopted, err)
 			} else {
 				b.txBytes.Add(int64(len(buf)))
+			}
+			if handoverOn && handover != adopted {
+				// 过渡双发（FIX-09，见 handoverGrace 注释）：尽力语义，不进发送计数。
+				_ = b.sendToSilent(c, handover, handoverRelay, buf)
 			}
 			continue
 		}
@@ -703,6 +739,25 @@ func (b *Bind) writeUDP(c *net.UDPConn, buf []byte, addr netip.AddrPort) error {
 	if err != nil && isLocalSendErr(err) {
 		b.sendLocalFails.Add(1)
 	}
+	return err
+}
+
+// sendTo 采纳路径的封装发送（按目标类型决定是否套腿帧）。
+func (b *Bind) sendTo(c *net.UDPConn, addr netip.AddrPort, isRelay bool, buf []byte) error {
+	if isRelay {
+		return b.writeUDP(c, proto.EncodeTagged(b.relayID, proto.FrameTypeData, buf), addr)
+	}
+	return b.writeUDP(c, buf, addr)
+}
+
+// sendToSilent 同 sendTo 但不进发送计数（过渡双发为尽力语义：旧路径的本地错误
+// 不得污染「环境性禁发」判据的 sendTries/sendLocalFails）。
+func (b *Bind) sendToSilent(c *net.UDPConn, addr netip.AddrPort, isRelay bool, buf []byte) error {
+	if isRelay {
+		_, err := c.WriteToUDPAddrPort(proto.EncodeTagged(b.relayID, proto.FrameTypeData, buf), addr)
+		return err
+	}
+	_, err := c.WriteToUDPAddrPort(buf, addr)
 	return err
 }
 

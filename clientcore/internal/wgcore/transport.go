@@ -28,9 +28,12 @@ import (
 )
 
 // DomainEndpoint 域名形态的 token 端点（endpoint-freshness D5：重赛跑时重解析用）。
+// Relay 必须随端口一起携带（FIX-14）：token 里写中继域名时，重解析产出的候选若不标
+// Relay，会按直连裸发——中继只认腿帧路由头，该腿静默失效。
 type DomainEndpoint struct {
-	Host string
-	Port uint16
+	Host  string
+	Port  uint16
+	Relay bool
 }
 
 // TransportConfig 会话门面参数。
@@ -242,7 +245,7 @@ func (t *Transport) refreshDomainLocked(ctx context.Context) {
 		}
 		for _, ip := range ips {
 			if ip.IsValid() {
-				fresh = append(fresh, wtransport.Candidate{Addr: netip.AddrPortFrom(ip.Unmap(), de.Port)})
+				fresh = append(fresh, wtransport.Candidate{Addr: netip.AddrPortFrom(ip.Unmap(), de.Port), Relay: de.Relay})
 			}
 		}
 	}
@@ -289,12 +292,15 @@ func sameCandidates(a, b []wtransport.Candidate) bool {
 	if len(a) != len(b) {
 		return false
 	}
+	// Relay 位参与比较（FIX-14）：同地址、不同腿类型的集合变化必须判「变了」
+	// （否则重解析后的中继腿会被当成等价而无日志、且旧 relayEps 语义残留）。
 	seen := map[netip.AddrPort]bool{}
 	for _, x := range a {
-		seen[x.Addr] = true
+		seen[x.Addr] = x.Relay
 	}
 	for _, y := range b {
-		if !seen[y.Addr] {
+		relay, ok := seen[y.Addr]
+		if !ok || relay != y.Relay {
 			return false
 		}
 	}

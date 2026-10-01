@@ -96,11 +96,14 @@ func Prepare(cfg Config) (*Core, error) {
 	c := &Core{cfg: cfg, logf: logf}
 
 	// ---- 隧道侧：netstack（内部流承载）+ WG device ----
+	// Identity 恒必填（FIX-17）：UAPI 私钥（peerIPCString）与地址派生都要它——旧校验
+	// 允许「显式 ClientTunnelIP + Identity=nil」通过，随后在 :131 解引用 nil panic
+	// （.so 内 panic 会带走宿主进程；导出 API 陷阱）。
+	if cfg.Identity == nil {
+		return nil, errors.New("wgcore: Identity 必填（隧道侧地址派生与 UAPI 私钥都需要；不能省略）")
+	}
 	cliIP := cfg.ClientTunnelIP
 	if !cliIP.IsValid() {
-		if cfg.Identity == nil {
-			return nil, errors.New("wgcore: Identity 与 ClientTunnelIP 至少要有一个")
-		}
 		cliIP = proto.DeriveTunnelIP(cfg.Secret, cfg.Identity.PublicKey())
 	}
 	wgTun, wgNet, err := wgnet.Create([]netip.Addr{cliIP}, cfg.MTU)

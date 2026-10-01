@@ -79,7 +79,7 @@ func domainEndpointPorts(domains []proto.Endpoint, logf Logf) []wgcore.DomainEnd
 			logf("token 端点 %q 端口非法（跳过重解析）", ep.Addr)
 			continue
 		}
-		out = append(out, wgcore.DomainEndpoint{Host: host, Port: uint16(port)})
+		out = append(out, wgcore.DomainEndpoint{Host: host, Port: uint16(port), Relay: ep.Relay})
 	}
 	return out
 }

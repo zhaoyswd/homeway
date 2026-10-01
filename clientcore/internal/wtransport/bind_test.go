@@ -673,3 +673,66 @@ func TestSwapSendStats(t *testing.T) {
 		t.Fatalf("取走后应为零：%d/%d", tries, fails)
 	}
 }
+
+// TestAdoptionHandoverDualSend（FIX-09）：稳态下从未知来源（非候选）切采纳 → 旧路径
+// 宽限双发（伪造源/错投不再形成「出站全打给错误地址 → 出口收不到 → 再无纠正包」的
+// 悬崖）；切回合法候选 → 过渡清除。
+func TestAdoptionHandoverDualSend(t *testing.T) {
+	live := mustLocalListener(t)
+	spoof := mustLocalListener(t)
+	b := newTestBind(t, Config{Candidates: []Candidate{{Addr: udpAddr(live)}}})
+	race, err := b.ParseEndpoint("race")
+	if err != nil {
+		t.Fatal(err)
+	}
+	wg := []byte{9, 0, 0}
+
+	// 镜像期：live 收镜像包（先排空）。
+	if err := b.Send([][]byte{wg}, race); err != nil {
+		t.Fatal(err)
+	}
+	if pkt := readWithDeadline(t, live, 2*time.Second); pkt == nil {
+		t.Fatal("live 未收镜像包")
+	}
+	// live 应答 → 采纳 live（稳态）。
+	live.WriteToUDPAddrPort(wg, localAddr(b.Port()))
+	if n, _ := callRecv(t, b, 2*time.Second); n != 1 {
+		t.Fatal("live 应答未被读入")
+	}
+	if a, _, ok := b.Adopted(); !ok || a != udpAddr(live) {
+		t.Fatalf("应采纳 live：%v", a)
+	}
+
+	// 未知来源应答 → 采纳切换（漫游学习语义保留）+ 登记过渡双发。
+	spoof.WriteToUDPAddrPort(wg, localAddr(b.Port()))
+	if n, _ := callRecv(t, b, 2*time.Second); n != 1 {
+		t.Fatal("spoof 应答未被读入")
+	}
+	if a, _, ok := b.Adopted(); !ok || a != udpAddr(spoof) {
+		t.Fatalf("未知来源应被采纳（漂移学习路径）：%v", a)
+	}
+	// 判据①：此后一发 Send 同时到达新路径与旧路径（宽限双发）。
+	if err := b.Send([][]byte{wg}, race); err != nil {
+		t.Fatal(err)
+	}
+	if got := readWithDeadline(t, spoof, 1*time.Second); string(got) != string(wg) {
+		t.Fatalf("新路径未收包：% x", got)
+	}
+	if got := readWithDeadline(t, live, 1*time.Second); string(got) != string(wg) {
+		t.Fatalf("旧路径未收宽限双发（单发悬崖回归）：% x", got)
+	}
+	// 判据②：切回合法候选（live 再应答）→ 过渡清除，不再向 spoof 双发。
+	live.WriteToUDPAddrPort(wg, localAddr(b.Port()))
+	if n, _ := callRecv(t, b, 2*time.Second); n != 1 {
+		t.Fatal("live 再应答未被读入")
+	}
+	if err := b.Send([][]byte{wg}, race); err != nil {
+		t.Fatal(err)
+	}
+	if got := readWithDeadline(t, live, 1*time.Second); string(got) != string(wg) {
+		t.Fatalf("切回后 live 应收包：% x", got)
+	}
+	if got := readWithDeadline(t, spoof, 300*time.Millisecond); got != nil {
+		t.Fatalf("切回候选后不应再双发到未知来源（过渡未清除）：% x", got)
+	}
+}

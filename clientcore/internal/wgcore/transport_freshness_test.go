@@ -417,3 +417,49 @@ func TestDeliverProbedWiring(t *testing.T) {
 		}
 	}
 }
+
+// bindRelay 候选表里某地址的腿类型（Relay 位）。
+func bindRelay(t *Transport, addr string) bool {
+	for _, c := range t.core.Bind().Status().Candidates {
+		if c.Addr == addr {
+			return c.Relay
+		}
+	}
+	return false
+}
+
+// TestDomainRelayEndpointKeepsRelayOnRefresh（FIX-14）：域名中继端点重解析后 Relay 位
+// 保留（旧行为：DomainEndpoint 无 Relay 字段 → 重解析候选恒 direct，裸 WG 发给中继被
+// 丢，该腿静默失效）。
+func TestDomainRelayEndpointKeepsRelayOnRefresh(t *testing.T) {
+	lc := &logCap{}
+	tr, _, _ := newFreshTransport(t, lc,
+		[]DomainEndpoint{{Host: "relay.example.com", Port: 41741, Relay: true}},
+		[]wtransport.Candidate{{Addr: netip.MustParseAddrPort("192.0.2.1:41741"), Relay: true}},
+		func(ctx context.Context, host string) ([]netip.Addr, error) {
+			return []netip.Addr{netip.MustParseAddr("192.0.2.99")}, nil // 漂移后的新地址
+		})
+	tr.Rearm()
+	waitFor(t, 10*time.Second, func() bool { return bindHas(tr, "192.0.2.99:41741") }, "新解析地址进候选")
+	if !bindRelay(tr, "192.0.2.99:41741") {
+		t.Fatal("域名中继端点重解析后 Relay 位丢失（裸 WG 发中继必被丢）")
+	}
+	if bindRelay(tr, "192.0.2.10:41641") {
+		t.Fatal("直连静态候选不得被误标中继")
+	}
+}
+
+// TestPrepareRequiresIdentity（FIX-17）：显式 ClientTunnelIP + Identity=nil 曾通过旧校验、
+// 在 UAPI 组装处 nil panic（导出 API 陷阱：.so 内 panic 带走宿主）——现应在 Prepare 入口
+// 返回可行动错误。
+func TestPrepareRequiresIdentity(t *testing.T) {
+	_, err := Prepare(Config{
+		PeerID:         freshPeerID,
+		Secret:         freshSecret,
+		ClientTunnelIP: netip.MustParseAddr("100.64.255.7"),
+		// Identity: nil ← 关键
+	})
+	if err == nil {
+		t.Fatal("Identity=nil 应在 Prepare 入口报错（旧行为：UAPI 组装处 nil panic）")
+	}
+}

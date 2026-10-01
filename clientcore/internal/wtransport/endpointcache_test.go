@@ -280,3 +280,49 @@ func TestEndpointCacheMergeRelayFlagKept(t *testing.T) {
 		t.Fatalf("学习地址命中 static 中继条目时必须沿用 Relay 标记：%+v", got)
 	}
 }
+
+// TestVerifiedEndpointSurvivesLearnedTTL（FIX-11）：新鲜度 = max(学习, 验证)——持续被
+// 验证（长连每轮往返复标 VerifiedAt）的端点不得因「学习时刻」满 TTL 被静默删除。
+func TestVerifiedEndpointSurvivesLearnedTTL(t *testing.T) {
+	c := OpenEndpointCache(t.TempDir(), testPeerID())
+	now := time.Now()
+	long := ap("203.0.113.7:41641")
+	short := ap("203.0.113.8:41641")
+	c.Observe(long, SourceHint, now.Add(-8*24*time.Hour))   // 学习超 TTL
+	c.MarkVerified(long, SourceHint, now.Add(-time.Minute)) // 刚验证过（长连在用）
+	c.Observe(short, SourceHint, now.Add(-8*24*time.Hour))  // 同学习时刻、未验证
+	es := c.Entries(now)
+	if len(es) != 1 || es[0].Addr != long {
+		t.Fatalf("已验证端点应存活、未验证同龄端点应过期：%v", es)
+	}
+}
+
+// TestEndpointCacheConcurrentInstancesSave（FIX-12）：两份实例（跨进程/重建窗口）并发
+// Save——唯一 tmp 名不互踩（旧行为：同 tmp 名 → rename ENOENT/误删对方 tmp）。
+func TestEndpointCacheConcurrentInstancesSave(t *testing.T) {
+	dir := t.TempDir()
+	now := time.Now()
+	a := OpenEndpointCache(dir, testPeerID())
+	b := OpenEndpointCache(dir, testPeerID())
+	a.Observe(ap("203.0.113.7:41641"), SourceHint, now)
+	b.Observe(ap("203.0.113.8:41641"), SourceHint, now)
+	var wg sync.WaitGroup
+	errs := make(chan error, 40)
+	for i := 0; i < 20; i++ {
+		wg.Add(2)
+		go func() { defer wg.Done(); errs <- a.Save(now) }()
+		go func() { defer wg.Done(); errs <- b.Save(now) }()
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Fatalf("并发 Save 失败：%v", err)
+		}
+	}
+	// 终态：两端条目都在盘上（写前重读合并，末写者胜）。
+	c := OpenEndpointCache(dir, testPeerID())
+	if got := len(c.Entries(now)); got != 2 {
+		t.Fatalf("合并后盘上应有两条，实得 %d：%v", got, c.Entries(now))
+	}
+}
