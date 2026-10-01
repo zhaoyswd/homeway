@@ -3,12 +3,11 @@ package servercore
 import (
 	"errors"
 	"fmt"
+	"github.com/zhaoyswd/homeway/pkg/proto"
 	"strings"
 	"sync"
 	"testing"
 	"time"
-
-	"github.com/zhaoyswd/homeway/pkg/proto"
 )
 
 type fakeCfg struct {
@@ -90,6 +89,7 @@ func TestDeviceTableAddRefreshRotate(t *testing.T) {
 	if want := proto.DeriveTunnelIP(testSecret, pubN(1)); res.TunnelIP != want {
 		t.Fatalf("隧道地址 = %v，want %v", res.TunnelIP, want)
 	}
+	waitPendingDrained(t, tb)
 	if !fc.has(pubN(1)) {
 		t.Fatal("device 侧应写入 peer")
 	}
@@ -105,6 +105,7 @@ func TestDeviceTableAddRefreshRotate(t *testing.T) {
 	if err != nil || res.Action != ActionRotated || tb.Len() != 1 {
 		t.Fatalf("轮换：res=%+v err=%v len=%d", res, err, tb.Len())
 	}
+	waitPendingDrained(t, tb)
 	if fc.has(pubN(1)) {
 		t.Fatal("轮换后旧公钥应已从 device 移除")
 	}
@@ -146,6 +147,7 @@ func TestDeviceTableCapEvictsOnlyStale(t *testing.T) {
 	if tb.Len() != 2 {
 		t.Fatalf("Len=%d", tb.Len())
 	}
+	waitPendingDrained(t, tb)
 	if fc.has(pubN(1)) {
 		t.Fatal("最旧的失联设备应被淘汰")
 	}
@@ -345,7 +347,9 @@ func TestTunIPOccupancyTracked(t *testing.T) {
 	if _, err := tb.Register(regFor(pubN(1), devN(1), now), now); err != nil {
 		t.Fatal(err)
 	}
+	tb.mu.Lock()
 	e1 := tb.entries[devN(1)]
+	tb.mu.Unlock()
 	if !e1.tunIP.IsValid() {
 		t.Fatal("dentry 没记 tunIP（#16：应用面地址不进占用集合）")
 	}
@@ -360,6 +364,7 @@ func TestTunIPOccupancyTracked(t *testing.T) {
 	if _, err := tb.Register(regFor(pubN(2), devN(2), now), now); err != nil {
 		t.Fatal(err)
 	}
+	waitPendingDrained(t, tb)
 	pc := tb.cfg.(*fakeCfg).added[pubN(2)]
 	if pc.TunIP == e1.ip || pc.TunIP == e1.tunIP {
 		t.Fatalf("dev2 的 TunIP %v 与 dev1 的地址撞车未被处置", pc.TunIP)
@@ -382,7 +387,10 @@ func TestIPConflictRejectsRegistration(t *testing.T) {
 	if _, err := tb.Register(regFor(pub3, devN(3), now), now); !errors.Is(err, ErrTunnelIPConflict) {
 		t.Fatalf("撞车应 ErrTunnelIPConflict（显式拒绝），got %v", err)
 	}
-	if _, ok := tb.entries[devN(3)]; ok {
+	tb.mu.Lock()
+	_, inTable := tb.entries[devN(3)]
+	tb.mu.Unlock()
+	if inTable {
 		t.Fatal("被拒的注册不得入表（原实现会退池造一条注定不通的记录）")
 	}
 	// 撞车解除后可正常注册（拒绝不是闩锁）。
@@ -465,4 +473,83 @@ func TestIPConflictSamePubCloneAllowed(t *testing.T) {
 	if r2.TunnelIP != r1.TunnelIP {
 		t.Fatalf("克隆应沿用同一派生地址：%v vs %v", r2.TunnelIP, r1.TunnelIP)
 	}
+}
+
+// waitPendingDrained 等设备写入队列排空（FIX-67 起注册路径异步落地——「应答已发、
+// device 写入在飞」是正常形态，测试要观察 device 状态先等它）。
+func waitPendingDrained(t *testing.T, tb *DeviceTable) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if tb.PendingOps() == 0 {
+			// 队列空 ≠ 已执行完最后一条：pending 在执行体内才 -1 ⇒ 归零即已执行完。
+			return
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+	t.Fatalf("设备写入队列未在 2s 内排空（pending=%d）", tb.PendingOps())
+}
+
+// TestRegisterReturnsBeforeDeviceWrite（FIX-67）：注册路径**不等** device 写入完成
+// ——接收 goroutine（WG 收包）此前同步等 IpcSet 完成，devOpTimeout 的界意味着最坏
+// 2s 的全局停包。判据：device 写入被阻塞时 Register 仍立刻返回（且在 flying 期
+// PendingOps() > 0），放行后写入落地。
+func TestRegisterReturnsBeforeDeviceWrite(t *testing.T) {
+	fc := newBlockingCfg()
+	tb := NewDeviceTable(fc, [][32]byte{testSecret}, DeviceConfig{MaxDevices: 8})
+	now := time.Now()
+	fc.block()
+	start := time.Now()
+	res, err := tb.Register(regFor(pubN(1), devN(1), now), now)
+	took := time.Since(start)
+	if err != nil {
+		t.Fatalf("Register：%v", err)
+	}
+	if took > 500*time.Millisecond {
+		t.Fatalf("注册不该等 device 写入（耗时 %v）", took)
+	}
+	if tb.PendingOps() == 0 {
+		t.Fatal("device 写入在飞时 PendingOps 应 > 0（状态面）")
+	}
+	_ = res
+	fc.release()
+	waitPendingDrained(t, tb)
+	if !fc.has(pubN(1)) {
+		t.Fatal("放行后 device 写入应落地")
+	}
+}
+
+// blockingCfg：可阻塞的配置面（模拟 device 锁竞争/收工窗口）：block 之后 AddPeer
+// 一直挂到 release。
+type blockingCfg struct {
+	*fakeCfg
+	mu   sync.Mutex
+	hold chan struct{}
+}
+
+func newBlockingCfg() *blockingCfg { return &blockingCfg{fakeCfg: newFakeCfg()} }
+
+func (b *blockingCfg) block() {
+	b.mu.Lock()
+	b.hold = make(chan struct{})
+	b.mu.Unlock()
+}
+
+func (b *blockingCfg) release() {
+	b.mu.Lock()
+	if b.hold != nil {
+		close(b.hold)
+		b.hold = nil
+	}
+	b.mu.Unlock()
+}
+
+func (b *blockingCfg) AddPeer(pc PeerConfig) error {
+	b.mu.Lock()
+	h := b.hold
+	b.mu.Unlock()
+	if h != nil {
+		<-h
+	}
+	return b.fakeCfg.AddPeer(pc)
 }

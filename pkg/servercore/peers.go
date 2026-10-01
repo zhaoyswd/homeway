@@ -4,12 +4,12 @@ import (
 	"context"
 	"encoding/hex"
 	"errors"
+	"github.com/zhaoyswd/homeway/pkg/proto"
 	"math/rand"
 	"net/netip"
 	"sync"
+	"sync/atomic"
 	"time"
-
-	"github.com/zhaoyswd/homeway/pkg/proto"
 )
 
 // 设备表（2026-09-20 起，取代按 WG 公钥为键的动态 peer 表）。
@@ -129,6 +129,8 @@ type DeviceTable struct {
 	// 留下"表里已登记、device 里没有该 peer"的静默分歧。单消费者串行 ⇒ 提交顺序=执行顺序。
 	opCh    chan devOp
 	opStart sync.Once
+	// pending：未执行完的设备操作数（FIX-67 状态面）。
+	pending atomic.Int64
 }
 
 // devOp：一次设备配置操作（fn 执行完毕即 close(done)）。
@@ -141,6 +143,40 @@ type devOp struct {
 // 「设备正在收工」的窗口——放弃等待让 ReceiveFunc 能返回（操作仍在队列里按序执行，
 // 收工后自然完成或随设备一起消亡）。var 而非 const：单测压缩到毫秒级。
 var devOpTimeout = 2 * time.Second
+
+// applyDeviceOpAsync 只入队、**不等完成**（FIX-67：注册路径专用）。接收路径
+// （WG 收包 goroutine）此前同步等完成，devOpTimeout 的界意味着最坏 2s 的**全局停包**
+// （两条 op 串行或锁竞争时更长）——同机其它设备的流量、握手全被这条 goroutine 拖住。
+// 代价与补偿：注册应答先于 AddPeer 落地发出，而 client 的 WG 握手本就靠 device 里有
+// 这个 peer 才能完成 ⇒ 首个握手 initiation 可能被丢、由 WG 自己的重试兜住（毫秒级
+// 完成时无感）；换来的是停包窗口从「全员」缩到「只此一台的首个握手」。
+//
+// 失败面：入队超时（队列满 128）仍大声告警——那才是真正会产生「表与 device 不一致」
+// 的路径（完成超时不再影响调用方，操作仍在队列里按序执行）。
+func (t *DeviceTable) applyDeviceOpAsync(op func(), what string) {
+	t.opStart.Do(func() {
+		t.opCh = make(chan devOp, 128)
+		go func() {
+			for o := range t.opCh {
+				o.fn()
+				close(o.done)
+			}
+		}()
+	})
+	t.pending.Add(1)
+	timer := time.NewTimer(devOpTimeout)
+	defer timer.Stop()
+	select {
+	case t.opCh <- devOp{fn: func() { op(); t.pending.Add(-1) }, done: make(chan struct{})}:
+	case <-timer.C:
+		t.pending.Add(-1)
+		t.logf("peer: ⚠️ 设备配置操作排队超时（%v，%s）——本次**未执行**，device 与设备表可能不一致（等待下一条注册/重连对账收敛）", devOpTimeout, what)
+	}
+}
+
+// PendingOps 尚未执行完的设备配置操作数（FIX-67 状态面：注册已应答但 device 写入
+// 未落地时 >0；诊断/测试观察用）。
+func (t *DeviceTable) PendingOps() int64 { return t.pending.Load() }
 
 // applyDeviceOp：把操作提交到 FIFO 队列并在有限时间内等待完成。
 //
@@ -243,11 +279,12 @@ func (t *DeviceTable) Register(reg []byte, now time.Time) (Result, error) {
 		// 身份轮换：先移除旧 peer 再写新的 —— 顺序固定，避免旧 allowed_ip 悬空
 		//（两步包进同一个后台 op，串行保序）。
 		oldPub, oldIP := e.pub, e.ip
-		t.applyDeviceOp(func() {
+		// 接收路径：只入队不等完成（FIX-67；顺序由单消费者队列保证）。
+		t.applyDeviceOpAsync(func() {
 			if rerr := t.cfg.RemovePeer(oldPub); rerr != nil {
 				t.logf("peer: ! dev=%s rotate 移除旧 peer（pub=%s）失败：%v", devShort(devTag), pubShort(oldPub), rerr)
 			}
-		})
+		}, "rotate-remove")
 		ip, aerr := t.assignIPLocked(secret, pubkey, devTag)
 		if aerr != nil {
 			return Result{}, aerr
@@ -257,11 +294,11 @@ func (t *DeviceTable) Register(reg []byte, now time.Time) (Result, error) {
 			return Result{}, aerr
 		}
 		e.pub, e.psk, e.ip, e.tunIP, e.lastReg = pubkey, psk, ip, tunIP, now
-		t.applyDeviceOp(func() {
+		t.applyDeviceOpAsync(func() {
 			if aerr := t.cfg.AddPeer(PeerConfig{Pubkey: pubkey, PSK: psk, TunnelIP: ip, TunIP: tunIP}); aerr != nil {
 				t.logf("peer: ! dev=%s rotate 写入新 peer（pub=%s）失败：%v", devShort(devTag), pubShort(pubkey), aerr)
 			}
-		})
+		}, "rotate-add")
 		res := Result{DevTag: devTag, Pubkey: pubkey, TunnelIP: ip, Action: ActionRotated,
 			OldPubkey: oldPub, OldIP: oldIP, Idle: now.Sub(prev)}
 		t.logf("peer: ~ dev=%s rotate pub=%s→%s ip=%v→%v n=%d/%d",
@@ -285,11 +322,11 @@ func (t *DeviceTable) Register(reg []byte, now time.Time) (Result, error) {
 	}
 	e := &dentry{dev: devTag, pub: pubkey, psk: psk, ip: ip, tunIP: tunIP, lastReg: now, createdAt: now}
 	t.entries[devTag] = e
-	t.applyDeviceOp(func() {
+	t.applyDeviceOpAsync(func() {
 		if aerr := t.cfg.AddPeer(PeerConfig{Pubkey: pubkey, PSK: psk, TunnelIP: ip, TunIP: tunIP}); aerr != nil {
 			t.logf("peer: ! dev=%s 写入 peer（pub=%s）失败：%v", devShort(devTag), pubShort(pubkey), aerr)
 		}
-	})
+	}, "add")
 	if other, ok := t.findByPubLocked(pubkey, devTag); ok {
 		t.logf("peer: ! pub=%s 同时登记在 dev=%s 与 dev=%s（疑似同一身份被两台设备使用：克隆/迁移过应用数据？）",
 			pubShort(pubkey), devShort(other), devShort(devTag))
