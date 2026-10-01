@@ -72,20 +72,20 @@
 {"family":"cp","unit":"close-reason","value":"overrun","note":"","faces":["cp"],"status":"active","spec":"daemon-control-plane（reload/goodbye 关帧原因）"}
 {"family":"event-payload","unit":"via","value":"direct","note":"","faces":["napi","cp"],"status":"active","spec":"daemon-control-plane（值域冻结）+ contract-ledger"}
 {"family":"event-payload","unit":"via","value":"relay","note":"","faces":["napi","cp"],"status":"active","spec":"daemon-control-plane（值域冻结）+ contract-ledger"}
-{"family":"event-payload","unit":"via","value":"none","note":"单函数 default：applyLink 无 case 走 else；ExitHealth.ets 对 'none' 有比较 ⇒ 不入豁免减法（r4 新-3）。via 单元的 '' 空串哨兵（App 本地态、无生产者）不计入 App 值集","faces":["napi","cp"],"status":"active","spec":"daemon-control-plane（值域冻结）+ contract-ledger"}
+{"family":"event-payload","unit":"via","value":"none","note":"单函数 default：applyLink 无 case 走 else；ExitHealth.ets 对 'none' 有比较。豁免机制已随生成单源退役（app-logic-refactor 批 D）；via 单元的 '' 空串哨兵（App 本地态、无生产者）不计入 App 值集","faces":["napi","cp"],"status":"active","spec":"daemon-control-plane（值域冻结）+ contract-ledger"}
 {"family":"event-payload","unit":"via","value":"tunnel","note":"App 保留分支（applyLink 'tunnel' case）；本仓零产出者（bind.go 只产 direct/relay/none）；tier 旧 spec tailcat-direct-handshake-connect 历史口径（未注册时 via=tunnel）","faces":["napi","cp"],"status":"legacy-unreachable","spec":"daemon-control-plane（值域冻结）+ contract-ledger"}
 {"family":"event-payload","unit":"state","value":"idle","note":"","faces":["napi","cp"],"status":"active","spec":"daemon-control-plane（值域冻结）+ contract-ledger"}
 {"family":"event-payload","unit":"state","value":"starting","note":"","faces":["napi","cp"],"status":"active","spec":"daemon-control-plane（值域冻结）+ contract-ledger"}
 {"family":"event-payload","unit":"state","value":"ready","note":"","faces":["napi","cp"],"status":"active","spec":"daemon-control-plane（值域冻结）+ contract-ledger"}
 {"family":"event-payload","unit":"state","value":"failed","note":"","faces":["napi","cp"],"status":"active","spec":"daemon-control-plane（值域冻结）+ contract-ledger"}
-{"family":"event-payload","unit":"state","value":"stopping","note":"（ServiceSession.ets SVC_* 仅 4 值）","faces":["napi","cp"],"status":"active","spec":"daemon-control-plane（值域冻结）+ contract-ledger","exempt":"app-default","exemptSpec":"daemon-control-plane（值域冻结）+ contract-ledger","exemptSince":"2026-10-02"}
+{"family":"event-payload","unit":"state","value":"stopping","note":"（ServiceSession.ets SVC_* 仅 4 值）","faces":["napi","cp"],"status":"active","spec":"daemon-control-plane（值域冻结）+ contract-ledger"}
 {"family":"event-payload","unit":"diag","value":"gated","note":"App 无按值分派对象（spec 清单显式排除）","faces":["cp"],"status":"active","spec":"daemon-control-plane 诊因事件词表"}
 {"family":"event-payload","unit":"diag","value":"budget","note":"App 无按值分派对象（spec 清单显式排除）","faces":["cp"],"status":"active","spec":"daemon-control-plane 诊因事件词表"}
 {"family":"event-payload","unit":"diag","value":"probe_window","note":"App 无按值分派对象（spec 清单显式排除）","faces":["cp"],"status":"active","spec":"daemon-control-plane 诊因事件词表"}
-{"family":"term-frame","unit":"ended-code","value":"-1","note":"（endedMessage 仅 −2/−3 有 case；−1 由 reason 前置分支消费）","faces":["direct","napi"],"status":"active","spec":"exit-terminal + term-host-cli D8","exempt":"app-default","exemptSpec":"exit-terminal + term-host-cli D8","exemptSince":"2026-10-02"}
+{"family":"term-frame","unit":"ended-code","value":"-1","note":"（endedMessage 仅 −2/−3 有 case；−1 由 reason 前置分支消费）","faces":["direct","napi"],"status":"active","spec":"exit-terminal + term-host-cli D8"}
 {"family":"term-frame","unit":"ended-code","value":"-2","note":"","faces":["direct","napi"],"status":"active","spec":"exit-terminal + term-host-cli D8"}
 {"family":"term-frame","unit":"ended-code","value":"-3","note":"","faces":["direct","napi"],"status":"active","spec":"exit-terminal + term-host-cli D8"}
-{"family":"term-frame","unit":"ended-code","value":"math.MinInt32","note":"termEndNone 哨兵：不发 ENDED（客户端裸 EOF）；（endedMessage 仅 −2/−3 有 case）","faces":["direct","napi"],"status":"active","spec":"exit-terminal + term-host-cli D8","exempt":"app-default","exemptSpec":"exit-terminal + term-host-cli D8","exemptSince":"2026-10-02"}
+{"family":"term-frame","unit":"ended-code","value":"math.MinInt32","note":"termEndNone 哨兵：不发 ENDED（客户端裸 EOF）；（endedMessage 仅 −2/−3 有 case）","faces":["direct","napi"],"status":"active","spec":"exit-terminal + term-host-cli D8"}
 {"family":"term-frame","unit":"ended-reason","value":"replaced","note":"","faces":["direct","napi"],"status":"active","spec":"exit-terminal + term-host-cli D8"}
 {"family":"term-frame","unit":"ended-reason","value":"self_reconnect","note":"","faces":["direct","napi"],"status":"active","spec":"exit-terminal + term-host-cli D8"}
 {"family":"term-frame","unit":"feat","value":"1","note":"featList（真源 pkg/term feat*，位值十进制）；App 无按值分派对象（位字段，spec 清单排除）","faces":["direct","napi"],"status":"active","spec":"term-host-cli / term-surface-protocol"}
@@ -105,7 +105,7 @@
 {"family":"term-frame","unit":"stateV2-byte","value":"1","note":"STATE 帧 state 字节（agentStateKey 按字节分派）","faces":["direct","napi"],"status":"active","spec":"term-agent-state"}
 {"family":"term-frame","unit":"stateV2-byte","value":"2","note":"STATE 帧 state 字节（agentStateKey 按字节分派）","faces":["direct","napi"],"status":"active","spec":"term-agent-state"}
 {"family":"term-frame","unit":"stateV2-byte","value":"3","note":"STATE 帧 state 字节（agentStateKey 按字节分派）","faces":["direct","napi"],"status":"active","spec":"term-agent-state"}
-{"family":"term-frame","unit":"stateV2","value":"unknown","note":"（resolveStateKey 无 'unknown' case，落 default 返回 'unknown'）","faces":["direct","napi"],"status":"active","spec":"term-agent-state","exempt":"app-default","exemptSpec":"term-agent-state","exemptSince":"2026-10-02"}
+{"family":"term-frame","unit":"stateV2","value":"unknown","note":"（resolveStateKey 无 'unknown' case，落 default 返回 'unknown'）","faces":["direct","napi"],"status":"active","spec":"term-agent-state"}
 {"family":"term-frame","unit":"stateV2","value":"working","note":"","faces":["direct","napi"],"status":"active","spec":"term-agent-state"}
 {"family":"term-frame","unit":"stateV2","value":"blocked","note":"","faces":["direct","napi"],"status":"active","spec":"term-agent-state"}
 {"family":"term-frame","unit":"stateV2","value":"idle","note":"","faces":["direct","napi"],"status":"active","spec":"term-agent-state"}
@@ -122,16 +122,16 @@
 {"family":"term-frame","unit":"agent","value":"opencode","note":"","faces":["direct","napi"],"status":"active","spec":"term-agent-state"}
 {"family":"term-frame","unit":"agent","value":"openclaw","note":"","faces":["direct","napi"],"status":"active","spec":"term-agent-state"}
 {"family":"term-frame","unit":"agent","value":"other","note":"","faces":["direct","napi"],"status":"active","spec":"term-agent-state"}
-{"family":"term-frame","unit":"agent","value":"unknown","note":"（agentLabel·agentIcon 6 case）","faces":["direct","napi"],"status":"active","spec":"term-agent-state","exempt":"app-default","exemptSpec":"term-agent-state","exemptSince":"2026-10-02"}
+{"family":"term-frame","unit":"agent","value":"unknown","note":"（agentLabel·agentIcon 6 case）","faces":["direct","napi"],"status":"active","spec":"term-agent-state"}
 {"family":"term-error","unit":"code","value":"already_exists","note":"跨族同值：族④ files 同值——空间独立；经族⑦透传（App 分派见族⑦行）","faces":["direct","napi"],"status":"active","spec":"exit-terminal（ERROR 帧）+ term-host-cli / term-agent-state"}
-{"family":"term-error","unit":"code","value":"detect_off","note":"经族⑦透传","faces":["direct","napi"],"status":"active","spec":"exit-terminal（ERROR 帧）+ term-host-cli / term-agent-state","exempt":"app-default","exemptSpec":"exit-terminal（ERROR 帧）+ term-host-cli / term-agent-state","exemptSince":"2026-10-02"}
-{"family":"term-error","unit":"code","value":"marshal","note":"经族⑦透传","faces":["direct","napi"],"status":"active","spec":"exit-terminal（ERROR 帧）+ term-host-cli / term-agent-state","exempt":"app-default","exemptSpec":"exit-terminal（ERROR 帧）+ term-host-cli / term-agent-state","exemptSince":"2026-10-02"}
-{"family":"term-error","unit":"code","value":"no_agent","note":"经族⑦透传","faces":["direct","napi"],"status":"active","spec":"exit-terminal（ERROR 帧）+ term-host-cli / term-agent-state","exempt":"app-default","exemptSpec":"exit-terminal（ERROR 帧）+ term-host-cli / term-agent-state","exemptSince":"2026-10-02"}
+{"family":"term-error","unit":"code","value":"detect_off","note":"经族⑦透传","faces":["direct","napi"],"status":"active","spec":"exit-terminal（ERROR 帧）+ term-host-cli / term-agent-state"}
+{"family":"term-error","unit":"code","value":"marshal","note":"经族⑦透传","faces":["direct","napi"],"status":"active","spec":"exit-terminal（ERROR 帧）+ term-host-cli / term-agent-state"}
+{"family":"term-error","unit":"code","value":"no_agent","note":"经族⑦透传","faces":["direct","napi"],"status":"active","spec":"exit-terminal（ERROR 帧）+ term-host-cli / term-agent-state"}
 {"family":"term-error","unit":"code","value":"no_session","note":"经族⑦透传（App 分派见族⑦行）","faces":["direct","napi"],"status":"active","spec":"exit-terminal（ERROR 帧）+ term-host-cli / term-agent-state"}
-{"family":"term-error","unit":"code","value":"no_vt","note":"经族⑦透传","faces":["direct","napi"],"status":"active","spec":"exit-terminal（ERROR 帧）+ term-host-cli / term-agent-state","exempt":"app-default","exemptSpec":"exit-terminal（ERROR 帧）+ term-host-cli / term-agent-state","exemptSince":"2026-10-02"}
+{"family":"term-error","unit":"code","value":"no_vt","note":"经族⑦透传","faces":["direct","napi"],"status":"active","spec":"exit-terminal（ERROR 帧）+ term-host-cli / term-agent-state"}
 {"family":"term-error","unit":"code","value":"spawn_failed","note":"经族⑦透传（App 分派见族⑦行）","faces":["direct","napi"],"status":"active","spec":"exit-terminal（ERROR 帧）+ term-host-cli / term-agent-state"}
 {"family":"term-error","unit":"code","value":"too_many","note":"经族⑦透传（App 分派见族⑦行）","faces":["direct","napi"],"status":"active","spec":"exit-terminal（ERROR 帧）+ term-host-cli / term-agent-state"}
-{"family":"term-error","unit":"code","value":"too_many_clients","note":"经族⑦透传","faces":["direct","napi"],"status":"active","spec":"exit-terminal（ERROR 帧）+ term-host-cli / term-agent-state","exempt":"app-default","exemptSpec":"exit-terminal（ERROR 帧）+ term-host-cli / term-agent-state","exemptSince":"2026-10-02"}
+{"family":"term-error","unit":"code","value":"too_many_clients","note":"经族⑦透传","faces":["direct","napi"],"status":"active","spec":"exit-terminal（ERROR 帧）+ term-host-cli / term-agent-state"}
 {"family":"term-error","unit":"code","value":"term_version","note":"HELLO 版本声明与本出口不符（FIX-29 服务端版本门）；经族⑦透传（App 分派见族⑦行）","faces":["direct","napi"],"status":"active","spec":"term-proto-version-gate（exit-terminal 增量）"}
 {"family":"files-proto","unit":"code","value":"invalid_arg","note":"","faces":["direct","napi"],"status":"active","spec":"file-management"}
 {"family":"files-proto","unit":"code","value":"invalid_name","note":"","faces":["direct","napi"],"status":"active","spec":"file-management"}
@@ -142,7 +142,7 @@
 {"family":"files-proto","unit":"code","value":"op_failed","note":"","faces":["direct","napi"],"status":"active","spec":"file-management"}
 {"family":"files-proto","unit":"code","value":"canceled","note":"","faces":["direct","napi"],"status":"active","spec":"file-management"}
 {"family":"files-proto","unit":"code","value":"stream_open","note":"CodeStreamOpen（client.go 孤立常量：流开场失败）；connect 路径直透 App、op 路径被归一成 bridge_down","faces":["direct","napi"],"status":"active","spec":"file-management"}
-{"family":"files-proto","unit":"code","value":"server_busy","note":"并发闸拒绝（FIX-36：在册流满 MaxConns）；经族⑥透传、（带服务端 msg）","faces":["direct","napi"],"status":"active","spec":"file-management（并发闸）","exempt":"app-default","exemptSpec":"file-management（并发闸）","exemptSince":"2026-10-02"}
+{"family":"files-proto","unit":"code","value":"server_busy","note":"并发闸拒绝（FIX-36：在册流满 MaxConns）；经族⑥透传、（带服务端 msg）","faces":["direct","napi"],"status":"active","spec":"file-management（并发闸）"}
 {"family":"speedtest-reason","unit":"reason","value":"busy","note":"","faces":["napi","cp"],"status":"active","spec":"speedtest"}
 {"family":"speedtest-reason","unit":"reason","value":"link_down","note":"","faces":["napi","cp"],"status":"active","spec":"speedtest"}
 {"family":"speedtest-reason","unit":"reason","value":"bridge_down","note":"","faces":["napi","cp"],"status":"active","spec":"speedtest"}
@@ -151,23 +151,23 @@
 {"family":"speedtest-reason","unit":"reason","value":"interrupted","note":"","faces":["napi","cp"],"status":"active","spec":"speedtest"}
 {"family":"speedtest-reason","unit":"reason","value":"timeout","note":"","faces":["napi","cp"],"status":"active","spec":"speedtest"}
 {"family":"speedtest-reason","unit":"reason","value":"cancelled","note":"","faces":["napi","cp"],"status":"active","spec":"speedtest"}
-{"family":"speedtest-reason","unit":"reason","value":"invalid_arg","note":"单函数 default：speedTestReasonShort 无 case、Text 有 case ⇒ 不入豁免减法（r3 N-13）","faces":["napi","cp"],"status":"active","spec":"speedtest"}
+{"family":"speedtest-reason","unit":"reason","value":"invalid_arg","note":"speedTestReasonShort 显式 case（与 default 同文案，app-logic-refactor 批 A 补）；豁免机制已随生成单源退役（批 D）","faces":["napi","cp"],"status":"active","spec":"speedtest"}
 {"family":"speedtest-reason","unit":"cli-reason","value":"control_error","note":"CLI 自产（控制面调用失败的归因码；引擎不产生、App 不见）","faces":["cli"],"status":"active","spec":"speedtest-cli"}
 {"family":"bridge-files","unit":"code","value":"bridge_down","note":"","faces":["napi"],"status":"active","spec":"bridge-call-layer + file-management"}
 {"family":"bridge-files","unit":"code","value":"bridge_auth","note":"","faces":["napi"],"status":"active","spec":"bridge-call-layer + file-management"}
 {"family":"bridge-files","unit":"code","value":"busy","note":"","faces":["napi"],"status":"active","spec":"bridge-call-layer + file-management"}
 {"family":"bridge-files","unit":"code","value":"invalid_arg","note":"","faces":["napi"],"status":"active","spec":"bridge-call-layer + file-management"}
 {"family":"bridge-files","unit":"code","value":"no_session","note":"","faces":["napi"],"status":"active","spec":"bridge-call-layer + file-management"}
-{"family":"bridge-files","unit":"code","value":"op_failed","note":"（filesErrorMessage 无 case）","faces":["napi"],"status":"active","spec":"bridge-call-layer + file-management","exempt":"app-default","exemptSpec":"bridge-call-layer + file-management","exemptSince":"2026-10-02"}
-{"family":"bridge-files","unit":"code","value":"stream_open","note":"（filesErrorMessage 无 case）；connect 路径直透","faces":["napi"],"status":"active","spec":"bridge-call-layer + file-management","exempt":"app-default","exemptSpec":"bridge-call-layer + file-management","exemptSince":"2026-10-02"}
-{"family":"bridge-files","unit":"code","value":"marshal","note":"（filesErrorMessage 无 case）","faces":["napi"],"status":"active","spec":"bridge-call-layer + file-management","exempt":"app-default","exemptSpec":"bridge-call-layer + file-management","exemptSince":"2026-10-02"}
+{"family":"bridge-files","unit":"code","value":"op_failed","note":"（filesErrorMessage 无 case）","faces":["napi"],"status":"active","spec":"bridge-call-layer + file-management"}
+{"family":"bridge-files","unit":"code","value":"stream_open","note":"（filesErrorMessage 无 case）；connect 路径直透","faces":["napi"],"status":"active","spec":"bridge-call-layer + file-management"}
+{"family":"bridge-files","unit":"code","value":"marshal","note":"（filesErrorMessage 无 case）","faces":["napi"],"status":"active","spec":"bridge-call-layer + file-management"}
 {"family":"bridge-files","unit":"code","value":"already_exists","note":"④稳定码透传","faces":["napi"],"status":"active","spec":"bridge-call-layer + file-management"}
 {"family":"bridge-files","unit":"code","value":"canceled","note":"④稳定码透传","faces":["napi"],"status":"active","spec":"bridge-call-layer + file-management"}
 {"family":"bridge-files","unit":"code","value":"invalid_name","note":"④稳定码透传","faces":["napi"],"status":"active","spec":"bridge-call-layer + file-management"}
 {"family":"bridge-files","unit":"code","value":"is_dir","note":"④稳定码透传","faces":["napi"],"status":"active","spec":"bridge-call-layer + file-management"}
 {"family":"bridge-files","unit":"code","value":"not_found","note":"④稳定码透传","faces":["napi"],"status":"active","spec":"bridge-call-layer + file-management"}
 {"family":"bridge-files","unit":"code","value":"permission","note":"④稳定码透传","faces":["napi"],"status":"active","spec":"bridge-call-layer + file-management"}
-{"family":"bridge-files","unit":"code","value":"server_busy","note":"④稳定码透传；（filesErrorMessage 无 case——服务端并发闸的 msg 原样展示）","faces":["napi"],"status":"active","spec":"bridge-call-layer + file-management","exempt":"app-default","exemptSpec":"bridge-call-layer + file-management","exemptSince":"2026-10-02"}
+{"family":"bridge-files","unit":"code","value":"server_busy","note":"④稳定码透传；（filesErrorMessage 无 case——服务端并发闸的 msg 原样展示）","faces":["napi"],"status":"active","spec":"bridge-call-layer + file-management"}
 {"family":"bridge-files","unit":"code","value":"dial_failed","note":"","faces":["napi"],"status":"legacy-unreachable","spec":"bridge-call-layer + file-management"}
 {"family":"bridge-files","unit":"code","value":"files_not_enabled","note":"","faces":["napi"],"status":"legacy-unreachable","spec":"bridge-call-layer + file-management"}
 {"family":"bridge-files","unit":"code","value":"files_other_service","note":"","faces":["napi"],"status":"legacy-unreachable","spec":"bridge-call-layer + file-management"}
@@ -182,16 +182,16 @@
 {"family":"bridge-term","unit":"code","value":"term_foreign_service","note":"","faces":["napi"],"status":"active","spec":"bridge-call-layer + exit-terminal"}
 {"family":"bridge-term","unit":"code","value":"term_version","note":"","faces":["napi"],"status":"active","spec":"bridge-call-layer + exit-terminal"}
 {"family":"bridge-term","unit":"code","value":"io","note":"","faces":["napi"],"status":"active","spec":"bridge-call-layer + exit-terminal"}
-{"family":"bridge-term","unit":"code","value":"remote","note":"（termErrorMessage 无 case）","faces":["napi"],"status":"active","spec":"bridge-call-layer + exit-terminal","exempt":"app-default","exemptSpec":"bridge-call-layer + exit-terminal","exemptSince":"2026-10-02"}
-{"family":"bridge-term","unit":"code","value":"marshal","note":"（termErrorMessage 无 case）","faces":["napi"],"status":"active","spec":"bridge-call-layer + exit-terminal","exempt":"app-default","exemptSpec":"bridge-call-layer + exit-terminal","exemptSince":"2026-10-02"}
-{"family":"bridge-term","unit":"code","value":"already_exists","note":"（termErrorMessage 无 case）；③透传","faces":["napi"],"status":"active","spec":"bridge-call-layer + exit-terminal","exempt":"app-default","exemptSpec":"bridge-call-layer + exit-terminal","exemptSince":"2026-10-02"}
-{"family":"bridge-term","unit":"code","value":"detect_off","note":"（termErrorMessage 无 case）；③透传","faces":["napi"],"status":"active","spec":"bridge-call-layer + exit-terminal","exempt":"app-default","exemptSpec":"bridge-call-layer + exit-terminal","exemptSince":"2026-10-02"}
-{"family":"bridge-term","unit":"code","value":"no_agent","note":"（termErrorMessage 无 case）；③透传","faces":["napi"],"status":"active","spec":"bridge-call-layer + exit-terminal","exempt":"app-default","exemptSpec":"bridge-call-layer + exit-terminal","exemptSince":"2026-10-02"}
+{"family":"bridge-term","unit":"code","value":"remote","note":"（termErrorMessage 无 case）","faces":["napi"],"status":"active","spec":"bridge-call-layer + exit-terminal"}
+{"family":"bridge-term","unit":"code","value":"marshal","note":"（termErrorMessage 无 case）","faces":["napi"],"status":"active","spec":"bridge-call-layer + exit-terminal"}
+{"family":"bridge-term","unit":"code","value":"already_exists","note":"（termErrorMessage 无 case）；③透传","faces":["napi"],"status":"active","spec":"bridge-call-layer + exit-terminal"}
+{"family":"bridge-term","unit":"code","value":"detect_off","note":"（termErrorMessage 无 case）；③透传","faces":["napi"],"status":"active","spec":"bridge-call-layer + exit-terminal"}
+{"family":"bridge-term","unit":"code","value":"no_agent","note":"（termErrorMessage 无 case）；③透传","faces":["napi"],"status":"active","spec":"bridge-call-layer + exit-terminal"}
 {"family":"bridge-term","unit":"code","value":"no_session","note":"③透传","faces":["napi"],"status":"active","spec":"bridge-call-layer + exit-terminal"}
-{"family":"bridge-term","unit":"code","value":"no_vt","note":"（termErrorMessage 无 case）；③透传","faces":["napi"],"status":"active","spec":"bridge-call-layer + exit-terminal","exempt":"app-default","exemptSpec":"bridge-call-layer + exit-terminal","exemptSince":"2026-10-02"}
+{"family":"bridge-term","unit":"code","value":"no_vt","note":"（termErrorMessage 无 case）；③透传","faces":["napi"],"status":"active","spec":"bridge-call-layer + exit-terminal"}
 {"family":"bridge-term","unit":"code","value":"spawn_failed","note":"③透传","faces":["napi"],"status":"active","spec":"bridge-call-layer + exit-terminal"}
 {"family":"bridge-term","unit":"code","value":"too_many","note":"③透传","faces":["napi"],"status":"active","spec":"bridge-call-layer + exit-terminal"}
-{"family":"bridge-term","unit":"code","value":"too_many_clients","note":"（termErrorMessage 无 case）；③透传","faces":["napi"],"status":"active","spec":"bridge-call-layer + exit-terminal","exempt":"app-default","exemptSpec":"bridge-call-layer + exit-terminal","exemptSince":"2026-10-02"}
+{"family":"bridge-term","unit":"code","value":"too_many_clients","note":"（termErrorMessage 无 case）；③透传","faces":["napi"],"status":"active","spec":"bridge-call-layer + exit-terminal"}
 {"family":"bridge-term","unit":"code","value":"async_failed","note":"","faces":["napi"],"status":"legacy-unreachable","spec":"bridge-call-layer + exit-terminal"}
 {"family":"bridge-term","unit":"code","value":"invalid_name","note":"","faces":["napi"],"status":"legacy-unreachable","spec":"bridge-call-layer + exit-terminal"}
 {"family":"bridge-term","unit":"code","value":"timeout","note":"","faces":["napi"],"status":"legacy-unreachable","spec":"bridge-call-layer + exit-terminal"}
@@ -359,60 +359,63 @@
 {"family":"fixtures","unit":"surface-golden-fnv","name":"session-hexdump-diff","sha256":"f93d7ff4bca72ae8","note":"FNV-1a 64 文本摘要（manifest.tsv 既有口径；sha256 字段载该摘要）","faces":[],"status":"active","spec":"term-surface-protocol golden"}
 {"family":"fixtures","unit":"surface-golden-fnv","name":"session-styles","sha256":"c9d6ff2ce143581a","note":"manifest 第 6 列文本摘要（逐样例 FNV-1a 64）","faces":[],"status":"active","spec":"term-surface-protocol（跨仓 golden）"}
 {"family":"fixtures","unit":"surface-golden-fnv","name":"session-styles-diff","sha256":"08b3d888e7109ea3","note":"manifest 第 6 列文本摘要（逐样例 FNV-1a 64）","faces":[],"status":"active","spec":"term-surface-protocol（跨仓 golden）"}
-{"family": "napi-payload", "unit": "tun-status", "value": "state", "note": "恒有：阶段名", "faces": ["napi"], "status": "active", "spec": "clientcore-distribution / NAPI 载荷键集（FIX-76）"}
-{"family": "napi-payload", "unit": "tun-status", "value": "code", "note": "恒有", "faces": ["napi"], "status": "active", "spec": "clientcore-distribution / NAPI 载荷键集（FIX-76）"}
-{"family": "napi-payload", "unit": "tun-status", "value": "reason", "note": "恒有（阶段原因/随 demand 的判定原因同名词面）", "faces": ["napi"], "status": "active", "spec": "clientcore-distribution / NAPI 载荷键集（FIX-76）"}
-{"family": "napi-payload", "unit": "tun-status", "value": "meowed", "note": "恒有", "faces": ["napi"], "status": "active", "spec": "clientcore-distribution / NAPI 载荷键集（FIX-76）"}
-{"family": "napi-payload", "unit": "tun-status", "value": "readyBy", "note": "恒有（direct/relay/空）", "faces": ["napi"], "status": "active", "spec": "clientcore-distribution / NAPI 载荷键集（FIX-76）"}
-{"family": "napi-payload", "unit": "tun-status", "value": "running", "note": "恒有（0/1）", "faces": ["napi"], "status": "active", "spec": "clientcore-distribution / NAPI 载荷键集（FIX-76）"}
-{"family": "napi-payload", "unit": "tun-status", "value": "elapsedMs", "note": "恒有", "faces": ["napi"], "status": "active", "spec": "clientcore-distribution / NAPI 载荷键集（FIX-76）"}
-{"family": "napi-payload", "unit": "tun-status", "value": "demand", "note": "恒有：需求判定快照容器", "faces": ["napi"], "status": "active", "spec": "clientcore-distribution / NAPI 载荷键集（FIX-76）"}
-{"family": "napi-payload", "unit": "tun-status", "value": "active", "note": "恒有：随 demand", "faces": ["napi"], "status": "active", "spec": "clientcore-distribution / NAPI 载荷键集（FIX-76）"}
-{"family": "napi-payload", "unit": "tun-status", "value": "at", "note": "link/demand 两处：link 为 unix 秒、demand 为毫秒", "faces": ["napi"], "status": "active", "spec": "clientcore-distribution / NAPI 载荷键集（FIX-76）"}
-{"family": "napi-payload", "unit": "tun-status", "value": "fg", "note": "恒有：随 demand（仅诊断位）", "faces": ["napi"], "status": "active", "spec": "clientcore-distribution / NAPI 载荷键集（FIX-76）"}
-{"family": "napi-payload", "unit": "tun-status", "value": "outboundAt", "note": "可选：有 runner 且最近出站包才带", "faces": ["napi"], "status": "active", "spec": "clientcore-distribution / NAPI 载荷键集（FIX-76）"}
-{"family": "napi-payload", "unit": "tun-status", "value": "localErrAdopted", "note": "可选：有 runner/transport 才带", "faces": ["napi"], "status": "active", "spec": "clientcore-distribution / NAPI 载荷键集（FIX-76）"}
-{"family": "napi-payload", "unit": "tun-status", "value": "localErrTotal", "note": "可选：同上", "faces": ["napi"], "status": "active", "spec": "clientcore-distribution / NAPI 载荷键集（FIX-76）"}
-{"family": "napi-payload", "unit": "tun-status", "value": "unhealthyReason", "note": "可选：非空才带", "faces": ["napi"], "status": "active", "spec": "clientcore-distribution / NAPI 载荷键集（FIX-76）"}
-{"family": "napi-payload", "unit": "tun-status", "value": "stats", "note": "可选：有 runner 才带", "faces": ["napi"], "status": "active", "spec": "clientcore-distribution / NAPI 载荷键集（FIX-76）"}
-{"family": "napi-payload", "unit": "tun-status", "value": "fdReadBytes", "note": "可选：随 stats", "faces": ["napi"], "status": "active", "spec": "clientcore-distribution / NAPI 载荷键集（FIX-76）"}
-{"family": "napi-payload", "unit": "tun-status", "value": "fdWriteBytes", "note": "可选：随 stats", "faces": ["napi"], "status": "active", "spec": "clientcore-distribution / NAPI 载荷键集（FIX-76）"}
-{"family": "napi-payload", "unit": "tun-status", "value": "pfAccepted", "note": "可选：随 stats", "faces": ["napi"], "status": "active", "spec": "clientcore-distribution / NAPI 载荷键集（FIX-76）"}
-{"family": "napi-payload", "unit": "tun-status", "value": "pfFails", "note": "可选：随 stats", "faces": ["napi"], "status": "active", "spec": "clientcore-distribution / NAPI 载荷键集（FIX-76）"}
-{"family": "napi-payload", "unit": "tun-status", "value": "exitIp", "note": "可选：有 runner 才带（App 作 dnsAddresses）", "faces": ["napi"], "status": "active", "spec": "clientcore-distribution / NAPI 载荷键集（FIX-76）"}
-{"family": "napi-payload", "unit": "tun-status", "value": "link", "note": "可选：有 runner 才带", "faces": ["napi"], "status": "active", "spec": "clientcore-distribution / NAPI 载荷键集（FIX-76）"}
-{"family": "napi-payload", "unit": "tun-status", "value": "via", "note": "可选：随 link", "faces": ["napi"], "status": "active", "spec": "clientcore-distribution / NAPI 载荷键集（FIX-76）"}
-{"family": "napi-payload", "unit": "tun-status", "value": "ep", "note": "可选：随 link", "faces": ["napi"], "status": "active", "spec": "clientcore-distribution / NAPI 载荷键集（FIX-76）"}
-{"family": "napi-payload", "unit": "tun-status", "value": "rttMs", "note": "可选：随 link", "faces": ["napi"], "status": "active", "spec": "clientcore-distribution / NAPI 载荷键集（FIX-76）"}
-{"family": "napi-payload", "unit": "tun-status", "value": "portForwards", "note": "可选：有 runner 才带（元素形状 = pf-status 单元）", "faces": ["napi"], "status": "active", "spec": "clientcore-distribution / NAPI 载荷键集（FIX-76）"}
-{"family": "napi-payload", "unit": "tun-status", "value": "bridgeAuth", "note": "可选：桥已起（App 经 IPC 状态通道消费；不进日志）", "faces": ["napi"], "status": "active", "spec": "clientcore-distribution / NAPI 载荷键集（FIX-76）"}
-{"family": "napi-payload", "unit": "tun-status", "value": "bridgeFilesSock", "note": "可选：桥已起（三键同拍）", "faces": ["napi"], "status": "active", "spec": "clientcore-distribution / NAPI 载荷键集（FIX-76）"}
-{"family": "napi-payload", "unit": "tun-status", "value": "bridgeTermSock", "note": "可选：桥已起（三键同拍）", "faces": ["napi"], "status": "active", "spec": "clientcore-distribution / NAPI 载荷键集（FIX-76）"}
-{"family": "napi-payload", "unit": "tun-status", "value": "bridgeSpeedSock", "note": "可选：桥已起（三键同拍）", "faces": ["napi"], "status": "active", "spec": "clientcore-distribution / NAPI 载荷键集（FIX-76）"}
-{"family": "napi-payload", "unit": "tun-status", "value": "identity", "note": "可选：有身份快照才带", "faces": ["napi"], "status": "active", "spec": "clientcore-distribution / NAPI 载荷键集（FIX-76）"}
-{"family": "napi-payload", "unit": "tun-status", "value": "dev", "note": "可选：随 identity", "faces": ["napi"], "status": "active", "spec": "clientcore-distribution / NAPI 载荷键集（FIX-76）"}
-{"family": "napi-payload", "unit": "tun-status", "value": "pub", "note": "可选：随 identity", "faces": ["napi"], "status": "active", "spec": "clientcore-distribution / NAPI 载荷键集（FIX-76）"}
-{"family": "napi-payload", "unit": "tun-status", "value": "tunIp", "note": "可选：有 runner 且 Core 就绪才带（应用面地址）", "faces": ["napi"], "status": "active", "spec": "clientcore-distribution / NAPI 载荷键集（FIX-76）"}
-{"family": "napi-payload", "unit": "service-status", "value": "state", "note": "恒有（无实例短路形态 = {state:idle}）", "faces": ["napi"], "status": "active", "spec": "clientcore-distribution / NAPI 载荷键集（FIX-76）"}
-{"family": "napi-payload", "unit": "service-status", "value": "reason", "note": "恒有（短路形态不带）", "faces": ["napi"], "status": "active", "spec": "clientcore-distribution / NAPI 载荷键集（FIX-76）"}
-{"family": "napi-payload", "unit": "service-status", "value": "elapsedMs", "note": "可选：有实例才带", "faces": ["napi"], "status": "active", "spec": "clientcore-distribution / NAPI 载荷键集（FIX-76）"}
-{"family": "napi-payload", "unit": "service-status", "value": "bridgeAuth", "note": "可选：桥已起", "faces": ["napi"], "status": "active", "spec": "clientcore-distribution / NAPI 载荷键集（FIX-76）"}
-{"family": "napi-payload", "unit": "service-status", "value": "bridgeFilesSock", "note": "可选：桥已起（三键同拍）", "faces": ["napi"], "status": "active", "spec": "clientcore-distribution / NAPI 载荷键集（FIX-76）"}
-{"family": "napi-payload", "unit": "service-status", "value": "bridgeTermSock", "note": "可选：桥已起（三键同拍）", "faces": ["napi"], "status": "active", "spec": "clientcore-distribution / NAPI 载荷键集（FIX-76）"}
-{"family": "napi-payload", "unit": "service-status", "value": "bridgeSpeedSock", "note": "可选：桥已起（三键同拍）", "faces": ["napi"], "status": "active", "spec": "clientcore-distribution / NAPI 载荷键集（FIX-76）"}
-{"family": "napi-payload", "unit": "service-status", "value": "link", "note": "可选：有 link 快照才带", "faces": ["napi"], "status": "active", "spec": "clientcore-distribution / NAPI 载荷键集（FIX-76）"}
-{"family": "napi-payload", "unit": "service-status", "value": "via", "note": "可选：随 link", "faces": ["napi"], "status": "active", "spec": "clientcore-distribution / NAPI 载荷键集（FIX-76）"}
-{"family": "napi-payload", "unit": "service-status", "value": "ep", "note": "可选：随 link", "faces": ["napi"], "status": "active", "spec": "clientcore-distribution / NAPI 载荷键集（FIX-76）"}
-{"family": "napi-payload", "unit": "service-status", "value": "at", "note": "可选：随 link（unix 秒）", "faces": ["napi"], "status": "active", "spec": "clientcore-distribution / NAPI 载荷键集（FIX-76）"}
-{"family": "napi-payload", "unit": "service-status", "value": "rttMs", "note": "可选：随 link", "faces": ["napi"], "status": "active", "spec": "clientcore-distribution / NAPI 载荷键集（FIX-76）"}
-{"family": "napi-payload", "unit": "service-status", "value": "identity", "note": "可选：有 link 且有身份才带", "faces": ["napi"], "status": "active", "spec": "clientcore-distribution / NAPI 载荷键集（FIX-76）"}
-{"family": "napi-payload", "unit": "service-status", "value": "dev", "note": "可选：随 identity", "faces": ["napi"], "status": "active", "spec": "clientcore-distribution / NAPI 载荷键集（FIX-76）"}
-{"family": "napi-payload", "unit": "service-status", "value": "pub", "note": "可选：随 identity", "faces": ["napi"], "status": "active", "spec": "clientcore-distribution / NAPI 载荷键集（FIX-76）"}
-{"family": "napi-payload", "unit": "service-status", "value": "stats", "note": "可选：有统计快照才带", "faces": ["napi"], "status": "active", "spec": "clientcore-distribution / NAPI 载荷键集（FIX-76）"}
-{"family": "napi-payload", "unit": "service-status", "value": "rxBytes", "note": "可选：随 stats", "faces": ["napi"], "status": "active", "spec": "clientcore-distribution / NAPI 载荷键集（FIX-76）"}
-{"family": "napi-payload", "unit": "service-status", "value": "txBytes", "note": "可选：随 stats", "faces": ["napi"], "status": "active", "spec": "clientcore-distribution / NAPI 载荷键集（FIX-76）"}
-{"family": "napi-payload", "unit": "pf-status", "value": "listen", "note": "恒有：监听端口（元素匹配键）", "faces": ["napi"], "status": "active", "spec": "clientcore-distribution / NAPI 载荷键集（FIX-76）"}
-{"family": "napi-payload", "unit": "pf-status", "value": "target", "note": "恒有：目标描述（App 不读，供诊断）", "faces": ["napi"], "status": "active", "spec": "clientcore-distribution / NAPI 载荷键集（FIX-76）"}
-{"family": "napi-payload", "unit": "pf-status", "value": "state", "note": "恒有：listening/failed", "faces": ["napi"], "status": "active", "spec": "clientcore-distribution / NAPI 载荷键集（FIX-76）"}
-{"family": "napi-payload", "unit": "pf-status", "value": "err", "note": "恒有：失败原因（可空串）", "faces": ["napi"], "status": "active", "spec": "clientcore-distribution / NAPI 载荷键集（FIX-76）"}
-{"family": "napi-payload", "unit": "pf-status", "value": "conns", "note": "恒有：在世连接数", "faces": ["napi"], "status": "active", "spec": "clientcore-distribution / NAPI 载荷键集（FIX-76）"}
+{"family":"napi-payload","unit":"tun-status","value":"state","note":"恒有：阶段名","faces":["napi"],"status":"active","spec":"clientcore-distribution / NAPI 载荷键集（FIX-76）"}
+{"family":"napi-payload","unit":"tun-status","value":"code","note":"恒有","faces":["napi"],"status":"active","spec":"clientcore-distribution / NAPI 载荷键集（FIX-76）"}
+{"family":"napi-payload","unit":"tun-status","value":"reason","note":"恒有（阶段原因/随 demand 的判定原因同名词面）","faces":["napi"],"status":"active","spec":"clientcore-distribution / NAPI 载荷键集（FIX-76）"}
+{"family":"napi-payload","unit":"tun-status","value":"meowed","note":"恒有","faces":["napi"],"status":"active","spec":"clientcore-distribution / NAPI 载荷键集（FIX-76）"}
+{"family":"napi-payload","unit":"tun-status","value":"readyBy","note":"恒有（direct/relay/空）","faces":["napi"],"status":"active","spec":"clientcore-distribution / NAPI 载荷键集（FIX-76）"}
+{"family":"napi-payload","unit":"tun-status","value":"running","note":"恒有（0/1）","faces":["napi"],"status":"active","spec":"clientcore-distribution / NAPI 载荷键集（FIX-76）"}
+{"family":"napi-payload","unit":"tun-status","value":"elapsedMs","note":"恒有","faces":["napi"],"status":"active","spec":"clientcore-distribution / NAPI 载荷键集（FIX-76）"}
+{"family":"napi-payload","unit":"tun-status","value":"demand","note":"恒有：需求判定快照容器","faces":["napi"],"status":"active","spec":"clientcore-distribution / NAPI 载荷键集（FIX-76）"}
+{"family":"napi-payload","unit":"tun-status","value":"active","note":"恒有：随 demand","faces":["napi"],"status":"active","spec":"clientcore-distribution / NAPI 载荷键集（FIX-76）"}
+{"family":"napi-payload","unit":"tun-status","value":"at","note":"link/demand 两处：link 为 unix 秒、demand 为毫秒","faces":["napi"],"status":"active","spec":"clientcore-distribution / NAPI 载荷键集（FIX-76）"}
+{"family":"napi-payload","unit":"tun-status","value":"fg","note":"恒有：随 demand（仅诊断位）","faces":["napi"],"status":"active","spec":"clientcore-distribution / NAPI 载荷键集（FIX-76）"}
+{"family":"napi-payload","unit":"tun-status","value":"outboundAt","note":"可选：有 runner 且最近出站包才带","faces":["napi"],"status":"active","spec":"clientcore-distribution / NAPI 载荷键集（FIX-76）"}
+{"family":"napi-payload","unit":"tun-status","value":"localErrAdopted","note":"可选：有 runner/transport 才带","faces":["napi"],"status":"active","spec":"clientcore-distribution / NAPI 载荷键集（FIX-76）"}
+{"family":"napi-payload","unit":"tun-status","value":"localErrTotal","note":"可选：同上","faces":["napi"],"status":"active","spec":"clientcore-distribution / NAPI 载荷键集（FIX-76）"}
+{"family":"napi-payload","unit":"tun-status","value":"unhealthyReason","note":"可选：非空才带","faces":["napi"],"status":"active","spec":"clientcore-distribution / NAPI 载荷键集（FIX-76）"}
+{"family":"napi-payload","unit":"tun-status","value":"stats","note":"可选：有 runner 才带","faces":["napi"],"status":"active","spec":"clientcore-distribution / NAPI 载荷键集（FIX-76）"}
+{"family":"napi-payload","unit":"tun-status","value":"fdReadBytes","note":"可选：随 stats","faces":["napi"],"status":"active","spec":"clientcore-distribution / NAPI 载荷键集（FIX-76）"}
+{"family":"napi-payload","unit":"tun-status","value":"fdWriteBytes","note":"可选：随 stats","faces":["napi"],"status":"active","spec":"clientcore-distribution / NAPI 载荷键集（FIX-76）"}
+{"family":"napi-payload","unit":"tun-status","value":"pfAccepted","note":"可选：随 stats","faces":["napi"],"status":"active","spec":"clientcore-distribution / NAPI 载荷键集（FIX-76）"}
+{"family":"napi-payload","unit":"tun-status","value":"pfFails","note":"可选：随 stats","faces":["napi"],"status":"active","spec":"clientcore-distribution / NAPI 载荷键集（FIX-76）"}
+{"family":"napi-payload","unit":"tun-status","value":"exitIp","note":"可选：有 runner 才带（App 作 dnsAddresses）","faces":["napi"],"status":"active","spec":"clientcore-distribution / NAPI 载荷键集（FIX-76）"}
+{"family":"napi-payload","unit":"tun-status","value":"link","note":"可选：有 runner 才带","faces":["napi"],"status":"active","spec":"clientcore-distribution / NAPI 载荷键集（FIX-76）"}
+{"family":"napi-payload","unit":"tun-status","value":"via","note":"可选：随 link","faces":["napi"],"status":"active","spec":"clientcore-distribution / NAPI 载荷键集（FIX-76）"}
+{"family":"napi-payload","unit":"tun-status","value":"ep","note":"可选：随 link","faces":["napi"],"status":"active","spec":"clientcore-distribution / NAPI 载荷键集（FIX-76）"}
+{"family":"napi-payload","unit":"tun-status","value":"rttMs","note":"可选：随 link","faces":["napi"],"status":"active","spec":"clientcore-distribution / NAPI 载荷键集（FIX-76）"}
+{"family":"napi-payload","unit":"tun-status","value":"portForwards","note":"可选：有 runner 才带（元素形状 = pf-status 单元）","faces":["napi"],"status":"active","spec":"clientcore-distribution / NAPI 载荷键集（FIX-76）"}
+{"family":"napi-payload","unit":"tun-status","value":"bridgeAuth","note":"可选：桥已起（App 经 IPC 状态通道消费；不进日志）","faces":["napi"],"status":"active","spec":"clientcore-distribution / NAPI 载荷键集（FIX-76）"}
+{"family":"napi-payload","unit":"tun-status","value":"bridgeFilesSock","note":"可选：桥已起（三键同拍）","faces":["napi"],"status":"active","spec":"clientcore-distribution / NAPI 载荷键集（FIX-76）"}
+{"family":"napi-payload","unit":"tun-status","value":"bridgeTermSock","note":"可选：桥已起（三键同拍）","faces":["napi"],"status":"active","spec":"clientcore-distribution / NAPI 载荷键集（FIX-76）"}
+{"family":"napi-payload","unit":"tun-status","value":"bridgeSpeedSock","note":"可选：桥已起（三键同拍）","faces":["napi"],"status":"active","spec":"clientcore-distribution / NAPI 载荷键集（FIX-76）"}
+{"family":"napi-payload","unit":"tun-status","value":"identity","note":"可选：有身份快照才带","faces":["napi"],"status":"active","spec":"clientcore-distribution / NAPI 载荷键集（FIX-76）"}
+{"family":"napi-payload","unit":"tun-status","value":"dev","note":"可选：随 identity","faces":["napi"],"status":"active","spec":"clientcore-distribution / NAPI 载荷键集（FIX-76）"}
+{"family":"napi-payload","unit":"tun-status","value":"pub","note":"可选：随 identity","faces":["napi"],"status":"active","spec":"clientcore-distribution / NAPI 载荷键集（FIX-76）"}
+{"family":"napi-payload","unit":"tun-status","value":"tunIp","note":"可选：有 runner 且 Core 就绪才带（应用面地址）","faces":["napi"],"status":"active","spec":"clientcore-distribution / NAPI 载荷键集（FIX-76）"}
+{"family":"napi-payload","unit":"service-status","value":"state","note":"恒有（无实例短路形态 = {state:idle}）","faces":["napi"],"status":"active","spec":"clientcore-distribution / NAPI 载荷键集（FIX-76）"}
+{"family":"napi-payload","unit":"service-status","value":"reason","note":"恒有（短路形态不带）","faces":["napi"],"status":"active","spec":"clientcore-distribution / NAPI 载荷键集（FIX-76）"}
+{"family":"napi-payload","unit":"service-status","value":"elapsedMs","note":"可选：有实例才带","faces":["napi"],"status":"active","spec":"clientcore-distribution / NAPI 载荷键集（FIX-76）"}
+{"family":"napi-payload","unit":"service-status","value":"bridgeAuth","note":"可选：桥已起","faces":["napi"],"status":"active","spec":"clientcore-distribution / NAPI 载荷键集（FIX-76）"}
+{"family":"napi-payload","unit":"service-status","value":"bridgeFilesSock","note":"可选：桥已起（三键同拍）","faces":["napi"],"status":"active","spec":"clientcore-distribution / NAPI 载荷键集（FIX-76）"}
+{"family":"napi-payload","unit":"service-status","value":"bridgeTermSock","note":"可选：桥已起（三键同拍）","faces":["napi"],"status":"active","spec":"clientcore-distribution / NAPI 载荷键集（FIX-76）"}
+{"family":"napi-payload","unit":"service-status","value":"bridgeSpeedSock","note":"可选：桥已起（三键同拍）","faces":["napi"],"status":"active","spec":"clientcore-distribution / NAPI 载荷键集（FIX-76）"}
+{"family":"napi-payload","unit":"service-status","value":"link","note":"可选：有 link 快照才带","faces":["napi"],"status":"active","spec":"clientcore-distribution / NAPI 载荷键集（FIX-76）"}
+{"family":"napi-payload","unit":"service-status","value":"via","note":"可选：随 link","faces":["napi"],"status":"active","spec":"clientcore-distribution / NAPI 载荷键集（FIX-76）"}
+{"family":"napi-payload","unit":"service-status","value":"ep","note":"可选：随 link","faces":["napi"],"status":"active","spec":"clientcore-distribution / NAPI 载荷键集（FIX-76）"}
+{"family":"napi-payload","unit":"service-status","value":"at","note":"可选：随 link（unix 秒）","faces":["napi"],"status":"active","spec":"clientcore-distribution / NAPI 载荷键集（FIX-76）"}
+{"family":"napi-payload","unit":"service-status","value":"rttMs","note":"可选：随 link","faces":["napi"],"status":"active","spec":"clientcore-distribution / NAPI 载荷键集（FIX-76）"}
+{"family":"napi-payload","unit":"service-status","value":"identity","note":"可选：有 link 且有身份才带","faces":["napi"],"status":"active","spec":"clientcore-distribution / NAPI 载荷键集（FIX-76）"}
+{"family":"napi-payload","unit":"service-status","value":"dev","note":"可选：随 identity","faces":["napi"],"status":"active","spec":"clientcore-distribution / NAPI 载荷键集（FIX-76）"}
+{"family":"napi-payload","unit":"service-status","value":"pub","note":"可选：随 identity","faces":["napi"],"status":"active","spec":"clientcore-distribution / NAPI 载荷键集（FIX-76）"}
+{"family":"napi-payload","unit":"service-status","value":"stats","note":"可选：有统计快照才带","faces":["napi"],"status":"active","spec":"clientcore-distribution / NAPI 载荷键集（FIX-76）"}
+{"family":"napi-payload","unit":"service-status","value":"rxBytes","note":"可选：随 stats","faces":["napi"],"status":"active","spec":"clientcore-distribution / NAPI 载荷键集（FIX-76）"}
+{"family":"napi-payload","unit":"service-status","value":"txBytes","note":"可选：随 stats","faces":["napi"],"status":"active","spec":"clientcore-distribution / NAPI 载荷键集（FIX-76）"}
+{"family":"napi-payload","unit":"pf-status","value":"listen","note":"恒有：监听端口（元素匹配键）","faces":["napi"],"status":"active","spec":"clientcore-distribution / NAPI 载荷键集（FIX-76）"}
+{"family":"napi-payload","unit":"pf-status","value":"target","note":"恒有：目标描述（App 不读，供诊断）","faces":["napi"],"status":"active","spec":"clientcore-distribution / NAPI 载荷键集（FIX-76）"}
+{"family":"napi-payload","unit":"pf-status","value":"state","note":"恒有：listening/failed","faces":["napi"],"status":"active","spec":"clientcore-distribution / NAPI 载荷键集（FIX-76）"}
+{"family":"napi-payload","unit":"pf-status","value":"err","note":"恒有：失败原因（可空串）","faces":["napi"],"status":"active","spec":"clientcore-distribution / NAPI 载荷键集（FIX-76）"}
+{"family":"napi-payload","unit":"pf-status","value":"conns","note":"恒有：在世连接数","faces":["napi"],"status":"active","spec":"clientcore-distribution / NAPI 载荷键集（FIX-76）"}
+{"family":"portfwd","unit":"err","value":"bind_failed","note":"listen 失败（当前唯一可产出的映射级失败码；permission denied 归因降级并入——监听端口 ≥1024 校验前置下实际不可达）","faces":["napi"],"status":"active","spec":"port-forwarding"}
+{"family":"portfwd","unit":"err","value":"dial_failed","note":"登记保留值：拨号失败是每连接瞬态、不构成映射级 failed（当前零产出）","faces":["napi"],"status":"active","spec":"port-forwarding"}
+{"family":"portfwd","unit":"err","value":"invalid_target","note":"登记保留值：目标非法在整表校验处直接拒绝、不落映射状态（当前零产出）","faces":["napi"],"status":"active","spec":"port-forwarding"}

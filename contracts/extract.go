@@ -111,6 +111,11 @@ var constRules = []constRule{
 		Units: map[string]string{"Code": "code"},
 	},
 	{
+		// 端口映射失败码（tunStatusJSON.portForwards[].code；app-logic-refactor 批 E）。
+		Dir: "pkg/portfwd", Family: "portfwd",
+		Units: map[string]string{"ErrCode": "err"},
+	},
+	{
 		Dir: "pkg/speedtest", Family: "speedtest-reason",
 		Units: map[string]string{"Reason": "reason"},
 	},

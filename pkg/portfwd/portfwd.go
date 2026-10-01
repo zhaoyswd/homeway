@@ -51,6 +51,16 @@ func ValidateTarget(ip string, port uint16) error {
 // ErrBadTarget 目标地址形态非法（须为空或 IPv4 字面量）。
 var ErrBadTarget = errors.New("目标须为空（出口自己）或 IPv4 字面量")
 
+// 映射失败码（tunStatusJSON.portForwards[].code；稳定枚举，App 按码分派、不匹配原文）。
+// 值集进契约台账（portfwd/err 单元，app-logic-refactor 批 E）。当前可产出的映射级失败码
+// 为 ErrCodeBindFailed（listen 失败）；ErrCodeDialFailed/ErrCodeInvalidTarget 为登记保留值
+// （拨号失败是每连接瞬态、不构成映射级 failed；目标非法在整表校验处直接拒绝，不落状态）。
+const (
+	ErrCodeBindFailed    = "bind_failed"
+	ErrCodeDialFailed    = "dial_failed"
+	ErrCodeInvalidTarget = "invalid_target"
+)
+
 // DescribeTarget 目标的呈现文案（ip 空 = 出口自己；port 0 = 同监听端口 ⇒ 落成 listen）。
 func DescribeTarget(ip string, port, listen uint16) string {
 	if ip == "" {
