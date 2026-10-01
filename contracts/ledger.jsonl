@@ -360,3 +360,60 @@
 {"family":"fixtures","unit":"surface-golden-fnv","name":"session-hexdump-diff","sha256":"f93d7ff4bca72ae8","note":"FNV-1a 64 文本摘要（manifest.tsv 既有口径；sha256 字段载该摘要）","faces":[],"status":"active","spec":"term-surface-protocol golden"}
 {"family":"fixtures","unit":"surface-golden-fnv","name":"session-styles","sha256":"c9d6ff2ce143581a","note":"manifest 第 6 列文本摘要（逐样例 FNV-1a 64）","faces":[],"status":"active","spec":"term-surface-protocol（跨仓 golden）"}
 {"family":"fixtures","unit":"surface-golden-fnv","name":"session-styles-diff","sha256":"08b3d888e7109ea3","note":"manifest 第 6 列文本摘要（逐样例 FNV-1a 64）","faces":[],"status":"active","spec":"term-surface-protocol（跨仓 golden）"}
+{"family": "napi-payload", "unit": "tun-status", "value": "state", "note": "恒有：阶段名", "faces": ["napi"], "status": "active", "spec": "clientcore-distribution / NAPI 载荷键集（FIX-76）"}
+{"family": "napi-payload", "unit": "tun-status", "value": "code", "note": "恒有", "faces": ["napi"], "status": "active", "spec": "clientcore-distribution / NAPI 载荷键集（FIX-76）"}
+{"family": "napi-payload", "unit": "tun-status", "value": "reason", "note": "恒有（阶段原因/随 demand 的判定原因同名词面）", "faces": ["napi"], "status": "active", "spec": "clientcore-distribution / NAPI 载荷键集（FIX-76）"}
+{"family": "napi-payload", "unit": "tun-status", "value": "meowed", "note": "恒有", "faces": ["napi"], "status": "active", "spec": "clientcore-distribution / NAPI 载荷键集（FIX-76）"}
+{"family": "napi-payload", "unit": "tun-status", "value": "readyBy", "note": "恒有（direct/relay/空）", "faces": ["napi"], "status": "active", "spec": "clientcore-distribution / NAPI 载荷键集（FIX-76）"}
+{"family": "napi-payload", "unit": "tun-status", "value": "running", "note": "恒有（0/1）", "faces": ["napi"], "status": "active", "spec": "clientcore-distribution / NAPI 载荷键集（FIX-76）"}
+{"family": "napi-payload", "unit": "tun-status", "value": "elapsedMs", "note": "恒有", "faces": ["napi"], "status": "active", "spec": "clientcore-distribution / NAPI 载荷键集（FIX-76）"}
+{"family": "napi-payload", "unit": "tun-status", "value": "demand", "note": "恒有：需求判定快照容器", "faces": ["napi"], "status": "active", "spec": "clientcore-distribution / NAPI 载荷键集（FIX-76）"}
+{"family": "napi-payload", "unit": "tun-status", "value": "active", "note": "恒有：随 demand", "faces": ["napi"], "status": "active", "spec": "clientcore-distribution / NAPI 载荷键集（FIX-76）"}
+{"family": "napi-payload", "unit": "tun-status", "value": "at", "note": "link/demand 两处：link 为 unix 秒、demand 为毫秒", "faces": ["napi"], "status": "active", "spec": "clientcore-distribution / NAPI 载荷键集（FIX-76）"}
+{"family": "napi-payload", "unit": "tun-status", "value": "fg", "note": "恒有：随 demand（仅诊断位）", "faces": ["napi"], "status": "active", "spec": "clientcore-distribution / NAPI 载荷键集（FIX-76）"}
+{"family": "napi-payload", "unit": "tun-status", "value": "outboundAt", "note": "可选：有 runner 且最近出站包才带", "faces": ["napi"], "status": "active", "spec": "clientcore-distribution / NAPI 载荷键集（FIX-76）"}
+{"family": "napi-payload", "unit": "tun-status", "value": "localErrAdopted", "note": "可选：有 runner/transport 才带", "faces": ["napi"], "status": "active", "spec": "clientcore-distribution / NAPI 载荷键集（FIX-76）"}
+{"family": "napi-payload", "unit": "tun-status", "value": "localErrTotal", "note": "可选：同上", "faces": ["napi"], "status": "active", "spec": "clientcore-distribution / NAPI 载荷键集（FIX-76）"}
+{"family": "napi-payload", "unit": "tun-status", "value": "unhealthyReason", "note": "可选：非空才带", "faces": ["napi"], "status": "active", "spec": "clientcore-distribution / NAPI 载荷键集（FIX-76）"}
+{"family": "napi-payload", "unit": "tun-status", "value": "stats", "note": "可选：有 runner 才带", "faces": ["napi"], "status": "active", "spec": "clientcore-distribution / NAPI 载荷键集（FIX-76）"}
+{"family": "napi-payload", "unit": "tun-status", "value": "fdReadBytes", "note": "可选：随 stats", "faces": ["napi"], "status": "active", "spec": "clientcore-distribution / NAPI 载荷键集（FIX-76）"}
+{"family": "napi-payload", "unit": "tun-status", "value": "fdWriteBytes", "note": "可选：随 stats", "faces": ["napi"], "status": "active", "spec": "clientcore-distribution / NAPI 载荷键集（FIX-76）"}
+{"family": "napi-payload", "unit": "tun-status", "value": "pfAccepted", "note": "可选：随 stats", "faces": ["napi"], "status": "active", "spec": "clientcore-distribution / NAPI 载荷键集（FIX-76）"}
+{"family": "napi-payload", "unit": "tun-status", "value": "pfFails", "note": "可选：随 stats", "faces": ["napi"], "status": "active", "spec": "clientcore-distribution / NAPI 载荷键集（FIX-76）"}
+{"family": "napi-payload", "unit": "tun-status", "value": "exitIp", "note": "可选：有 runner 才带（App 作 dnsAddresses）", "faces": ["napi"], "status": "active", "spec": "clientcore-distribution / NAPI 载荷键集（FIX-76）"}
+{"family": "napi-payload", "unit": "tun-status", "value": "link", "note": "可选：有 runner 才带", "faces": ["napi"], "status": "active", "spec": "clientcore-distribution / NAPI 载荷键集（FIX-76）"}
+{"family": "napi-payload", "unit": "tun-status", "value": "via", "note": "可选：随 link", "faces": ["napi"], "status": "active", "spec": "clientcore-distribution / NAPI 载荷键集（FIX-76）"}
+{"family": "napi-payload", "unit": "tun-status", "value": "ep", "note": "可选：随 link", "faces": ["napi"], "status": "active", "spec": "clientcore-distribution / NAPI 载荷键集（FIX-76）"}
+{"family": "napi-payload", "unit": "tun-status", "value": "rttMs", "note": "可选：随 link", "faces": ["napi"], "status": "active", "spec": "clientcore-distribution / NAPI 载荷键集（FIX-76）"}
+{"family": "napi-payload", "unit": "tun-status", "value": "portForwards", "note": "可选：有 runner 才带（元素形状 = pf-status 单元）", "faces": ["napi"], "status": "active", "spec": "clientcore-distribution / NAPI 载荷键集（FIX-76）"}
+{"family": "napi-payload", "unit": "tun-status", "value": "bridgeAuth", "note": "可选：桥已起（App 经 IPC 状态通道消费；不进日志）", "faces": ["napi"], "status": "active", "spec": "clientcore-distribution / NAPI 载荷键集（FIX-76）"}
+{"family": "napi-payload", "unit": "tun-status", "value": "bridgeFilesSock", "note": "可选：桥已起（三键同拍）", "faces": ["napi"], "status": "active", "spec": "clientcore-distribution / NAPI 载荷键集（FIX-76）"}
+{"family": "napi-payload", "unit": "tun-status", "value": "bridgeTermSock", "note": "可选：桥已起（三键同拍）", "faces": ["napi"], "status": "active", "spec": "clientcore-distribution / NAPI 载荷键集（FIX-76）"}
+{"family": "napi-payload", "unit": "tun-status", "value": "bridgeSpeedSock", "note": "可选：桥已起（三键同拍）", "faces": ["napi"], "status": "active", "spec": "clientcore-distribution / NAPI 载荷键集（FIX-76）"}
+{"family": "napi-payload", "unit": "tun-status", "value": "identity", "note": "可选：有身份快照才带", "faces": ["napi"], "status": "active", "spec": "clientcore-distribution / NAPI 载荷键集（FIX-76）"}
+{"family": "napi-payload", "unit": "tun-status", "value": "dev", "note": "可选：随 identity", "faces": ["napi"], "status": "active", "spec": "clientcore-distribution / NAPI 载荷键集（FIX-76）"}
+{"family": "napi-payload", "unit": "tun-status", "value": "pub", "note": "可选：随 identity", "faces": ["napi"], "status": "active", "spec": "clientcore-distribution / NAPI 载荷键集（FIX-76）"}
+{"family": "napi-payload", "unit": "tun-status", "value": "tunIp", "note": "可选：有 runner 且 Core 就绪才带（应用面地址）", "faces": ["napi"], "status": "active", "spec": "clientcore-distribution / NAPI 载荷键集（FIX-76）"}
+{"family": "napi-payload", "unit": "service-status", "value": "state", "note": "恒有（无实例短路形态 = {state:idle}）", "faces": ["napi"], "status": "active", "spec": "clientcore-distribution / NAPI 载荷键集（FIX-76）"}
+{"family": "napi-payload", "unit": "service-status", "value": "reason", "note": "恒有（短路形态不带）", "faces": ["napi"], "status": "active", "spec": "clientcore-distribution / NAPI 载荷键集（FIX-76）"}
+{"family": "napi-payload", "unit": "service-status", "value": "elapsedMs", "note": "可选：有实例才带", "faces": ["napi"], "status": "active", "spec": "clientcore-distribution / NAPI 载荷键集（FIX-76）"}
+{"family": "napi-payload", "unit": "service-status", "value": "bridgeAuth", "note": "可选：桥已起", "faces": ["napi"], "status": "active", "spec": "clientcore-distribution / NAPI 载荷键集（FIX-76）"}
+{"family": "napi-payload", "unit": "service-status", "value": "bridgeFilesSock", "note": "可选：桥已起（三键同拍）", "faces": ["napi"], "status": "active", "spec": "clientcore-distribution / NAPI 载荷键集（FIX-76）"}
+{"family": "napi-payload", "unit": "service-status", "value": "bridgeTermSock", "note": "可选：桥已起（三键同拍）", "faces": ["napi"], "status": "active", "spec": "clientcore-distribution / NAPI 载荷键集（FIX-76）"}
+{"family": "napi-payload", "unit": "service-status", "value": "bridgeSpeedSock", "note": "可选：桥已起（三键同拍）", "faces": ["napi"], "status": "active", "spec": "clientcore-distribution / NAPI 载荷键集（FIX-76）"}
+{"family": "napi-payload", "unit": "service-status", "value": "link", "note": "可选：有 link 快照才带", "faces": ["napi"], "status": "active", "spec": "clientcore-distribution / NAPI 载荷键集（FIX-76）"}
+{"family": "napi-payload", "unit": "service-status", "value": "via", "note": "可选：随 link", "faces": ["napi"], "status": "active", "spec": "clientcore-distribution / NAPI 载荷键集（FIX-76）"}
+{"family": "napi-payload", "unit": "service-status", "value": "ep", "note": "可选：随 link", "faces": ["napi"], "status": "active", "spec": "clientcore-distribution / NAPI 载荷键集（FIX-76）"}
+{"family": "napi-payload", "unit": "service-status", "value": "at", "note": "可选：随 link（unix 秒）", "faces": ["napi"], "status": "active", "spec": "clientcore-distribution / NAPI 载荷键集（FIX-76）"}
+{"family": "napi-payload", "unit": "service-status", "value": "rttMs", "note": "可选：随 link", "faces": ["napi"], "status": "active", "spec": "clientcore-distribution / NAPI 载荷键集（FIX-76）"}
+{"family": "napi-payload", "unit": "service-status", "value": "identity", "note": "可选：有 link 且有身份才带", "faces": ["napi"], "status": "active", "spec": "clientcore-distribution / NAPI 载荷键集（FIX-76）"}
+{"family": "napi-payload", "unit": "service-status", "value": "dev", "note": "可选：随 identity", "faces": ["napi"], "status": "active", "spec": "clientcore-distribution / NAPI 载荷键集（FIX-76）"}
+{"family": "napi-payload", "unit": "service-status", "value": "pub", "note": "可选：随 identity", "faces": ["napi"], "status": "active", "spec": "clientcore-distribution / NAPI 载荷键集（FIX-76）"}
+{"family": "napi-payload", "unit": "service-status", "value": "stats", "note": "可选：有统计快照才带", "faces": ["napi"], "status": "active", "spec": "clientcore-distribution / NAPI 载荷键集（FIX-76）"}
+{"family": "napi-payload", "unit": "service-status", "value": "rxBytes", "note": "可选：随 stats", "faces": ["napi"], "status": "active", "spec": "clientcore-distribution / NAPI 载荷键集（FIX-76）"}
+{"family": "napi-payload", "unit": "service-status", "value": "txBytes", "note": "可选：随 stats", "faces": ["napi"], "status": "active", "spec": "clientcore-distribution / NAPI 载荷键集（FIX-76）"}
+{"family": "napi-payload", "unit": "pf-status", "value": "listen", "note": "恒有：监听端口（元素匹配键）", "faces": ["napi"], "status": "active", "spec": "clientcore-distribution / NAPI 载荷键集（FIX-76）"}
+{"family": "napi-payload", "unit": "pf-status", "value": "target", "note": "恒有：目标描述（App 不读，供诊断）", "faces": ["napi"], "status": "active", "spec": "clientcore-distribution / NAPI 载荷键集（FIX-76）"}
+{"family": "napi-payload", "unit": "pf-status", "value": "state", "note": "恒有：listening/failed", "faces": ["napi"], "status": "active", "spec": "clientcore-distribution / NAPI 载荷键集（FIX-76）"}
+{"family": "napi-payload", "unit": "pf-status", "value": "err", "note": "恒有：失败原因（可空串）", "faces": ["napi"], "status": "active", "spec": "clientcore-distribution / NAPI 载荷键集（FIX-76）"}
+{"family": "napi-payload", "unit": "pf-status", "value": "conns", "note": "恒有：在世连接数", "faces": ["napi"], "status": "active", "spec": "clientcore-distribution / NAPI 载荷键集（FIX-76）"}

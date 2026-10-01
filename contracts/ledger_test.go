@@ -88,6 +88,39 @@ func TestLedgerProductionMatches(t *testing.T) {
 			}
 		}
 	}
+	// 载荷键集族（FIX-76）：与常量族同口径双向对账（生产 = AST 收的 map 键）。
+	// 一个 (family, unit) 可由多条规则贡献（如 tun-status 的主组装 + demand 子载荷）——
+	// 按单元去重后逐单元比对。
+	payloadUnits := map[[2]string]bool{}
+	for _, r := range payloadRules {
+		payloadUnits[[2]string{r.Family, r.Unit}] = true
+	}
+	for key := range payloadUnits {
+		family, unit := key[0], key[1]
+		checked++
+		got := map[string]bool{}
+		for v := range computed[family][unit] {
+			got[v] = true
+		}
+		want := led.Active(family, unit)
+		var unregistered, stale []string
+		for v := range got {
+			if !want[v] {
+				unregistered = append(unregistered, v)
+			}
+		}
+		for v := range want {
+			if !got[v] {
+				stale = append(stale, v)
+			}
+		}
+		if len(unregistered) > 0 || len(stale) > 0 {
+			sort.Strings(unregistered)
+			sort.Strings(stale)
+			t.Errorf("规则①（载荷键集）%s/%s 不一致：代码未登记 %v（红：先登台账+spec delta 再进代码）；台账腐化 %v（红：组装面已不产，改状态或删行须走 delta）",
+				family, unit, unregistered, stale)
+		}
+	}
 	if checked == 0 {
 		t.Fatal("提取清单为空（空集假绿）")
 	}

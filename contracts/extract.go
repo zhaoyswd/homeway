@@ -138,6 +138,27 @@ var ctorRules = []ctorRule{
 	{Dir: "clientcore/cmd/clientcore", Funcs: []string{"speedFail"}, Family: "speedtest-reason", Unit: "reason"},
 }
 
+// payloadRule 一条「JSON 载荷键集」提取规则（FIX-76）：AST 走指定函数体，收
+// `map[string]any{...}` 复合字面量的字符串键与 `<map变量>["键"] = …` 下标赋值
+// （含多 LHS）。**按 AST 收、不用正则**（正则会把 `{"state":"unknown"}` 这类
+// 兜底字符串与日志文案一起捞进来）；同一 (family, unit) 可由多条规则并集贡献
+// （如 tun-status 的主组装 + demand 子载荷）。
+type payloadRule struct {
+	Dir    string
+	Func   string
+	Family string
+	Unit   string
+}
+
+// payloadRules 载荷键集的提取清单（载荷 = NAPI 面下发的 JSON；键集是跨仓契约，
+// 生产者在本仓、消费者在 tier App 侧 ArkTS 解析器——tier check-vocab-sync 对账）。
+var payloadRules = []payloadRule{
+	{Dir: "clientcore/cmd/clientcore", Func: "serviceSnapshotJSON", Family: "napi-payload", Unit: "service-status"},
+	{Dir: "clientcore/cmd/clientcore", Func: "tunStatusJSON", Family: "napi-payload", Unit: "tun-status"},
+	{Dir: "clientcore/cmd/clientcore", Func: "demandSnapshotJSON", Family: "napi-payload", Unit: "tun-status"},
+	{Dir: "clientcore/cmd/clientcore", Func: "pfStatusJSON", Family: "napi-payload", Unit: "pf-status"},
+}
+
 // Extract 生产值集提取结果：family → unit → value → 常量名（或「ctor:函数名」）。
 type Extracted map[string]map[string]map[string]string
 
@@ -182,6 +203,53 @@ func ExtractAll(root string) (Extracted, error) {
 			}
 		}
 	}
+	for _, r := range payloadRules {
+		pkg, err := parseDir(root, r.Dir, seenDir)
+		if err != nil {
+			return nil, err
+		}
+		found := false
+		for _, f := range pkg.Files {
+			ast.Inspect(f, func(n ast.Node) bool {
+				fd, ok := n.(*ast.FuncDecl)
+				if !ok || fd.Name.Name != r.Func || fd.Body == nil {
+					return true
+				}
+				found = true
+				ast.Inspect(fd.Body, func(m ast.Node) bool {
+					switch v := m.(type) {
+					case *ast.CompositeLit:
+						// map[string]any{...}：收字符串键（嵌套字面量由本遍历继续走到）
+						if _, isMap := v.Type.(*ast.MapType); isMap {
+							for _, el := range v.Elts {
+								if kv, ok := el.(*ast.KeyValueExpr); ok {
+									if k, ok := stringLit(kv.Key); ok {
+										setExtracted(out, r.Family, r.Unit, k, "key:"+r.Func)
+									}
+								}
+							}
+						}
+					case *ast.AssignStmt:
+						// m["键"] = … / a["p"], b["q"] = x, y：收下标 LHS 的字符串键
+						for _, lhs := range v.Lhs {
+							ix, ok := lhs.(*ast.IndexExpr)
+							if !ok {
+								continue
+							}
+							if k, ok := stringLit(ix.Index); ok {
+								setExtracted(out, r.Family, r.Unit, k, "key:"+r.Func)
+							}
+						}
+					}
+					return true
+				})
+				return false
+			})
+		}
+		if !found {
+			return nil, fmt.Errorf("contracts: %s 找不到载荷组装函数 %s（改名/挪窝须同批更新 payloadRules）", r.Dir, r.Func)
+		}
+	}
 	for _, r := range ctorRules {
 		pkg, err := parseDir(root, r.Dir, seenDir)
 		if err != nil {
@@ -212,6 +280,19 @@ func ExtractAll(root string) (Extracted, error) {
 		}
 	}
 	return out, nil
+}
+
+// stringLit 字符串字面量的值（非字符串字面量返回 false）。
+func stringLit(e ast.Expr) (string, bool) {
+	bl, ok := e.(*ast.BasicLit)
+	if !ok || bl.Kind != token.STRING {
+		return "", false
+	}
+	s, err := strconv.Unquote(bl.Value)
+	if err != nil {
+		return "", false
+	}
+	return s, true
 }
 
 func setExtracted(out Extracted, family, unit, value, name string) {
