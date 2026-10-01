@@ -54,11 +54,14 @@ func pfTargetText(f tunPortForward) string {
 
 // pfState 一条映射的运行状态（tunStatusJSON 下发给扩展，端口转发页展示）。
 // conns 是当前活跃转发连接数（accept 成功 +1、连接结束 -1）。
+// Code 是失败映射的稳定错误码（App 按码分派、不匹配 Err 原文；值集进契约台账 portfwd/err，
+// app-logic-refactor 批 E）：listen 失败 ⇒ portfwd.ErrCodeBindFailed；成功/listening 时为空串。
 type pfState struct {
 	Listen uint16
 	Target string
 	State  string // listening | failed
 	Err    string
+	Code   string
 	conns  atomic.Int64
 }
 
@@ -92,6 +95,7 @@ func (t *tunRunner) setPortForwards(fwds []tunPortForward) {
 		if err != nil {
 			st.State = "failed"
 			st.Err = err.Error()
+			st.Code = portfwd.ErrCodeBindFailed
 			t.logf("port-forward: 监听 127.0.0.1:%d 失败（%v）——该条映射不可用，不影响隧道", f.Listen, err)
 		} else {
 			t.logf("port-forward: 127.0.0.1:%d -> %s 监听中", f.Listen, st.Target)
@@ -261,6 +265,7 @@ func (t *tunRunner) pfStatusJSON() []map[string]any {
 			"target": st.Target,
 			"state":  st.State,
 			"err":    st.Err,
+			"code":   st.Code,
 			"conns":  st.conns.Load(),
 		})
 	}

@@ -419,3 +419,4 @@
 {"family":"portfwd","unit":"err","value":"bind_failed","note":"listen 失败（当前唯一可产出的映射级失败码；permission denied 归因降级并入——监听端口 ≥1024 校验前置下实际不可达）","faces":["napi"],"status":"active","spec":"port-forwarding"}
 {"family":"portfwd","unit":"err","value":"dial_failed","note":"登记保留值：拨号失败是每连接瞬态、不构成映射级 failed（当前零产出）","faces":["napi"],"status":"active","spec":"port-forwarding"}
 {"family":"portfwd","unit":"err","value":"invalid_target","note":"登记保留值：目标非法在整表校验处直接拒绝、不落映射状态（当前零产出）","faces":["napi"],"status":"active","spec":"port-forwarding"}
+{"family":"napi-payload","unit":"pf-status","value":"code","note":"恒有：失败映射的稳定错误码（listening/无错时为空串）；值集=portfwd/err 单元","faces":["napi"],"status":"active","spec":"port-forwarding + contract-ledger"}

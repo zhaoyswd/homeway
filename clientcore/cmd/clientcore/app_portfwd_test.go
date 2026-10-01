@@ -10,6 +10,8 @@ import (
 	"net/netip"
 	"testing"
 	"time"
+
+	"github.com/zhaoyswd/homeway/pkg/portfwd"
 )
 
 // errExitSession 拨号必败的假上游：探测性 TCP 连接万一真被 accept，也不许碰 nil。
@@ -123,8 +125,18 @@ func TestSetPortForwardsConflictMarksFailed(t *testing.T) {
 	if st[0]["state"] != "failed" || st[0]["listen"] != busy {
 		t.Fatalf("被占口应记 failed：%v", st[0])
 	}
+	// app-logic-refactor 批 E：失败映射带稳定错误码（App 按码分派、不匹配 err 原文）
+	if st[0]["code"] != portfwd.ErrCodeBindFailed {
+		t.Fatalf("被占口 code 应为 %q：%v", portfwd.ErrCodeBindFailed, st[0])
+	}
+	if st[0]["err"] == "" {
+		t.Fatalf("err 原文应保留作诊断消息：%v", st[0])
+	}
 	if st[1]["state"] != "listening" {
 		t.Fatalf("另一条应正常 listening：%v", st[1])
+	}
+	if st[1]["code"] != "" {
+		t.Fatalf("listening 条目 code 应为空串：%v", st[1])
 	}
 }
 
