@@ -452,7 +452,7 @@ func (c *conn) reader() {
 				return
 			}
 			c.handleStreamData(body)
-		case OpWelcome, OpReload, OpRsp, OpEvt, OpResync, OpStreamEnd:
+		case OpWelcome, OpReload, OpRsp, OpEvt, OpStreamEnd:
 			return // 服务端方向的帧从前端来：次序错乱，裸断
 		}
 	}

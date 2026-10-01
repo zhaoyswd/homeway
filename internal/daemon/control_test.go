@@ -141,7 +141,7 @@ func TestControlPlaneAssemblyEndToEnd(t *testing.T) {
 	if err := json.Unmarshal(raw, &added); err != nil || added.ID == "" {
 		t.Fatalf("host.add：%v（%s）", err, raw)
 	}
-	if added.Reach == nil || added.Reach.Tier != facade.ReachTierDirect {
+	if added.Reach.Tier != facade.ReachTierDirect {
 		t.Fatalf("host.add 结论载荷：%+v", added.Reach)
 	}
 	select {

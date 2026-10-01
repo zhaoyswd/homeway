@@ -129,23 +129,13 @@ func hostAddCLI(args []string, version string, w io.Writer) error {
 
 // printHostAdded 三档映射输出（spec host-cli「host add 的呈现」）。
 //
-// exec-r1 第 1 条：Reach == nil（**版本偏斜**——3a 期常驻 daemon 的 host.add 回
-// HostBrief{id,name,addedAt}，无 reach 字段；daemon 独立常驻、升级 CLI 二进制不重启
-// 它时该形态可达）走降级分支——不得解引用、不得静默；主机确实已入表（旧 daemon 会
-// 先入表），提示重启 daemon 后可复核。未知 tier 值（词表只增，未来新增或漂移）同样
-// 非静默（exec-r1 第 4 条）：打印原始值 +「验证结论未知」，添加本身成功不误报失败。
+// 未知 tier 值（词表只增，未来新增或漂移）非静默（exec-r1 第 4 条）：打印原始值 +
+// 「验证结论未知」，添加本身成功不误报失败。（FIX-92：`Reach == nil` 的「旧 daemon
+// 版本偏斜」分支已删——Reach 现为值类型，该形态随统一进程退役不存在。）
 func printHostAdded(w io.Writer, res *control.HostAddResult) {
 	name := res.Name
 	if name == "" {
 		name = "-"
-	}
-	if res.Reach == nil {
-		hint := ""
-		if res.Name != "" {
-			hint = fmt.Sprintf("（homeway host status %s）", res.Name)
-		}
-		fmt.Fprintf(w, "已添加主机 %s（%s）——旧版守护进程无验证结论，重启 daemon 后可复核%s\n", name, shortHostID(res.ID), hint)
-		return
 	}
 	switch res.Reach.Tier {
 	case facade.ReachTierDirect:

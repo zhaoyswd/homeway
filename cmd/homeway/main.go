@@ -14,8 +14,8 @@
 //
 // 统一进程只认全局 flag（--state/--verbose）；角色 flag 打在统一进程形态 = 可行动
 // 错误（r1 中-1——角色参数走 config 或 serve/relay 前台形态）。同 state 单实例锁
-// （<state>/lock）对统一进程与前台单角色互斥。旧名词 `exit`/`daemon` = 迁移提示
-// 报错（非零码，不再按旧语义启动任何进程）。
+// （<state>/lock）对统一进程与前台单角色互斥。旧名词 `exit`/`daemon` 的迁移提示已删
+// （FIX-92——直接落「不认识的子命令」）。
 package main
 
 import (
@@ -93,12 +93,6 @@ func run(args []string) int {
 		err = daemon.ImportCLI(rest, os.Stdout)
 	case "reset":
 		err = daemon.ResetCLI(rest, os.Stdout)
-	case "exit":
-		fmt.Fprintln(os.Stderr, "homeway: `exit` 已更名为 `serve`——前台出口用 `homeway serve`，统一进程（按 config 期望态装配全部角色）直接 `homeway`，启停/查询用 `homeway serve start|stop|status|token`；请更新脚本与文档")
-		return 2
-	case "daemon":
-		fmt.Fprintln(os.Stderr, "homeway: `daemon` 已并入统一进程——直接 `homeway`（零参前台；按 config 期望态装配全部角色）；状态看 `homeway status`（旧 daemon status 已删除）；请更新脚本与文档")
-		return 2
 	case "term":
 		// 远程接入缝注入（term-remote D1）：`term … --host <ref>` 经 daemon 控制面
 		// 转发；nil = 仅本地面（此处恒注入）。

@@ -112,7 +112,6 @@ type Client struct {
 	pendingW sync.WaitGroup
 
 	eventsC  chan EventBody
-	resyncC  chan ResyncBody
 	goodbyeC chan GoodbyeBody
 	reloadC  chan ReloadBody
 	welcomeC chan *WelcomeBody
@@ -199,7 +198,6 @@ func Dial(ctx context.Context, sockPath string, frontend FrontendInfo) (*Client,
 	c := &Client{
 		nc:       nc,
 		eventsC:  make(chan EventBody, 1024),
-		resyncC:  make(chan ResyncBody, 4),
 		goodbyeC: make(chan GoodbyeBody, 1),
 		reloadC:  make(chan ReloadBody, 1),
 		notifyC:  make(chan ResponseBody, 16),
@@ -462,14 +460,6 @@ func (c *Client) reader() {
 				default:
 					// 客户端侧缓冲满（测试消费者太慢）：断开由使用方重启客户端；
 					// 真实前端应有自己的有界缓冲与重订阅策略。
-				}
-			}
-		case OpResync:
-			var r ResyncBody
-			if err := json.Unmarshal(body, &r); err == nil {
-				select {
-				case c.resyncC <- r:
-				default:
 				}
 			}
 		case OpGoodbye:

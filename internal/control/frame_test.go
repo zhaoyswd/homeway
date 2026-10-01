@@ -107,7 +107,7 @@ func TestFrameTruncatedBody(t *testing.T) {
 }
 
 func TestValidOpTable(t *testing.T) {
-	valid := []byte{OpHello, OpWelcome, OpReload, OpGoodbye, OpReq, OpRsp, OpEvt, OpResync, OpStreamData, OpStreamEnd}
+	valid := []byte{OpHello, OpWelcome, OpReload, OpGoodbye, OpReq, OpRsp, OpEvt, OpStreamData, OpStreamEnd}
 	for _, op := range valid {
 		if !ValidOp(op) {
 			t.Fatalf("0x%02x 应为合法 op", op)

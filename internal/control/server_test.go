@@ -174,9 +174,9 @@ func (f *fakeBackend) AddHost(name, token string, force bool) (HostAddResult, er
 	f.briefs = append(f.briefs, b)
 	res := HostAddResult{ID: id, Name: name, AddedAt: 1700000000}
 	if force {
-		res.Reach = &HostReach{Tier: facade.ReachTierSkipped, Tested: []ReachTested{}}
+		res.Reach = HostReach{Tier: facade.ReachTierSkipped, Tested: []ReachTested{}}
 	} else {
-		res.Reach = &HostReach{Tier: facade.ReachTierDirect, BestEp: "203.0.113.1:41641", RttMs: 12, Tested: []ReachTested{{Ep: "203.0.113.1:41641", RttMs: 12}}}
+		res.Reach = HostReach{Tier: facade.ReachTierDirect, BestEp: "203.0.113.1:41641", RttMs: 12, Tested: []ReachTested{{Ep: "203.0.113.1:41641", RttMs: 12}}}
 	}
 	return res, nil
 }
@@ -688,7 +688,7 @@ func TestOpsHappyPath(t *testing.T) {
 	if err := json.Unmarshal(raw, &add); err != nil || add.ID == "" || add.AddedAt == 0 {
 		t.Fatalf("host.add 载荷：%v（%s）", err, raw)
 	}
-	if add.Reach == nil || add.Reach.Tier != facade.ReachTierDirect || add.Reach.BestEp == "" || len(add.Reach.Tested) == 0 {
+	if add.Reach.Tier != facade.ReachTierDirect || add.Reach.BestEp == "" || len(add.Reach.Tested) == 0 {
 		t.Fatalf("host.add reach 结论缺失：%+v", add.Reach)
 	}
 	// host.list。
@@ -762,7 +762,7 @@ func TestErrorCodeMappingNegativeCases(t *testing.T) {
 		t.Fatalf("force 应添加成功：%v", err)
 	}
 	var forced HostAddResult
-	if err := json.Unmarshal(raw, &forced); err != nil || forced.Reach == nil || forced.Reach.Tier != facade.ReachTierSkipped || forced.Reach.Tested == nil || len(forced.Reach.Tested) != 0 {
+	if err := json.Unmarshal(raw, &forced); err != nil || forced.Reach.Tier != facade.ReachTierSkipped || forced.Reach.Tested == nil || len(forced.Reach.Tested) != 0 {
 		t.Fatalf("force 载荷应为 skipped（端点未实测）：%s", raw)
 	}
 	if _, err := c.Request(ctx, facade.OpHostRemove, HostRemoveArgs{Host: forced.ID}); err != nil {

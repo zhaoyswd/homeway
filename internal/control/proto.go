@@ -51,12 +51,6 @@ type GoodbyeBody struct {
 	Reason string `json:"reason"`
 }
 
-// ResyncBody resync 帧 body（v1 词表冻结、服务端无发射场景——订阅原子性由总线锁
-// 保证；帧可解码，留给后续版本的服务端主动重同步）。
-type ResyncBody struct {
-	Reason string `json:"reason"`
-}
-
 // ---------- 请求/响应 ----------
 
 // RequestBody 请求帧 body。Op 为操作名（词表见 opHandlers 注册表）；Args 为该操作
@@ -96,10 +90,10 @@ type HostAddArgs struct {
 
 // HostAddResult host.add 成功载荷。
 type HostAddResult struct {
-	ID      string     `json:"id"`
-	Name    string     `json:"name,omitempty"`
-	AddedAt int64      `json:"addedAt"`
-	Reach   *HostReach `json:"reach,omitempty"` // 3b 只增：验证三档结论（nil 不出现——服务端恒填）
+	ID      string    `json:"id"`
+	Name    string    `json:"name,omitempty"`
+	AddedAt int64     `json:"addedAt"`
+	Reach   HostReach `json:"reach"` // 验证三档结论（FIX-92：值类型——「旧 daemon 无 reach」的版本偏斜分支已随统一进程退役删除）
 }
 
 // （reach.tier 词表 ReachTierDirect/Relay/Skipped 已迁 clientcore/facade/vocab.go。）

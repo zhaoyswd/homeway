@@ -102,7 +102,7 @@ func TestHostAddFourPaths(t *testing.T) {
 	if err := json.Unmarshal(raw, &r1); err != nil {
 		t.Fatal(err)
 	}
-	if r1.Reach == nil || r1.Reach.Tier != facade.ReachTierDirect || r1.Reach.BestEp != direct.pc.LocalAddr().String() || r1.Reach.RttMs < 0 {
+	if r1.Reach.Tier != facade.ReachTierDirect || r1.Reach.BestEp != direct.pc.LocalAddr().String() || r1.Reach.RttMs < 0 {
 		t.Fatalf("直连结论不符：%+v", r1.Reach)
 	}
 	if len(r1.Reach.Tested) != 1 || r1.Reach.Tested[0].Relay {
@@ -122,7 +122,7 @@ func TestHostAddFourPaths(t *testing.T) {
 	if err := json.Unmarshal(raw, &r2); err != nil {
 		t.Fatal(err)
 	}
-	if r2.Reach == nil || r2.Reach.Tier != facade.ReachTierRelay || r2.Reach.BestEp != relay.pc.LocalAddr().String() {
+	if r2.Reach.Tier != facade.ReachTierRelay || r2.Reach.BestEp != relay.pc.LocalAddr().String() {
 		t.Fatalf("仅中继结论不符：%+v", r2.Reach)
 	}
 
@@ -158,7 +158,7 @@ func TestHostAddFourPaths(t *testing.T) {
 	if err := json.Unmarshal(raw, &r4); err != nil {
 		t.Fatal(err)
 	}
-	if r4.Reach == nil || r4.Reach.Tier != facade.ReachTierSkipped || r4.Reach.BestEp != "" || len(r4.Reach.Tested) != 0 {
+	if r4.Reach.Tier != facade.ReachTierSkipped || r4.Reach.BestEp != "" || len(r4.Reach.Tested) != 0 {
 		t.Fatalf("force 结论应为 skipped（端点未实测）：%+v", r4.Reach)
 	}
 
@@ -261,7 +261,7 @@ func TestHostAddProbeZeroSideEffect(t *testing.T) {
 	if err := json.Unmarshal(raw, &recB); err != nil {
 		t.Fatal(err)
 	}
-	if recB.Reach == nil || recB.Reach.Tier != facade.ReachTierDirect {
+	if recB.Reach.Tier != facade.ReachTierDirect {
 		t.Fatalf("B 结论应为 direct：%+v", recB.Reach)
 	}
 

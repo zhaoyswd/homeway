@@ -32,7 +32,6 @@ const (
 	OpReq        = 0x10 // req：请求（corr id 关联）
 	OpRsp        = 0x11 // rsp：响应（corr id 关联）
 	OpEvt        = 0x12 // evt：事件推送（seq 自包含）
-	OpResync     = 0x13 // resync：服务端主动要求全量重快照（v1 词表冻结、无发射场景）
 	OpStreamData = 0x20 // stream.data：[streamId:4][原始字节] 双向透传
 	OpStreamEnd  = 0x21 // stream.end：{streamId, reason}（reason ∈ closed|gone）
 )
@@ -46,7 +45,6 @@ var opNames = map[byte]string{
 	OpReq:        "req",
 	OpRsp:        "rsp",
 	OpEvt:        "evt",
-	OpResync:     "resync",
 	OpStreamData: "stream.data",
 	OpStreamEnd:  "stream.end",
 }

@@ -96,12 +96,13 @@ func (b *controlBackend) AddHost(name, token string, force bool) (control.HostAd
 	}, nil
 }
 
-// mapReach facade 结论 → wire 体。
-func mapReach(r *facade.HostReach) *control.HostReach {
+// mapReach facade 结论 → wire 体（值类型；facade 侧恒非 nil——三档赋值路径见 table.go）。
+func mapReach(r *facade.HostReach) control.HostReach {
+	out := control.HostReach{Tested: []control.ReachTested{}}
 	if r == nil {
-		return nil
+		return out
 	}
-	out := &control.HostReach{Tier: r.Tier, BestEp: r.BestEp, RttMs: r.RttMs, Tested: []control.ReachTested{}}
+	out.Tier, out.BestEp, out.RttMs = r.Tier, r.BestEp, r.RttMs
 	for _, t := range r.Tested {
 		out.Tested = append(out.Tested, control.ReachTested{Ep: t.Ep, Relay: t.Relay, RttMs: t.RttMs})
 	}

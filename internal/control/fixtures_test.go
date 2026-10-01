@@ -139,8 +139,6 @@ func bodyStructFor(op byte) any {
 		return &ResponseBody{}
 	case OpEvt:
 		return &EventBody{}
-	case OpResync:
-		return &ResyncBody{}
 	case OpStreamEnd:
 		return &StreamEndBody{}
 	}
@@ -286,7 +284,7 @@ func TestFixturesVocabularyCoversSpec(t *testing.T) {
 			t.Fatalf("fixtures 缺少 %s 类用例", c)
 		}
 	}
-	for _, op := range []byte{OpHello, OpWelcome, OpReload, OpGoodbye, OpReq, OpRsp, OpEvt, OpResync, OpStreamData, OpStreamEnd} {
+	for _, op := range []byte{OpHello, OpWelcome, OpReload, OpGoodbye, OpReq, OpRsp, OpEvt, OpStreamData, OpStreamEnd} {
 		if !ops[op] {
 			t.Fatalf("fixtures 缺少 op=0x%02x 的帧向量", op)
 		}
