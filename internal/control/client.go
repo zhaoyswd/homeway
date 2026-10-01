@@ -92,16 +92,6 @@ var ErrStreamEnded = errors.New("流已终结")
 // endReason 值只进本地错误文案，不上 wire）。
 const endReasonConn = "conn"
 
-// slowDelivery 满槽投递计数——**测试判别力钩子**（exec-r1 M1②）：reader 向流 recv
-// 投递 stream.data 时发现队列已满（即将阻塞等消费方读/连接关闭）即 +1。仅供单测
-// 断言「flood 真灌满 recv、reader 真进过阻塞投递」（与「恰好没灌满」区分）；
-// 生产代码零读取、投递 select 原样保留 ⇒ 测试外零行为改动。
-var slowDelivery atomic.Uint64
-
-// SlowDeliveryCount 返回满槽投递的累计次数（测试判别力钩子，exec-r1 M1②：
-// 消费者 = internal/daemon 的 TestStreamConnCloseEscapeHatch 前置断言）。
-func SlowDeliveryCount() uint64 { return slowDelivery.Load() }
-
 // Client 控制面客户端（一连接一客户端）。
 type Client struct {
 	nc      net.Conn
@@ -489,10 +479,8 @@ func (c *Client) reader() {
 			}
 			if st, ok := c.streams.Load(id); ok {
 				s := st.(*ClientStream)
-				// 测试判别力钩子（exec-r1 M1②）：满槽即计数（本次投递将阻塞等消费方
-				// 或连接关闭）；只探测计数，下面的投递 select 原样保留 ⇒ 零行为改动。
 				if len(s.recv) == cap(s.recv) {
-					slowDelivery.Add(1)
+					noteSlowDeliveryForTest() // 测试判别力钩子（见 testhooks.go；探测零副作用）
 				}
 				// L4 下行背压显式化（term-remote 2.1）：满槽时阻塞投递而非 default 丢弃
 				//——丢帧对 term 是无从感知的静默画面损坏（协议无重传/校验），阻塞是唯一

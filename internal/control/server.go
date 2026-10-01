@@ -242,9 +242,12 @@ type conn struct {
 
 // highItem highC 的元素：控制帧字节；subConfirm 非 0 = 该帧是订阅确认 rsp
 // （成功或错误应答——corr 即门闩标记），writer **写出后**按 corr 清门闩（B3）。
+// ack 非 nil = 写出完成后关闭它（FIX-97：告别帧的「真写出」信号——取代原先
+// 「轮询队列长度 + sleep 猜测取走→写出的微窗口」）。
 type highItem struct {
 	frame      []byte
 	subConfirm uint64
+	ack        chan struct{}
 }
 
 func newConn(s *Server, nc net.Conn) *conn {
@@ -337,15 +340,23 @@ func (c *conn) runStreamOpen(req RequestBody) {
 // close 永久互等挂死、`Server.Close()`（daemon 收工路径）收不了尾（exec-r1 M1）。
 func (c *conn) close(reason string) {
 	c.once.Do(func() {
+		var ack chan struct{}
 		if reason != "" {
-			if f := encodeJSONFrame(OpGoodbye, GoodbyeBody{Reason: reason}); f != nil {
-				select {
-				case c.highC <- highItem{frame: f}:
-				default: // 队列满：尽力语义，丢弃告别帧不挂等
-				}
+			ack = c.enqueueHighAck(encodeJSONFrame(OpGoodbye, GoodbyeBody{Reason: reason}))
+		}
+		// 等在途控制帧被 writer 取走（有界轮询——覆盖告别帧之前已入队的尽力帧）；
+		// 告别帧本身用**写出 ack** 精确等待（FIX-97：取代原「轮询 + 20ms 微窗口 sleep」，
+		// writer 已停/连接坏时统一 500ms 超时收尾）。
+		deadline := time.Now().Add(500 * time.Millisecond)
+		for len(c.highC) > 0 && time.Now().Before(deadline) {
+			time.Sleep(2 * time.Millisecond)
+		}
+		if ack != nil {
+			select {
+			case <-ack:
+			case <-time.After(time.Until(deadline)):
 			}
 		}
-		waitHighDrained(c) // reload/goodbye 等在途告别帧的有界等待（空队列零等待）
 		close(c.closed)
 		_ = c.nc.Close()
 		c.streamsMu.Lock()
@@ -368,6 +379,22 @@ func (c *conn) close(reason string) {
 		c.heldFrames = nil
 		c.subMu.Unlock()
 	})
+}
+
+// enqueueHighAck 把一条控制帧放入 highC 并返回「写出完成」信号（writer 的
+// writeHighItem 写出成功后 close 它）；队列满（前端不读的病态）返回 nil——尽力
+// 语义，不挂等（FIX-97）。
+func (c *conn) enqueueHighAck(frame []byte) chan struct{} {
+	if frame == nil {
+		return nil
+	}
+	ack := make(chan struct{})
+	select {
+	case c.highC <- highItem{frame: frame, ack: ack}:
+		return ack
+	default:
+		return nil
+	}
 }
 
 // sendHigh 控制帧入 highC（阻塞有界：closed 退出——队列满且前端不读的病态由写
@@ -477,7 +504,13 @@ func (c *conn) handleHello(body []byte) bool {
 	if hello.ProtoVersion != ProtoVersion {
 		c.s.cfg.Logf("control: 前端 %s/%s 协议版本 %d 不匹配（本端 %d）——reload",
 			hello.Frontend.Kind, hello.Frontend.Name, hello.ProtoVersion, ProtoVersion)
-		c.sendHigh(encodeJSONFrame(OpReload, ReloadBody{Reason: ReloadProtoMismatch}))
+		if ack := c.enqueueHighAck(encodeJSONFrame(OpReload, ReloadBody{Reason: ReloadProtoMismatch})); ack != nil {
+			// 等 reload **真写出**再关（FIX-97 写出 ack；有界）。
+			select {
+			case <-ack:
+			case <-time.After(500 * time.Millisecond):
+			}
+		}
 		c.close("")
 		return false
 	}
@@ -1092,18 +1125,6 @@ func (c *conn) writer() {
 	}
 }
 
-// waitHighDrained 等 writer 把 highC 取尽（告别帧送出的有界等待）。
-func waitHighDrained(c *conn) {
-	deadline := time.Now().Add(500 * time.Millisecond)
-	for time.Now().Before(deadline) {
-		if len(c.highC) == 0 {
-			break
-		}
-		time.Sleep(2 * time.Millisecond)
-	}
-	time.Sleep(20 * time.Millisecond) // 取走→写出的微窗口
-}
-
 func (c *conn) drainHigh() bool {
 	for {
 		select {
@@ -1123,6 +1144,9 @@ func (c *conn) drainHigh() bool {
 func (c *conn) writeHighItem(item highItem) bool {
 	if !c.writeFrame(item.frame) {
 		return false
+	}
+	if item.ack != nil {
+		close(item.ack) // FIX-97：告别帧的「真写出」信号
 	}
 	if item.subConfirm == 0 {
 		return true

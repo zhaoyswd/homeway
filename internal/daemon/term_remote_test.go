@@ -549,7 +549,7 @@ func TestStreamConnEndThenEOF(t *testing.T) {
 // TestStreamBackpressureNoLoss 的配方——节拍防 TCP 合并、逐块成条目，>64 条必灌满 recv，
 // 与 internal/control 同款确定化取向。原用例前置不成立的真实根因是从未发 HELLO、
 // flood 根本没开闸（exec-report 整改段已正名），非「全速进不了满槽」）；用
-// control.SlowDeliveryCount() 断言 reader 真进过满槽投递
+// control.SlowDeliveryCountForTest() 断言 reader 真进过满槽投递
 // （否则本用例对逃生口无判别力，前置不成立就地红）；Close 预算 8s→500ms，让「先
 // Client.Close()」定序可判——反序（先 stream.Close 等 rsp）退化为等满 ≤2s 兜底 ctx
 // 才返回（rsp 由被阻塞的 reader 投递；**无界** ctx 才恒挂死），500ms 预算下反序必红。
@@ -560,7 +560,7 @@ func TestStreamConnCloseEscapeHatch(t *testing.T) {
 	r := TermRemote("test")
 	ctx, cancel := rtCtx(t)
 	defer cancel()
-	before := control.SlowDeliveryCount()
+	before := control.SlowDeliveryCountForTest()
 	conn, err := r.DialTerm(ctx, rig.dir, rig.macID)
 	if err != nil {
 		t.Fatal(err)
@@ -574,7 +574,7 @@ func TestStreamConnCloseEscapeHatch(t *testing.T) {
 	time.Sleep(1200 * time.Millisecond)
 	// M1②：可断言前置——reader 确实进过满槽（阻塞）投递；=0 说明 flood 没灌满 recv，
 	// 本用例沦为「非阻塞态下 Close 有界返回」（对 P0 逃生口无判别力），就地红。
-	if got := control.SlowDeliveryCount() - before; got == 0 {
+	if got := control.SlowDeliveryCountForTest() - before; got == 0 {
 		t.Fatal("前置不成立：reader 从未进入满槽投递（flood 未灌满客户端 recv）——本用例对逃生口无判别力")
 	} else {
 		t.Logf("满槽投递计数 +%d（前置成立：reader 已阻塞在 recv<-）", got)
