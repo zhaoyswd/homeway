@@ -589,7 +589,7 @@ func serveTokenCLI(args []string, version string, w io.Writer) error {
 			return fmt.Errorf("serve.token 载荷解析失败：%w", err)
 		}
 		printTokenReveal(w, "serve", res.Token, res.Source, res.Eps)
-		warnNoEndpoints(w, res.Eps)
+		warnNoEndpoints(w, res.Source, res.Eps)
 		return nil
 	}
 	tok, eps, ok, err := server.RevealLastToken(filepath.Join(*g.stateDir, "serve"))
@@ -600,7 +600,7 @@ func serveTokenCLI(args []string, version string, w io.Writer) error {
 		return errors.New("台账为空（serve 从未铸出 token）：先启动 `homeway serve start`，等首轮端点探测后重试")
 	}
 	printTokenReveal(w, "serve", tok, "ledger", eps)
-	warnNoEndpoints(w, eps)
+	warnNoEndpoints(w, "ledger", eps)
 	return nil
 }
 
@@ -684,8 +684,11 @@ func printTokenReveal(w io.Writer, role, token, source string, eps []string) {
 // warnNoEndpoints 无端点 token 的可行动提示（exec-r1 低-5）：台账末行是 endpoints=null
 // 的预热行时，这枚 token 连不上（没有可拨的端点）——提示稍后重试或看 events.log 的
 // 「客户端 token」行（首轮铸出后 token 行自带端点）。
-func warnNoEndpoints(w io.Writer, eps []string) {
-	if len(eps) == 0 {
+// exec-r2 N1 兜底门控：提示只对台账路径（ledger/ledger-early）成立——runtime 真源的
+// 端点与 token 同快照（铸出前提 eps 非空），快照边界缺端点 ≠「token 无端点」，
+// 不得按无端点告警（在跑稳态曾因此打出与事实相反的假告警）。
+func warnNoEndpoints(w io.Writer, source string, eps []string) {
+	if len(eps) == 0 && source != "runtime" {
 		fmt.Fprintln(w, "⚠️ 该 token 无端点（serve 首轮端点尚未铸出——启动后约 15s 完成首轮公网探测）；稍后重试，或看 <state>/cache/events.log 的「客户端 token」行")
 	}
 }

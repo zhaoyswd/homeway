@@ -273,7 +273,10 @@ func (ro *roleOps) ServeToken() (control.ServeTokenResult, error) {
 		if cur := role.Current(); cur != nil {
 			roleAssembled = true
 			if tok := cur.CurrentToken(); tok != "" {
-				return control.ServeTokenResult{Token: tok, Source: "runtime"}, nil
+				// exec-r2 N1：runtime 分支同样回填端点（快照与铸出 token 同源——
+				// lastPublished+监听口；铸出前提 eps 非空）。不填则 CLI 侧
+				// warnNoEndpoints 在在跑稳态误报「该 token 无端点」（与事实相反）。
+				return control.ServeTokenResult{Token: tok, Source: "runtime", Eps: cur.Snapshot().Endpoints}, nil
 			}
 		}
 	}

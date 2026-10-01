@@ -41,7 +41,9 @@ func (roleOpsStub) ServeStatus() ServeStatusResult {
 	return ServeStatusResult{Peers: []ServePeerBrief{}}
 }
 func (roleOpsStub) ServeToken() (ServeTokenResult, error) {
-	return ServeTokenResult{Token: "hmw1stub", Source: "runtime"}, nil
+	// exec-r2 N1：runtime 来源同样带端点（真实绑定 = roleops.go runtime 分支回填
+	// 快照端点；dispatch 用例据此锁 wire 形状——Eps 必须随回执过线）。
+	return ServeTokenResult{Token: "hmw1stub", Source: "runtime", Eps: []string{"192.0.2.10:41641（内网）"}}, nil
 }
 func (roleOpsStub) RelayStart() (RoleActionResult, error) {
 	return RoleActionResult{Action: "started"}, nil

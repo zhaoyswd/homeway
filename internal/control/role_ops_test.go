@@ -61,8 +61,10 @@ func TestRoleOpsServeRelayDispatch(t *testing.T) {
 		t.Fatal(err)
 	}
 	var stok ServeTokenResult
-	if err := json.Unmarshal(raw, &stok); err != nil || stok.Token == "" {
-		t.Fatalf("serve.token 回执：%s（%v）", raw, err)
+	// exec-r2 N1：runtime 来源的回执必须带端点（真实绑定在 roleops.go runtime 分支
+	// 回填快照端点——CLI 侧 warnNoEndpoints 以 Eps 为据；回执缺 Eps = 稳态假告警）。
+	if err := json.Unmarshal(raw, &stok); err != nil || stok.Token == "" || len(stok.Eps) == 0 {
+		t.Fatalf("serve.token 回执（token+endpoints 均须在）：%s（%v）", raw, err)
 	}
 	raw, err = c.Request(ctx, facade.OpRelayToken, nil)
 	if err != nil {

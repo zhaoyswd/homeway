@@ -187,6 +187,18 @@ func TestServeGroupTokenDualPath(t *testing.T) {
 	if !strings.Contains(runningOut, "hmw1") {
 		t.Fatalf("在跑段应输出 hmw1 token：\n%s", runningOut)
 	}
+	// exec-r2 N1 接线级判据（真 roleOps → 控制面 wire → CLI 全链）：在跑稳态
+	// （token 已铸出 = runtime 路径）必须走运行态真源、带端点行、且不得打
+	// 「该 token 无端点」假告警——roleops.go runtime 分支删掉 Eps 回填即红。
+	if !strings.Contains(runningOut, "来源：运行态真源") {
+		t.Fatalf("在跑段应走运行态真源：\n%s", runningOut)
+	}
+	if !strings.Contains(runningOut, "端点：") {
+		t.Fatalf("在跑段稳态应带端点行（runtime 分支回填 Eps）：\n%s", runningOut)
+	}
+	if strings.Contains(runningOut, "该 token 无端点") {
+		t.Fatalf("在跑段稳态不得打无端点假告警（exec-r2 N1）：\n%s", runningOut)
+	}
 
 	// 停角色（进程在跑）→ token 的未跑列 = L2 台账末行（r1 中-6 混合态同款降级）。
 	out.Reset()
@@ -486,16 +498,28 @@ func TestPrintTokenRevealSourceNotes(t *testing.T) {
 
 // TestWarnNoEndpoints 无端点 token 的可行动提示（exec-r1 低-5）：台账末行是
 // endpoints=null 预热行时提示「首轮端点尚未铸出 + 稍后重试/看 events.log」；
-// 有端点时不打提示。
+// 有端点时不打提示。exec-r2 N1：按 Source 门控——runtime 真源的端点与 token
+// 同快照，缺端点不得告警（在跑稳态假告警的接线兜底）。
 func TestWarnNoEndpoints(t *testing.T) {
-	var out bytes.Buffer
-	warnNoEndpoints(&out, nil)
-	if !strings.Contains(out.String(), "首轮端点尚未铸出") || !strings.Contains(out.String(), "events.log") {
-		t.Fatalf("无端点应打可行动提示：\n%s", out.String())
+	cases := []struct {
+		source string
+		eps    []string
+		want   bool // 是否应打提示行
+	}{
+		{"ledger", nil, true},                        // 台账预热行（预期场景）
+		{"ledger-early", nil, true},                  // 启动早期窗口（预期场景）
+		{"ledger", []string{"1.2.3.4:41641"}, false}, // 有端点不打
+		{"runtime", nil, false},                      // N1：runtime 不告警
+		{"runtime", []string{"1.2.3.4:41641（内网）"}, false},
 	}
-	out.Reset()
-	warnNoEndpoints(&out, []string{"1.2.3.4:41641"})
-	if out.Len() != 0 {
-		t.Fatalf("有端点不应打提示：\n%s", out.String())
+	for _, tc := range cases {
+		var out bytes.Buffer
+		warnNoEndpoints(&out, tc.source, tc.eps)
+		if tc.want != strings.Contains(out.String(), "该 token 无端点") {
+			t.Fatalf("source=%s eps=%v 提示应为 %v：\n%s", tc.source, tc.eps, tc.want, out.String())
+		}
+		if tc.want && !strings.Contains(out.String(), "events.log") {
+			t.Fatalf("无端点提示应含 events.log 落点：\n%s", out.String())
+		}
 	}
 }
