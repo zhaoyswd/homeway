@@ -16,7 +16,7 @@ homeway 自有代码的许可见 LICENSE（MIT）；本文件只覆盖**静态�
 一、随二进制分发的第三方组件
 --------------------------------------------------------------------------------
 - Go runtime（标准库与运行时） go1.24.0 — BSD-3-Clause — Copyright 2009 The Go Authors. — 平台：全部 — 全文见 ===== go =====
-- BurntSushi/toml（检测规则 manifest 解析） v1.4.1-0.20240526193622-a339e1f7089c — MIT — Copyright (c) 2013 TOML authors — 平台：darwin linux — 全文见 ===== toml =====
+- BurntSushi/toml（检测规则 manifest 与 config.toml 解析） v1.4.1-0.20240526193622-a339e1f7089c — MIT — Copyright (c) 2013 TOML authors — 平台：darwin linux windows — 全文见 ===== toml =====
 - creack/pty（出口侧 pty，终端会话用） v1.1.24 — MIT — Copyright (c) 2011 Keith Rarick — 平台：darwin linux — 全文见 ===== pty =====
 - google/btree（B 树，gVisor 的依赖） v1.1.3 — Apache-2.0 — Copyright 2014 Google Inc. — 平台：darwin linux windows — 全文见 ===== btree =====
 - golang.org/x/crypto v0.48.0 — BSD-3-Clause — Copyright 2009 The Go Authors. — 平台：darwin linux windows — 全文见 ===== go =====

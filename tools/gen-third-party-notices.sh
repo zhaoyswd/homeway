@@ -26,7 +26,7 @@ RELEASE_TARGETS="darwin/arm64 darwin/amd64 linux/amd64 linux/arm64 linux/arm win
 # 模块 → "<节 id>|<展示名>|<许可名>|<版权行兜底：仅当 LICENSE 里没有 Copyright 行时用>"
 meta() {
   case "$1" in
-    github.com/BurntSushi/toml)        echo "toml|BurntSushi/toml（检测规则 manifest 解析）|MIT|" ;;
+    github.com/BurntSushi/toml)        echo "toml|BurntSushi/toml（检测规则 manifest 与 config.toml 解析）|MIT|" ;;
     github.com/creack/pty)             echo "pty|creack/pty（出口侧 pty，终端会话用）|MIT|" ;;
     github.com/google/btree)           echo "btree|google/btree（B 树，gVisor 的依赖）|Apache-2.0|Copyright 2014 Google Inc." ;;
     golang.org/x/crypto)               echo "xgo|golang.org/x/crypto|BSD-3-Clause|" ;;
