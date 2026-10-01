@@ -18,7 +18,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/zhaoyswd/homeway/clientcore/facade"
 	"github.com/zhaoyswd/homeway/internal/cliopts"
+	"github.com/zhaoyswd/homeway/internal/control"
 	"github.com/zhaoyswd/homeway/internal/nodeconfig"
 	"github.com/zhaoyswd/homeway/internal/nodestate"
 )
@@ -120,6 +122,65 @@ func TestSpawnStaleLockJudgedNotRunning(t *testing.T) {
 	// notRunningDial：锁被持有时即使 ENOENT 也不按未运行（防双拉起）。
 	if notRunningDial(os.ErrNotExist, dir) {
 		t.Fatal("锁被持有时不得判未运行")
+	}
+}
+
+// TestSpawnLockHeldStartupWindowConverges 5.1 门禁批实测撞出的竞态钉死（正例）：
+// 两个 CLI 同时冷启动的另一交错——第二个 CLI 首拨 ENOENT 时第一个进程**已取锁、
+// control.sock 尚未就绪**。期望 = 不立刻报「不可达」，有界等就绪后重拨复用
+// （不拉第二个进程：拉起计数为 0）。
+func TestSpawnLockHeldStartupWindowConverges(t *testing.T) {
+	dir := spawnTestState(t)
+	// 本测试进程持锁 = 「正在启动的第一个进程」（取锁 → control.sock 就绪之间的窗口）。
+	lock, err := nodestate.AcquireInstanceLock(dir, "homeway")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lock.Release()
+	// 300ms 后窗口结束：真控制面 listener 上线（真握手，重拨须真成功）。
+	go func() {
+		time.Sleep(300 * time.Millisecond)
+		_, ln, err := control.ListenControl(dir)
+		if err != nil {
+			return // 用例随后在就绪等待处红
+		}
+		srv := control.NewServer(control.ServerConfig{
+			ServerVersion: "t", Bus: facade.NewBus(facade.NewGeneration(), facade.BusConfig{}),
+			Backend: &noopBackend{},
+		})
+		go func() { _ = srv.Serve(ln) }()
+		time.Sleep(2 * time.Second) // 保 listener 在世到重拨完成（随后随进程退出收工）
+	}()
+	before := spawnAttemptedForTest
+	c, err := dialControlSpawn(context.Background(), dir, "t", "cli-test")
+	if err != nil {
+		t.Fatalf("启动窗口内应等就绪并复用（不得立刻报不可达）：%v", err)
+	}
+	c.Close()
+	if got := spawnAttemptedForTest - before; got != 0 {
+		t.Fatalf("锁被持有时不得拉起第二个进程（拉起计数 +%d）", got)
+	}
+}
+
+// TestSpawnLockHeldNoSocketBoundedError 同窗口的负例：锁被持有且 socket 永不出现
+// （持有者卡死/异常）——有界等后按「不可达」报可行动错误（预算注入缩短），零拉起。
+func TestSpawnLockHeldNoSocketBoundedError(t *testing.T) {
+	dir := spawnTestState(t)
+	lock, err := nodestate.AcquireInstanceLock(dir, "homeway")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lock.Release()
+	spawnReadyTimeout = 300 * time.Millisecond
+	t.Cleanup(func() { spawnReadyTimeout = 10 * time.Second })
+
+	before := spawnAttemptedForTest
+	_, err = dialControlSpawn(context.Background(), dir, "t", "cli-test")
+	if err == nil || !strings.Contains(err.Error(), "未在运行") {
+		t.Fatalf("窗口耗尽应报可行动错误：%v", err)
+	}
+	if got := spawnAttemptedForTest - before; got != 0 {
+		t.Fatalf("锁被持有时不得拉起第二个进程（拉起计数 +%d）", got)
 	}
 }
 

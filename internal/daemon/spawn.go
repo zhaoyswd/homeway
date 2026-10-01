@@ -6,7 +6,8 @@ package daemon
 //
 // 未运行判定（r1 低-3，与 lock.go 口径一致）：control.sock connect
 // ENOENT/ECONNREFUSED **且** <state>/lock 的 flock 试探拿得到（残留锁文件 + 无进程
-// = 可拉起；拿不到 = 进程在跑、按「不可达」报可行动错误，不拉第二个）。
+// = 可拉起；拿不到 = 进程在跑、不拉第二个——其中「锁被持有但 socket 未就绪」=
+// 另一进程正在启动的窗口，有界等就绪复用，等不到才按「不可达」报可行动错误）。
 //
 // 与 launchd KeepAlive 的交互（r1 中-3 选 a；检测集合 r2 新-3）：检测到托管形态
 //（模板 label ∪ 现役 me.zhaozhe.homeway-exit——或本机任意 homeway 代理 plist）时
@@ -68,10 +69,21 @@ var (
 // 可行动错误。
 func dialControlSpawn(ctx context.Context, stateDir, version, name string) (*control.Client, error) {
 	sock := controlSockOf(stateDir)
-	if c, _, err := control.Dial(ctx, sock, control.FrontendInfo{Kind: "cli", Name: name, Version: version}); err == nil {
+	c, _, err := control.Dial(ctx, sock, control.FrontendInfo{Kind: "cli", Name: name, Version: version})
+	if err == nil {
 		return c, nil
-	} else if !notRunningDial(err, stateDir) {
+	}
+	if !notRunningDial(err, stateDir) {
 		// 进程在跑但不可达（锁被持有 / 非 ENOENT·ECONNREFUSED 族）——不拉第二个。
+		// 其中「未运行族错误 + 锁被持有」= 另一进程刚取锁、control.sock 尚未就绪的
+		// **启动窗口**（两个 CLI 同时冷启动的竞态：第二个进入者此时不该立刻报错，
+		// 5.1 门禁批整面负载下实测撞出）——有界等就绪后重拨复用；等不到（或本就
+		// 非未运行族：超时/权限/协议）才按原错误报可行动文案。
+		if notRunningFamily(err) && waitControlReady(stateDir, spawnReadyTimeout) {
+			if c2, _, derr := control.Dial(ctx, sock, control.FrontendInfo{Kind: "cli", Name: name, Version: version}); derr == nil {
+				return c2, nil
+			}
+		}
 		return nil, controlDialErr(stateDir, sock, err)
 	}
 
@@ -89,11 +101,11 @@ func dialControlSpawn(ctx context.Context, stateDir, version, name string) (*con
 	// 就绪后重拨（新预算：原 ctx 的预算可能已在首次拨号里烧掉大半）。
 	dctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	c, _, err := control.Dial(dctx, sock, control.FrontendInfo{Kind: "cli", Name: name, Version: version})
-	if err != nil {
-		return nil, controlDialErr(stateDir, sock, err)
+	c2, _, derr := control.Dial(dctx, sock, control.FrontendInfo{Kind: "cli", Name: name, Version: version})
+	if derr != nil {
+		return nil, controlDialErr(stateDir, sock, derr)
 	}
-	return c, nil
+	return c2, nil
 }
 
 // ensureRunning 拉起统一进程并等 control.sock 就绪（10s 上限）。
@@ -153,8 +165,14 @@ func startSpawnedProcess(stateDir string) (int, error) {
 
 // notRunningDial 拨号失败是否可判「未运行」（r1 低-3）：ENOENT/ECONNREFUSED 族 +
 // <state>/lock 的 flock 试探拿得到。
+// notRunningFamily 未运行族拨号错误（ENOENT = socket 不存在 / ECONNREFUSED =
+// 残留 socket 的监听者已消失）。
+func notRunningFamily(dialErr error) bool {
+	return errors.Is(dialErr, fs.ErrNotExist) || isConnRefused(dialErr)
+}
+
 func notRunningDial(dialErr error, stateDir string) bool {
-	if !errors.Is(dialErr, fs.ErrNotExist) && !isConnRefused(dialErr) {
+	if !notRunningFamily(dialErr) {
 		return false // 其它错误（超时/权限/协议）不按未运行处理
 	}
 	return !nodestate.LockHeld(stateDir)
