@@ -36,8 +36,23 @@ type Carriers struct {
 	Spd *SpeedtestManager
 
 	// addMu 「全局端口检查 + 落地」的串行化（forward.add 与 socks.on 两入口共享
-	// 同一回环命名空间，check-then-act 必须原子）。
+	// 同一回环命名空间，check-then-act 必须原子）；**成员检查也在其内**（FIX-05：
+	// host.remove 的「删条目 → 级联」与本层并发时，检查落在临界区外可造出
+	// 「控制面再也删不掉」的孤儿监听——级联同持 addMu，双向互斥）。
 	addMu sync.Mutex
+	// hostExists 主机表成员谓词（Attach 时注入；nil = 不校验——直接构造的测试形态）。
+	hostExists func(id [32]byte) bool
+}
+
+// peerIDFromHex Host 字段（peerID hex）→ id；坏 hex = 不在表。
+func peerIDFromHex(s string) ([32]byte, bool) {
+	var id [32]byte
+	b, err := hex.DecodeString(s)
+	if err != nil || len(b) != 32 {
+		return id, false
+	}
+	copy(id[:], b)
+	return id, true
 }
 
 // openCarriers 打开三个管理器（读各自持久化文件、按表重建监听/运行面）。
@@ -75,6 +90,11 @@ func openCarriersWithSocksDefault(stateDir string, dial carrierDial, socksDefLis
 func (c *Carriers) AddForward(rule ForwardRule) error {
 	c.addMu.Lock()
 	defer c.addMu.Unlock()
+	if c.hostExists != nil { // 成员检查在临界区内（FIX-05；见 addMu 注释）
+		if id, ok := peerIDFromHex(rule.Host); !ok || !c.hostExists(id) {
+			return ErrNoHost
+		}
+	}
 	if owner, taken := c.Fwd.portOwner(rule.Listen); taken {
 		return fmt.Errorf("%w：%d 已被 %s 占用", ErrPortTaken, rule.Listen, owner)
 	}
@@ -96,6 +116,11 @@ func (c *Carriers) ForwardStates(host string) []ForwardState { return c.Fwd.List
 func (c *Carriers) SocksOn(host string, listen uint16) (uint16, error) {
 	c.addMu.Lock()
 	defer c.addMu.Unlock()
+	if c.hostExists != nil { // 成员检查在临界区内（FIX-05）
+		if id, ok := peerIDFromHex(host); !ok || !c.hostExists(id) {
+			return 0, ErrNoHost
+		}
+	}
 	// socks×socks 的跨主机冲突（含记忆端口、文案含另选提示）由 SocksManager.On
 	// 自带；这里只补 forward 侧的占用检查——按**解析后的端口**判（exec-r1 B1：
 	// 此前 listen==0 时整个跳过，靠 On 恒落 1080 的〔错误〕假设兜着）。
@@ -127,8 +152,12 @@ func (c *Carriers) SpeedtestStatus(host string) *SpeedtestStatus { return c.Spd.
 func (c *Carriers) SpeedtestCancel(host string) { c.Spd.Cancel(host) }
 
 // RemoveHost host.remove 级联：forward 规则（delete 语义，不强关）、socks 监听
-// （off 语义，显式 RST + 记忆消失）、speedtest（cancel）。
+// （off 语义，显式 RST + 记忆消失）、speedtest（cancel）。持 addMu（FIX-05）：
+// 与 AddForward/SocksOn 的成员检查互斥——级联要么看到规则并删掉，要么规则因
+// 成员检查失败而根本落不了地。
 func (c *Carriers) RemoveHost(id [32]byte) {
+	c.addMu.Lock()
+	defer c.addMu.Unlock()
 	host := hex.EncodeToString(id[:])
 	c.Fwd.RemoveHost(host)
 	c.Sks.RemoveHost(host)

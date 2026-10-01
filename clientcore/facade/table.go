@@ -115,6 +115,10 @@ type hostTable struct {
 	eventf   func(format string, args ...any)
 	events   TableEvents
 	hooks    tableHooks
+	// opMu 表**变更**（Add/Remove/Close）的串行化（FIX-07）：临界区比 r.mu 宽——覆盖
+	// 锁外的会话停止（最长 6s）与会话构造；r.mu 只护内存表快照，读面（Hosts/Sessions/
+	// HostStates/Host）不再被刷新/删除/收工窗口整体阻塞。锁序：opMu → r.mu。
+	opMu sync.Mutex
 	// endpointCacheDir / out L3 注入（空 = 按 stateDir 推导）。
 	endpointCacheDir string
 	out              string
@@ -256,25 +260,23 @@ func (r *hostTable) startSessionLocked(e *hostEntry) {
 // （落盘失败零副作用：内存未动、无会话已起）；同键刷新 = 先落盘新 token（内存
 // 暂不动——失败即回滚，内存不留新 token、旧会话照跑）→ 停旧 → 起新、内存记录换
 // 新值。一次落盘失败既不丢已登记主机也不留孤儿会话。
+//
+// FIX-07：变更经 opMu 串行化；**停旧会话（最长 6s）在 r.mu 外做**——读面不被阻塞。
 func (r *hostTable) Add(name, token string) (HostRecord, error) {
 	tok, err := proto.DecodeToken(token)
 	if err != nil {
 		return HostRecord{}, fmt.Errorf("%w：%v", ErrBadToken, err)
 	}
-	// B6：事件 payload 锁内拷贝、锁外 emit（回调重入 Hosts()/Sessions() 不再自死锁）。
-	var emitAdded func()
+	r.opMu.Lock()
+	defer r.opMu.Unlock()
+
 	r.mu.Lock()
-	defer func() {
-		r.mu.Unlock()
-		if emitAdded != nil {
-			emitAdded()
-		}
-	}()
 	if e, ok := r.hosts[tok.PeerID]; ok {
+		// 同后端重签发：同键刷新（「token 哈希」备选否决的理由）。
 		if e.rec.Token == token {
+			r.mu.Unlock()
 			return HostRecord{}, ErrHostExists
 		}
-		// 同后端重签发：同键刷新（「token 哈希」备选否决的理由）。
 		newRec := e.rec
 		newRec.Token = token
 		if name != "" {
@@ -282,22 +284,29 @@ func (r *hostTable) Add(name, token string) (HostRecord, error) {
 		}
 		next := replaceRecord(r.recordsLocked(), newRec)
 		if err := r.saveRecordsLocked(next); err != nil {
+			r.mu.Unlock()
 			return HostRecord{}, err // 内存保持旧 token、旧会话照跑（磁盘也未动）
 		}
+		old := e.sess
+		recID, recName := e.rec.ID, e.rec.Name
+		r.mu.Unlock()
 		// 停旧会话。B7①（用户面）：Stop -1 = 拒绝该操作 + events.log 记行——此时
 		// 磁盘或已含新 token、内存保持旧值，重试或重启按磁盘收敛（如实注记）。
 		// 「拒绝」是名义拒绝：拒绝的是**更新内存**——Stop 已被调用过一次
 		// （stopOnce 不可回退），旧会话对象虽仍在册但已进入收尾/垂死，该主机短暂
 		// 离线属预期。
-		if e.sess != nil && stopFunc(e.sess) < 0 {
-			r.eventf("hosts: %s（%s）token 刷新被拒——会话停止超时（-1，垂死会话仍在收尾；重试或重启按磁盘收敛）", e.rec.ID, e.rec.Name)
+		if old != nil && stopFunc(old) < 0 {
+			r.eventf("hosts: %s（%s）token 刷新被拒——会话停止超时（-1，垂死会话仍在收尾；重试或重启按磁盘收敛）", recID, recName)
 			return HostRecord{}, errStopTimeout
 		}
+		r.mu.Lock()
 		e.rec = newRec
 		e.sess = nil            // 旧会话已停：先摘引用（新会话构造失败时条目呈「会话对象不在」而非挂尸体）
 		r.startSessionLocked(e) // 新会话装回原条目：hooks/观测面/计数器同读 e.dm（中-1）
-		r.logf("hosts: %s（%s）token 已刷新（同后端重签发）", e.rec.ID, e.rec.Name)
-		return e.rec, nil
+		rec := e.rec
+		r.mu.Unlock()
+		r.logf("hosts: %s（%s）token 已刷新（同后端重签发）", rec.ID, rec.Name)
+		return rec, nil
 	}
 	rec := HostRecord{
 		ID:      hex.EncodeToString(tok.PeerID[:]),
@@ -306,14 +315,15 @@ func (r *hostTable) Add(name, token string) (HostRecord, error) {
 		AddedAt: time.Now(),
 	}
 	if err := r.saveRecordsLocked(append(r.recordsLocked(), rec)); err != nil {
+		r.mu.Unlock()
 		return HostRecord{}, err // 落盘失败零副作用：内存未动、无会话已起
 	}
 	r.hosts[tok.PeerID] = r.startEntryLocked(rec)
+	r.mu.Unlock()
 	r.logf("hosts: + %s（%s）", rec.ID, rec.Name)
+	// 锁外 emit（B6：payload 锁内拷贝、锁外发；回调重入 Hosts()/Sessions() 不再自死锁）。
 	if r.events != nil {
-		id, nm, at := rec.ID, rec.Name, rec.AddedAt.UnixMilli()
-		ev := r.events
-		emitAdded = func() { ev.HostAdded(id, nm, at) }
+		r.events.HostAdded(rec.ID, rec.Name, rec.AddedAt.UnixMilli())
 	}
 	return rec, nil
 }
@@ -321,34 +331,34 @@ func (r *hostTable) Add(name, token string) (HostRecord, error) {
 // Remove 摘除一台主机（先落盘、停会话、删条目——B5 对称化：落盘失败 = 内存与会话
 // 均未动）。停会话遇 -1 = B7① 用户面拒绝 + events.log 记行（磁盘或已不含该记录，
 // 重试或重启按磁盘收敛）。
+// FIX-07：停会话（最长 6s）在 r.mu 外做（opMu 保变更互斥）——读面不被停止窗阻塞。
 func (r *hostTable) Remove(id [32]byte) error {
-	var emitRemoved func()
+	r.opMu.Lock()
+	defer r.opMu.Unlock()
 	r.mu.Lock()
-	defer func() {
-		r.mu.Unlock()
-		if emitRemoved != nil {
-			emitRemoved()
-		}
-	}()
 	e, ok := r.hosts[id]
 	if !ok {
+		r.mu.Unlock()
 		return fmt.Errorf("%w：%s", ErrNoHost, hex.EncodeToString(id[:]))
 	}
 	if err := r.saveRecordsLocked(withoutRecord(r.recordsLocked(), e.rec.ID)); err != nil {
+		r.mu.Unlock()
 		return err // 内存未动、会话未动
 	}
-	if e.sess != nil && stopFunc(e.sess) < 0 {
-		r.eventf("hosts: %s（%s）删除被拒——会话停止超时（-1，垂死会话仍在收尾；重试或重启按磁盘收敛）", e.rec.ID, e.rec.Name)
+	sess, recID, recName := e.sess, e.rec.ID, e.rec.Name
+	r.mu.Unlock()
+	if sess != nil && stopFunc(sess) < 0 {
+		// -1 时磁盘已无该条目、内存条目仍在——「拒绝」= 拒绝摘除内存；会话已进收尾、
+		// 该主机短暂离线属预期，重试收敛。
+		r.eventf("hosts: %s（%s）删除被拒——会话停止超时（-1，垂死会话仍在收尾；重试或重启按磁盘收敛）", recID, recName)
 		return errStopTimeout
 	}
-	// -1 时磁盘已无该条目、内存条目仍在——「拒绝」= 拒绝摘除内存；会话已进收尾、
-	// 该主机短暂离线属预期，重试收敛。
+	r.mu.Lock()
 	delete(r.hosts, id)
-	r.logf("hosts: - %s（%s）", e.rec.ID, e.rec.Name)
+	r.mu.Unlock()
+	r.logf("hosts: - %s（%s）", recID, recName)
 	if r.events != nil {
-		rid, reason := e.rec.ID, "user"
-		ev := r.events
-		emitRemoved = func() { ev.HostRemoved(rid, reason) }
+		r.events.HostRemoved(recID, "user")
 	}
 	return nil
 }
@@ -401,23 +411,34 @@ func (r *hostTable) Session(id [32]byte) *hostsession.Session {
 // Close 收工：停全部会话 + 逐台 session.removed 照发（r2 新-15 契约③——在途订阅
 // 前端经事件面看到完整收工，不静默消失；reason=detach）。B7③（清理收工面）：
 // Stop -1 记 events.log 后**继续**——垂死会话不绑架注册表收工与进程退出（尽力
-// 语义）。
+// 语义）。FIX-07：先锁内摘表，再锁外逐台停（6s 级停止不占表锁）。
 func (r *hostTable) Close() {
-	type removed struct{ id string }
+	r.opMu.Lock()
+	defer r.opMu.Unlock()
+	type stopItem struct {
+		sess     *hostsession.Session
+		id, name string
+	}
+	var stops []stopItem
+	var gone []string
 	r.mu.Lock()
-	var gone []removed
 	for id, e := range r.hosts {
-		if e.sess != nil && stopFunc(e.sess) < 0 {
-			r.eventf("hosts: %s（%s）收工停止超时（-1），继续收下一台", e.rec.ID, e.rec.Name)
+		gone = append(gone, e.rec.ID)
+		if e.sess != nil {
+			stops = append(stops, stopItem{sess: e.sess, id: e.rec.ID, name: e.rec.Name})
 		}
-		gone = append(gone, removed{id: e.rec.ID})
 		delete(r.hosts, id)
 	}
 	r.mu.Unlock()
+	for _, it := range stops {
+		if stopFunc(it.sess) < 0 {
+			r.eventf("hosts: %s（%s）收工停止超时（-1），继续收下一台", it.id, it.name)
+		}
+	}
 	// 锁外 emit（B6 发射锁序同守）。
 	if r.events != nil {
 		for _, g := range gone {
-			r.events.HostRemoved(g.id, "detach")
+			r.events.HostRemoved(g, "detach")
 		}
 	}
 }
@@ -592,6 +613,9 @@ func (d *Daemon) Attach(stateDir string) error {
 		tbl.Close()
 		return err
 	}
+	// 成员谓词注入（FIX-05）：AddForward/SocksOn 的成员检查在 addMu 临界区内跑，
+	// 与 RemoveHost 的级联互斥——防 host.remove × forward.add 并发造孤儿监听。
+	car.hostExists = func(id [32]byte) bool { return d.Host(id) != nil }
 	d.mu.Lock()
 	d.table = tbl
 	d.carriers = car

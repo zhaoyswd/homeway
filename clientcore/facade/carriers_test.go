@@ -1168,3 +1168,33 @@ func TestSpeedRunnerValueConnThroughHostSeam(t *testing.T) {
 		t.Fatalf("收场后在场腿应归零，实得 %d", n)
 	}
 }
+
+// TestCarriersAddRejectsRemovedHost（FIX-05）：成员检查在 addMu 临界区内——主机已被
+// host.remove 摘除后，forward.add/socks.on 必须拒绝（旧行为：绑定层 check 与本层落地
+// 分离，并发窗口可造出控制面再也删不掉的孤儿监听；级联持 addMu 与检查互斥）。
+func TestCarriersAddRejectsRemovedHost(t *testing.T) {
+	c := openTestCarriersWithDefault(t, &fakeDial{}, 0)
+	host := strings.Repeat("aa", 32)
+	var live atomic.Bool
+	live.Store(true)
+	c.hostExists = func(id [32]byte) bool { return live.Load() }
+
+	port := freePort(t)
+	if err := c.AddForward(ForwardRule{Host: host, Listen: port, TargetPort: 8080}); err != nil {
+		t.Fatalf("在表主机应可加规则：%v", err)
+	}
+	var id [32]byte
+	b, _ := hex.DecodeString(host)
+	copy(id[:], b)
+	c.RemoveHost(id) // 摘除 + 级联
+	if got := c.ForwardStates(host); len(got) != 0 {
+		t.Fatalf("级联应移除规则：%v", got)
+	}
+	live.Store(false) // 主机会话态：已摘除
+	if err := c.AddForward(ForwardRule{Host: host, Listen: port, TargetPort: 8080}); !errors.Is(err, ErrNoHost) {
+		t.Fatalf("已摘除主机加规则应 ErrNoHost（防孤儿监听），实得 %v", err)
+	}
+	if _, err := c.SocksOn(host, 0); !errors.Is(err, ErrNoHost) {
+		t.Fatalf("已摘除主机开 socks 应 ErrNoHost，实得 %v", err)
+	}
+}

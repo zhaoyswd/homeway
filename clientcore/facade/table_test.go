@@ -16,9 +16,11 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
+	"github.com/zhaoyswd/homeway/clientcore/hostsession"
 	"github.com/zhaoyswd/homeway/pkg/proto"
 )
 
@@ -397,4 +399,58 @@ func waitFileFace(t *testing.T, path string) {
 		time.Sleep(10 * time.Millisecond)
 	}
 	t.Fatalf("%s 未出现", path)
+}
+
+// TestTableReadsNotBlockedBySlowStop（FIX-07）：停会话（最长 6s）在 r.mu 外做——读面
+// （Hosts/Sessions）不被删除/刷新的停止窗阻塞（旧行为：持表锁同步 Stop，读面整体卡住）。
+func TestTableReadsNotBlockedBySlowStop(t *testing.T) {
+	dir := t.TempDir()
+	r := openTestTable(t, dir, tableOptions{strict: true})
+	tok, id := testToken(t, 9, "127.0.0.1:40099")
+	if _, err := r.Add("慢停", tok); err != nil {
+		t.Fatal(err)
+	}
+	orig := stopFunc
+	release := make(chan struct{})
+	entered := make(chan struct{})
+	var once, onceEntered sync.Once
+	rel := func() { once.Do(func() { close(release) }) }
+	stopFunc = func(s *hostsession.Session) int {
+		onceEntered.Do(func() { close(entered) })
+		<-release
+		return 0
+	}
+	t.Cleanup(func() { rel(); stopFunc = orig })
+
+	done := make(chan struct{})
+	go func() { _ = r.Remove(id); close(done) }()
+	select { // 等 Remove 真进入停止窗（stopFunc 已挂住）
+	case <-entered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Remove 未进入停止窗")
+	}
+	// 此刻 stop 正挂住：读面必须照常返回（旧行为持表锁 ⇒ 这里会卡住）。
+	res := make(chan int, 1)
+	go func() { res <- len(r.Hosts()) }()
+	start := time.Now()
+	select {
+	case n := <-res:
+		if n != 1 {
+			t.Fatalf("停止窗内条目应仍在表（-1 语义前提），实得 %d", n)
+		}
+		if e := time.Since(start); e > 200*time.Millisecond {
+			t.Fatalf("读面被停止窗阻塞：Hosts 耗时 %v（旧行为回归）", e)
+		}
+	case <-time.After(1 * time.Second):
+		t.Fatal("读面被停止窗阻塞（Hosts 1s 未返回——旧行为回归）")
+	}
+	rel()
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("放行后 Remove 未完成")
+	}
+	if got := len(r.Hosts()); got != 0 {
+		t.Fatalf("Remove 完成后表应为空，实得 %d", got)
+	}
 }

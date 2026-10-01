@@ -129,13 +129,16 @@ func ParseView(view string) [][32]byte {
 // 生命周期必经 Close〔finish/teardown 统一 backend.Close〕；消费方不 Close 则保守
 // 多算一次需求拍，无害）；Write 递增用户出站字节（源①——连接级记账面，探针不经
 // 此处，exec-r1 中-2 口径）。
+// 指针形态 + once（FIX-06）：Close 幂等——双关（defer + 显式）不得把在场腿计成负；
+// 值类型形态下 sync.Once 会随接收者拷贝失效，故一律 *countedConn。
 type countedConn struct {
 	net.Conn
 	dm      *hostDemand
+	once    sync.Once
 	onClose func()
 }
 
-func (c countedConn) Write(b []byte) (int, error) {
+func (c *countedConn) Write(b []byte) (int, error) {
 	n, err := c.Conn.Write(b)
 	if n > 0 {
 		c.dm.userTx.Add(int64(n)) // 源①：用户连接出站字节（只算出站方向，对齐手机 App TUN 口径）
@@ -143,7 +146,7 @@ func (c countedConn) Write(b []byte) (int, error) {
 	return n, err
 }
 
-func (c countedConn) Close() error {
-	c.onClose()
+func (c *countedConn) Close() error {
+	c.once.Do(c.onClose)
 	return c.Conn.Close()
 }

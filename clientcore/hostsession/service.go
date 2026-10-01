@@ -308,13 +308,21 @@ func (s *Session) snapshotState() (state, reason string, since time.Time) {
 }
 
 // setStopping：Stop 在途标记（只在尚未终态时置——不覆盖 failed/idle 的收尾原因）。
+// 走 observer 通知（FIX-08）：stopping 在 state 值域在册，前端按状态分派/置灰的界面
+// 在 Stop→收尾窗口内必须能看到它（此前直写字段，事件流永远不发该态）。
 func (s *Session) setStopping() {
 	s.mu.Lock()
-	if s.state == svcStateStarting || s.state == svcStateReady {
-		s.state = svcStateStopping
-		s.since = time.Now()
+	if s.state != svcStateStarting && s.state != svcStateReady {
+		s.mu.Unlock()
+		return
 	}
+	from := s.state
+	s.state, s.since = svcStateStopping, time.Now()
+	reason := s.reason
 	s.mu.Unlock()
+	if s.observer != nil {
+		s.observer.StateChanged(s, from, svcStateStopping, reason)
+	}
 }
 
 // isDone start goroutine 是否已退出（收工完成）。

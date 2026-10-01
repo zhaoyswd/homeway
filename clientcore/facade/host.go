@@ -121,8 +121,8 @@ func (h *Host) DialPort(ctx context.Context, port uint16) (net.Conn, error) {
 		return nil, err
 	}
 	if h.dm != nil {
-		h.dm.activeNx.Add(1) // 源②：在场腿（连接关闭时递减——countedConn）
-		return countedConn{Conn: conn, dm: h.dm, onClose: func() { h.dm.activeNx.Add(-1) }}, nil
+		h.dm.activeNx.Add(1) // 源②：在场腿（连接关闭时递减——countedConn；Close 幂等）
+		return &countedConn{Conn: conn, dm: h.dm, onClose: func() { h.dm.activeNx.Add(-1) }}, nil
 	}
 	return conn, nil
 }
@@ -146,8 +146,8 @@ func (h *Host) Dial(ctx context.Context, dst netip.AddrPort) (net.Conn, error) {
 		return nil, err
 	}
 	if h.dm != nil {
-		h.dm.activeNx.Add(1) // 源②：在场腿（连接关闭时递减——countedConn）
-		return countedConn{Conn: conn, dm: h.dm, onClose: func() { h.dm.activeNx.Add(-1) }}, nil
+		h.dm.activeNx.Add(1) // 源②：在场腿（连接关闭时递减——countedConn；Close 幂等）
+		return &countedConn{Conn: conn, dm: h.dm, onClose: func() { h.dm.activeNx.Add(-1) }}, nil
 	}
 	return conn, nil
 }
