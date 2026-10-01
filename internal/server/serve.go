@@ -233,6 +233,10 @@ func Start(ctx context.Context, cfg ServeConfig) (*Server, error) {
 		}
 	}
 	s := &Server{cfg: cfg, Stats: &intercept.Stats{}, state: st}
+	// 生命周期 ctx 在**装配起点**建（FIX-65）：观测面（公网端点探测/DDNS 自检/端口落盘）
+	// 与中继腿都挂它——挂角色 ctx 时「角色对象跨轮复用」会让上一轮的观测 goroutine 吊在
+	// 旧 ctx 上（跨轮泄漏）。取消点 = Close/Shutdown。
+	s.relayCtx, s.relayCancel = context.WithCancel(context.Background())
 	if len(cfg.DDNS) > 0 {
 		s.ddns = make(map[string]*ddnsCheckState, len(cfg.DDNS))
 		for _, d := range cfg.DDNS {
@@ -302,10 +306,8 @@ func Start(ctx context.Context, cfg ServeConfig) (*Server, error) {
 		Logf:          dlogf,
 	}, s.Stats)
 	if ierr != nil {
-		if s.dnsSrv != nil { // review F4：代答先于 Attach 起在此路径上要一起收
-			s.dnsSrv.Close()
-		}
-		tunDev.Close()
+		tunDev.Close() // 本地变量（尚未进 s.dev）：先收 netstack
+		s.Close()      // FIX-65：失败路径统一收口（dns/relayCtx/日志；intercept 未成不碰）
 		return nil, ierr
 	}
 	s.stopIntercept = inter.Close
@@ -345,7 +347,9 @@ func Start(ctx context.Context, cfg ServeConfig) (*Server, error) {
 	sbind.Table = s.Table
 
 	if err := s.dev.IpcSet(fmt.Sprintf("private_key=%s\nlisten_port=%d\n", hex.EncodeToString(priv[:]), cfg.ListenPort)); err != nil {
-		s.dev.Close()
+		// FIX-65：原路径只关 dev——拦截层（已 Attach 的 netstack listener）与 DNS 代答
+		// 都在泄漏；统一走 Close（内部逐步 nil 检查）。
+		s.Close()
 		return nil, err
 	}
 
@@ -377,7 +381,7 @@ func Start(ctx context.Context, cfg ServeConfig) (*Server, error) {
 	// 公网端点自动公布（UPnP 映射 + 同 socket STUN 观测；两条证据一致才写 public_endpoint.txt）。
 	// 必须放在 IpcSet 之后：device 到这一刻才打开 Bind（socket 有了端口，STUN 才有意义）。
 	// 循环挂角色 ctx（观测面随角色收工）；端口/端点文件落注入的 L3 目录。
-	s.StartPublicEndpoint(ctx, PublicOpts{
+	s.StartPublicEndpoint(s.relayCtx, PublicOpts{
 		PortFileDir: cfg.portDir(), UPnP: cfg.UPnP, STUN: cfg.STUN, STUN6: cfg.STUN6, Bind: sbind,
 		Pinned: cfg.BindAddr.IsValid() || resolvedIf != nil, Logf: logf,
 	})
@@ -486,8 +490,6 @@ func Start(ctx context.Context, cfg ServeConfig) (*Server, error) {
 		}
 	}
 
-	// 生命周期 ctx 在装配起点建（收工由 Close 取消，#8）。
-	s.relayCtx, s.relayCancel = context.WithCancel(context.Background())
 	if err := s.dev.Up(); err != nil { // FINDINGS 0.1-1
 		s.Close()
 		return nil, err
@@ -670,6 +672,9 @@ func (s *Server) closeLocalListeners() {
 // （≤1 小时）后过期。
 func (s *Server) shrinkUPnPClease() {
 	if !s.cfg.UPnP {
+		return
+	}
+	if s.bind == nil { // 装配早失败（bind 还没建）：没有要缩租的映射
 		return
 	}
 	ctx2, cancel := context.WithTimeout(context.Background(), 8*time.Second)

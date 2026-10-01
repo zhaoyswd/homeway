@@ -11,15 +11,17 @@ import (
 	"bufio"
 	"context"
 	"encoding/base64"
+	"fmt"
+	"github.com/zhaoyswd/homeway/pkg/dns"
+	"github.com/zhaoyswd/homeway/pkg/intercept"
+	"github.com/zhaoyswd/homeway/pkg/proto"
+	"github.com/zhaoyswd/homeway/pkg/servercore"
 	"net"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
-
-	"github.com/zhaoyswd/homeway/pkg/proto"
-	"github.com/zhaoyswd/homeway/pkg/servercore"
 )
 
 // freeUDPPort 抓一个空闲 UDP 端口（听完即关——串行测试下可用）。
@@ -341,4 +343,36 @@ func TestPeerTTLZeroMeansOff(t *testing.T) {
 	if _, ttl, _ := tbl.Limits(); ttl != 0 {
 		t.Fatalf("表限额应原样携带 0（0 = 关）：%v", ttl)
 	}
+}
+
+// TestCloseCleansPartialAssembly（FIX-65）：装配半途失败后统一走 Close——对**部分
+// 装配**的 Server（只有 dnsSrv + 生命周期 ctx，bind/dev/intercept 都还没建）调 Close
+// 不得 panic，且必须：取消 relayCtx（观测面/中继腿随之收）与关掉 DNS 代答。
+// 原实现的失败路径各自手写清理（只关 dev / 只关 dns+tunDev），漏一处就是一串泄漏。
+func TestCloseCleansPartialAssembly(t *testing.T) {
+	dnsPort := freeUDPPort(t)
+	dsrv, err := dns.Listen(dns.Config{Addr: fmt.Sprintf("127.0.0.1:%d", dnsPort), Logf: func(string, ...any) {}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	s := &Server{
+		cfg:         ServeConfig{DNSPort: dnsPort, UPnP: false},
+		Stats:       &intercept.Stats{},
+		dnsSrv:      dsrv,
+		relayCtx:    ctx,
+		relayCancel: cancel,
+	}
+	s.Close() // 不得 panic（bind/dev/intercept/files 全 nil）
+	select {
+	case <-ctx.Done():
+	default:
+		t.Fatal("Close 应取消生命周期 ctx（观测面/中继腿随之收）")
+	}
+	// DNS 监听已释放：同端口可再绑。
+	pc, lerr := net.ListenPacket("udp", fmt.Sprintf("127.0.0.1:%d", dnsPort))
+	if lerr != nil {
+		t.Fatalf("DNS 代答未收（端口仍占）：%v", lerr)
+	}
+	_ = pc.Close()
 }
