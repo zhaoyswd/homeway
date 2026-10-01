@@ -3,7 +3,6 @@ package servercore
 import (
 	"errors"
 	"fmt"
-	"net/netip"
 	"strings"
 	"sync"
 	"testing"
@@ -337,28 +336,6 @@ func TestDeviceTableConcurrentRegister(t *testing.T) {
 	}
 }
 
-// netip 零值哨兵回归：分配/回收全走显式标志。
-func TestIPPoolZeroValueSentinelRegression(t *testing.T) {
-	p := newIPPool(netip.MustParseAddr(tunnelBase))
-	ip1 := p.Acquire()
-	ip2 := p.Acquire()
-	if !ip1.IsValid() || !ip2.IsValid() || ip1 == ip2 {
-		t.Fatalf("分配非法：%v %v", ip1, ip2)
-	}
-	if !ip1.Is4() || ip1.String() != "100.64.0.1" {
-		t.Fatalf("首个分配应为基址+1：%v", ip1)
-	}
-	p.Release(ip1)
-	if got := p.Acquire(); got != ip1 {
-		t.Fatalf("回收地址未被复用：got=%v want=%v", got, ip1)
-	}
-	p.Release(ip1)
-	p.Release(ip1)
-	if got := p.Acquire(); got != ip1 {
-		t.Fatalf("重复释放后池状态被污染：got=%v", got)
-	}
-}
-
 // #16：设备表必须同时跟踪两个派生 /32（隧道地址 + 应用面地址）——allowedips 是
 // 全局前缀表，任一 /32 撞车都会错路由。占用判定（ipTakenLocked）必须并集生效，
 // 冲突时 assignTunIPLocked 退池并打告警。
@@ -379,14 +356,41 @@ func TestTunIPOccupancyTracked(t *testing.T) {
 	if !tb.ipTakenLocked(e1.ip) || !tb.ipTakenLocked(e1.tunIP) {
 		t.Fatal("ipTakenLocked 不认双地址集合（#16 回归）")
 	}
-	// 第二台设备：AddPeer 落下去的 TunIP 不得与 dev1 的任何地址相同
-	//（派生撞车走退池路径——真撞上概率 ~2^-16，这里只验证「集合判定在」）。
+	// 第二台设备：AddPeer 落下去的 TunIP 不得与 dev1 的任何地址相同。
 	if _, err := tb.Register(regFor(pubN(2), devN(2), now), now); err != nil {
 		t.Fatal(err)
 	}
 	pc := tb.cfg.(*fakeCfg).added[pubN(2)]
 	if pc.TunIP == e1.ip || pc.TunIP == e1.tunIP {
 		t.Fatalf("dev2 的 TunIP %v 与 dev1 的地址撞车未被处置", pc.TunIP)
+	}
+}
+
+// TestIPConflictRejectsRegistration（FIX-66）：派生地址撞车 ⇒ **显式拒绝注册**
+// （ErrTunnelIPConflict），不再退池造一条「客户端永远不会用」的注定不通记录。
+// 构造：先算出目标公钥的派生地址，塞一条占用它的条目（模拟撞车），再注册。
+func TestIPConflictRejectsRegistration(t *testing.T) {
+	tb := NewDeviceTable(newFakeCfg(), [][32]byte{testSecret}, DeviceConfig{})
+	now := time.Now()
+	pub3 := pubN(3)
+	derived := proto.DeriveTunnelIP(testSecret, pub3) // 与 assignIPLocked 同函数
+	// 占住该地址（伪装成另一台设备）。
+	tb.mu.Lock()
+	tb.entries[devN(99)] = &dentry{dev: devN(99), pub: pubN(99), ip: derived, tunIP: proto.DeriveTunIP(testSecret, pubN(99)), lastReg: now, createdAt: now}
+	tb.mu.Unlock()
+
+	if _, err := tb.Register(regFor(pub3, devN(3), now), now); !errors.Is(err, ErrTunnelIPConflict) {
+		t.Fatalf("撞车应 ErrTunnelIPConflict（显式拒绝），got %v", err)
+	}
+	if _, ok := tb.entries[devN(3)]; ok {
+		t.Fatal("被拒的注册不得入表（原实现会退池造一条注定不通的记录）")
+	}
+	// 撞车解除后可正常注册（拒绝不是闩锁）。
+	tb.mu.Lock()
+	delete(tb.entries, devN(99))
+	tb.mu.Unlock()
+	if _, err := tb.Register(regFor(pub3, devN(3), now), now); err != nil {
+		t.Fatalf("撞车解除后应可注册：%v", err)
 	}
 }
 
@@ -441,4 +445,24 @@ func TestApplyDeviceOpKeepsSubmissionOrder(t *testing.T) {
 	got := append([]string(nil), order...)
 	mu.Unlock()
 	t.Fatalf("操作未全部执行：%v", got)
+}
+
+// TestIPConflictSamePubCloneAllowed（FIX-66 的边界）：**同公钥**不同 devTag（克隆/
+// 迁移应用数据）沿用同一派生地址、照常注册（这是既有场景，不算「注定不通」）；
+// 只有**不同公钥**撞同一地址才拒（TestIPConflictRejectsRegistration）。
+func TestIPConflictSamePubCloneAllowed(t *testing.T) {
+	tb := NewDeviceTable(newFakeCfg(), [][32]byte{testSecret}, DeviceConfig{MaxDevices: 8})
+	now := time.Now()
+	pub := pubN(0x55)
+	r1, err := tb.Register(regFor(pub, devN(1), now), now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	r2, err := tb.Register(regFor(pub, devN(2), now.Add(time.Second)), now.Add(time.Second))
+	if err != nil {
+		t.Fatalf("同公钥克隆应照常注册（沿用同址）：%v", err)
+	}
+	if r2.TunnelIP != r1.TunnelIP {
+		t.Fatalf("克隆应沿用同一派生地址：%v vs %v", r2.TunnelIP, r1.TunnelIP)
+	}
 }

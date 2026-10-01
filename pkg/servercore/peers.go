@@ -71,6 +71,10 @@ var (
 	ErrNoToken = errors.New("peers: reg 验证失败（无匹配 token）")
 	// ErrTableFull 表满且所有设备都在活跃宽限期内刷新过——拒绝新设备，绝不淘汰在线设备。
 	ErrTableFull = errors.New("peers: 设备表已满且没有超过活跃宽限期的失联设备")
+	// ErrTunnelIPConflict 派生地址与在表设备的地址撞车（FIX-66）：**显式拒绝注册**。
+	// 原实现退到池地址并造一条设备记录——但客户端只会用它自己派生的地址发包，池地址
+	// 永远收不到它的流：那条记录是「注定不通」的，还占了表位与 allowed_ip 名额。
+	ErrTunnelIPConflict = errors.New("peers: 派生隧道地址与在表设备冲突（请在该设备上重置本机身份后重连）")
 )
 
 // DeviceConfig 设备表参数（零值走默认）。
@@ -114,7 +118,6 @@ type DeviceTable struct {
 	grace time.Duration
 
 	entries map[proto.DevTag]*dentry
-	pool    *ipPool
 
 	// opCh / opStart：设备配置操作（AddPeer/RemovePeer=IpcSet）的**FIFO 单消费者队列**。
 	// 这些操作拿的是 wireguard device 的内部锁——**绝不能在 ReceiveFunc 里同步等它**：
@@ -170,9 +173,6 @@ func (t *DeviceTable) applyDeviceOp(op func()) {
 	}
 }
 
-// tunnelBase：冲突兜底地址池基址（/16，逐 /32 分配）。正常路径不用池，见 assignIPLocked。
-const tunnelBase = "100.64.0.0"
-
 // NewDeviceTable 建表（cfg 零值走默认：32 台 / 7 天 / 10 分钟宽限）。
 func NewDeviceTable(cfg Configurer, secrets [][32]byte, opt DeviceConfig) *DeviceTable {
 	if opt.MaxDevices <= 0 {
@@ -189,7 +189,6 @@ func NewDeviceTable(cfg Configurer, secrets [][32]byte, opt DeviceConfig) *Devic
 		ttl:     opt.TTL,
 		grace:   opt.Grace,
 		entries: make(map[proto.DevTag]*dentry, opt.MaxDevices),
-		pool:    newIPPool(netip.MustParseAddr(tunnelBase)),
 	}
 }
 
@@ -243,16 +242,20 @@ func (t *DeviceTable) Register(reg []byte, now time.Time) (Result, error) {
 		}
 		// 身份轮换：先移除旧 peer 再写新的 —— 顺序固定，避免旧 allowed_ip 悬空
 		//（两步包进同一个后台 op，串行保序）。
-		oldPub, oldIP, oldTunIP := e.pub, e.ip, e.tunIP
+		oldPub, oldIP := e.pub, e.ip
 		t.applyDeviceOp(func() {
 			if rerr := t.cfg.RemovePeer(oldPub); rerr != nil {
 				t.logf("peer: ! dev=%s rotate 移除旧 peer（pub=%s）失败：%v", devShort(devTag), pubShort(oldPub), rerr)
 			}
 		})
-		t.pool.Release(oldIP)
-		t.pool.Release(oldTunIP)
-		ip := t.assignIPLocked(secret, pubkey, devTag)
-		tunIP := t.assignTunIPLocked(secret, pubkey, devTag)
+		ip, aerr := t.assignIPLocked(secret, pubkey, devTag)
+		if aerr != nil {
+			return Result{}, aerr
+		}
+		tunIP, aerr := t.assignTunIPLocked(secret, pubkey, devTag)
+		if aerr != nil {
+			return Result{}, aerr
+		}
 		e.pub, e.psk, e.ip, e.tunIP, e.lastReg = pubkey, psk, ip, tunIP, now
 		t.applyDeviceOp(func() {
 			if aerr := t.cfg.AddPeer(PeerConfig{Pubkey: pubkey, PSK: psk, TunnelIP: ip, TunIP: tunIP}); aerr != nil {
@@ -272,8 +275,14 @@ func (t *DeviceTable) Register(reg []byte, now time.Time) (Result, error) {
 			return Result{}, ErrTableFull
 		}
 	}
-	ip := t.assignIPLocked(secret, pubkey, devTag)
-	tunIP := t.assignTunIPLocked(secret, pubkey, devTag)
+	ip, aerr := t.assignIPLocked(secret, pubkey, devTag)
+	if aerr != nil {
+		return Result{}, aerr
+	}
+	tunIP, aerr := t.assignTunIPLocked(secret, pubkey, devTag)
+	if aerr != nil {
+		return Result{}, aerr
+	}
 	e := &dentry{dev: devTag, pub: pubkey, psk: psk, ip: ip, tunIP: tunIP, lastReg: now, createdAt: now}
 	t.entries[devTag] = e
 	t.applyDeviceOp(func() {
@@ -356,20 +365,30 @@ func (t *DeviceTable) evictStaleLocked(now time.Time) bool {
 // assignIPLocked：隧道地址 = 两端各自从 (secret, 公钥) 派生（tasks 3.7）。
 // 理论冲突（cap=32 时 ≈0.05%）退到池分配并大声告警 —— 注意身份持久化之后
 // 重启不再换钥匙，消解冲突要靠用户「重置本机身份」。
-func (t *DeviceTable) assignIPLocked(secret [32]byte, pub [32]byte, dev proto.DevTag) netip.Addr {
+func (t *DeviceTable) assignIPLocked(secret [32]byte, pub [32]byte, dev proto.DevTag) (netip.Addr, error) {
 	ip := proto.DeriveTunnelIP(secret, pub)
 	if !t.ipTakenLocked(ip) {
-		return ip
+		return ip, nil
 	}
-	for {
-		fallback := t.pool.Acquire()
-		if t.ipTakenLocked(fallback) {
-			continue
+	// 同公钥不同 devTag（克隆/迁移应用数据的既有场景）：同一把钥匙派生地址本就相同，
+	// 不算冲突——沿用该地址（上层会打「疑似同一身份」告警）；设备实际用的就是这个地址，
+	// 记录也不「注定不通」。
+	if t.ipHeldByPubLocked(pub, ip) {
+		return ip, nil
+	}
+	t.logf("peer: ! dev=%s reject reason=ip-conflict ip=%v（派生地址与在表设备撞车；消解 = 手机上「重置本机身份」后重连）",
+		devShort(dev), ip)
+	return netip.Addr{}, ErrTunnelIPConflict
+}
+
+// ipHeldByPubLocked 该地址是否由**同一公钥**的条目持有（克隆场景的判据）。
+func (t *DeviceTable) ipHeldByPubLocked(pub [32]byte, ip netip.Addr) bool {
+	for _, e := range t.entries {
+		if e.pub == pub && (e.ip == ip || e.tunIP == ip) {
+			return true
 		}
-		t.logf("⚠️ 隧道地址冲突：dev=%s 的派生地址 %v 已被其他设备占用，本次退到池地址 %v（客户端仍用派生地址发包 ⇒ 该设备会不通；请在手机上「重置本机身份」后重连）",
-			devShort(dev), ip, fallback)
-		return fallback
 	}
+	return false
 }
 
 // ipTakenLocked 判断某地址是否已被表内设备占用（调用方持锁）。**双地址集合**
@@ -387,21 +406,16 @@ func (t *DeviceTable) ipTakenLocked(ip netip.Addr) bool {
 // assignTunIPLocked：应用面地址 = proto.DeriveTunIP（同设备相等已在 proto 层守卫）；
 // 与**其他设备**的任一地址撞车时退池并大声告警（与隧道地址冲突同语义：客户端仍用
 // 派生地址 ⇒ 该设备应用面不通，消解靠手机「重置本机身份」）。
-func (t *DeviceTable) assignTunIPLocked(secret [32]byte, pub [32]byte, dev proto.DevTag) netip.Addr {
+func (t *DeviceTable) assignTunIPLocked(secret [32]byte, pub [32]byte, dev proto.DevTag) (netip.Addr, error) {
 	ip := proto.DeriveTunIP(secret, pub)
 	if !t.ipTakenLocked(ip) {
-		return ip
+		return ip, nil
 	}
-	for {
-		fallback := t.pool.Acquire()
-		if t.ipTakenLocked(fallback) {
-			continue
-		}
-		t.logf("⚠️ 应用面地址冲突：dev=%s 的派生 TunIP %v 已被其他设备占用，本次退到池地址 %v"+
-			"（客户端仍用派生地址 ⇒ 该设备应用流量不通；请在手机上「重置本机身份」后重连）",
-			devShort(dev), ip, fallback)
-		return fallback
+	if t.ipHeldByPubLocked(pub, ip) { // 同公钥（克隆）：同址合法，见 assignIPLocked
+		return ip, nil
 	}
+	t.logf("peer: ! dev=%s reject reason=ip-conflict tunip=%v（应用面派生地址与在表设备撞车）", devShort(dev), ip)
+	return netip.Addr{}, ErrTunnelIPConflict
 }
 
 // findByPubLocked 找「同一公钥挂在别的 devTag 上」的条目（克隆检测，诊断用）。
@@ -416,8 +430,6 @@ func (t *DeviceTable) findByPubLocked(pub [32]byte, except proto.DevTag) (proto.
 
 func (t *DeviceTable) removeLocked(e *dentry) {
 	delete(t.entries, e.dev) // map 删除带显式 found 语义（下面 Release 幂等）
-	t.pool.Release(e.ip)
-	t.pool.Release(e.tunIP) // 双地址时代的池归还（#16；非池地址 Release 是 no-op）
 	pub := e.pub
 	t.applyDeviceOp(func() {
 		if err := t.cfg.RemovePeer(pub); err != nil {
@@ -481,42 +493,3 @@ func devShort(d proto.DevTag) string { return hex.EncodeToString(d[:4]) }
 func pubShort(p [32]byte) string     { return hex.EncodeToString(p[:4]) }
 
 func roundDur(d time.Duration) time.Duration { return d.Round(time.Second) }
-
-// ipPool：顺序分配 + 释放回收（只服务隧道地址冲突的兜底路径）。
-// 全部显式标志，零值地址不承担「未找到」语义。
-type ipPool struct {
-	base netip.Addr
-	next uint32
-	used map[netip.Addr]struct{}
-	free []netip.Addr
-}
-
-func newIPPool(base netip.Addr) *ipPool {
-	// next 从 1 起：base+0 是网段地址（100.64.0.0），不该分配给主机（FINDINGS/设计 §9-1）。
-	return &ipPool{base: base, next: 1, used: make(map[netip.Addr]struct{})}
-}
-
-func (p *ipPool) Acquire() netip.Addr {
-	if n := len(p.free); n > 0 {
-		ip := p.free[n-1]
-		p.free = p.free[:n-1]
-		p.used[ip] = struct{}{}
-		return ip
-	}
-	for {
-		ip := netip.AddrFrom4([4]byte{p.base.As4()[0], p.base.As4()[1], byte(p.next >> 8), byte(p.next)})
-		p.next++
-		if _, taken := p.used[ip]; !taken {
-			p.used[ip] = struct{}{}
-			return ip
-		}
-	}
-}
-
-func (p *ipPool) Release(ip netip.Addr) {
-	if _, ok := p.used[ip]; !ok {
-		return // 幂等
-	}
-	delete(p.used, ip)
-	p.free = append(p.free, ip)
-}
