@@ -25,6 +25,13 @@ type Row struct {
 	Faces  []string `json:"faces"`
 	Status string   `json:"status"`
 	Spec   string   `json:"spec"`
+	// Exempt：**结构化豁免**（FIX-102：取代 note 里自由文本「App 走 default」标记——
+	// 后者是「谁都能写的逃生口」）。值域冻结：目前仅 "app-default"（App 侧按值分派
+	// 无 case、走 default 展示服务端 msg）。非空时 ExemptSpec/ExemptSince **必填**
+	//（豁免依据的能力域/change 名 + 生效日期 YYYY-MM-DD；TestLedgerExemptSchema 校验）。
+	Exempt      string `json:"exempt,omitempty"`
+	ExemptSpec  string `json:"exemptSpec,omitempty"`
+	ExemptSince string `json:"exemptSince,omitempty"`
 }
 
 // FixturesRow 台账摘要行（fixtures 逐向量内容寻址——字节冻结门的数据面）。

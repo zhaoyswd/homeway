@@ -4,6 +4,7 @@
 package contracts
 
 import (
+	"regexp"
 	"sort"
 	"testing"
 )
@@ -168,8 +169,10 @@ func TestLedgerBridgeTablesReferential(t *testing.T) {
 	}
 }
 
-// TestLedgerExemptionNotes 五条豁免 note（r3 N-11 + r4 新-3 修订）与单函数 default
-// note 必须逐条在位——note 是规则⑤（tier 侧脚本）的减法/记录数据面，丢了即假红。
+// TestLedgerExemptionNotes 豁免行（r3 N-11 + r4 新-3 修订）与哨兵/零产出者行必须逐条
+// 在位。FIX-102：豁免从 note 自由文本标记改为**结构化字段**（exempt/exemptSpec/
+// exemptSince）——本测试断言豁免行的结构化字段（tier 侧脚本的减法数据面），
+// note 里只留解释文本；非豁免行仍按 note 子串断言。
 func TestLedgerExemptionNotes(t *testing.T) {
 	root := testRoot(t)
 	led, err := Load(root)
@@ -177,21 +180,21 @@ func TestLedgerExemptionNotes(t *testing.T) {
 		t.Fatal(err)
 	}
 	must := []struct{ family, unit, value, substr string }{
-		{"bridge-files", "code", "op_failed", "App 走 default"},
-		{"bridge-files", "code", "stream_open", "App 走 default"},
-		{"bridge-files", "code", "marshal", "App 走 default"},
-		{"bridge-term", "code", "remote", "App 走 default"},
-		{"bridge-term", "code", "marshal", "App 走 default"},
+		{"bridge-files", "code", "op_failed", ""},
+		{"bridge-files", "code", "stream_open", ""},
+		{"bridge-files", "code", "marshal", ""},
+		{"bridge-term", "code", "remote", ""},
+		{"bridge-term", "code", "marshal", ""},
 		// 6.2 补登（App 面对账首跑检出）：③透传里 App 无 case 的 already_exists 与
-		// termEndNone 哨兵同样落 default（design 族⑦「③无 case 值走 default（note 豁免）」
-		// / tasks 1.1「ENDED code −1/哨兵——note『App 走 default』」）。
-		{"bridge-term", "code", "already_exists", "App 走 default"},
-		{"term-frame", "ended-code", "math.MinInt32", "App 走 default"},
+		// termEndNone 哨兵同样落 default（design 族⑦「③无 case 值走 default（豁免）」
+		// / tasks 1.1「ENDED code −1/哨兵——豁免」）。
+		{"bridge-term", "code", "already_exists", ""},
+		{"term-frame", "ended-code", "math.MinInt32", ""},
 		{"event-payload", "via", "none", "不入豁免减法"},
 		{"event-payload", "via", "tunnel", "本仓零产出者"},
-		{"event-payload", "state", "stopping", "App 走 default"},
-		{"term-frame", "agent", "unknown", "App 走 default"},
-		{"term-frame", "ended-code", "-1", "App 走 default"},
+		{"event-payload", "state", "stopping", ""},
+		{"term-frame", "agent", "unknown", ""},
+		{"term-frame", "ended-code", "-1", ""},
 		{"speedtest-reason", "reason", "invalid_arg", "不入豁免减法"},
 	}
 	for _, m := range must {
@@ -199,7 +202,11 @@ func TestLedgerExemptionNotes(t *testing.T) {
 		for _, r := range led.Rows {
 			if r.Family == m.family && r.Unit == m.unit && r.Value == m.value {
 				found = true
-				if !containsStr(r.Note, m.substr) {
+				if m.substr == "" {
+					if r.Exempt != "app-default" {
+						t.Errorf("%s/%s=%s 应为结构化豁免 exempt=app-default（现 exempt=%q note=%q）", m.family, m.unit, m.value, r.Exempt, r.Note)
+					}
+				} else if !containsStr(r.Note, m.substr) {
 					t.Errorf("%s/%s=%s note 缺 %q（现 note：%q）", m.family, m.unit, m.value, m.substr, r.Note)
 				}
 				if m.value == "tunnel" && r.Status != "legacy-unreachable" {
@@ -210,6 +217,40 @@ func TestLedgerExemptionNotes(t *testing.T) {
 		if !found {
 			t.Errorf("缺行 %s/%s=%s", m.family, m.unit, m.value)
 		}
+	}
+}
+
+// TestLedgerExemptSchema（FIX-102）：结构化豁免的 schema 冻结——值域 {app-default}，
+// 非空时 ExemptSpec/ExemptSince **必填**（spec 非空；since 为 YYYY-MM-DD 形态）。
+// 取代「note 里自由文本『App 走 default』」的逃生口：豁免集从此可 diff、可审计。
+func TestLedgerExemptSchema(t *testing.T) {
+	root := testRoot(t)
+	led, err := Load(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	allowed := map[string]bool{"app-default": true}
+	sinceRe := regexp.MustCompile(`^\d{4}-\d{2}-\d{2}$`)
+	bad := 0
+	for _, r := range led.Rows {
+		if r.Exempt == "" {
+			continue
+		}
+		if !allowed[r.Exempt] {
+			t.Errorf("%s/%s=%s exempt=%q 越出冻结值域（仅 app-default）", r.Family, r.Unit, r.Value, r.Exempt)
+			bad++
+		}
+		if r.ExemptSpec == "" {
+			t.Errorf("%s/%s=%s 豁免缺 exemptSpec（豁免依据的能力域/change 名必填）", r.Family, r.Unit, r.Value)
+			bad++
+		}
+		if !sinceRe.MatchString(r.ExemptSince) {
+			t.Errorf("%s/%s=%s 豁免缺/坏 exemptSince=%q（须 YYYY-MM-DD）", r.Family, r.Unit, r.Value, r.ExemptSince)
+			bad++
+		}
+	}
+	if bad > 0 {
+		t.Fatalf("豁免 schema 不一致 %d 处", bad)
 	}
 }
 

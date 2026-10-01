@@ -78,14 +78,14 @@
 {"family":"event-payload","unit":"state","value":"starting","note":"","faces":["napi","cp"],"status":"active","spec":"daemon-control-plane（值域冻结）+ contract-ledger"}
 {"family":"event-payload","unit":"state","value":"ready","note":"","faces":["napi","cp"],"status":"active","spec":"daemon-control-plane（值域冻结）+ contract-ledger"}
 {"family":"event-payload","unit":"state","value":"failed","note":"","faces":["napi","cp"],"status":"active","spec":"daemon-control-plane（值域冻结）+ contract-ledger"}
-{"family":"event-payload","unit":"state","value":"stopping","note":"App 走 default（ServiceSession.ets SVC_* 仅 4 值）","faces":["napi","cp"],"status":"active","spec":"daemon-control-plane（值域冻结）+ contract-ledger"}
+{"family":"event-payload","unit":"state","value":"stopping","note":"（ServiceSession.ets SVC_* 仅 4 值）","faces":["napi","cp"],"status":"active","spec":"daemon-control-plane（值域冻结）+ contract-ledger","exempt":"app-default","exemptSpec":"daemon-control-plane（值域冻结）+ contract-ledger","exemptSince":"2026-10-02"}
 {"family":"event-payload","unit":"diag","value":"gated","note":"App 无按值分派对象（spec 清单显式排除）","faces":["cp"],"status":"active","spec":"daemon-control-plane 诊因事件词表"}
 {"family":"event-payload","unit":"diag","value":"budget","note":"App 无按值分派对象（spec 清单显式排除）","faces":["cp"],"status":"active","spec":"daemon-control-plane 诊因事件词表"}
 {"family":"event-payload","unit":"diag","value":"probe_window","note":"App 无按值分派对象（spec 清单显式排除）","faces":["cp"],"status":"active","spec":"daemon-control-plane 诊因事件词表"}
-{"family":"term-frame","unit":"ended-code","value":"-1","note":"App 走 default（endedMessage 仅 −2/−3 有 case；−1 由 reason 前置分支消费）","faces":["direct","napi"],"status":"active","spec":"exit-terminal + term-host-cli D8"}
+{"family":"term-frame","unit":"ended-code","value":"-1","note":"（endedMessage 仅 −2/−3 有 case；−1 由 reason 前置分支消费）","faces":["direct","napi"],"status":"active","spec":"exit-terminal + term-host-cli D8","exempt":"app-default","exemptSpec":"exit-terminal + term-host-cli D8","exemptSince":"2026-10-02"}
 {"family":"term-frame","unit":"ended-code","value":"-2","note":"","faces":["direct","napi"],"status":"active","spec":"exit-terminal + term-host-cli D8"}
 {"family":"term-frame","unit":"ended-code","value":"-3","note":"","faces":["direct","napi"],"status":"active","spec":"exit-terminal + term-host-cli D8"}
-{"family":"term-frame","unit":"ended-code","value":"math.MinInt32","note":"termEndNone 哨兵：不发 ENDED（客户端裸 EOF）；App 走 default（endedMessage 仅 −2/−3 有 case）","faces":["direct","napi"],"status":"active","spec":"exit-terminal + term-host-cli D8"}
+{"family":"term-frame","unit":"ended-code","value":"math.MinInt32","note":"termEndNone 哨兵：不发 ENDED（客户端裸 EOF）；（endedMessage 仅 −2/−3 有 case）","faces":["direct","napi"],"status":"active","spec":"exit-terminal + term-host-cli D8","exempt":"app-default","exemptSpec":"exit-terminal + term-host-cli D8","exemptSince":"2026-10-02"}
 {"family":"term-frame","unit":"ended-reason","value":"replaced","note":"","faces":["direct","napi"],"status":"active","spec":"exit-terminal + term-host-cli D8"}
 {"family":"term-frame","unit":"ended-reason","value":"self_reconnect","note":"","faces":["direct","napi"],"status":"active","spec":"exit-terminal + term-host-cli D8"}
 {"family":"term-frame","unit":"feat","value":"1","note":"featList（真源 pkg/term feat*，位值十进制）；App 无按值分派对象（位字段，spec 清单排除）","faces":["direct","napi"],"status":"active","spec":"term-host-cli / term-surface-protocol"}
@@ -105,7 +105,7 @@
 {"family":"term-frame","unit":"stateV2-byte","value":"1","note":"STATE 帧 state 字节（agentStateKey 按字节分派）","faces":["direct","napi"],"status":"active","spec":"term-agent-state"}
 {"family":"term-frame","unit":"stateV2-byte","value":"2","note":"STATE 帧 state 字节（agentStateKey 按字节分派）","faces":["direct","napi"],"status":"active","spec":"term-agent-state"}
 {"family":"term-frame","unit":"stateV2-byte","value":"3","note":"STATE 帧 state 字节（agentStateKey 按字节分派）","faces":["direct","napi"],"status":"active","spec":"term-agent-state"}
-{"family":"term-frame","unit":"stateV2","value":"unknown","note":"App 走 default（resolveStateKey 无 'unknown' case，落 default 返回 'unknown'）","faces":["direct","napi"],"status":"active","spec":"term-agent-state"}
+{"family":"term-frame","unit":"stateV2","value":"unknown","note":"（resolveStateKey 无 'unknown' case，落 default 返回 'unknown'）","faces":["direct","napi"],"status":"active","spec":"term-agent-state","exempt":"app-default","exemptSpec":"term-agent-state","exemptSince":"2026-10-02"}
 {"family":"term-frame","unit":"stateV2","value":"working","note":"","faces":["direct","napi"],"status":"active","spec":"term-agent-state"}
 {"family":"term-frame","unit":"stateV2","value":"blocked","note":"","faces":["direct","napi"],"status":"active","spec":"term-agent-state"}
 {"family":"term-frame","unit":"stateV2","value":"idle","note":"","faces":["direct","napi"],"status":"active","spec":"term-agent-state"}
@@ -122,16 +122,16 @@
 {"family":"term-frame","unit":"agent","value":"opencode","note":"","faces":["direct","napi"],"status":"active","spec":"term-agent-state"}
 {"family":"term-frame","unit":"agent","value":"openclaw","note":"","faces":["direct","napi"],"status":"active","spec":"term-agent-state"}
 {"family":"term-frame","unit":"agent","value":"other","note":"","faces":["direct","napi"],"status":"active","spec":"term-agent-state"}
-{"family":"term-frame","unit":"agent","value":"unknown","note":"App 走 default（agentLabel·agentIcon 6 case）","faces":["direct","napi"],"status":"active","spec":"term-agent-state"}
+{"family":"term-frame","unit":"agent","value":"unknown","note":"（agentLabel·agentIcon 6 case）","faces":["direct","napi"],"status":"active","spec":"term-agent-state","exempt":"app-default","exemptSpec":"term-agent-state","exemptSince":"2026-10-02"}
 {"family":"term-error","unit":"code","value":"already_exists","note":"跨族同值：族④ files 同值——空间独立；经族⑦透传（App 分派见族⑦行）","faces":["direct","napi"],"status":"active","spec":"exit-terminal（ERROR 帧）+ term-host-cli / term-agent-state"}
-{"family":"term-error","unit":"code","value":"detect_off","note":"经族⑦透传、App 走 default","faces":["direct","napi"],"status":"active","spec":"exit-terminal（ERROR 帧）+ term-host-cli / term-agent-state"}
-{"family":"term-error","unit":"code","value":"marshal","note":"经族⑦透传、App 走 default","faces":["direct","napi"],"status":"active","spec":"exit-terminal（ERROR 帧）+ term-host-cli / term-agent-state"}
-{"family":"term-error","unit":"code","value":"no_agent","note":"经族⑦透传、App 走 default","faces":["direct","napi"],"status":"active","spec":"exit-terminal（ERROR 帧）+ term-host-cli / term-agent-state"}
+{"family":"term-error","unit":"code","value":"detect_off","note":"经族⑦透传","faces":["direct","napi"],"status":"active","spec":"exit-terminal（ERROR 帧）+ term-host-cli / term-agent-state","exempt":"app-default","exemptSpec":"exit-terminal（ERROR 帧）+ term-host-cli / term-agent-state","exemptSince":"2026-10-02"}
+{"family":"term-error","unit":"code","value":"marshal","note":"经族⑦透传","faces":["direct","napi"],"status":"active","spec":"exit-terminal（ERROR 帧）+ term-host-cli / term-agent-state","exempt":"app-default","exemptSpec":"exit-terminal（ERROR 帧）+ term-host-cli / term-agent-state","exemptSince":"2026-10-02"}
+{"family":"term-error","unit":"code","value":"no_agent","note":"经族⑦透传","faces":["direct","napi"],"status":"active","spec":"exit-terminal（ERROR 帧）+ term-host-cli / term-agent-state","exempt":"app-default","exemptSpec":"exit-terminal（ERROR 帧）+ term-host-cli / term-agent-state","exemptSince":"2026-10-02"}
 {"family":"term-error","unit":"code","value":"no_session","note":"经族⑦透传（App 分派见族⑦行）","faces":["direct","napi"],"status":"active","spec":"exit-terminal（ERROR 帧）+ term-host-cli / term-agent-state"}
-{"family":"term-error","unit":"code","value":"no_vt","note":"经族⑦透传、App 走 default","faces":["direct","napi"],"status":"active","spec":"exit-terminal（ERROR 帧）+ term-host-cli / term-agent-state"}
+{"family":"term-error","unit":"code","value":"no_vt","note":"经族⑦透传","faces":["direct","napi"],"status":"active","spec":"exit-terminal（ERROR 帧）+ term-host-cli / term-agent-state","exempt":"app-default","exemptSpec":"exit-terminal（ERROR 帧）+ term-host-cli / term-agent-state","exemptSince":"2026-10-02"}
 {"family":"term-error","unit":"code","value":"spawn_failed","note":"经族⑦透传（App 分派见族⑦行）","faces":["direct","napi"],"status":"active","spec":"exit-terminal（ERROR 帧）+ term-host-cli / term-agent-state"}
 {"family":"term-error","unit":"code","value":"too_many","note":"经族⑦透传（App 分派见族⑦行）","faces":["direct","napi"],"status":"active","spec":"exit-terminal（ERROR 帧）+ term-host-cli / term-agent-state"}
-{"family":"term-error","unit":"code","value":"too_many_clients","note":"经族⑦透传、App 走 default","faces":["direct","napi"],"status":"active","spec":"exit-terminal（ERROR 帧）+ term-host-cli / term-agent-state"}
+{"family":"term-error","unit":"code","value":"too_many_clients","note":"经族⑦透传","faces":["direct","napi"],"status":"active","spec":"exit-terminal（ERROR 帧）+ term-host-cli / term-agent-state","exempt":"app-default","exemptSpec":"exit-terminal（ERROR 帧）+ term-host-cli / term-agent-state","exemptSince":"2026-10-02"}
 {"family":"term-error","unit":"code","value":"term_version","note":"HELLO 版本声明与本出口不符（FIX-29 服务端版本门）；经族⑦透传（App 分派见族⑦行）","faces":["direct","napi"],"status":"active","spec":"term-proto-version-gate（exit-terminal 增量）"}
 {"family":"files-proto","unit":"code","value":"invalid_arg","note":"","faces":["direct","napi"],"status":"active","spec":"file-management"}
 {"family":"files-proto","unit":"code","value":"invalid_name","note":"","faces":["direct","napi"],"status":"active","spec":"file-management"}
@@ -142,7 +142,7 @@
 {"family":"files-proto","unit":"code","value":"op_failed","note":"","faces":["direct","napi"],"status":"active","spec":"file-management"}
 {"family":"files-proto","unit":"code","value":"canceled","note":"","faces":["direct","napi"],"status":"active","spec":"file-management"}
 {"family":"files-proto","unit":"code","value":"stream_open","note":"CodeStreamOpen（client.go 孤立常量：流开场失败）；connect 路径直透 App、op 路径被归一成 bridge_down","faces":["direct","napi"],"status":"active","spec":"file-management"}
-{"family":"files-proto","unit":"code","value":"server_busy","note":"并发闸拒绝（FIX-36：在册流满 MaxConns）；经族⑥透传、App 走 default（带服务端 msg）","faces":["direct","napi"],"status":"active","spec":"file-management（并发闸）"}
+{"family":"files-proto","unit":"code","value":"server_busy","note":"并发闸拒绝（FIX-36：在册流满 MaxConns）；经族⑥透传、（带服务端 msg）","faces":["direct","napi"],"status":"active","spec":"file-management（并发闸）","exempt":"app-default","exemptSpec":"file-management（并发闸）","exemptSince":"2026-10-02"}
 {"family":"speedtest-reason","unit":"reason","value":"busy","note":"","faces":["napi","cp"],"status":"active","spec":"speedtest"}
 {"family":"speedtest-reason","unit":"reason","value":"link_down","note":"","faces":["napi","cp"],"status":"active","spec":"speedtest"}
 {"family":"speedtest-reason","unit":"reason","value":"bridge_down","note":"","faces":["napi","cp"],"status":"active","spec":"speedtest"}
@@ -158,16 +158,16 @@
 {"family":"bridge-files","unit":"code","value":"busy","note":"","faces":["napi"],"status":"active","spec":"bridge-call-layer + file-management"}
 {"family":"bridge-files","unit":"code","value":"invalid_arg","note":"","faces":["napi"],"status":"active","spec":"bridge-call-layer + file-management"}
 {"family":"bridge-files","unit":"code","value":"no_session","note":"","faces":["napi"],"status":"active","spec":"bridge-call-layer + file-management"}
-{"family":"bridge-files","unit":"code","value":"op_failed","note":"App 走 default（filesErrorMessage 无 case）","faces":["napi"],"status":"active","spec":"bridge-call-layer + file-management"}
-{"family":"bridge-files","unit":"code","value":"stream_open","note":"App 走 default（filesErrorMessage 无 case）；connect 路径直透","faces":["napi"],"status":"active","spec":"bridge-call-layer + file-management"}
-{"family":"bridge-files","unit":"code","value":"marshal","note":"App 走 default（filesErrorMessage 无 case）","faces":["napi"],"status":"active","spec":"bridge-call-layer + file-management"}
+{"family":"bridge-files","unit":"code","value":"op_failed","note":"（filesErrorMessage 无 case）","faces":["napi"],"status":"active","spec":"bridge-call-layer + file-management","exempt":"app-default","exemptSpec":"bridge-call-layer + file-management","exemptSince":"2026-10-02"}
+{"family":"bridge-files","unit":"code","value":"stream_open","note":"（filesErrorMessage 无 case）；connect 路径直透","faces":["napi"],"status":"active","spec":"bridge-call-layer + file-management","exempt":"app-default","exemptSpec":"bridge-call-layer + file-management","exemptSince":"2026-10-02"}
+{"family":"bridge-files","unit":"code","value":"marshal","note":"（filesErrorMessage 无 case）","faces":["napi"],"status":"active","spec":"bridge-call-layer + file-management","exempt":"app-default","exemptSpec":"bridge-call-layer + file-management","exemptSince":"2026-10-02"}
 {"family":"bridge-files","unit":"code","value":"already_exists","note":"④稳定码透传","faces":["napi"],"status":"active","spec":"bridge-call-layer + file-management"}
 {"family":"bridge-files","unit":"code","value":"canceled","note":"④稳定码透传","faces":["napi"],"status":"active","spec":"bridge-call-layer + file-management"}
 {"family":"bridge-files","unit":"code","value":"invalid_name","note":"④稳定码透传","faces":["napi"],"status":"active","spec":"bridge-call-layer + file-management"}
 {"family":"bridge-files","unit":"code","value":"is_dir","note":"④稳定码透传","faces":["napi"],"status":"active","spec":"bridge-call-layer + file-management"}
 {"family":"bridge-files","unit":"code","value":"not_found","note":"④稳定码透传","faces":["napi"],"status":"active","spec":"bridge-call-layer + file-management"}
 {"family":"bridge-files","unit":"code","value":"permission","note":"④稳定码透传","faces":["napi"],"status":"active","spec":"bridge-call-layer + file-management"}
-{"family":"bridge-files","unit":"code","value":"server_busy","note":"④稳定码透传；App 走 default（filesErrorMessage 无 case——服务端并发闸的 msg 原样展示）","faces":["napi"],"status":"active","spec":"bridge-call-layer + file-management"}
+{"family":"bridge-files","unit":"code","value":"server_busy","note":"④稳定码透传；（filesErrorMessage 无 case——服务端并发闸的 msg 原样展示）","faces":["napi"],"status":"active","spec":"bridge-call-layer + file-management","exempt":"app-default","exemptSpec":"bridge-call-layer + file-management","exemptSince":"2026-10-02"}
 {"family":"bridge-files","unit":"code","value":"dial_failed","note":"","faces":["napi"],"status":"legacy-unreachable","spec":"bridge-call-layer + file-management"}
 {"family":"bridge-files","unit":"code","value":"files_not_enabled","note":"","faces":["napi"],"status":"legacy-unreachable","spec":"bridge-call-layer + file-management"}
 {"family":"bridge-files","unit":"code","value":"files_other_service","note":"","faces":["napi"],"status":"legacy-unreachable","spec":"bridge-call-layer + file-management"}
@@ -182,16 +182,16 @@
 {"family":"bridge-term","unit":"code","value":"term_foreign_service","note":"","faces":["napi"],"status":"active","spec":"bridge-call-layer + exit-terminal"}
 {"family":"bridge-term","unit":"code","value":"term_version","note":"","faces":["napi"],"status":"active","spec":"bridge-call-layer + exit-terminal"}
 {"family":"bridge-term","unit":"code","value":"io","note":"","faces":["napi"],"status":"active","spec":"bridge-call-layer + exit-terminal"}
-{"family":"bridge-term","unit":"code","value":"remote","note":"App 走 default（termErrorMessage 无 case）","faces":["napi"],"status":"active","spec":"bridge-call-layer + exit-terminal"}
-{"family":"bridge-term","unit":"code","value":"marshal","note":"App 走 default（termErrorMessage 无 case）","faces":["napi"],"status":"active","spec":"bridge-call-layer + exit-terminal"}
-{"family":"bridge-term","unit":"code","value":"already_exists","note":"App 走 default（termErrorMessage 无 case）；③透传","faces":["napi"],"status":"active","spec":"bridge-call-layer + exit-terminal"}
-{"family":"bridge-term","unit":"code","value":"detect_off","note":"App 走 default（termErrorMessage 无 case）；③透传","faces":["napi"],"status":"active","spec":"bridge-call-layer + exit-terminal"}
-{"family":"bridge-term","unit":"code","value":"no_agent","note":"App 走 default（termErrorMessage 无 case）；③透传","faces":["napi"],"status":"active","spec":"bridge-call-layer + exit-terminal"}
+{"family":"bridge-term","unit":"code","value":"remote","note":"（termErrorMessage 无 case）","faces":["napi"],"status":"active","spec":"bridge-call-layer + exit-terminal","exempt":"app-default","exemptSpec":"bridge-call-layer + exit-terminal","exemptSince":"2026-10-02"}
+{"family":"bridge-term","unit":"code","value":"marshal","note":"（termErrorMessage 无 case）","faces":["napi"],"status":"active","spec":"bridge-call-layer + exit-terminal","exempt":"app-default","exemptSpec":"bridge-call-layer + exit-terminal","exemptSince":"2026-10-02"}
+{"family":"bridge-term","unit":"code","value":"already_exists","note":"（termErrorMessage 无 case）；③透传","faces":["napi"],"status":"active","spec":"bridge-call-layer + exit-terminal","exempt":"app-default","exemptSpec":"bridge-call-layer + exit-terminal","exemptSince":"2026-10-02"}
+{"family":"bridge-term","unit":"code","value":"detect_off","note":"（termErrorMessage 无 case）；③透传","faces":["napi"],"status":"active","spec":"bridge-call-layer + exit-terminal","exempt":"app-default","exemptSpec":"bridge-call-layer + exit-terminal","exemptSince":"2026-10-02"}
+{"family":"bridge-term","unit":"code","value":"no_agent","note":"（termErrorMessage 无 case）；③透传","faces":["napi"],"status":"active","spec":"bridge-call-layer + exit-terminal","exempt":"app-default","exemptSpec":"bridge-call-layer + exit-terminal","exemptSince":"2026-10-02"}
 {"family":"bridge-term","unit":"code","value":"no_session","note":"③透传","faces":["napi"],"status":"active","spec":"bridge-call-layer + exit-terminal"}
-{"family":"bridge-term","unit":"code","value":"no_vt","note":"App 走 default（termErrorMessage 无 case）；③透传","faces":["napi"],"status":"active","spec":"bridge-call-layer + exit-terminal"}
+{"family":"bridge-term","unit":"code","value":"no_vt","note":"（termErrorMessage 无 case）；③透传","faces":["napi"],"status":"active","spec":"bridge-call-layer + exit-terminal","exempt":"app-default","exemptSpec":"bridge-call-layer + exit-terminal","exemptSince":"2026-10-02"}
 {"family":"bridge-term","unit":"code","value":"spawn_failed","note":"③透传","faces":["napi"],"status":"active","spec":"bridge-call-layer + exit-terminal"}
 {"family":"bridge-term","unit":"code","value":"too_many","note":"③透传","faces":["napi"],"status":"active","spec":"bridge-call-layer + exit-terminal"}
-{"family":"bridge-term","unit":"code","value":"too_many_clients","note":"App 走 default（termErrorMessage 无 case）；③透传","faces":["napi"],"status":"active","spec":"bridge-call-layer + exit-terminal"}
+{"family":"bridge-term","unit":"code","value":"too_many_clients","note":"（termErrorMessage 无 case）；③透传","faces":["napi"],"status":"active","spec":"bridge-call-layer + exit-terminal","exempt":"app-default","exemptSpec":"bridge-call-layer + exit-terminal","exemptSince":"2026-10-02"}
 {"family":"bridge-term","unit":"code","value":"async_failed","note":"","faces":["napi"],"status":"legacy-unreachable","spec":"bridge-call-layer + exit-terminal"}
 {"family":"bridge-term","unit":"code","value":"invalid_name","note":"","faces":["napi"],"status":"legacy-unreachable","spec":"bridge-call-layer + exit-terminal"}
 {"family":"bridge-term","unit":"code","value":"timeout","note":"","faces":["napi"],"status":"legacy-unreachable","spec":"bridge-call-layer + exit-terminal"}
