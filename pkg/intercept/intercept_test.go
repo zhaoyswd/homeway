@@ -393,7 +393,7 @@ func TestUDPSessionStatsScope(t *testing.T) {
 		return d.DialContext(ctx, network, echo.String())
 	}, func(c *Config) {
 		c.UDPIdle = 300 * time.Millisecond // 会话快速按空闲收口，计数断言不用等
-		c.DNSPort = echo.Port()
+		c.DNS = &fakeDNS{}
 		c.DNSIdle = 300 * time.Millisecond
 	})
 	// waitIdle：等活跃会话数归零（会话关闭时才上报归宿计数）。
@@ -410,8 +410,11 @@ func TestUDPSessionStatsScope(t *testing.T) {
 			time.Sleep(20 * time.Millisecond)
 		}
 	}
-	udpRoundtrip := func(dstPort string, msg string, wantReply bool) {
+	udpRoundtrip := func(dstPort string, msg string, wantReply bool, want string) {
 		t.Helper()
+		if want == "" {
+			want = msg // 回显形态：应答 = 请求
+		}
 		pc, err := h.cli.DialUDPAddrPort(
 			netip.AddrPortFrom(netip.MustParseAddr(cliAddr), 0),
 			netip.MustParseAddrPort(foreignDst+":"+dstPort),
@@ -440,26 +443,46 @@ func TestUDPSessionStatsScope(t *testing.T) {
 			if err != nil {
 				t.Fatalf("read: %v", err)
 			}
-			if string(buf[:n]) != msg {
-				t.Fatalf("echo = %q", string(buf[:n]))
+			if string(buf[:n]) != want {
+				t.Fatalf("应答 = %q（期望 %q）", string(buf[:n]), want)
 			}
 		}
 		pc.Close()
 		waitIdle()
 	}
 
-	// ① 豁免（DNS :53 改写 → 代答每查询必回包）：计数两组都必须是 0。
-	udpRoundtrip("53", "dns-q", true)
+	// ① 豁免类会话（隧道 IP 同端口豁免 / 写死公共 DNS 的 :53 兜底——代答每查询必
+	// 回包、豁免腿不落地）：计数两组都必须是 0。
+	udpRoundtrip("53", "dns-q", true, "dns:dns-q")
+	if r, n := h.st.UDPSessions(); r != 0 || n != 0 {
+		t.Fatalf("DNS 兜底会话不得进归宿计数：replied=%d noReply=%d", r, n)
+	}
+	// ①b 隧道 IP 同端口豁免（dial 注入把回环目标重定向到 echo，必有回包）同样不计。
+	exemptPC, err := h.cli.DialUDPAddrPort(
+		netip.AddrPortFrom(netip.MustParseAddr(cliAddr), 0),
+		netip.MustParseAddrPort(srvAddr+":7788"),
+	)
+	if err != nil {
+		t.Fatalf("udp dial: %v", err)
+	}
+	exemptPC.SetDeadline(time.Now().Add(5 * time.Second))
+	exemptPC.Write([]byte("exempt-q"))
+	buf0 := make([]byte, 256)
+	if _, rerr := exemptPC.Read(buf0); rerr != nil {
+		t.Fatalf("豁免腿应拿到回显：%v", rerr)
+	}
+	exemptPC.Close()
+	waitIdle()
 	if r, n := h.st.UDPSessions(); r != 0 || n != 0 {
 		t.Fatalf("豁免会话不得进归宿计数：replied=%d noReply=%d", r, n)
 	}
 	// ② transit 有回包 → replied+1。
-	udpRoundtrip("5353", "transit-ok", true)
+	udpRoundtrip("5353", "transit-ok", true, "")
 	if r, n := h.st.UDPSessions(); r != 1 || n != 0 {
 		t.Fatalf("transit 有回包应 replied=1：replied=%d noReply=%d", r, n)
 	}
 	// ③ transit 无回包（黑洞，只有上行）→ noReply+1。
-	udpRoundtrip("5354", "transit-dead", false)
+	udpRoundtrip("5354", "transit-dead", false, "")
 	if r, n := h.st.UDPSessions(); r != 1 || n != 1 {
 		t.Fatalf("transit 无回包应 noReply=1：replied=%d noReply=%d", r, n)
 	}
@@ -534,38 +557,79 @@ func TestUDPSessionCap(t *testing.T) {
 	}
 }
 
-// dns-host-resolver：任意目的 :53 改写到 127.0.0.1:DNSPort（单元级映射断言）。
-func TestTargetDNSRewrite(t *testing.T) {
-	in := &Interceptor{cfg: Config{TunnelIP: netip.MustParseAddr(srvAddr), DNSPort: 5300}}
-	for _, dst := range []string{srvAddr + ":53", foreignDst + ":53", "8.8.8.8:53"} {
-		tgt, exempt := in.target(netip.MustParseAddrPort(dst))
-		if !exempt || tgt.String() != "127.0.0.1:5300" {
-			t.Fatalf("%s 应改写到 127.0.0.1:5300，got %v exempt=%v", dst, tgt, exempt)
+// fakeDNS：进程内代答腿替身（FIX-60）——UDP 面把查询包成 "dns:<原文>" 回投，
+// TCP 面按行回 "dns-tcp:<行>"；记录两面收到的报文供路由断言。
+type fakeDNS struct {
+	mu  sync.Mutex
+	udp []string
+	tcp []string
+}
+
+func (f *fakeDNS) Answer(q []byte) []byte {
+	f.mu.Lock()
+	f.udp = append(f.udp, string(q))
+	f.mu.Unlock()
+	return append([]byte("dns:"), q...)
+}
+
+func (f *fakeDNS) ServeStream(conn net.Conn) {
+	defer conn.Close()
+	sc := bufio.NewScanner(conn)
+	for sc.Scan() {
+		line := sc.Text()
+		f.mu.Lock()
+		f.tcp = append(f.tcp, line)
+		f.mu.Unlock()
+		if _, err := conn.Write([]byte("dns-tcp:" + line + "\n")); err != nil {
+			return
 		}
-	}
-	// 非 53 的隧道 IP 豁免照旧
-	if tgt, exempt := in.target(netip.MustParseAddrPort(srvAddr + ":7802")); !exempt || tgt.String() != "127.0.0.1:7802" {
-		t.Fatalf("豁免语义应保持，got %v exempt=%v", tgt, exempt)
-	}
-	// 其它目的端口不受影响
-	if tgt, exempt := in.target(netip.MustParseAddrPort(foreignDst + ":443")); exempt || tgt.String() != foreignDst+":443" {
-		t.Fatalf("过境语义应保持，got %v exempt=%v", tgt, exempt)
-	}
-	// DNSPort=0 = 禁用改写
-	in.cfg.DNSPort = 0
-	if _, exempt := in.target(netip.MustParseAddrPort(foreignDst + ":53")); exempt {
-		t.Fatal("DNSPort=0 不应改写 :53")
 	}
 }
 
-// dns-host-resolver 端到端：客户端发往「任意 IP:53」的 UDP 查询被改写进本机代答端口。
-func TestDNSRewriteUDP(t *testing.T) {
-	echo := echoUDP(t)
-	h := newHarness(t, func(ctx context.Context, network, address string) (net.Conn, error) {
-		var d net.Dialer
-		return d.DialContext(ctx, network, address)
-	})
-	h.in.cfg.DNSPort = echo.Port() // 发包前设置，无并发
+func (f *fakeDNS) counts() (udp, tcp int) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return len(f.udp), len(f.tcp)
+}
+
+// FIX-60：:53 的去向——生产里隧道 IP:53 由栈内真 listener 接（demux 直投，
+// 本层看不到，机制判据在 internal/server TestTunnelDNSListeners）；本层兜底腿
+// **不按目的地址筛选**：任何 :53 落到这里都进程内应答（listener 缺失时是降级
+// 安全网，写死公共 DNS 时是泄漏面兜底）。这里锁兜底腿的开关与端口筛选。
+func TestDNSRoutingShape(t *testing.T) {
+	in := &Interceptor{cfg: Config{TunnelIP: netip.MustParseAddr(srvAddr), DNS: &fakeDNS{}}}
+	if !in.isDNS(netip.MustParseAddrPort(srvAddr + ":53")) {
+		t.Fatal("隧道 IP:53 落到本层时同样进程内应答（降级安全网）")
+	}
+	if !in.isDNS(netip.MustParseAddrPort("8.8.8.8:53")) || !in.isDNS(netip.MustParseAddrPort(foreignDst+":53")) {
+		t.Fatal("写死公共 DNS 的 :53 应走进程内兜底")
+	}
+	if in.isDNS(netip.MustParseAddrPort(foreignDst + ":443")) {
+		t.Fatal("非 :53 不得进兜底")
+	}
+	// DNS=nil = 关闭兜底（:53 按原目标过境重拨）
+	in.cfg.DNS = nil
+	if in.isDNS(netip.MustParseAddrPort("8.8.8.8:53")) {
+		t.Fatal("DNS=nil 不应兜底")
+	}
+	// 隧道 IP 的豁免映射照旧（DNS 关时 :53 落本机同端口——与旧口径一致）
+	if tgt, exempt := in.target(netip.MustParseAddrPort(srvAddr + ":53")); !exempt || tgt.String() != "127.0.0.1:53" {
+		t.Fatalf("隧道 IP:53 豁免语义应保持，got %v exempt=%v", tgt, exempt)
+	}
+	if tgt, exempt := in.target(netip.MustParseAddrPort(srvAddr + ":7802")); !exempt || tgt.String() != "127.0.0.1:7802" {
+		t.Fatalf("豁免语义应保持，got %v exempt=%v", tgt, exempt)
+	}
+	if tgt, exempt := in.target(netip.MustParseAddrPort(foreignDst + ":443")); exempt || tgt.String() != foreignDst+":443" {
+		t.Fatalf("过境语义应保持，got %v exempt=%v", tgt, exempt)
+	}
+}
+
+// FIX-60 端到端：写死公共 DNS（非隧道 IP 的 :53）的 UDP 查询走进程内代答——
+// 应答从原目的地址回投（客户端是 connected socket，源地址不对就收不到），
+// 且**不拨任何真实网络**（dial 记录为空）。
+func TestDNSFallbackUDP(t *testing.T) {
+	fake := &fakeDNS{}
+	h := newHarnessCfg(t, nil, func(c *Config) { c.DNS = fake })
 	pc, err := h.cli.DialUDPAddrPort(
 		netip.AddrPortFrom(netip.MustParseAddr(cliAddr), 0),
 		netip.MustParseAddrPort(foreignDst+":53"), // 写死公共 DNS 形态的目的
@@ -583,45 +647,50 @@ func TestDNSRewriteUDP(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read: %v", err)
 	}
-	if string(buf[:n]) != "dns-q" {
-		t.Fatalf("echo = %q", string(buf[:n]))
+	if got := string(buf[:n]); got != "dns:dns-q" {
+		t.Fatalf("应答应来自进程内代答 = %q", got)
 	}
-	if len(h.dialed) != 1 || h.dialed[0] != echo.String() {
-		t.Fatalf("应改写拨到 %v，got %v", echo, h.dialed)
+	if len(h.dialed) != 0 {
+		t.Fatalf("DNS 兜底不得落地拨号：%v", h.dialed)
+	}
+	if u, _ := fake.counts(); u != 1 {
+		t.Fatalf("代答器应收 1 条 UDP 查询，got %d", u)
 	}
 }
 
-// dns-host-resolver 端到端：TCP :53 同样改写（截断重试路径）。
-func TestDNSRewriteTCP(t *testing.T) {
-	echo := echoTCP(t)
-	h := newHarness(t, func(ctx context.Context, network, address string) (net.Conn, error) {
-		var d net.Dialer
-		return d.DialContext(ctx, network, address)
-	})
-	h.in.cfg.DNSPort = echo.Port()
+// FIX-60 端到端：TCP :53 同样走进程内代答（DNS 截断后的重试路径）。
+func TestDNSFallbackTCP(t *testing.T) {
+	fake := &fakeDNS{}
+	h := newHarnessCfg(t, nil, func(c *Config) { c.DNS = fake })
 	c, err := h.cli.DialTCPAddrPort(netip.MustParseAddrPort(foreignDst + ":53"))
 	if err != nil {
 		t.Fatalf("dial: %v", err)
 	}
 	defer c.Close()
-	if got := roundtrip(t, c, "dns-tcp"); got != "dns-tcp" {
-		t.Fatalf("echo = %q", got)
+	if got := roundtrip(t, c, "tcp-q"); got != "dns-tcp:tcp-q" {
+		t.Fatalf("应答应来自进程内代答 = %q", got)
 	}
-	if len(h.dialed) != 1 || h.dialed[0] != echo.String() {
-		t.Fatalf("应改写拨到 %v，got %v", echo, h.dialed)
+	if len(h.dialed) != 0 {
+		t.Fatalf("DNS 兜底不得落地拨号：%v", h.dialed)
+	}
+	if _, tc := fake.counts(); tc != 1 {
+		t.Fatalf("代答器应收 1 条 TCP 查询，got %d", tc)
 	}
 }
 
-// dns-host-resolver M4：DNS 会话用 DNSIdle（默认 10s）回收，普通 UDP 仍按 UDPIdle。
-// 同五元组第二次发包时，DNS 会话已回收重建（dial 计数 +1），普通会话未回收（计数不变）。
-func TestDNSUDPSessionShortIdle(t *testing.T) {
+// dns-host-resolver M4：DNS 兜底会话用 DNSIdle（默认 10s）回收，普通 UDP 仍按
+// UDPIdle。同五元组第二次发包时，DNS 会话已回收重建（新会话编号 +1）、普通会话
+// 未回收（编号不变）。FIX-60 起 DNS 腿不拨号（进程内代答），判据从 dial 计数换成
+// 会话编号——旧判据在「零拨号」的新形态下恒真，会失去意义。
+func TestDNSFallbackSessionShortIdle(t *testing.T) {
 	echo := echoUDP(t)
-	h := newHarness(t, func(ctx context.Context, network, address string) (net.Conn, error) {
+	h := newHarnessCfg(t, func(ctx context.Context, network, address string) (net.Conn, error) {
 		var d net.Dialer
 		return d.DialContext(ctx, network, echo.String()) // 全部重定向到回显（含 transit 对照腿）
+	}, func(c *Config) {
+		c.DNS = &fakeDNS{}
+		c.DNSIdle = 300 * time.Millisecond
 	})
-	h.in.cfg.DNSPort = echo.Port() // 发包前设置，无并发（同 TestUDPSessionCap 手法）
-	h.in.cfg.DNSIdle = 300 * time.Millisecond
 
 	dialPort := func(port int) *gonet.UDPConn {
 		pc, err := h.cli.DialUDPAddrPort(
@@ -648,19 +717,19 @@ func TestDNSUDPSessionShortIdle(t *testing.T) {
 
 	dnsPC := dialPort(53)
 	send(dnsPC, "dns-1")
-	base := len(h.dialed)
+	base := h.in.seq.Load()
 	time.Sleep(600 * time.Millisecond) // 超过 DNSIdle（300ms），未超过 UDPIdle（30s）
 	send(dnsPC, "dns-2")
-	if got := len(h.dialed) - base; got != 1 {
-		t.Fatalf("DNS 会话应在短 idle 后回收重建（dial +1）, got +%d", got)
+	if got := h.in.seq.Load() - base; got != 1 {
+		t.Fatalf("DNS 兜底会话应在短 idle 后回收重建（新会话 +1）, got +%d", got)
 	}
 
 	plainPC := dialPort(5399)
 	send(plainPC, "plain-1")
-	base = len(h.dialed)
+	base = h.in.seq.Load()
 	time.Sleep(600 * time.Millisecond)
 	send(plainPC, "plain-2")
-	if got := len(h.dialed) - base; got != 0 {
+	if got := h.in.seq.Load() - base; got != 0 {
 		t.Fatalf("普通 UDP 会话不应在 DNSIdle 内回收, got +%d", got)
 	}
 }
@@ -742,13 +811,14 @@ func TestUDPConcurrentSameDstTransit(t *testing.T) {
 	assertNoEndpointFail(t, h)
 }
 
-// 事故原样（DNS 改写腿）：手机系统解析器把 :53 查询打到隧道 IP，多条查询
-// 并发/背靠背到达——目的改写进代答后同样共享 (隧道IP,53) 的 spoof 绑定。
-func TestUDPConcurrentDNSRewrite(t *testing.T) {
-	echo := echoUDP(t)
-	h := newHarnessCfg(t, nil, func(c *Config) { c.DNSPort = echo.Port() })
+// 事故原样（DNS 兜底腿）：手机解析器把 :53 查询打到**写死的公共 DNS**（隧道 IP:53
+// 是栈内 listener，不再走 spoof 绑定）——多条查询并发/背靠背到达时，同样共享
+// (目的IP,53) 的 spoof 绑定。FIX-60 前这条腿的目的地址是隧道 IP；重构后事故形态
+// 只剩公共 DNS 这一支，回归用例随之瞄准它。
+func TestUDPConcurrentDNSFallback(t *testing.T) {
+	h := newHarnessCfg(t, nil, func(c *Config) { c.DNS = &fakeDNS{} })
 	const flows = 8
-	dst := netip.MustParseAddrPort(srvAddr + ":53") // 手机解析器的实际目的
+	dst := netip.MustParseAddrPort(foreignDst + ":53") // 手机解析器的实际目的（写死公共 DNS）
 	pcs := make([]*gonet.UDPConn, flows)
 	for i := range pcs {
 		pc, err := h.cli.DialUDPAddrPort(
@@ -782,8 +852,8 @@ func TestUDPConcurrentDNSRewrite(t *testing.T) {
 			}
 			n, err := pc.Read(buf)
 			if err == nil {
-				if got := string(buf[:n]); got != want {
-					t.Fatalf("dns flow #%d echo = %q", i, got)
+				if got := string(buf[:n]); got != "dns:"+want {
+					t.Fatalf("dns flow #%d 应答 = %q", i, got)
 				}
 				break
 			}

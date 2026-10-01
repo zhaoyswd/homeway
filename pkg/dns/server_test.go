@@ -2,6 +2,7 @@ package dns
 
 import (
 	"encoding/binary"
+	"errors"
 	"net"
 	"os"
 	"path/filepath"
@@ -99,27 +100,52 @@ func udpQuery(t *testing.T, server string, query []byte, wait time.Duration) []b
 	return buf[:n]
 }
 
-// newTestServer：随机端口 + 指定 resolv 内容 + 可注入兜底。
-func newTestServer(t *testing.T, resolv string, fallback string) *Server {
+// newTestServer / newTestServerCfg：host 形态测试台——在本机 127.0.0.1:随机口建
+// UDP+TCP 监听并注入代答。FIX-60 起包里不再有 host 监听构造器（生产 = 隧道栈内
+// listener 注入），测试自建注入以保持既有用例的查询面不变。
+func newTestServer(t *testing.T, resolv string, fallback string) *testServer {
+	return newTestServerCfg(t, resolv, fallback, nil)
+}
+
+func newTestServerCfg(t *testing.T, resolv string, fallback string, mutate func(*Config)) *testServer {
 	t.Helper()
 	path := filepath.Join(t.TempDir(), "resolv.conf")
 	if err := os.WriteFile(path, []byte(resolv), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	s, err := Listen(Config{
-		Addr:        "127.0.0.1:0",
+	cfg := Config{
 		ResolvPath:  path,
 		FallbackDNS: fallback,
 		Budget:      time.Second,
 		Logf:        func(string, ...any) {},
 		DLogf:       func(string, ...any) {},
-	})
+	}
+	if mutate != nil {
+		mutate(&cfg)
+	}
+	s := New(cfg)
+	pc, err := net.ListenPacket("udp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
+	ln, err := net.Listen("tcp", pc.LocalAddr().String()) // 同一端口（真实上游/解析器形态）
+	if err != nil {
+		pc.Close()
+		t.Fatal(err)
+	}
+	s.ServePacketConn(pc)
+	s.ServeListener(ln)
 	t.Cleanup(func() { s.Close() })
-	return s
+	return &testServer{Server: s, addr: pc.LocalAddr().String()}
 }
+
+// testServer：*Server + host 监听地址（测试便利；生产形态没有 host 地址）。
+type testServer struct {
+	*Server
+	addr string
+}
+
+func (ts *testServer) Addr() string { return ts.addr }
 
 func TestServerForwardAndClampTTL(t *testing.T) {
 	up := startFakeUpstream(t, func(q []byte) []byte {
@@ -489,17 +515,8 @@ func TestSelfCheckPassesWithSlowPath(t *testing.T) {
 // review M5：TCP 客户端连接上限 + Close 收线（均注入缩短）。
 func TestServerTCPCapAndClose(t *testing.T) {
 	up := startFakeUpstream(t, func(q []byte) []byte { return buildResponse(q, 0, 5) })
-	path := filepath.Join(t.TempDir(), "resolv.conf")
-	os.WriteFile(path, []byte("nameserver 127.0.0.1:"+portOf(t, up.udp.LocalAddr())+"\n"), 0o644)
-	s, err := Listen(Config{
-		Addr: "127.0.0.1:0", ResolvPath: path, FallbackDNS: "127.0.0.1:1",
-		Budget: time.Second, MaxTCPConns: 2,
-		Logf: func(string, ...any) {}, DLogf: func(string, ...any) {},
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { s.Close() })
+	s := newTestServerCfg(t, "nameserver 127.0.0.1:"+portOf(t, up.udp.LocalAddr()), "127.0.0.1:1",
+		func(c *Config) { c.MaxTCPConns = 2 })
 	dial := func() net.Conn {
 		c, err := net.Dial("tcp", s.Addr())
 		if err != nil {
@@ -525,4 +542,46 @@ func TestServerTCPCapAndClose(t *testing.T) {
 	if _, err := c1.Read(buf); err == nil {
 		t.Fatal("Close 后已 accept 的连接应被断开")
 	}
+}
+
+// FIX-60：监听面注入的生命周期契约——Close 收掉注入的 listener（UDP+TCP），
+// 关后注入当场被拒（注册与收工同锁，不留「收工后冒出来的 listener」）。
+func TestServedListenerLifecycle(t *testing.T) {
+	s := New(Config{ResolvPath: filepath.Join(t.TempDir(), "none"), Logf: func(string, ...any) {}})
+	pc, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ln, err := net.Listen("tcp", pc.LocalAddr().String())
+	if err != nil {
+		pc.Close()
+		t.Fatal(err)
+	}
+	addr := pc.LocalAddr().String()
+	s.ServePacketConn(pc)
+	s.ServeListener(ln)
+	// 收工：注入的两条 listener 都随 Close 释放（同端口可再绑）。
+	s.Close()
+	if pc2, err := net.ListenPacket("udp", addr); err != nil {
+		t.Fatalf("UDP 监听未随 Close 释放：%v", err)
+	} else {
+		pc2.Close()
+	}
+	if ln2, err := net.Listen("tcp", addr); err != nil {
+		t.Fatalf("TCP 监听未随 Close 释放：%v", err)
+	} else {
+		ln2.Close()
+	}
+	// 关后注入被拒：当场关掉、不注册（读应立刻得 ErrClosed；仍开着的 socket 会读超时）。
+	pc3, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.ServePacketConn(pc3)
+	_ = pc3.SetReadDeadline(time.Now().Add(300 * time.Millisecond))
+	buf := make([]byte, 8)
+	if _, _, rerr := pc3.ReadFrom(buf); !errors.Is(rerr, net.ErrClosed) {
+		t.Fatalf("收工后注入的 listener 应被当场关闭（读应得 ErrClosed），got %v", rerr)
+	}
+	_ = s.Close()
 }

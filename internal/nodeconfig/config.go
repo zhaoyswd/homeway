@@ -56,7 +56,7 @@ type Serve struct {
 	// PublicEndpoint 显式公网端点（逗号分隔 ip:port；FIX-61）：非空 = 配置覆盖公布端点，
 	// 跳过 UPnP/STUN 推断（推断在不能枚举/观测的环境里无解）。
 	PublicEndpoint string
-	DNSPort        uint16   // DNS 代答端口；0 = 关闭代答
+	DNSPort        uint16   // DNS 代答开关/客户端解析腿端口（隧道 IP:53 恒服务；0 = 关闭代答）
 	FilesRoot      string   // files 根；空 = $HOME
 	DDNS           []string // DDNS 裸域名，可多条（出口只读解析，不自更记录）
 }
@@ -361,7 +361,8 @@ const headerComment = `# homeway 配置（L1 意图层，唯一人写文件；06
 # 键表（省略即默认）：
 #   [serve] enabled / listen(1-65535) / bind_interface(auto|none|网卡|IP) /
 #           upnp / stun / stun6 / relay(rl1… 或 IP:port) / max_peers /
-#           peer_ttl(时长串，"0s"=关) / dns_port(0=关) / files_root(空=$HOME)
+#           peer_ttl(时长串，"0s"=关) / dns_port(0=关；非 0 = 客户端解析腿端口，缺省 5300) /
+#           files_root(空=$HOME)
 #   [[serve.ddns]] domain = "裸域名"（可多条；出口只读解析，记录由外部 DDNS 维护）
 #   [relay] enabled / listen(":41741") / advertise(逗号分隔，空=自动探测)
 # 客户端角色无配置节（随进程常开）；host 表在 <state>/client/hosts.json（不进 config）。

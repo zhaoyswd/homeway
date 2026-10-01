@@ -3,8 +3,8 @@
 // 每主机至多一个 listener（多主机 = 多端口，浏览器按端口选出口）；{on,listen} 记忆
 // 持久化于 <state>/socks.json（0600、原子读改写、损坏按空表重建 + 告警）。off 不抹
 // 端口记忆（下次 on 缺省沿用）。域名远程解析 = DNS-over-TCP→5300（Host.DialPort(5300)
-// → 出口豁免转投本机代答），**MUST NOT 本地解析**（结构保证：本文件无任何系统解析
-// 调用）。缓存**每 listener 一份**（r1 中-2：缓存 key =（出口主机, 域名）——每主机一
+// → 出口**隧道栈内**的解析腿 listener，FIX-60），**MUST NOT 本地解析**（结构保证：
+// 本文件无任何系统解析调用）。缓存**每 listener 一份**（r1 中-2：缓存 key =（出口主机, 域名）——每主机一
 // listener 的实现形态即天然隔离；有界 256、TTL 取应答钳制值、否定不缓存、逐出即弃）。
 // 在世连接（r1 中-6）：off/级联 = 显式关（SetLinger(0) RST——「off」之后不得仍有
 // 代理流量经隧道跑）。
@@ -29,8 +29,9 @@ import (
 // socksFileName 开关记忆持久化文件（0600）。
 const socksFileName = "socks.json"
 
-// socksDialPort 出口 DNS 代答端口（pkg/dns 默认监听 127.0.0.1:5300；经隧道的查询由
-// 出口 intercept 豁免转投）。
+// socksDNSPort 出口客户端解析腿端口（隧道 IP:<它> 的 TCP —— 出口在**隧道栈内**
+// 起的 DNS-over-TCP listener，见 homeway pkg/dns / internal/server FIX-60；
+// 由出口 internal/server.DefaultDNSPort 对钉，两边同号）。
 const socksDNSPort = 5300
 
 // socks 默认监听端口与缓存边界。
@@ -347,7 +348,8 @@ func (m *SocksManager) stopListener(e *socksEntryRT) {
 
 // resolverFor 域名远程解析腿（socks 承载面的解析注入）：缓存（每 listener 一份 = 每
 // 主机一份——key（出口主机, 域名）的隔离由「cache 实例随 listener」实现，r1 中-2）→
-// 未命中经 Host.DialPort(5300) 拨出口代答 TCP 面发 DNS-over-TCP A 查询；否定/超时
+// 未命中经 Host.DialPort(5300) 拨出口代答 TCP 面发 DNS-over-TCP A 查询（出口在隧道
+// 栈内监听该端口，FIX-60）；否定/超时
 // 不缓存。ctx 预算由 socks 服务端套（ResolveBudget）。
 func (m *SocksManager) resolverFor(host string, cache *dnsCache) socks.Resolver {
 	return func(ctx context.Context, name string) ([]netip.Addr, error) {

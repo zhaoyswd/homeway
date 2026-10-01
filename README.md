@@ -355,8 +355,8 @@ homeway socks status [--json]
 ```
 
 **域名目标的解析在出口侧远程完成**（MUST NOT 本地解析）：CONNECT 带主机名时统一进程
-经隧道拨该主机出口的 DNS 代答（TCP 查询 → `Host.DialPort(5300)` → 出口
-`127.0.0.1:5300`）发 A 查询，以应答 IPv4 拨隧道——fake-ip/内网 DNS/geo 场景下解析权
+经隧道拨该主机出口的 DNS 代答解析腿（TCP 查询 → `Host.DialPort(5300)` →
+出口隧道栈内的 listener：隧道 IP:`5300`）发 A 查询，以应答 IPv4 拨隧道——fake-ip/内网 DNS/geo 场景下解析权
 跟着指定出口走（`curl --socks5-hostname` 强制域名形态）。解析结果按应答 TTL 缓存
 （每 listener 一份 = 按出口主机隔离，有界 256、逐出即弃、否定不缓存；多 A 记录顺序
 尝试）。采证判据：出口侧 dns 计数行（TCP 查询）+ intercept 豁免/transit dialok 行。

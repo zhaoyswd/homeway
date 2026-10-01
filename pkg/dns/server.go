@@ -14,10 +14,14 @@ import (
 	"time"
 )
 
-// Server：出口侧 DNS 代答（openspec dns-host-resolver）。
+// Server：出口侧 DNS 代答（openspec dns-host-resolver；FIX-60 起监听面注入）。
 //
-// 监听仅回环；经隧道的 :53 查询由 intercept 的端口改写投到这里（见
-// pkg/intercept 的 target）。上游 = 主机系统解析（Upstreams 跟随 resolv.conf），
+// 本包**不建任何 host 监听**：出口把代答挂在隧道栈内（隧道 IP:53 UDP/TCP =
+// 手机声明的 DNS；隧道 IP:<解析腿端口> TCP = 客户端远程解析腿），由调用方
+// 用 gonet 建 listener 喂进来（ServePacketConn/ServeListener）——没有「host
+// 端口被占 ⇒ 手机解析全断」的失败模式，也没有 5300 改写这种隐藏契约。
+// 非隧道 IP 的 :53（应用写死公共 DNS）由拦截层走进程内入口（Answer/ServeStream），
+// 不落地任何真实网络。上游 = 主机系统解析（Upstreams 跟随 resolv.conf），
 // 按序尝试 + 末位公共 DNS 兜底（仅连接层失败触发，否定应答绝不兜底）；
 // 单查询总预算内完成；v6 类 qtype 回空应答；应答 TTL 钳制 ≤60s；UDP 超限
 // 截断置 TC。每查询 recover + 在途上限——出口单进程多手机共享，DNS 处理
@@ -25,15 +29,19 @@ import (
 type Server struct {
 	cfg Config
 	ups *Upstreams
-	udp net.PacketConn
-	tcp net.Listener
 
 	closed    chan struct{}
 	inFlight  atomic.Int32
 	fbOnceLog atomic.Bool
 
-	// TCP 客户端面（本机可达）：连接跟踪 + 上限（review M5——Close 能收线、
-	// 挂连接的本地进程不能无限耗 goroutine/fd）。closeOnce 属实例（review F3）。
+	// 注入的监听面（Close 统一收；注册与关闭同锁，关后的注入被拒）。
+	lnMu      sync.Mutex
+	pcs       []net.PacketConn
+	lns       []net.Listener
+	statsOnce sync.Once
+
+	// TCP 客户端面（隧道内可达）：连接跟踪 + 上限（review M5——Close 能收线、
+	// 挂连接的客户端不能无限耗 goroutine/fd）。closeOnce 属实例（review F3）。
 	closeOnce sync.Once
 	connsMu   sync.Mutex
 	conns     connreg.Registry // 按 id 记账（FIX-73）
@@ -44,7 +52,6 @@ type Server struct {
 // Config 代答配置（零值用默认；Dial 上游不可注入——测试用 ResolvPath +
 // FallbackDNS 指向本地 fake 上游）。
 type Config struct {
-	Addr        string               // 监听地址（默认 127.0.0.1:5300；:0 = 随机，测试用）
 	ResolvPath  string               // 默认 /etc/resolv.conf
 	FallbackDNS string               // 全部 nameserver 连接层失败时的末位兜底（默认 223.5.5.5）
 	Budget      time.Duration        // 单查询总预算（默认 2.5s，主/兜共享）
@@ -55,7 +62,6 @@ type Config struct {
 }
 
 const (
-	defaultDNSPort  = 5300
 	defaultFallback = "223.5.5.5"
 	defaultBudget   = 2500 * time.Millisecond
 	defaultInFlight = 256
@@ -63,16 +69,14 @@ const (
 	statsInterval   = 60 * time.Second
 	udpBufSize      = 64 << 10
 	maxPerTry       = 800 * time.Millisecond // 单次上游尝试的预算上限（review F1：防静默上游吃干总预算）
-	maxTCPConns     = 64                     // TCP 客户端面（本机可达）连接上限（review M5）
+	maxTCPConns     = 64                     // TCP 客户端面（隧道内可达）连接上限（review M5）
 	tcpIdle         = 30 * time.Second       // TCP 客户端单消息空闲期限
 )
 
-// Listen 建 UDP+TCP 双 listener 并加载上游。自环防护：监听端口为 53 时剔除
-// 回环上游（上游查询打回自身，查询风暴）。
-func Listen(cfg Config) (*Server, error) {
-	if cfg.Addr == "" {
-		cfg.Addr = fmt.Sprintf("127.0.0.1:%d", defaultDNSPort)
-	}
+// New 建代答核心（上游跟随器 + 状态），不建监听——监听面由调用方注入，代答
+// 拥有其生命周期（Close 统一收）。上游初次加载失败不致命：空表周期重试，
+// 期间查询落兜底（review M6）。
+func New(cfg Config) *Server {
 	if cfg.ResolvPath == "" {
 		cfg.ResolvPath = "/etc/resolv.conf"
 	}
@@ -94,54 +98,59 @@ func Listen(cfg Config) (*Server, error) {
 	if cfg.DLogf == nil {
 		cfg.DLogf = func(string, ...any) {}
 	}
-	ups, err := NewUpstreams(cfg.ResolvPath)
-	if err != nil {
-		return nil, fmt.Errorf("dns: 无可用上游（%s：%v）", cfg.ResolvPath, err)
-	}
-	_, port, _ := net.SplitHostPort(cfg.Addr)
-	if port == "53" { // 自环：上游按 <host>:53 拨，监听 53 时回环上游会打回自己
-		filtered := ups.list[:0:0]
-		for _, up := range ups.list {
-			if ip := net.ParseIP(up); ip != nil && ip.IsLoopback() {
-				cfg.Logf("⚠️ dns 上游 %s 指向回环且监听为 53（自环），已剔除", up)
-				continue
-			}
-			filtered = append(filtered, up)
-		}
-		if len(filtered) == 0 {
-			return nil, errors.New("dns: 全部上游为自环地址，代答不可用")
-		}
-		ups.list = filtered
-	}
-	udp, err := net.ListenPacket("udp", cfg.Addr)
-	if err != nil {
-		return nil, err
-	}
-	tcp, err := net.Listen("tcp", udp.LocalAddr().String())
-	if err != nil {
-		udp.Close()
-		return nil, err
-	}
-	s := &Server{cfg: cfg, ups: ups, udp: udp, tcp: tcp, closed: make(chan struct{})}
-	go s.serveUDP()
-	go s.serveTCP()
-	go s.statsLoop()
-	return s, nil
+	return &Server{cfg: cfg, ups: NewUpstreams(cfg.ResolvPath), closed: make(chan struct{})}
 }
 
-// Addr 实际监听地址（:0 时取内核分配值）。
-func (s *Server) Addr() string { return s.udp.LocalAddr().String() }
+// ServePacketConn 接管一条 UDP 查询面（可多次调用；Close 统一收）。
+// 已收工时当场关掉（注册与收工同锁，不留「收工后冒出来的 listener」）。
+func (s *Server) ServePacketConn(pc net.PacketConn) {
+	s.lnMu.Lock()
+	select {
+	case <-s.closed:
+		s.lnMu.Unlock()
+		pc.Close()
+		return
+	default:
+	}
+	s.pcs = append(s.pcs, pc)
+	s.lnMu.Unlock()
+	go s.serveUDP(pc)
+	go s.statsLoopOnce() // 统计行随第一个监听面起（无监听=无服务，不用打）
+}
+
+// ServeListener 接管一条 TCP 查询面（同上；隧道 IP:53 与客户端解析腿各一条）。
+func (s *Server) ServeListener(ln net.Listener) {
+	s.lnMu.Lock()
+	select {
+	case <-s.closed:
+		s.lnMu.Unlock()
+		ln.Close()
+		return
+	default:
+	}
+	s.lns = append(s.lns, ln)
+	s.lnMu.Unlock()
+	go s.serveTCP(ln)
+	go s.statsLoopOnce()
+}
 
 // UpstreamsText 当前上游列表的逗连摘要（判据行用）。
 func (s *Server) UpstreamsText() string { return strings.Join(s.ups.List(), ", ") }
 
-// Close 收工（listener 双关 + 通知 TCP 连接收线；在途查询靠 budget 自行了断）。
-// Once 防并发双 Close panic（review F3：select/default 只防顺序二次调用）。
+// Close 收工（注入的 listener 全关 + 通知 TCP 连接收线；在途查询靠 budget
+// 自行了断）。Once 防并发双 Close panic（review F3：select/default 只防顺序二次调用）。
 func (s *Server) Close() error {
 	s.closeOnce.Do(func() {
 		close(s.closed)
-		s.tcp.Close()
-		s.udp.Close()
+		s.lnMu.Lock()
+		for _, pc := range s.pcs {
+			pc.Close()
+		}
+		for _, ln := range s.lns {
+			ln.Close()
+		}
+		s.pcs, s.lns = nil, nil
+		s.lnMu.Unlock()
 		s.conns.CloseAll(nil)
 	})
 	return nil
@@ -155,38 +164,23 @@ func (s *Server) StatsLine() string {
 		s.fail.Load(), s.dropped.Load(), s.malformed.Load(), s.aaaaMixed.Load())
 }
 
-// SelfCheck 启动自验证：**经监听器真发**一条 UDP 查询走完整链路（监听 →
-// 转发 → 上游），校验拿到合法应答且非 SERVFAIL（review M2：直调 respond 的
-// 老实现里失败分支不可达——上游全死时 respond 本地造 SERVFAIL 也返回非 nil，
-// 恒过；NXDOMAIN 仍算「链路活着」）。
+// SelfCheck 启动自验证：真跑一遍「查询 → 上游」链路，校验拿到合法应答且非
+// SERVFAIL（review M2：直调本地造 SERVFAIL 的老路不可达——上游全死时也要报出来，
+// 见 TestSelfCheckFailsWhenAllDead）。FIX-60 起监听面在隧道栈内（由调用方注入、
+// 不存在被别的进程占用这类失败），自检的变量只剩「上游此刻可达吗」——不再经
+// listener 往返（栈内自发自收会把包发去手机，见 pkg/wgnet 无回环网卡）。
 func (s *Server) SelfCheck() error {
-	q := selfCheckQuery()
-	// 期限 ≥ 代答预算 + 余量（review3 中1）：resolv.conf 前几位是静默死上游时，
-	// F1 的均分让首个真实应答 ~1.6s 才到——1s 期限会在这种真实故障场景打假告警。
-	dl := s.cfg.Budget + 500*time.Millisecond
-	c, err := net.DialTimeout("udp", s.Addr(), dl)
-	if err != nil {
-		return err
-	}
-	defer c.Close()
-	_ = c.SetDeadline(time.Now().Add(dl))
-	if _, err := c.Write(q); err != nil {
-		return err
-	}
-	buf := make([]byte, 4096)
-	n, err := c.Read(buf)
-	if err != nil {
-		return fmt.Errorf("自验证无应答（监听/上游全不可达）：%w", err)
-	}
-	resp := buf[:n]
-	if len(resp) < 12 || binary.BigEndian.Uint16(resp[0:2]) != binary.BigEndian.Uint16(q[0:2]) {
-		return errors.New("自验证应答不合法")
+	resp := s.respond(selfCheckQuery(), false)
+	if resp == nil {
+		return errors.New("自验证无应答（查询处理失败）")
 	}
 	if resp[3]&0x0F == 2 { // SERVFAIL = 上游全挂且兜底也失败
 		return errors.New("自验证拿到 SERVFAIL（上游全挂且兜底失败）")
 	}
 	return nil
 }
+
+func (s *Server) statsLoopOnce() { s.statsOnce.Do(func() { go s.statsLoop() }) }
 
 func (s *Server) statsLoop() {
 	t := time.NewTicker(statsInterval)
@@ -201,20 +195,19 @@ func (s *Server) statsLoop() {
 	}
 }
 
-func (s *Server) serveUDP() {
+func (s *Server) serveUDP(pc net.PacketConn) {
 	buf := make([]byte, udpBufSize)
 	for {
-		n, addr, err := s.udp.ReadFrom(buf)
+		n, addr, err := pc.ReadFrom(buf)
 		if err != nil {
-			if !errors.Is(err, net.ErrClosed) {
-				// 临时性错误（如上游不可达回灌的 ECONNREFUSED）不该杀死监听循环
-				//（review F2：一次错误永久退出且无日志 = 静默失能）。
-				s.cfg.DLogf("dns: UDP 读错误（继续）：%v", err)
-				time.Sleep(50 * time.Millisecond)
-			}
-			if errors.Is(err, net.ErrClosed) {
+			if errors.Is(err, net.ErrClosed) || s.isClosed() {
 				return
 			}
+			// 临时性错误（如上游不可达回灌的 ECONNREFUSED）不该杀死监听循环
+			//（review F2：一次错误永久退出且无日志 = 静默失能）；收工/栈拆
+			// 引起的读错误走上面的 isClosed 出口，不在这里空转。
+			s.cfg.DLogf("dns: UDP 读错误（继续）：%v", err)
+			time.Sleep(50 * time.Millisecond)
 			continue
 		}
 		pkt := make([]byte, n)
@@ -234,73 +227,95 @@ func (s *Server) serveUDP() {
 				}
 			}()
 			if resp := s.respond(pkt, false); resp != nil {
-				s.udp.WriteTo(resp, addr) // best-effort
+				pc.WriteTo(resp, addr) // best-effort
 			}
 		}(addr, pkt)
 	}
 }
 
-func (s *Server) serveTCP() {
+func (s *Server) serveTCP(ln net.Listener) {
 	for {
-		conn, err := s.tcp.Accept()
+		conn, err := ln.Accept()
 		if err != nil {
-			if errors.Is(err, net.ErrClosed) {
+			if errors.Is(err, net.ErrClosed) || s.isClosed() {
 				return
 			}
 			s.cfg.DLogf("dns: TCP accept 错误（继续）：%v", err)
 			time.Sleep(50 * time.Millisecond)
 			continue
 		}
-		s.connsMu.Lock()
-		// Close 已整段跑完的窗口（review3 低）：这条 conn 注册进已清扫的表只会
-		// 等自己的 deadline——拿锁后复查，关了就别注册。
-		select {
-		case <-s.closed:
-			s.connsMu.Unlock()
-			conn.Close()
-			continue
-		default:
-		}
-		id, ok := s.conns.Add(conn, s.cfg.MaxTCPConns) // 本机可达面也要有闸（review M5；可注入）
+		go s.ServeStream(conn)
+	}
+}
+
+// isClosed：收工标志（读错误按它分流——栈/角色收工时读错误不是「临时故障」，
+// 不能进 50ms 空转）。
+func (s *Server) isClosed() bool {
+	select {
+	case <-s.closed:
+		return true
+	default:
+		return false
+	}
+}
+
+// Answer 处理一条 UDP DNS 查询报文（nil = 不回包）。**进程内入口**：拦截层拿它
+// 兜底「应用写死公共 DNS（非隧道 IP 的 :53）」的查询（FIX-60）——应答从原目的
+// 地址回给客户端，查询不落地任何真实网络（v6 过滤不留明文泄漏面）。
+// 调用方已保证并发安全（respond 自身无共享可变状态）。
+func (s *Server) Answer(query []byte) []byte { return s.respond(query, false) }
+
+// ServeStream 在一条已建立的 DNS-over-TCP 流上服务（RFC 1035 分帧，逐消息应答；
+// 连接计数走同一上限表）。两条消费面同源：本包 accept 循环（隧道内 listener）与
+// 拦截层的「写死公共 DNS 的 :53 TCP」进程内兜底。**conn 生命周期归本函数**（返回前关）。
+func (s *Server) ServeStream(conn net.Conn) {
+	s.connsMu.Lock()
+	// Close 已整段跑完的窗口（review3 低）：这条 conn 注册进已清扫的表只会
+	// 等自己的 deadline——拿锁后复查，关了就别注册。
+	select {
+	case <-s.closed:
 		s.connsMu.Unlock()
-		if !ok {
-			conn.Close()
+		conn.Close()
+		return
+	default:
+	}
+	id, ok := s.conns.Add(conn, s.cfg.MaxTCPConns) // 隧道内可达面也要有闸（review M5；可注入）
+	s.connsMu.Unlock()
+	if !ok {
+		conn.Close()
+		s.dropped.Add(1)
+		return
+	}
+	defer func() {
+		conn.Close()
+		s.conns.Remove(id)
+	}()
+	for {
+		// 每条消息一个空闲期限：挂住不发的客户端不能无限占 goroutine/fd。
+		_ = conn.SetDeadline(time.Now().Add(tcpIdle))
+		q, err := readTCPMessage(conn)
+		if err != nil {
+			return
+		}
+		s.qtcp.Add(1) // TCP 面单列（StatsLine 判据行；UDP 的 q 语义不变）
+		if int(s.inFlight.Add(1)) > s.cfg.MaxInFlight {
+			s.inFlight.Add(-1)
 			s.dropped.Add(1)
 			continue
 		}
-		go func(conn net.Conn, id uint64) {
+		var resp []byte
+		func() {
+			defer s.inFlight.Add(-1)
 			defer func() {
-				conn.Close()
-				s.conns.Remove(id)
+				if r := recover(); r != nil {
+					s.malformed.Add(1)
+				}
 			}()
-			for {
-				// 每条消息一个空闲期限：挂住不发的本地进程不能无限占 goroutine/fd。
-				_ = conn.SetDeadline(time.Now().Add(tcpIdle))
-				q, err := readTCPMessage(conn)
-				if err != nil {
-					return
-				}
-				s.qtcp.Add(1) // TCP 面单列（StatsLine 判据行；UDP 的 q 语义不变）
-				if int(s.inFlight.Add(1)) > s.cfg.MaxInFlight {
-					s.inFlight.Add(-1)
-					s.dropped.Add(1)
-					continue
-				}
-				var resp []byte
-				func() {
-					defer s.inFlight.Add(-1)
-					defer func() {
-						if r := recover(); r != nil {
-							s.malformed.Add(1)
-						}
-					}()
-					resp = s.respond(q, true)
-				}()
-				if resp == nil || writeTCPMessage(conn, resp) != nil {
-					return
-				}
-			}
-		}(conn, id)
+			resp = s.respond(q, true)
+		}()
+		if resp == nil || writeTCPMessage(conn, resp) != nil {
+			return
+		}
 	}
 }
 

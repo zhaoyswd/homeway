@@ -613,7 +613,8 @@ func tunStatusJSON() string {
 			}
 			via, ep, rttMs, at := tr.linkSnapshot()
 			// dns-host-resolver：出口隧道 IP（扩展用它作 VpnConfig 的 dnsAddresses；
-			// 查询经隧道命中出口 :53 改写 → 本机代答）。常量契约见 wgcore DefaultTunnelIP。
+			// 查询经隧道命中出口栈内的 :53 listener——FIX-60 起不再有回环端口改写）。
+			// 常量契约见 wgcore DefaultTunnelIP。
 			m["exitIp"] = tr.cl.ServerTunnelIP().String()
 			m["link"] = map[string]any{
 				"via":   via,

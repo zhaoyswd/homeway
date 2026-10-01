@@ -11,7 +11,6 @@ import (
 	"bufio"
 	"context"
 	"encoding/base64"
-	"fmt"
 	"github.com/zhaoyswd/homeway/pkg/dns"
 	"github.com/zhaoyswd/homeway/pkg/intercept"
 	"github.com/zhaoyswd/homeway/pkg/proto"
@@ -347,17 +346,26 @@ func TestPeerTTLZeroMeansOff(t *testing.T) {
 
 // TestCloseCleansPartialAssembly（FIX-65）：装配半途失败后统一走 Close——对**部分
 // 装配**的 Server（只有 dnsSrv + 生命周期 ctx，bind/dev/intercept 都还没建）调 Close
-// 不得 panic，且必须：取消 relayCtx（观测面/中继腿随之收）与关掉 DNS 代答。
+// 不得 panic，且必须：取消 relayCtx（观测面/中继腿随之收）与关掉 DNS 代答（含它
+// 接管的注入 listener——FIX-60 起代答自己没有监听面，生命周期全看注入）。
 // 原实现的失败路径各自手写清理（只关 dev / 只关 dns+tunDev），漏一处就是一串泄漏。
 func TestCloseCleansPartialAssembly(t *testing.T) {
-	dnsPort := freeUDPPort(t)
-	dsrv, err := dns.Listen(dns.Config{Addr: fmt.Sprintf("127.0.0.1:%d", dnsPort), Logf: func(string, ...any) {}})
-	if err != nil {
-		t.Fatal(err)
+	dsrv := dns.New(dns.Config{Logf: func(string, ...any) {}})
+	pc, lerr := net.ListenPacket("udp", "127.0.0.1:0")
+	if lerr != nil {
+		t.Fatal(lerr)
 	}
+	ln, lerr := net.Listen("tcp", pc.LocalAddr().String())
+	if lerr != nil {
+		pc.Close()
+		t.Fatal(lerr)
+	}
+	dsrv.ServePacketConn(pc)
+	dsrv.ServeListener(ln)
+	addr := pc.LocalAddr().String()
 	ctx, cancel := context.WithCancel(context.Background())
 	s := &Server{
-		cfg:         ServeConfig{DNSPort: dnsPort, UPnP: false},
+		cfg:         ServeConfig{DNSPort: uint16(pc.LocalAddr().(*net.UDPAddr).Port), UPnP: false},
 		Stats:       &intercept.Stats{},
 		dnsSrv:      dsrv,
 		relayCtx:    ctx,
@@ -369,12 +377,12 @@ func TestCloseCleansPartialAssembly(t *testing.T) {
 	default:
 		t.Fatal("Close 应取消生命周期 ctx（观测面/中继腿随之收）")
 	}
-	// DNS 监听已释放：同端口可再绑。
-	pc, lerr := net.ListenPacket("udp", fmt.Sprintf("127.0.0.1:%d", dnsPort))
-	if lerr != nil {
-		t.Fatalf("DNS 代答未收（端口仍占）：%v", lerr)
+	// 注入的监听已随代答收工：同端口可再绑。
+	pc2, lerr2 := net.ListenPacket("udp", addr)
+	if lerr2 != nil {
+		t.Fatalf("DNS 代答未收（注入的 listener 仍占着）：%v", lerr2)
 	}
-	_ = pc.Close()
+	_ = pc2.Close()
 }
 
 // TestManualPublicEndpointIsPublished（FIX-61）：--public-endpoint = 配置覆盖最高优先

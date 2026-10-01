@@ -38,7 +38,7 @@ func CLI(args []string) error {
 	ddns := fs.String("ddns", "", "DDNS 域名（如 home.example.com）：token 额外带上 host:端口 条目（显式给 = 覆盖 config 的全部条目）；域名记录由你的 DDNS 设施维护，出口只读不自更")
 	maxPeers := fs.Int("max-peers", 32, "设备表容量（同时记住的设备数上限；表满只淘汰超过活跃宽限期未刷新的失联设备）")
 	peerTTL := fs.Duration("peer-ttl", 7*24*time.Hour, "长期不活跃设备的回收期限（0 = 关闭 TTL 回收）")
-	dnsPort := fs.Uint("dns-port", uint(DefaultDNSPort), "DNS 代答监听端口（任意目的 :53 的隧道查询改写到这里，上游=主机系统解析；0 = 关闭代答，:53 按原目标过境重拨）")
+	dnsPort := fs.Uint("dns-port", uint(DefaultDNSPort), "DNS 代答开关与客户端解析腿端口（隧道 IP:53 UDP+TCP 恒服务手机解析；该值 = 客户端远程解析腿 TCP 端口，clientcore 写死 5300；0 = 关闭代答，:53 按原目标过境重拨）")
 	verbose := fs.Bool("verbose", false, "摘要+细节日志同时回显终端（现场排障用）；默认终端只出 token 与端点变化")
 	fs.Usage = func() {
 		fmt.Fprintln(os.Stderr, `用法：

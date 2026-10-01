@@ -34,7 +34,7 @@ const (
 	DefaultFilesPort     = uint16(7802) // files 原生协议（后端本机 127.0.0.1）
 	DefaultTermPort      = uint16(7724) // 终端会话 / agent gateway（与旧栈 tunnel 内虚拟端口同号）
 	DefaultSpeedtestPort = uint16(7803) // 测速服务（tunnel-speedtest：内存收发、不落盘）
-	DefaultDNSPort       = uint16(5300) // DNS 代答（任意目的 :53 改写到这里；不用 53——macOS 非 root 绑不上回环特权端口）
+	DefaultDNSPort       = uint16(5300) // DNS 代答：客户端远程解析腿端口（隧道 IP:<它> TCP；隧道 IP:53 UDP+TCP 恒服务手机解析；不用 53 是历史选择，clientcore 写死 5300）
 )
 
 // BindMode：WG socket（打洞/STUN）钉哪张物理网卡。
@@ -60,7 +60,7 @@ type ServeConfig struct {
 	FilesRoot     string        // files 根（空 = 用户主目录；协议恒读写）
 	TermPort      uint16        // 终端会话 / agent gateway 在本机的监听端口
 	SpeedtestPort uint16        // 测速服务在本机的监听端口（StateDir 为空时该服务不启用）
-	DNSPort       uint16        // DNS 代答监听端口（0 = 禁用：:53 按原目标过境重拨；cli 默认 DefaultDNSPort）
+	DNSPort       uint16        // DNS 代答开关/客户端解析腿端口（0 = 禁用：:53 按原目标过境重拨；cli 默认 DefaultDNSPort）
 	MaxDevices    int           // 设备表容量（0 = 32）
 	PeerTTL       time.Duration // 长期不活跃设备的回收期限（**0 = 关闭 TTL 回收**；缺省 7 天由 config/flag 层落值，FIX-62）
 	// PublicEndpoint 显式公网端点（逗号分隔 `ip:port` 列表；FIX-61）：非空 = **配置覆盖**，
@@ -258,32 +258,40 @@ func Start(ctx context.Context, cfg ServeConfig) (*Server, error) {
 		}
 		logf("DDNS：已配置 %d 个域名（token 叠加域名条目、既有端点全保留；自检随公网端点探测同拍跑）", len(cfg.DDNS))
 	}
-	// DNS 代答（dns-host-resolver）：任意目的 :53 的隧道查询改写进本机代答，
-	// 上游 = 主机系统解析（resolv.conf 跟随；启动时暂无上游不致命——空表周期
-	// 重试，期间查询落兜底，review M6）。可选服务（与 files/term 同取舍），但
-	// 降级后果如实写：监听失败（被占）时 DNSPort 传 0（禁改写）——手机声明的
-	// DNS 是隧道 IP，豁免落到 127.0.0.1:53 无人监听 ⇒ **手机系统解析全断**
-	// （只有应用写死公共 DNS 的查询还有明文过境）。这是硬依赖：靠启动自验证
-	// 的告警行发现，靠进程重启恢复（KeepAlive/launchd 兜）。
-	var dnsPort uint16
+	// DNS 代答（dns-host-resolver；FIX-60 结构）：监听面**在隧道栈内**——隧道
+	// IP:53（UDP+TCP，手机声明的 DNS）是栈内真 listener，demux 先投它（拦截层
+	// 不再改写端口）；客户端远程解析腿（TCP，缺省 5300，clientcore 写死同号）同栈
+	// 监听；应用写死公共 DNS（非隧道 IP 的 :53）由拦截层进程内兜底（v6 过滤不留
+	// 明文泄漏面）。因此没有「host 端口被占 ⇒ 手机解析全断」的失败模式：栈内
+	// listener 不与别的进程抢端口，失败只剩「地址未挂/已被别的栈内 listener
+	// 占用」这类装配问题（逐条告警，兜底腿不受影响）。
+	var dnsOn bool
 	if cfg.DNSPort != 0 {
-		dsrv, derr := dns.Listen(dns.Config{
-			Addr:  fmt.Sprintf("127.0.0.1:%d", cfg.DNSPort),
-			Logf:  logf,
-			DLogf: dlogf,
-		})
-		if derr != nil {
-			logf("⚠️ dns 代答监听失败（%v）——隧道侧 DNS 将全断（隧道IP:53 豁免无人应答），其余功能不受影响；请检查端口占用并重启", derr)
+		dsrv := dns.New(dns.Config{Logf: logf, DLogf: dlogf})
+		pcs, lns, derrs := listenTunnelDNS(ns, cfg.TunnelIP, cfg.DNSPort)
+		for _, e := range derrs {
+			logf("⚠️ dns 代答监听失败（%v）——该面按「未监听」处理（:53 兜底腿仍会应答隧道内查询）", e)
+		}
+		if len(pcs) == 0 && len(lns) == 0 {
+			// 一个都没成：代答整体摘除（与配置关闭同口径）。理论上只有 TunnelIP
+			// 未挂到栈上才会走到这里（装配错误）。
+			logf("⚠️ dns 代答未能建立任何隧道内监听——按关闭处理（:53 按原目标过境重拨）")
 		} else {
-			// 自验证先于就绪行（review M2）：经监听器真发一条查询，失败=告警
-			// 可达（老实现的失败分支是死代码）。失败不禁用改写——上游会跟随
-			// 主机恢复，翻转改写会让 DNS 在两种模式间抖动。
+			for _, pc := range pcs {
+				dsrv.ServePacketConn(pc)
+			}
+			for _, ln := range lns {
+				dsrv.ServeListener(ln)
+			}
+			// 自验证先于就绪行（review M2）：上游此刻可达吗——失败不禁用代答
+			//（上游会跟随主机恢复，翻转会让 DNS 在两种模式间抖动）。
 			if serr := dsrv.SelfCheck(); serr != nil {
 				logf("⚠️ dns 代答自验证未通过（%v）——上游此刻不可达（会跟随主机恢复/空表周期重试），期间查询按 SERVFAIL/兜底处理", serr)
 			}
 			s.dnsSrv = dsrv
-			dnsPort = cfg.DNSPort
-			logf("dns 代答就绪：listen=127.0.0.1:%d upstream=%s", cfg.DNSPort, dsrv.UpstreamsText())
+			dnsOn = true
+			logf("dns 代答就绪：tunnel=%v:53（UDP+TCP）resolve=%v:%d（TCP）upstream=%s",
+				cfg.TunnelIP, cfg.TunnelIP, cfg.DNSPort, dsrv.UpstreamsText())
 		}
 	}
 	// 过境拦截层（l3-exit-intercept）。转发出站流量**一律走系统默认路由**（2026-09-19 定稿）：
@@ -308,7 +316,9 @@ func Start(ctx context.Context, cfg ServeConfig) (*Server, error) {
 	}
 	inter, ierr := intercept.Attach(ns, intercept.Config{
 		TunnelIP: cfg.TunnelIP,
-		DNSPort:  dnsPort,
+		// DNS：:53 的进程内代答腿（FIX-60）——正常由栈内 listener 接（隧道 IP:53），
+		// 本腿兜底写死公共 DNS 的查询与 listener 缺失的降级。
+		DNS: s.dnsSrv,
 		// 过境 TCP 边界（FIX-63）：原 64/30min 耦合——64 路并发对「手机全量流量」太
 		// 窄（一次页面加载的并行连接就能顶到），而 30min 空闲又让泄漏连接占坑过久。
 		// 现 1024 路 / 5min：上限与 pkg/intercept 的默认（4096）同量级留余量；空闲取
@@ -515,8 +525,8 @@ func Start(ctx context.Context, cfg ServeConfig) (*Server, error) {
 	}
 	pub := priv.PublicKey()
 	// 注意：这里是**配置端口**；端口被占用会自动退让，实际端口在下面异步落盘时打（见 listen_port.txt）。
-	logf("serve 就绪：wg=:%d（配置端口；被占用会自动退让）tunnel=%v files=%d term=%d speedtest=%d dns=%d tokens=%d key=%x…",
-		cfg.ListenPort, cfg.TunnelIP, cfg.FilesPort, cfg.TermPort, cfg.SpeedtestPort, dnsPort, len(secrets), pub[:6])
+	logf("serve 就绪：wg=:%d（配置端口；被占用会自动退让）tunnel=%v files=%d term=%d speedtest=%d dns=%v tokens=%d key=%x…",
+		cfg.ListenPort, cfg.TunnelIP, cfg.FilesPort, cfg.TermPort, cfg.SpeedtestPort, dnsOn, len(secrets), pub[:6])
 	return s, nil
 }
 

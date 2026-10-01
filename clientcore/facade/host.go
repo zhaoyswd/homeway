@@ -129,8 +129,8 @@ func (h *Host) DialPort(ctx context.Context, port uint16) (net.Conn, error) {
 
 // Dial 任意目标拨号缝（3e §2.1，D5）：与 DialPort 同 healing 路径、同 demand 记账
 // （源① 拨号尝试 + 源② 在场腿 countedConn）、同重建窗口语义——消费方 = forward 的
-// 任意 IP 目标与 socks 承载面（出口可达目标）；DialPort 仍是出口本机服务端口的
-// 文档主缝（term/files/speedtest/5300 既有消费者零改动）。
+// 任意 IP 目标与 socks 承载面（出口可达目标）；DialPort 仍是出口服务端口的
+// 文档主缝（term/files/speedtest 经 UDS 映射、5300 = 隧道内解析腿，既有消费者零改动）。
 func (h *Host) Dial(ctx context.Context, dst netip.AddrPort) (net.Conn, error) {
 	if h.sess == nil {
 		return nil, ErrNoHost

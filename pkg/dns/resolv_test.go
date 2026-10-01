@@ -17,10 +17,7 @@ func writeResolv(t *testing.T, path, content string) {
 func TestUpstreamsFollowChange(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "resolv.conf")
 	writeResolv(t, path, "# comment\nnameserver 192.168.3.1\n")
-	u, err := NewUpstreams(path)
-	if err != nil {
-		t.Fatal(err)
-	}
+	u := NewUpstreams(path)
 	if got := u.List(); len(got) != 1 || got[0] != "192.168.3.1" {
 		t.Fatalf("初始列表错误: %v", got)
 	}
@@ -41,10 +38,7 @@ func TestUpstreamsFollowChange(t *testing.T) {
 func TestUpstreamsKeepsLastGoodOnCorruption(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "resolv.conf")
 	writeResolv(t, path, "nameserver 192.168.3.1\n")
-	u, err := NewUpstreams(path)
-	if err != nil {
-		t.Fatal(err)
-	}
+	u := NewUpstreams(path)
 	// 瞬坏：空文件 / 只有注释
 	writeResolv(t, path, "")
 	os.Chtimes(path, time.Now().Add(2*time.Second), time.Now().Add(2*time.Second))
@@ -67,10 +61,7 @@ func TestUpstreamsKeepsLastGoodOnCorruption(t *testing.T) {
 func TestUpstreamsEmptyThenRecover(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "resolv.conf")
 	writeResolv(t, path, "search example.com\n") // 无 nameserver：不再失败（review M6）
-	u, err := NewUpstreams(path)
-	if err != nil {
-		t.Fatal(err)
-	}
+	u := NewUpstreams(path)
 	if got := u.List(); len(got) != 0 {
 		t.Fatalf("空表应返回空, got %v", got)
 	}

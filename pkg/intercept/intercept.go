@@ -12,9 +12,11 @@
 //  2. 栈必须 HandleLocal:false（见 wgnet.Opts）：混杂模式的临时端点会命中
 //     HandlePacket 的源地址自检，把所有外来包当「自己发出的」丢弃。
 //
-// 注册 SetTransportProtocolHandler 后，netstack 原生 listener 不再收到
-// demux 失败的包——所以后端本机服务监听真实 127.0.0.1、靠豁免转投到达
-// （历史上兼容期 flows 监听也是这个原因挪出 netstack 的，随 flows 退役已删）。
+// 注册 SetTransportProtocolHandler 后，demux 未命中的包才进本层——出口的本机
+// 服务（files/term/测速/端口转发）监听真实 127.0.0.1、靠豁免转投到达；DNS 代答
+// 反过来：**隧道 IP:53 是栈内真 listener**（demux 先投它），本层只兜底「应用
+// 写死公共 DNS（非隧道 IP 的 :53）」的查询——进程内交给代答器，不落地真实网络
+// （FIX-60；旧形态是任意 :53 改写到 host 127.0.0.1:5300）。
 package intercept
 
 import (
@@ -57,10 +59,13 @@ const (
 // Config：拦截层配置。Dial/ListenUDP 可注入（测试）；nil 用系统默认直连。
 type Config struct {
 	TunnelIP netip.Addr // 出口隧道 IP（dst == 它 → 豁免转投 127.0.0.1:同端口）
-	// DNSPort：DNS 代答监听端口。非 0 时任意目的 :53 改写到 127.0.0.1:DNSPort
-	//（dns-host-resolver；0 = 禁用）。
-	DNSPort uint16
-	// DNSIdle：DNS 会话的空闲回收（默认 10s；测试注入缩短）。
+	// DNS：:53 的进程内代答腿（dns.Server 实现；nil = 关闭兜底，:53 按原目标
+	// 过境重拨）。正常路径 = 隧道 IP:53 由栈内真 listener 接（demux 先投它，本层
+	// 看不到），本腿负责写死公共 DNS 的查询与 listener 缺失时的降级兜底——都不
+	// 落地真实网络（FIX-60：旧形态是「任意 :53 改写到 127.0.0.1:5300」，5300 是
+	// 隐藏契约，且代答 host 端口被占 = 手机解析全断）。
+	DNS DNSAnswerer
+	// DNSIdle：DNS 兜底会话的空闲回收（默认 10s；测试注入缩短）。
 	DNSIdle time.Duration
 	// Dial 同时服务 TCP 与 UDP 重拨（udp = Dial("udp", target)，返回已连接 socket）。
 	Dial func(ctx context.Context, network, address string) (net.Conn, error)
@@ -80,6 +85,16 @@ type Config struct {
 	// false = 未处理，netstack 按「无监听」回 ICMP 不可达（客户端快速失败）。
 	MaxUDPSessions int
 	Logf           func(format string, args ...any)
+}
+
+// DNSAnswerer：:53 进程内代答腿（pkg/dns.Server 实现；见 Config.DNS）。
+// 接口留在本包 = 拦截层不依赖 dns 包（测试可注入假实现）。
+type DNSAnswerer interface {
+	// Answer 处理一条 UDP DNS 查询报文，返回应答（nil = 不回包）。
+	Answer(query []byte) []byte
+	// ServeStream 在一条已建立的 DNS-over-TCP 流上服务（RFC 1035 分帧）；
+	// **conn 生命周期归它**（返回前关）。
+	ServeStream(conn net.Conn)
 }
 
 // Interceptor：挂在 wgnet 栈上的过境流拦截层。Close 收全部会话。
@@ -257,20 +272,19 @@ func (in *Interceptor) regLen() int {
 	return len(in.reg)
 }
 
-// target：原始目的 → 实际重拨目标（豁免映射 + DNS 端口改写，dns-host-resolver）。
-//
-// DNS 改写：任意目的地址的 :53（TCP/UDP 共用本函数）→ 127.0.0.1:DNSPort。
-// 不筛目的地址——应用写死公共 DNS（8.8.8.8 等）的查询同样进代答，否则 v6
-// 过滤对这些查询出现泄漏面。不用 53 端口监听：macOS 非 root 绑不上回环
-// 特权端口；绑 0.0.0.0:53 则是开放解析器。DNSPort=0 = 禁用改写。
+// target：原始目的 → 实际重拨目标（豁免映射：隧道 IP → 本机回环同端口）。
 func (in *Interceptor) target(dst netip.AddrPort) (target netip.AddrPort, exempt bool) {
-	if in.cfg.DNSPort != 0 && dst.Port() == 53 {
-		return netip.AddrPortFrom(loopback4(), in.cfg.DNSPort), true
-	}
 	if dst.Addr() == in.cfg.TunnelIP {
 		return netip.AddrPortFrom(loopback4(), dst.Port()), true
 	}
 	return dst, false
+}
+
+// isDNS：:53 的进程内兜底腿。**不按目的地址筛选**：隧道 IP:53 正常由栈内 listener
+// 接（demux 先投它，本层根本看不到这些包）；listener 缺失/构建失败时同一兜底腿照样
+// 应答隧道内查询（应答源地址 = 原目的，语义一致）——留作降级安全网。
+func (in *Interceptor) isDNS(dst netip.AddrPort) bool {
+	return in.cfg.DNS != nil && dst.Port() == 53
 }
 
 func loopback4() netip.Addr { return netip.MustParseAddr("127.0.0.1") }
@@ -307,6 +321,10 @@ func (in *Interceptor) serveTCP(r *tcp.ForwarderRequest, dst, src netip.AddrPort
 		r.Complete(true)
 		return
 	default:
+	}
+	if in.isDNS(dst) {
+		in.serveDNSTCP(r, dst, src)
+		return
 	}
 	target, exempt := in.target(dst)
 	kind := "transit"
@@ -369,6 +387,36 @@ func (in *Interceptor) serveTCP(r *tcp.ForwarderRequest, dst, src netip.AddrPort
 		in.st.DecrFlow()
 	}
 	in.cfg.Logf("intercept: tcp %s %v ← %v 关闭", kind, target, src)
+}
+
+// serveDNSTCP：写死公共 DNS 的 :53 TCP 兜底（FIX-60）。客户端面建端点后直接在
+// 进程内跑 DNS-over-TCP 会话（代答器 ServeStream 与隧道内 listener 同源），
+// 不拨任何真实网络——应答的源地址 = 原目的（如 8.8.8.8:53），与 UDP 兜底同口径。
+// 不进 drain 登记（与豁免腿同类：本地进程内收尾，不占过境宽限）。
+func (in *Interceptor) serveDNSTCP(r *tcp.ForwarderRequest, dst, src netip.AddrPort) {
+	var wq waiter.Queue
+	ep, terr := r.CreateEndpoint(&wq)
+	if terr != nil {
+		// 同 serveTCP：CreateEndpoint 失败也要 Complete(true) 摘除 inFlight。
+		r.Complete(true)
+		if in.st != nil {
+			in.st.IncrFail()
+		}
+		in.cfg.Logf("intercept: tcp dns %v ← %v 建端点失败：%v", dst, src, terr)
+		return
+	}
+	r.Complete(false) // 段所有权交给端点（顺序同 serveTCP）
+	ep.SocketOptions().SetDelayOption(false)
+	conn := gonet.NewTCPConn(&wq, ep)
+	if in.st != nil {
+		in.st.IncrFlow()
+	}
+	in.cfg.Logf("intercept: tcp dns %v ← %v（进程内代答）", dst, src)
+	in.cfg.DNS.ServeStream(conn) // conn 生命周期归 ServeStream（返回前关）
+	if in.st != nil {
+		in.st.DecrFlow()
+	}
+	in.cfg.Logf("intercept: tcp dns %v ← %v 关闭", dst, src)
 }
 
 // ---------- UDP ----------
@@ -435,27 +483,31 @@ func (in *Interceptor) dropUDP(key string) {
 }
 
 func (in *Interceptor) serveUDP(dst, src netip.AddrPort, key string, first []byte) {
+	// dns：写死公共 DNS 的兜底腿（进程内代答，不落地真实网络）——与 transit/exempt
+	// 并列的第三类，日志与统计口径都单列（见下与 stats.go）。
+	dns := in.isDNS(dst)
 	target, exempt := in.target(dst)
 	kind := "transit"
-	if exempt {
+	switch {
+	case dns:
+		kind = "dns"
+	case exempt:
 		kind = "exempt"
 	}
 	// DNS 会话用更短的空闲回收（review M4）：stub resolver 每查询换源端口时
 	// :53 五元组会话高频新建，60s 全局 idle 会把 4096 会话表堆满、挤掉非 DNS
 	// UDP（QUIC/游戏）。DNS 一问一答即闲，10s 足够覆盖重传窗口。
 	idle := in.cfg.UDPIdle
-	if in.cfg.DNSPort != 0 && target.Port() == in.cfg.DNSPort && target.Addr() == loopback4() {
+	if dns {
 		if in.cfg.DNSIdle > 0 {
 			idle = in.cfg.DNSIdle
 		} else {
 			idle = defaultDNSIdle
 		}
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), dialTimeout)
-	defer cancel()
 	network := "udp4"
 	netProto := ipv4.ProtocolNumber
-	if target.Addr().Is6() {
+	if dst.Addr().Is6() { // 端点族跟随**原目的**（豁免目标被映射成 127.0.0.1，但 spoof 端点绑的是原目的地址）
 		network = "udp6"
 		netProto = ipv6.ProtocolNumber
 	}
@@ -471,14 +523,23 @@ func (in *Interceptor) serveUDP(dst, src netip.AddrPort, key string, first []byt
 		in.cfg.Logf("intercept: udp %s %v ← %v 建端点失败：%v", kind, target, src, err)
 		return
 	}
-	real, err := in.cfg.Dial(ctx, network, target.String())
-	if err != nil {
-		peer.Close()
-		if in.st != nil {
-			in.st.IncrFail()
+	// real：上游腿。dns = 进程内代答腿（应答从原目的地址回客户端，不开真实 socket）；
+	// 其余 = 本机 socket 重拨。
+	var real net.Conn
+	if dns {
+		real = newDNSLeg(in.cfg.DNS)
+	} else {
+		ctx, cancel := context.WithTimeout(context.Background(), dialTimeout)
+		defer cancel()
+		real, err = in.cfg.Dial(ctx, network, target.String())
+		if err != nil {
+			peer.Close()
+			if in.st != nil {
+				in.st.IncrFail()
+			}
+			in.cfg.Logf("intercept: udp %s %v ← %v 开 socket 失败：%v", kind, target, src, err)
+			return
 		}
-		in.cfg.Logf("intercept: udp %s %v ← %v 开 socket 失败：%v", kind, target, src, err)
-		return
 	}
 	// 首包 + 在建窗口的重放（顺序保持：先 first 再 pending）。
 	for _, p := range append([][]byte{first}, in.takePending(key)...) {
@@ -571,7 +632,9 @@ func (in *Interceptor) serveUDP(dst, src netip.AddrPort, key string, first []byt
 	wg.Wait()
 	if in.st != nil {
 		in.st.DecrFlow()
-		if !exempt {
+		if !exempt && !dns {
+			// 只有真实转发（transit）会话进 udpcap 的归宿计数：豁免/本机回环与
+			// DNS 代答（每查询必回包）掺进去会把「实测有回包」做成恒真（stats.go 口径）。
 			in.st.IncrUDPSession(downSeen.Load())
 		}
 	}
@@ -585,8 +648,8 @@ func (in *Interceptor) serveUDP(dst, src netip.AddrPort, key string, first []byt
 // 整条流被丢（2026-09-23 实测：手机 DNS 建会话 96% 失败，每个新域名熬解析器
 // 多轮超时，出口侧 bind udp <隧道IP>:53: port is in use 十分钟刷 503 次）。
 // 共享的 demux 正确性由 Connect 后按全四元组注册保证（各流的端点互不抢占）。
-// 「出口自己不在 netstack 里监听 UDP」⇒ 不存在与不设 reuse 的端点互斥的来源，
-// 共享语义只属于本函数创建的 spoof 端点。
+// 出口自己的 UDP 监听面（DNS 代答：绑隧道 IP:53）与本函数的 spoof 端点绑地址
+// 不同（本机地址 vs 外来目的地址），互不竞争；共享语义只属于 spoof 端点。
 func dialUDPShared(s *stack.Stack, local, remote tcpip.FullAddress, netProto tcpip.NetworkProtocolNumber) (*gonet.UDPConn, error) {
 	var wq waiter.Queue
 	ep, terr := s.NewEndpoint(header.UDPProtocolNumber, netProto, &wq)

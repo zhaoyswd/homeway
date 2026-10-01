@@ -30,14 +30,16 @@ const checkInterval = time.Second
 // systemd-resolved 未就绪时 resolv.conf 可能暂时为空/不可读——若此时失败，
 // 代答整个生命周期都不会再尝试（手机侧已声明隧道 IP 为 DNS，后果全断）。
 // 空表 + List() 的周期重试（见下）覆盖这个窗口；期间查询自然落到兜底上游。
-func NewUpstreams(path string) (*Upstreams, error) {
+// 因而本构造器没有失败路径（FIX-60：原先唯一的 error 出口是 host :53 监听形态的
+// 自环剔除，监听面搬进隧道栈后该形态不复存在）。
+func NewUpstreams(path string) *Upstreams {
 	u := &Upstreams{path: path, lastCheck: time.Now()}
 	if fi, err := os.Stat(path); err == nil {
 		if list := parseResolvNameservers(path); len(list) > 0 {
 			u.list, u.mtime = list, fi.ModTime()
 		}
 	}
-	return u, nil
+	return u
 }
 
 // List 返回当前 nameserver 列表（host 形式，resolv.conf 的 nameserver 都是 IP）。
