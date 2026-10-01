@@ -40,6 +40,9 @@ func (s *Stats) UDPSessions() (uint64, uint64) {
 // IncrReject 计一次「并发闸拒绝」（连接在建立流量前被拒）。
 func (s *Stats) IncrReject() { atomic.AddUint64(&s.rejected, 1) }
 
+// Rejects 已累计的并发闸拒绝数（FIX-63：拒绝行直接带它，排查不必另找统计面）。
+func (s *Stats) Rejects() int64 { return int64(atomic.LoadUint64(&s.rejected)) }
+
 func (s *Stats) Snapshot() map[string]uint64 {
 	return map[string]uint64{
 		"dialok":   atomic.LoadUint64(&s.dialOK),

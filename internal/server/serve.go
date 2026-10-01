@@ -62,7 +62,7 @@ type ServeConfig struct {
 	SpeedtestPort uint16         // 测速服务在本机的监听端口（StateDir 为空时该服务不启用）
 	DNSPort       uint16         // DNS 代答监听端口（0 = 禁用：:53 按原目标过境重拨；cli 默认 DefaultDNSPort）
 	MaxDevices    int            // 设备表容量（0 = 32）
-	PeerTTL       time.Duration  // 长期不活跃设备的回收期限（0 = 7 天；<0 = 关闭 TTL 回收）
+	PeerTTL       time.Duration  // 长期不活跃设备的回收期限（**0 = 关闭 TTL 回收**；缺省 7 天由 config/flag 层落值，FIX-62）
 	BuildTag      string         // 探测应答里回报的构建标记（空 = 用内置默认）
 	BindAddr      netip.Addr     // 非零 = 把 WG UDP socket 绑到该地址（该网卡出站；STUN 观测同 socket）
 	BindIface     *net.Interface // 非空 = 双栈监听并整条 socket 钉在该网卡（同时支持 v4/v6 客户端）
@@ -122,9 +122,6 @@ func (c *ServeConfig) fill() {
 	}
 	if c.MaxDevices <= 0 {
 		c.MaxDevices = 32
-	}
-	if c.PeerTTL == 0 {
-		c.PeerTTL = 7 * 24 * time.Hour
 	}
 }
 
@@ -294,8 +291,13 @@ func Start(ctx context.Context, cfg ServeConfig) (*Server, error) {
 	inter, ierr := intercept.Attach(ns, intercept.Config{
 		TunnelIP:      cfg.TunnelIP,
 		DNSPort:       dnsPort,
-		MaxConns:      64,
-		TCPIdle:       30 * time.Minute,
+		// 过境 TCP 边界（FIX-63）：原 64/30min 耦合——64 路并发对「手机全量流量」太
+		// 窄（一次页面加载的并行连接就能顶到），而 30min 空闲又让泄漏连接占坑过久。
+		// 现 1024 路 / 5min：上限与 pkg/intercept 的默认（4096）同量级留余量；空闲取
+		// 评审区间上沿（3–5min）——交互式长空闲（无应用层 keepalive 的 SSH）5 分钟被
+		// 收是取舍：再短会误伤，再长则泄漏占坑。被收表现为连接重置，应用重连即可。
+		MaxConns:      1024,
+		TCPIdle:       5 * time.Minute,
 		LocalServices: localSvcs,
 		Logf:          dlogf,
 	}, s.Stats)

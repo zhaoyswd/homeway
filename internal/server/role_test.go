@@ -326,3 +326,19 @@ func TestServeSnapshotMasksToken(t *testing.T) {
 		t.Fatalf("快照监听口 %d ≠ 实际 %d", snap.ListenPort, b.LocalPort())
 	}
 }
+
+// TestPeerTTLZeroMeansOff（FIX-62）：0 = **关闭** TTL 回收（三处口径统一）。
+// 原实现 fill() 把 0 改写成 7 天——「--peer-ttl 0」/config `peer_ttl="0s"` 都
+// 无法真正关掉回收（口径写「0 = 关」，行为是「0 = 缺省」）。
+func TestPeerTTLZeroMeansOff(t *testing.T) {
+	var c ServeConfig
+	c.fill()
+	if c.PeerTTL != 0 {
+		t.Fatalf("fill 不得改写 PeerTTL（0 = 关），got %v", c.PeerTTL)
+	}
+	// 设备表：TTL=0 ⇒ 不回收（peers.go 的 ttl<=0 分支；构造器不再把 0 改写成 7 天）。
+	tbl := servercore.NewDeviceTable(nil, nil, servercore.DeviceConfig{MaxDevices: 4})
+	if _, ttl, _ := tbl.Limits(); ttl != 0 {
+		t.Fatalf("表限额应原样携带 0（0 = 关）：%v", ttl)
+	}
+}

@@ -76,7 +76,7 @@ var (
 // DeviceConfig 设备表参数（零值走默认）。
 type DeviceConfig struct {
 	MaxDevices int           // <=0 = 32
-	TTL        time.Duration // 0 = 7 天；<0 = 关闭 TTL 回收
+	TTL        time.Duration // **0 = 关闭 TTL 回收**（缺省 7d 由 config/flag 层落值，FIX-62；<0 视同关）
 	Grace      time.Duration // <=0 = 10 分钟（表满淘汰门槛）
 }
 
@@ -177,9 +177,6 @@ const tunnelBase = "100.64.0.0"
 func NewDeviceTable(cfg Configurer, secrets [][32]byte, opt DeviceConfig) *DeviceTable {
 	if opt.MaxDevices <= 0 {
 		opt.MaxDevices = defaultMaxDevices
-	}
-	if opt.TTL == 0 {
-		opt.TTL = defaultTTL
 	}
 	if opt.Grace <= 0 {
 		opt.Grace = defaultGrace

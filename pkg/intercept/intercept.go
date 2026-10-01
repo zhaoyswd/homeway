@@ -286,7 +286,14 @@ func (in *Interceptor) handleTCP(r *tcp.ForwarderRequest) {
 		if in.st != nil {
 			in.st.IncrReject()
 		}
-		in.cfg.Logf("intercept: tcp 拒绝 %v ← %v（并发上限 %d）", dst, src, in.cfg.MaxConns)
+		// 拒绝行带在册数（含本次 +1 前的值）与拒绝累计（FIX-63：拒绝行原本只有上限，
+		// 排查时要另找统计面才知道「拒了多少、当时在册多少」）。
+		rejects := int64(0)
+		if in.st != nil {
+			rejects = in.st.Rejects()
+		}
+		in.cfg.Logf("intercept: tcp 拒绝 %v ← %v（并发上限 %d，在册 %d，累计拒绝 %d）",
+			dst, src, in.cfg.MaxConns, in.conns.Load()+1, rejects)
 		r.Complete(true)
 		return
 	}

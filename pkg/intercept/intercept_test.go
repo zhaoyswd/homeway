@@ -795,3 +795,62 @@ func TestUDPConcurrentDNSRewrite(t *testing.T) {
 	}
 	assertNoEndpointFail(t, h)
 }
+
+// TestTCPRejectLineHasCounts（FIX-63）：并发闸拒绝行带**在册数**与**累计拒绝数**，
+// 且拒绝会计入 Stats.rejected（排查不必另找统计面）。
+func TestTCPRejectLineHasCounts(t *testing.T) {
+	echo := echoTCP(t)
+	var mu sync.Mutex
+	var lines []string
+	h := newHarnessCfg(t, func(ctx context.Context, network, address string) (net.Conn, error) {
+		var d net.Dialer
+		return d.DialContext(ctx, network, echo.String())
+	}, func(c *Config) {
+		c.Logf = func(f string, a ...any) {
+			mu.Lock()
+			lines = append(lines, fmt.Sprintf(f, a...))
+			mu.Unlock()
+		}
+	})
+	h.in.cfg.MaxConns = 1
+
+	// 第一路占住在册名额（连上 echo 不关）。
+	c1, err := h.cli.DialTCPAddrPort(netip.AddrPortFrom(netip.MustParseAddr(srvAddr), 8080))
+	if err != nil {
+		t.Fatalf("第一路应放行：%v", err)
+	}
+	defer c1.Close()
+	// 等第一路真正在册（dialok 行出现）。
+	waitLogLine(t, &mu, &lines, "dialok")
+
+	// 第二路：超上限被拒（连接直接不通）。
+	if _, err := h.cli.DialTCPAddrPort(netip.AddrPortFrom(netip.MustParseAddr(srvAddr), 8081)); err == nil {
+		t.Fatal("超上限的第二路应被拒（连接不该建立）")
+	}
+	waitLogLine(t, &mu, &lines, "累计拒绝")
+	mu.Lock()
+	joined := strings.Join(lines, "\n")
+	mu.Unlock()
+	if !strings.Contains(joined, "在册") || !strings.Contains(joined, "累计拒绝 1") {
+		t.Fatalf("拒绝行应含在册数与累计拒绝数：\n%s", joined)
+	}
+	if got := h.st.Rejects(); got != 1 {
+		t.Fatalf("Stats.rejected 应计 1，got %d", got)
+	}
+}
+
+// waitLogLine 轮询等日志出现子串（harness 日志是并发写的，加锁读快照）。
+func waitLogLine(t *testing.T, mu *sync.Mutex, lines *[]string, want string) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		mu.Lock()
+		joined := strings.Join(*lines, "\n")
+		mu.Unlock()
+		if strings.Contains(joined, want) {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("等日志 %q 超时", want)
+}

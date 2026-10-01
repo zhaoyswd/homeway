@@ -324,3 +324,44 @@ func TestUpdateSerialWritesPreserved(t *testing.T) {
 		t.Fatalf("串行更新应累积到 41002，got %d", got.Serve.Listen)
 	}
 }
+
+// TestPeerTTLZeroOffAbsentDefault（FIX-62）：三处口径统一为「0 = 关」：
+// 省略键 = 缺省 7 天（defaultFile 预装）；显式 "0s" = 关；负值 = 非法。
+func TestPeerTTLZeroOffAbsentDefault(t *testing.T) {
+	dir := t.TempDir()
+	path := Path(dir)
+	// 省略键 ⇒ 缺省 7 天。
+	if err := os.WriteFile(path, []byte(""), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	c, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.Serve.PeerTTL != 7*24*time.Hour {
+		t.Fatalf("省略键应为缺省 7 天，got %v", c.Serve.PeerTTL)
+	}
+	// 显式 0 ⇒ 关（不再被 fill 改写成 7 天）。
+	if err := os.WriteFile(path, []byte("peer_ttl = \"0s\"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	_ = err
+	// 该键在 [serve] 段下：
+	if err := os.WriteFile(path, []byte("[serve]\npeer_ttl = \"0s\"\nlisten = 41641\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	c, err = Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.Serve.PeerTTL != 0 {
+		t.Fatalf("显式 0s 应为「关」（0），got %v", c.Serve.PeerTTL)
+	}
+	// 负值非法。
+	if err := os.WriteFile(path, []byte("[serve]\npeer_ttl = \"-1h\"\nlisten = 41641\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Load(path); err == nil || !strings.Contains(err.Error(), "peer_ttl") {
+		t.Fatalf("负值应被校验拒绝：%v", err)
+	}
+}

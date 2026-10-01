@@ -52,7 +52,7 @@ type Serve struct {
 	STUN6         string        // v6 路径校验；空 = 关
 	Relay         string        // 上游中继 token（rl1…）或裸 IP:port（开放模式）；空 = 不用
 	MaxPeers      int           // 设备表容量
-	PeerTTL       time.Duration // 失联设备回收 TTL；0 = 关
+	PeerTTL       time.Duration // 失联设备回收 TTL；**0 = 关**（缺省 7d 由 Default() 落、省略键即缺省；<0 非法）
 	DNSPort       uint16        // DNS 代答端口；0 = 关闭代答
 	FilesRoot     string        // files 根；空 = $HOME
 	DDNS          []string      // DDNS 裸域名，可多条（出口只读解析，不自更记录）
@@ -259,7 +259,7 @@ func validateFile(path string, f *fileConfig) error {
 		return err
 	}
 	if f.Serve.PeerTTL < 0 {
-		return bad("serve.peer_ttl", "%v 非法（时长串，如 \"168h\"；不小于 0）", f.Serve.PeerTTL)
+		return bad("serve.peer_ttl", "%v 非法（时长串，如 \"168h\"；须 ≥ 0，0 = 关闭 TTL 回收）", f.Serve.PeerTTL)
 	}
 	for _, d := range f.Serve.DDNS {
 		if d.Domain == "" {
