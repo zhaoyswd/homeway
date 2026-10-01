@@ -345,7 +345,13 @@ public:
     // `snapshots` 是普通 uint64（Stats 要可拷贝，不能塞 atomic），而它由 transport reader
     // 线程写在 `m_gridMu` 之外——NAPI 侧（回前台探活的判据）读它属数据竞争。这里单独用
     // atomic 记一份，写点与 `m_stats.snapshots++` 相邻（同一处，不会漂移）。
-    uint64_t snapshotCount() const { return m_snapCount.load(std::memory_order_relaxed); }
+    // FIX-31：跨线程读统计的唯一入口——**锁内拷一份**。stats() 返回的是 m_stats 的
+    // 引用（普通 uint64，由 transport reader 线程写），跨线程裸读属数据竞争；此前只给
+    // snapshots 一个 atomic 特例（m_snapCount），其余字段照旧竞争，特例本身也已无消费者。
+    Stats statsSnapshot() const {
+        std::lock_guard<std::mutex> lk(m_statsMu);
+        return m_stats;
+    }
     // 最近一次拒收原因（观测/诊断）。
     const std::string& lastError() const { return m_lastError; }
     static constexpr uint64_t kFragTimeoutMs = 3000;
@@ -358,7 +364,10 @@ private:
     uint64_t m_fragStartMs = 0;
     bool m_fragActive = false;
     Stats m_stats;
-    std::atomic<uint64_t> m_snapCount{0}; // 见 snapshotCount()：跨线程读的那一份（L3）
+    // m_statsMu 保护 m_stats（reader 线程写 / 任意线程经 statsSnapshot() 读）。
+    // 写侧只在 onFrame/noteRemoteError/pollTimeout/applyFetchRows 内持锁自增，
+    // 锁序 = statsMu → gridMu（无反向路径，见 FIX-31 注释）。
+    mutable std::mutex m_statsMu;
     std::string m_lastError;
     std::string m_lastTitle;  // 上一次转发过的标题（变化才发 OSC 事件）
     std::atomic<uint8_t> m_agentKind{0};

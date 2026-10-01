@@ -479,6 +479,8 @@ std::string CellGrid::toText() const {
 // ---- SurfaceSession（客户端状态机，任务 3.1）----
 
 bool SurfaceSession::onFrame(uint8_t op, const uint8_t* payload, size_t len, uint64_t nowMs) {
+    // FIX-31：本方法内所有 m_stats 自增都在 m_statsMu 下（跨线程读者走 statsSnapshot()）。
+    std::lock_guard<std::mutex> slk(m_statsMu);
     m_stats.framesIn++;
     m_stats.bytesIn += len;
     if (len >= 1 && (payload[0] & kFragMoreBit) != 0 && !m_fragActive) {
@@ -536,7 +538,6 @@ bool SurfaceSession::onFrame(uint8_t op, const uint8_t* payload, size_t len, uin
             m_snapshotOk.store(true, std::memory_order_relaxed);
             m_stats.snapshots++;
             // 跨线程读的那一份（L3）：与上一行同处递增，保持两个计数一致。
-            m_snapCount.fetch_add(1, std::memory_order_relaxed);
             // 标题（任务 3.4）：surface 腿本地 vt 看不到 OSC，标题来自快照与 STATE 帧。
             noteTitle(snap.title);
             return false;
@@ -607,6 +608,8 @@ void SurfaceSession::noteTitle(const std::string& title) {
 }
 
 void SurfaceSession::noteRemoteError() {
+    std::lock_guard<std::mutex> slk(m_statsMu);
+
     // 稳态的出口 opError（原来被传输层的 default 静默吞掉）：计数 + **清预取单飞**——
     // 否则一次 FETCH 失败就把 m_fetchPending 永久钉住，回滚预取死掉、缓存填不上（真机症状：
     // 新会话上下滑不生效，且预取计数停在 1 不动）。
@@ -620,6 +623,8 @@ void SurfaceSession::noteAgentState(uint8_t agent, uint8_t state) {
 }
 
 bool SurfaceSession::pollTimeout(uint64_t nowMs) {
+    std::lock_guard<std::mutex> slk(m_statsMu);
+
     if (!m_fragActive) return false;
     if (nowMs - m_fragStartMs < kFragTimeoutMs) return false;
     m_asm.reset();
@@ -631,6 +636,8 @@ bool SurfaceSession::pollTimeout(uint64_t nowMs) {
 }
 
 bool SurfaceSession::applyFetchRows(const FetchRowsReply& reply) {
+    std::lock_guard<std::mutex> slk(m_statsMu);
+
     std::lock_guard<std::mutex> lk(m_gridMu);
     const Geometry g = m_grid.geometry();
     if (reply.geom.cols != g.cols || reply.geom.rows != g.rows) {

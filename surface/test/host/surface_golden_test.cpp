@@ -179,7 +179,14 @@ int main(int argc, char** argv) {
                 now += 1;
             }
         }
-        const auto& st = sess.stats();
+        // FIX-31：跨线程安全读入口（锁内拷一份）。宿主测试是单线程，用它与用
+        // stats() 等价——这里刻意用新入口，保证它被真实编译/执行到。
+        const auto st = sess.statsSnapshot();
+        if (st.framesIn == 0) {
+            failures++;
+            std::cerr << "[FAIL] " << s.name << "：statsSnapshot 未反映收到的帧（framesIn=0）\n";
+            continue;
+        }
         if (needFetch || st.patchRejects > 0 || st.fragTimeouts > 0) {
             failures++;
             std::cerr << "[FAIL] " << s.name << "：状态机拒收/请求全量了（rejects=" << st.patchRejects
@@ -291,7 +298,7 @@ int main(int argc, char** argv) {
             const auto& d = diffFrames[1];
             bool fetch = false;
             for (const auto& ch : d.chunks) fetch = early.onFrame(d.op, ch.data(), ch.size(), 1000);
-            if (!fetch || early.stats().patchRejects == 0 || early.hasSnapshot()) {
+            if (!fetch || early.statsSnapshot().patchRejects == 0 || early.hasSnapshot()) {
                 failures++;
                 std::cerr << "[FAIL] 负路径①：差分早于快照时应拒收并请求全量\n";
             } else {
@@ -345,7 +352,7 @@ int main(int argc, char** argv) {
             const bool early = s2.onFrame(frames[0].op, partial.data(), partial.size(), 1000);
             const bool beforeTimeout = s2.pollTimeout(1000 + tierterm::SurfaceSession::kFragTimeoutMs - 1);
             const bool afterTimeout = s2.pollTimeout(1000 + tierterm::SurfaceSession::kFragTimeoutMs + 1);
-            if (early || beforeTimeout || !afterTimeout || s2.stats().fragTimeouts != 1) {
+            if (early || beforeTimeout || !afterTimeout || s2.statsSnapshot().fragTimeouts != 1) {
                 failures++;
                 std::cerr << "[FAIL] 负路径③：不完整分片组该在超时后丢弃并请求全量\n";
             } else {
