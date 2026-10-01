@@ -22,7 +22,9 @@ func testRoot(t *testing.T) string {
 // 台账多于代码 = 台账腐化红。
 func TestLedgerProductionMatches(t *testing.T) {
 	root := testRoot(t)
-	ex, err := ExtractAll(root)
+	// ComputedSets = 生成器（ledgergen）与门共用的同一计算面（FIX-101）：
+	// 提取结果 + 族⑥⑦透传并集（mapNativeFilesErr/ERROR 帧透传不滤值）。
+	computed, err := ComputedSets(root)
 	if err != nil {
 		t.Fatalf("提取失败：%v", err)
 	}
@@ -30,31 +32,6 @@ func TestLedgerProductionMatches(t *testing.T) {
 	if err != nil {
 		t.Fatalf("台账加载失败：%v", err)
 	}
-
-	// 族⑥⑦的生产集 = 自产常量 ∪ 透传族全集（mapNativeFilesErr/ERROR 帧透传不滤值）。
-	computed := Extracted{}
-	for fam, units := range ex {
-		computed[fam] = map[string]map[string]string{}
-		for u, vals := range units {
-			m := map[string]string{}
-			for v, n := range vals {
-				m[v] = n
-			}
-			computed[fam][u] = m
-		}
-	}
-	mergeInto := func(family, unit string, src map[string]string) {
-		if computed[family][unit] == nil {
-			computed[family][unit] = map[string]string{}
-		}
-		for v, n := range src {
-			if _, ok := computed[family][unit][v]; !ok {
-				computed[family][unit][v] = n
-			}
-		}
-	}
-	mergeInto("bridge-files", "code", ex["files-proto"]["code"])
-	mergeInto("bridge-term", "code", ex["term-error"]["code"])
 
 	checked := 0
 	for _, r := range constRules {

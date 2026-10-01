@@ -435,3 +435,69 @@ func parseFileComments(fset *token.FileSet, path string) (*ast.File, error) {
 func unquote(v string) (string, error) {
 	return strconv.Unquote(v)
 }
+
+// ComputedSets 生产值集的**完整计算面**（规则① 的比较基集）：提取结果 + 族⑥⑦透传
+// 并集（bridge-files/bridge-term 的透传不滤值）。测试门与 ledgergen 生成器共用同一
+// 计算——两处各算一遍会让生成器与门漂移。
+func ComputedSets(root string) (Extracted, error) {
+	ex, err := ExtractAll(root)
+	if err != nil {
+		return nil, err
+	}
+	computed := Extracted{}
+	for fam, units := range ex {
+		computed[fam] = map[string]map[string]string{}
+		for u, vals := range units {
+			m := map[string]string{}
+			for v, n := range vals {
+				m[v] = n
+			}
+			computed[fam][u] = m
+		}
+	}
+	mergeInto := func(family, unit string, src map[string]string) {
+		if computed[family][unit] == nil {
+			computed[family][unit] = map[string]string{}
+		}
+		for v, n := range src {
+			if _, ok := computed[family][unit][v]; !ok {
+				computed[family][unit][v] = n
+			}
+		}
+	}
+	mergeInto("bridge-files", "code", ex["files-proto"]["code"])
+	mergeInto("bridge-term", "code", ex["term-error"]["code"])
+	return computed, nil
+}
+
+// UnitRef 一个 (family, unit) 对（生成器与门遍历提取清单用）。
+type UnitRef struct {
+	Family string
+	Unit   string
+}
+
+// ExtractUnits 有提取源的 (family, unit) 全集（constRules ∪ payloadRules ∪ ctorRules，
+// 去重、稳定序）。生成器据此遍历；空集时返回空切片（调用方按「空集假绿」拒绝）。
+func ExtractUnits() []UnitRef {
+	seen := map[UnitRef]bool{}
+	var out []UnitRef
+	add := func(family, unit string) {
+		k := UnitRef{family, unit}
+		if !seen[k] {
+			seen[k] = true
+			out = append(out, k)
+		}
+	}
+	for _, r := range constRules {
+		for _, u := range r.Units {
+			add(r.Family, u)
+		}
+	}
+	for _, r := range payloadRules {
+		add(r.Family, r.Unit)
+	}
+	for _, r := range ctorRules {
+		add(r.Family, r.Unit)
+	}
+	return out
+}
