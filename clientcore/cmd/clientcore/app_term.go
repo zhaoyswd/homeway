@@ -6,10 +6,10 @@
 // （127.0.0.1:7723 → 隧道 → 出口 term 端口，见 app_termbridge.go）说帧协议即可：
 // 每次操作开一条短连接、发一帧、读回复、关连接。JSON 进 JSON 出（NAPI 侧整体挪出 JS 线程）。
 //
-// 帧操作码与协议版本经 import `pkg/term` 编译期锚定（core-homeway-merge 任务 2.6，
-// 此前是手抄常量）；帧编解码（3 字节头）与 ERROR/KILL 载荷布局仍是本文件的手抄子集，
-// 升级帧格式时须与 homeway `pkg/term/frames.go` 两侧同改。这里只实现一次性操作需要的子集：
-// GREETING / LIST / KILL / OK / ERROR。
+// 帧操作码、协议版本与**帧编解码**全部经 import `pkg/term`（core-homeway-merge 任务 2.6
+// 锚定常量；FIX-94 起 EncodeFrame/ReadFrame/DecodeGreeting/DecodeErrorPayload/EncodeName
+// 导出面取代本文件的手抄子集——升级帧格式只需改 homeway 一处）。本文件只剩一次性操作
+// （GREETING / LIST / KILL / OK / ERROR）的**归因层**（termError 码表）。
 package main
 
 /*
@@ -18,10 +18,8 @@ package main
 import "C"
 
 import (
-	"encoding/binary"
 	"encoding/json"
 	"fmt"
-	"io"
 	"net"
 	"time"
 
@@ -107,7 +105,7 @@ func termDial(authHex, sock string) (net.Conn, *termError) {
 		return nil, termErrf(termCodeBridgeAuth, "终端通道鉴权失败：%v", err)
 	}
 	_ = conn.SetDeadline(time.Now().Add(termIOTimeout))
-	code, payload, err := termReadFrame(conn)
+	code, payload, err := term.ReadFrame(conn)
 	if err != nil {
 		_ = conn.Close()
 		// 两种可能都在这条分支上：① 出口根本没有 term 服务（官方版/旧版，链路会先被
@@ -126,7 +124,7 @@ func termDial(authHex, sock string) (net.Conn, *termError) {
 		return nil, termErrf(termCodeTermForeign,
 			"出口 %d 端口上不是终端服务（收到帧 0x%02x）", termServicePort(), code)
 	}
-	if len(payload) < 5 || payload[0] != term.ProtoVer {
+	if ver, _, gerr := term.DecodeGreeting(payload); gerr != nil || ver != term.ProtoVer {
 		_ = conn.Close()
 		return nil, termErrf(termCodeTermVersion, "出口终端服务协议版本不匹配（本端 %d）", term.ProtoVer)
 	}
@@ -139,10 +137,10 @@ func termList(authHex, sock string) (map[string]any, *termError) {
 		return nil, terr
 	}
 	defer conn.Close()
-	if err := termWriteFrame(conn, term.OpList, nil); err != nil {
+	if _, err := conn.Write(term.EncodeFrame(term.OpList, nil)); err != nil {
 		return nil, termErrf(termCodeIO, "发送 LIST 失败：%v", err)
 	}
-	code, payload, err := termReadFrame(conn)
+	code, payload, err := term.ReadFrame(conn)
 	if err != nil {
 		return nil, termErrf(termCodeIO, "读取 LIST 回复失败：%v", err)
 	}
@@ -172,14 +170,10 @@ func termKill(name string, authHex, sock string) (map[string]any, *termError) {
 		return nil, terr
 	}
 	defer conn.Close()
-	// KILL 载荷 = [nameLen:1][name]
-	payload := make([]byte, 1+len(name))
-	payload[0] = byte(len(name))
-	copy(payload[1:], name)
-	if err := termWriteFrame(conn, term.OpKill, payload); err != nil {
+	if _, err := conn.Write(term.EncodeFrame(term.OpKill, term.EncodeName(name))); err != nil {
 		return nil, termErrf(termCodeIO, "发送 KILL 失败：%v", err)
 	}
-	code, reply, err := termReadFrame(conn)
+	code, reply, err := term.ReadFrame(conn)
 	if err != nil {
 		return nil, termErrf(termCodeIO, "读取 KILL 回复失败：%v", err)
 	}
@@ -193,49 +187,13 @@ func termKill(name string, authHex, sock string) (map[string]any, *termError) {
 	}
 }
 
-// termDecodeError 解 ERROR 载荷：[codeLen:1][code][msgLen:2 LE][msg]。
+// termDecodeError 解 ERROR 载荷（布局经 pkg/term.DecodeErrorPayload——单一来源）。
 func termDecodeError(p []byte) *termError {
-	if len(p) < 1 {
-		return termErrf(termCodeRemote, "出口返回了空错误帧")
-	}
-	codeLen := int(p[0])
-	if len(p) < 1+codeLen+2 {
+	code, msg, err := term.DecodeErrorPayload(p)
+	if err != nil {
 		return termErrf(termCodeRemote, "出口错误帧格式不完整")
 	}
-	code := string(p[1 : 1+codeLen])
-	off := 1 + codeLen
-	msgLen := int(binary.LittleEndian.Uint16(p[off : off+2]))
-	if len(p) < off+2+msgLen {
-		return termErrf(termCodeRemote, "出口错误帧消息不完整（code=%s）", code)
-	}
-	return &termError{Code: code, Msg: string(p[off+2 : off+2+msgLen])}
-}
-
-// ---- 帧编解码（子集）----
-
-func termWriteFrame(w io.Writer, op byte, payload []byte) error {
-	buf := make([]byte, 3+len(payload))
-	buf[0] = op
-	binary.LittleEndian.PutUint16(buf[1:3], uint16(len(payload)))
-	copy(buf[3:], payload)
-	_, err := w.Write(buf)
-	return err
-}
-
-func termReadFrame(r io.Reader) (byte, []byte, error) {
-	var hdr [3]byte
-	if _, err := io.ReadFull(r, hdr[:]); err != nil {
-		return 0, nil, err
-	}
-	n := int(binary.LittleEndian.Uint16(hdr[1:3]))
-	var payload []byte
-	if n > 0 {
-		payload = make([]byte, n)
-		if _, err := io.ReadFull(r, payload); err != nil {
-			return 0, nil, err
-		}
-	}
-	return hdr[0], payload, nil
+	return &termError{Code: code, Msg: msg}
 }
 
 func termMarshal(res map[string]any, err *termError) *C.char {

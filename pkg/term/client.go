@@ -10,6 +10,7 @@ package term
 import (
 	"context"
 	"errors"
+	"io"
 	"net"
 )
 
@@ -35,6 +36,30 @@ const (
 
 // StreamDial 起一条内部流（生产 = 拨隧道 IP 的 TermPort，出口豁免转投本机同端口）。
 type StreamDial func(ctx context.Context) (net.Conn, error)
+
+// ---- 帧编解码的导出面（FIX-94：clientcore 的一次性操作曾手抄这套布局，两侧同改是
+// 维护陷阱——统一从这里取；归因文案仍由调用方按自己的错误码空间组装）----
+
+// EncodeFrame 组一帧（[op][len:2 LE][payload]）。
+func EncodeFrame(op byte, payload []byte) []byte { return encodeTermFrame(op, payload) }
+
+// ReadFrame 读一帧（返回 op 与载荷；io.EOF 等错误原样上抛）。
+func ReadFrame(r io.Reader) (op byte, payload []byte, err error) {
+	f, err := readTermFrame(r)
+	if err != nil {
+		return 0, nil, err
+	}
+	return f.op, f.payload, nil
+}
+
+// DecodeGreeting 解 GREETING 载荷（ver + features；长度不足报 errTermFrame）。
+func DecodeGreeting(p []byte) (ver byte, features uint32, err error) { return decGreeting(p) }
+
+// DecodeErrorPayload 解 ERROR 载荷（[codeLen:1][code][msgLen:2 LE][msg]）。
+func DecodeErrorPayload(p []byte) (code, msg string, err error) { return decErrPayload(p) }
+
+// EncodeName 组 [nameLen:1][name]（KILL 等按名操作的载荷）。
+func EncodeName(name string) []byte { return encName(name) }
 
 // Client 终端服务客户端（每条腿一条流；会话由后端持有，断腿不杀进程）。
 type Client struct{ Dial StreamDial }
