@@ -308,7 +308,7 @@ func TestForwardDeleteNotForceClose(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer conn.Close()
-	waitFor(t, time.Second, func() bool {
+	waitFor(t, enterWait, func() bool {
 		for _, st := range c.ForwardStates(host) {
 			if st.Conns >= 1 {
 				return true
@@ -437,6 +437,11 @@ func TestSocksCorruptRebuild(t *testing.T) {
 }
 
 // waitFor 轮询等待条件成立。
+// enterWait：状态面「进入/到达」等待预算。CI 共享 runner 高负载下 1s 预算偶发超时
+// （2026-10-02 v0.16.0 发版预跑实测 TestSpeedRunnerCancelDuringWaiting 1.01s 超时；
+// 同刻本地 10 连跑全绿）——到达/入口类等待统一用它；窗口/节拍等语义断言不用本值。
+const enterWait = 5 * time.Second
+
 func waitFor(t *testing.T, timeout time.Duration, cond func() bool, what string) {
 	t.Helper()
 	deadline := time.Now().Add(timeout)
@@ -700,7 +705,7 @@ func TestSocksOffRSTLiveConns(t *testing.T) {
 	if conn == nil {
 		t.Fatal("CONNECT 应成功")
 	}
-	waitFor(t, time.Second, func() bool { return c.SocksStates()[0].Conns >= 1 }, "在世连接可观察")
+	waitFor(t, enterWait, func() bool { return c.SocksStates()[0].Conns >= 1 }, "在世连接可观察")
 
 	if err := c.SocksOff(host); err != nil {
 		t.Fatal(err)
@@ -858,15 +863,16 @@ func TestSpeedRunnerWaitingExpiry(t *testing.T) {
 	}
 	c := openTestCarriers(t, fd)
 	host := strings.Repeat("aa", 32)
-	ack := c.SpeedtestStart(host, SpeedtestStart{Down: time.Second, Up: time.Second, WaitMs: 600})
+	// WaitMs 放大到 3s：窗口须显著大于入口延迟（600ms 在 CI 负载下贴边，入口+观测会错过窗口）。
+	ack := c.SpeedtestStart(host, SpeedtestStart{Down: time.Second, Up: time.Second, WaitMs: 3000})
 	if ack.Phase != "waiting" {
 		t.Fatalf("start 应返回 waiting：%+v", ack)
 	}
-	waitFor(t, time.Second, func() bool {
+	waitFor(t, enterWait, func() bool {
 		st := c.SpeedtestStatus(host)
 		return st != nil && st.Waiting
 	}, "预算内应保持 waiting")
-	waitFor(t, 3*time.Second, func() bool {
+	waitFor(t, 6*time.Second, func() bool {
 		st := c.SpeedtestStatus(host)
 		return st != nil && !st.Waiting && st.Snap.Reason == speedtest.ReasonLinkDown
 	}, "到点应 link_down 收场")
@@ -882,7 +888,7 @@ func TestSpeedRunnerCancelDuringWaiting(t *testing.T) {
 	c := openTestCarriers(t, fd)
 	host := strings.Repeat("aa", 32)
 	c.SpeedtestStart(host, SpeedtestStart{Down: time.Second, Up: time.Second, WaitMs: 60000})
-	waitFor(t, time.Second, func() bool {
+	waitFor(t, enterWait, func() bool {
 		st := c.SpeedtestStatus(host)
 		return st != nil && st.Waiting
 	}, "应进入 waiting")
