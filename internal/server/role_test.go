@@ -39,9 +39,9 @@ func freeUDPPort(t *testing.T) uint16 {
 func safeServeCfg(t *testing.T, stateDir string, mutate func(*ServeConfig)) ServeConfig {
 	t.Helper()
 	// 兜底窗缩到亚秒（生产 15s；同款 var 测试缝，见 role.go）。
-	old := tokenFallbackWait
-	tokenFallbackWait = 200 * time.Millisecond
-	t.Cleanup(func() { tokenFallbackWait = old })
+	old := tokenFallbackWait.Load()
+	tokenFallbackWait.Store(int64(200 * time.Millisecond))
+	t.Cleanup(func() { tokenFallbackWait.Store(old) })
 	cfg := ServeConfig{
 		StateDir:   stateDir,
 		ListenPort: freeUDPPort(t),

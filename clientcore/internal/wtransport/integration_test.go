@@ -47,8 +47,9 @@ type srvHarness struct {
 	secret [32]byte
 	psk    [32]byte
 	cliPub [32]byte
-	// cliPubMu：cliPub 的同步（harness 竞态：客户端栈起来后 REG 可能已到、
-	// 注册 Once 在接收 goroutine 里读，而测试主 goroutine 这时才写 cliPub）。
+	// cliPubMu：cliPub / allowIP 的同步（harness 竞态：客户端栈起来后 REG 可能已到、
+	// 注册 Once 在接收 goroutine 里读，而测试主 goroutine 这时才写这两个字段——
+	// allowIP 同因纳入本锁，CI -race 首跑实拍）。
 	cliPubMu sync.Mutex
 	allowIP  netip.Addr // 登记给客户端的 allowed_ip；零值 = 用固定 cliTunnelIP（场景①–③）
 	once     sync.Once
@@ -95,9 +96,23 @@ func (h *srvHarness) clientPubSlice() []byte {
 	return append([]byte(nil), h.cliPub[:]...)
 }
 
+// setAllowIP：写 allowIP（与接收 goroutine 的读同锁，见 cliPubMu 注释）。
+func (h *srvHarness) setAllowIP(ip netip.Addr) {
+	h.cliPubMu.Lock()
+	h.allowIP = ip
+	h.cliPubMu.Unlock()
+}
+
+// allowIPSnapshot：读 allowIP（锁内取）。
+func (h *srvHarness) allowIPSnapshot() netip.Addr {
+	h.cliPubMu.Lock()
+	defer h.cliPubMu.Unlock()
+	return h.allowIP
+}
+
 func (h *srvHarness) registerClient() {
 	h.once.Do(func() {
-		ip := h.allowIP
+		ip := h.allowIPSnapshot()
 		if !ip.IsValid() {
 			ip = netip.MustParseAddr(cliTunnelIP)
 		}
@@ -622,7 +637,7 @@ func TestIntegrationTransitE2E(t *testing.T) {
 	if !netip.MustParsePrefix("100.64.0.0/16").Contains(cliIP) {
 		t.Fatalf("派生隧道地址越界：%v", cliIP)
 	}
-	h.allowIP = cliIP
+	h.setAllowIP(cliIP)
 	// 客户端栈用 wgnet.Create（= 生产手机形态：HandleLocal:true——评审整改
 	// 2026-09-22：此前抄了出口侧的 CreateOpts(false)，注释还自称同构；本栈在测试里
 	// 扮演手机客户端，HandleLocal 只影响回环目的地的本地短路，对过境场景无影响）。
@@ -879,7 +894,7 @@ func TestIntegrationFilesOverTunnel(t *testing.T) {
 	id, _ := NewIdentity()
 	bind := NewBind(Config{PeerID: token.PeerID, Secret: token.Secret, Identity: id, Candidates: []Candidate{{Addr: cand}}})
 	cliIP := proto.DeriveTunnelIP(secret, id.PublicKey())
-	h.allowIP = cliIP
+	h.setAllowIP(cliIP)
 	cliTun, cliNS, err := wgnet.Create([]netip.Addr{cliIP}, 1280)
 	if err != nil {
 		t.Fatal(err)
@@ -1029,7 +1044,7 @@ func newTunnelFixture(t *testing.T) *tunnelFixture {
 	}
 	bind := NewBind(Config{PeerID: token.PeerID, Secret: token.Secret, Identity: id, Candidates: []Candidate{{Addr: cand}}})
 	cliIP := proto.DeriveTunnelIP(secret, id.PublicKey())
-	h.allowIP = cliIP
+	h.setAllowIP(cliIP)
 	cliTun, cliNS, err := wgnet.Create([]netip.Addr{cliIP}, 1280)
 	if err != nil {
 		t.Fatal(err)

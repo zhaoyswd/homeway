@@ -13,12 +13,16 @@ import (
 	"os"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
 // tokenFallbackWait：探测被关（--upnp=false --stun=”）时 token 兜底的等待窗。
-// var 只为测试可缩（同 devOpTimeout/ddnsLogf 先例）；生产 = 15s。
-var tokenFallbackWait = 15 * time.Second
+// 原子读写（CI -race 首跑实拍：测试 Cleanup 的复位与兜底 goroutine 的读构成竞态）；
+// 生产 = 15s，测试经此缝缩短（同 devOpTimeout/ddnsLogf 先例）。
+var tokenFallbackWait atomic.Int64
+
+func init() { tokenFallbackWait.Store(int64(15 * time.Second)) }
 
 // StopGrace：serve stop 的过境 TCP 存量连接有界宽限（design D5 开放项⑦定稿：
 // 10s 内继续承载、到期 RST；「停了还能通最多 10s」由 status 的 stopping 相位如实呈现）。
@@ -111,7 +115,7 @@ func (r *Role) Run(ctx context.Context) error {
 			select {
 			case <-ctx.Done():
 				return
-			case <-time.After(tokenFallbackWait):
+			case <-time.After(time.Duration(tokenFallbackWait.Load())):
 			}
 		}
 		for i := 0; i < 10; i++ {

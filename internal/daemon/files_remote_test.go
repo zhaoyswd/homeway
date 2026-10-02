@@ -261,10 +261,14 @@ func TestFilesStreamConnWriteEndTranslation(t *testing.T) {
 	if werr == nil {
 		t.Fatal("对端不读 + 背靠背连发：流应被背压收流（Write 报终结）")
 	}
-	// 写路径终结 = streamend.Error（类型化归因）+ Reason=gone + 「流已终结」文案。
+	// 写路径终结 = streamend.Error（类型化归因）+ 「流已终结」文案。终结原因二态皆
+	// 可达（CI -race 首跑实拍 closed）：出口侧先撞上行/工位界 = gone，先撞对端关闭/
+	// EOF = closed（调度差异决定谁先观测）——本用例钉 daemon 侧「翻译」契约（类型 +
+	// 文案 + Unwrap 链），出口侧的 gone 分类由 internal/control 的背压用例钉住
+	// （TestStreamSendErrorsAfterEnd / l2_upstream，含钉接收缓冲的 CI 适配）。
 	var se *streamend.Error
-	if !errors.As(werr, &se) || se.Reason != streamend.Gone {
-		t.Fatalf("Write 终结应翻译 streamend.Error{gone}：%v", werr)
+	if !errors.As(werr, &se) || (se.Reason != streamend.Gone && se.Reason != streamend.Closed) {
+		t.Fatalf("Write 终结应翻译 streamend.Error{gone|closed}：%v", werr)
 	}
 	if !strings.Contains(werr.Error(), "流已终结") {
 		t.Fatalf("终结文案应含「流已终结」（与 term_remote_test 既有断言同款约束）：%v", werr)
