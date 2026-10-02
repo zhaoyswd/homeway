@@ -414,13 +414,24 @@ func TestTableReadsNotBlockedBySlowStop(t *testing.T) {
 	release := make(chan struct{})
 	entered := make(chan struct{})
 	var once, onceEntered sync.Once
+	var stuck *hostsession.Session // 注入缝拦下的会话（收尾补跑真实停止，见下）
 	rel := func() { once.Do(func() { close(release) }) }
 	stopFunc = func(s *hostsession.Session) int {
+		stuck = s
 		onceEntered.Do(func() { close(entered) })
 		<-release
 		return 0
 	}
-	t.Cleanup(func() { rel(); stopFunc = orig })
+	// 收尾：放行 + 补跑真实停止。注入缝刻意「不真停」（保持窗口语义不变），会话若留活，
+	// connect goroutine 的迟到写会在 TempDir 清理时撞上（CI 实测 identity: directory
+	// not empty）——这里补一刀收口，再还原注入缝。
+	t.Cleanup(func() {
+		rel()
+		if stuck != nil {
+			orig(stuck)
+		}
+		stopFunc = orig
+	})
 
 	done := make(chan struct{})
 	go func() { _ = r.Remove(id); close(done) }()
