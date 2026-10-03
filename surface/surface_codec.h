@@ -363,6 +363,9 @@ public:
     static constexpr uint64_t kFragTimeoutMs = 3000;
 
 private:
+    // 无锁体（FIX 2026-10-03 自死锁）：onFrame（已持 statsMu）的 kOpFetchRows 分支
+    // 经它进——公开 applyFetchRows 会二次取 statsMu（非递归锁）当场死锁。
+    bool applyFetchRowsLocked(const FetchRowsReply& reply);
     FragmentAssembler m_asm;
     CellGrid m_grid;
     std::atomic<bool> m_haveSnapshot{false};
