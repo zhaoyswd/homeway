@@ -25,6 +25,8 @@ package term
 import (
 	"sync"
 	"time"
+
+	"github.com/zhaoyswd/homeway/pkg/term/vt"
 )
 
 const (
@@ -60,7 +62,8 @@ type surfaceStats struct {
 	fetchMiss     uint64 // FETCH-ROWS 落空（越界/备用屏）
 	writeTimeout  uint64 // 写失败/超时断腿次数
 	sentDiffs     uint64 // 差分成功下发（用于 7.4 的差分 vs 原始 ANSI 对照）
-	trims         uint64 // 回滚裁剪触发的强制全量重建（任务 3.3；观测用）
+	trims         uint64 // 非平移回落触发的强制全量重建（行号语义变化；观测用）
+	shifts        uint64 // 平移型回落（真裁剪/erase 前缀，差分继续；观测用）
 }
 
 // surfaceLeg 一条 surface 腿的投递状态。
@@ -83,11 +86,17 @@ type surfaceLeg struct {
 	hasBase bool
 	// lastWriteCost 上次写耗时（> 合并窗 ⇒ 链路有压力，下一拍走全量）。
 	lastWriteCost time.Duration
-	// lastSnapTotal / hasSnapTotal：上次全量快照时的回滚条 total（任务 3.3）。
-	// total **变小**只可能是回滚裁剪（写入时只增或持平）⇒ 绝对行号滑动 ⇒ 该腿的镜像/拉取行
-	// 全部失锚，必须重发全量让客户端重建（判据见 noteScrollbar）。
-	lastSnapTotal uint64
-	hasSnapTotal  bool
+	// lastSent 是**上一拍已告知客户端**的回滚条（任务 3.3 + 2026-10-03 平移判据）。
+	// 回滚条回落（total 变小）分两类：
+	//   * **平移型**（真裁剪踢最旧页 / 清回滚 / erase 前缀）：len 不变、距底（total-offset）
+	//     不变——行号空间纯平移，客户端能自己平移缓存（applyDiff 放行 + ScrollModel 平移键），
+	//     不需要全量。旧判据只有「total 变小」，把 shell 重绘/清屏这类正常回落也当裁剪 ⇒
+	//     长历史会话每条命令一记全量快照风暴（真机「执行命令后滚不动历史」的根因）。
+	//   * **非平移**（距底或 len 变化）：行号语义不再纯平移，必须全量重建让客户端重新锚定。
+	// 基线必须**每拍随差分推进**（noteSentScrollbar）——只记快照时刻的值会把输出增长期间
+	// 的回落漏判/误判（真机风暴的连锁机制：全量抬高基线 ⇒ 下一条命令的回落又穿透）。
+	lastSent    vt.Scrollbar
+	hasLastSent bool
 
 	stats surfaceStats
 }
@@ -190,20 +199,47 @@ func (l *surfaceLeg) noteFetchRows(hit bool) {
 	}
 }
 
-// noteScrollbar 记下本拍的回滚条 total，并在**检测到裁剪**时要求全量重建（任务 3.3）。
+// noteScrollbar 记下本拍要发帧的回滚条，并在检测到**非平移回落**时要求全量重建。
 //
-// 判据：total 比上次快照时小 ⇒ 回滚被裁剪（page 粒度；探针实测：写 4000 行时 total 从 2001
-// 掉到 1719）。此时 [0,total) 的绝对行号整体滑动，客户端缓存的镜像行与拉取行都指向别的内容，
-// 只有一次新的全量（含新镜像 + 新 total）能让它重新锚定。返回 true = 已置 needSnapshot。
-func (l *surfaceLeg) noteScrollbar(total uint64) bool {
+// 回落判据（2026-10-03 修「执行命令后滚不动历史」）：total 变小分两类——
+//   * **平移型**（len 不变且距底 total-offset 不变）：真裁剪踢最旧页 / 清回滚 / erase 前缀，
+//     行号空间纯平移。客户端 CellGrid::applyDiff 放行这类差分、ScrollModel 把缓存行号键
+//     同步平移（深层历史保留）⇒ **不需要全量**，继续发差分。
+//     旧判据只有「total < 上次」——shell 重绘/清屏这类正常回落（真机实测：zsh 每条命令
+//     输出+重绘让 total 锯齿 ±11 行）全被当裁剪 ⇒ 长历史会话每条命令一记全量快照风暴。
+//   * **非平移**（距底或 len 变化）：行号语义不再纯平移（视口真被移动/reflow）⇒ 置
+//     needSnapshot 让客户端全量重锚。
+//
+// 基线（lastSent）在 noteSentScrollbar 里**每拍随成功入队的帧推进**（快照与差分都算）——
+// 只记快照时刻会把输出增长期间的回落漏判，且全量抬高基线后下一条命令的回落又穿透基线，
+// 形成风暴连锁（真机 23:06-23:07 实测：12+ 记连续全量）。
+//
+// 返回 true = 已置 needSnapshot（调用方打判据行）。
+func (l *surfaceLeg) noteScrollbar(sb vt.Scrollbar) bool {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	trimmed := l.hasSnapTotal && total < l.lastSnapTotal
-	if trimmed {
-		l.needSnapshot = true
-		l.stats.trims++
+	if !l.hasLastSent {
+		return false // 还没告知过客户端任何回滚条：首次 attach 本来就走全量
 	}
-	return trimmed
+	prev := l.lastSent
+	if sb.Total >= prev.Total {
+		return false // 增长/持平 = 输出推进，不是回落
+	}
+	pureShift := sb.Len == prev.Len && (prev.Total-prev.Offset) == (sb.Total-sb.Offset)
+	if pureShift {
+		l.stats.shifts++
+		return false // 平移型：客户端自己平移缓存，差分照发
+	}
+	l.needSnapshot = true
+	l.stats.trims++
+	return true
+}
+
+// noteSentScrollbar 在一帧（快照或差分）成功入队后推进基线（与 commitBaseline 同一时机）。
+func (l *surfaceLeg) noteSentScrollbar(sb vt.Scrollbar) {
+	l.mu.Lock()
+	l.lastSent, l.hasLastSent = sb, true
+	l.mu.Unlock()
 }
 
 // statsSnapshot 读计数器（观测/诊断用）。

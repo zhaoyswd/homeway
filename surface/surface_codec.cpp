@@ -453,9 +453,20 @@ bool CellGrid::applyDiff(const Diff& diff) {
     // 光标绘制冲突（规格里那条校验，v2 起才有落点）：光标必须落在本帧几何内，否则整帧拒收。
     // x == cols 是合法的（宽字符/末列待折行的「待决定位置」），所以上界取 <=。
     if (diff.cursor.x > diff.geom.cols || diff.cursor.y >= diff.geom.rows) return false;
-    // 回滚裁剪（total 变小）⇒ 绝对行号整体滑动，镜像/拉取行全部失锚 ⇒ 整帧拒收并请求全量。
-    // （v4 起差分带回滚条，客户端自己就能判；服务端的 noteScrollbar 只是同一判据的提前量。）
-    if (diff.scroll.total < m_scroll.total) return false;
+    // 回滚条回落（total 变小）：**平移型放行**（2026-10-03 修「执行命令后滚不动历史」）。
+    // len 不变且距底（total-offset）不变 ⇒ 行号空间纯平移（真裁剪/清回滚/erase 前缀），
+    // 视口内容连续——接受本帧，ScrollModel::onDiffScroll 会把缓存行号键同步平移。
+    // 出口旧版对这类回落强制全量快照，长历史会话每条命令一记快照风暴，滚出镜像窗口的
+    // 历史永远补不回来。非平移回落（距底/len 变化，如视口真被移动）仍拒收走全量自愈。
+    if (diff.scroll.total < m_scroll.total) {
+        const uint64_t dTotal = m_scroll.total - diff.scroll.total;
+        const bool pureShift = diff.scroll.len == m_scroll.len &&
+                               (m_scroll.total - m_scroll.offset) ==
+                                   (diff.scroll.total - diff.scroll.offset) &&
+                               m_scroll.offset >= dTotal &&
+                               (m_scroll.offset - diff.scroll.offset) == dTotal;
+        if (!pureShift) return false;
+    }
     for (const auto& row : diff.rows) {
         if (row.y >= m_geom.rows) return false;  // 行越界：拒收
         m_rows[row.y] = row;

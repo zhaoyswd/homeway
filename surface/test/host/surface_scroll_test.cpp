@@ -533,10 +533,94 @@ int main() {
         check(fin.load(), "onFrame(kOpFetchRows) 不得自死锁（statsMu 重入；2s 内必须返回）");
     }
 
+    // ⑫ 平移型全量快照保深层缓存（2026-10-03 修「执行命令后滚不动历史」）：出口旧版对
+    //     total 回落（shell 重绘/erase）强制全量快照，长历史会话每条命令一记；这些回落的
+    //     特征是行号空间纯平移（len/距底不变、offset 与 total 同步减 D）——深层缓存按键
+    //     -D 平移后仍有效，清空重拉会让滚出镜像窗口的视图在快照风暴期永远补不回来。
+    {
+        ScrollModel m = setup();                       // 缓存 [400,700)，offset=700，total=1000
+        m.scrollByPixels(-50.0f * 40.0f, 40.0f);       // viewTop = 650，滚 50 行
+        bool drift = false;
+        m.onFetchReply(310, mkRows(310, 90, kCols), drift);  // 预取并入 [310,400)——深层历史
+        check(m.cachedTop() == 310, "前置：预取后缓存顶应到 310");
+        Geometry g;
+        g.cols = kCols;
+        g.rows = kViewRows;
+        g.revision = 9;
+        Scrollbar sb;
+        // 平移型回落：total 1000→900、offset 700→600（D=100）、len 不变、距底 300→300 不变。
+        sb.total = 900;
+        sb.offset = 600;
+        sb.len = kViewRows;
+        m.onSnapshot(g, mkRows(600, kViewRows, kCols), mkRows(300, 300, kCols), sb);
+        check(m.cachedTop() == 210, "平移型快照应保留深层缓存（预取行 310 平移到 210）");
+        check(m.scrollRows() > 49.0f && m.scrollRows() < 51.0f,
+              "平移型快照滚动量应原样保留（viewTop 与 offset 同步平移）");
+        // 内容连续性分两层：视口上方 10 视口内以**新镜像**为准（新数据就地刷新同键）；
+        // 更深处（新镜像之外、原预取区）是平移过来的旧内容——滚到 250（预取区 [210,300)）
+        // 画出的应是原预取行 350 的内容（行号平移、内容不动）。
+        std::vector<Row> vp = mkRows(600, kViewRows, kCols);
+        auto w = m.window(vp, kCols, kViewRows);
+        check(w.valid && w.absTop == 550, "平移后视图顶 = 新 offset - 滚动量 = 550");
+        m.scrollByPixels(-(350.0f - 50.0f) * 40.0f, 40.0f);  // 滚动量 50 → 350
+        auto wDeep = m.window(vp, kCols, kViewRows);
+        check(wDeep.valid && wDeep.absTop == 250 && firstSymbol(wDeep) == "350",
+              "平移后深层窗口内容应是原预取行（absTop=250 → 原 350 行内容）");
+    }
+
+    // ⑬ 差分平移（出口对平移型回落直接发差分）：onDiffScroll 收到 offset/total 同步回落
+    //     ⇒ 缓存键平移、滚动量不动。旧实现把 offset 减小当「视口被上移」把滚动量往回缩——
+    //     语义错了（服务端 vt 视口恒在底部，offset 减小只能是行号空间滑动）。
+    {
+        ScrollModel m = setup();                       // [400,700)，offset=700
+        m.scrollByPixels(-50.0f * 40.0f, 40.0f);       // 滚 50 行
+        Scrollbar sb;
+        sb.total = 900;                                // total/offset 同步 -100：平移
+        sb.offset = 600;
+        sb.len = kViewRows;
+        m.onDiffScroll(sb);
+        check(m.cachedTop() == 300, "差分平移应把缓存顶 400 平移到 300");
+        check(m.scrollRows() > 49.0f && m.scrollRows() < 51.0f,
+              "差分平移滚动量应不动（旧实现错误地往回缩 100）");
+        std::vector<Row> vp = mkRows(600, kViewRows, kCols);
+        auto w = m.window(vp, kCols, kViewRows);
+        check(w.valid && firstSymbol(w) == "650", "差分平移后首行内容应是原 650 行");
+    }
+
+    // ⑭ CellGrid::applyDiff 对平移型回落放行、非平移拒收：这是差分路径的闸门——平移型
+    //     （len/距底不变）接受，让 ScrollModel 平移缓存；非平移（距底变化）整帧拒收走全量。
+    {
+        CellGrid grid;
+        Snapshot snap;
+        snap.geom.cols = kCols;
+        snap.geom.rows = kViewRows;
+        snap.geom.revision = 1;
+        snap.scroll.total = 1000;
+        snap.scroll.offset = 970;  // 贴底：offset = total - len
+        snap.scroll.len = kViewRows;
+        snap.grid = mkRows(970, kViewRows, kCols);
+        grid.reset(snap);
+        Diff d;
+        d.geom = snap.geom;
+        d.scroll.len = kViewRows;
+        // 平移型回落：total/offset 同步 -11（zsh 重绘锯齿的典型幅度）。
+        d.scroll.total = 989;
+        d.scroll.offset = 959;
+        check(grid.applyDiff(d), "平移型回落的差分应放行（客户端自己平移缓存）");
+        check(grid.scrollbar().total == 989, "放行后回滚条应随差分更新");
+        // 非平移回落：距底变化（total-offset 从 30 变 25）⇒ 拒收走全量自愈。
+        Diff d2;
+        d2.geom = snap.geom;
+        d2.scroll.len = kViewRows;
+        d2.scroll.total = 960;
+        d2.scroll.offset = 935;  // 距底 960-935=25 ≠ 30
+        check(!grid.applyDiff(d2), "非平移回落的差分必须拒收（行号语义已变，走全量重锚）");
+    }
+
     if (failures > 0) {
         std::cerr << failures << " 项不一致\n";
         return 1;
     }
-    std::cout << "surface 回滚模型：全部通过（镜像基址 / 亚行偏移 / 预取配方 / 冻结 / 锚点漂移 / 锚定重建 / 补缺口 / 新会话冷启动 / FETCH-ROWS 自死锁回归）\n";
+    std::cout << "surface 回滚模型：全部通过（镜像基址 / 亚行偏移 / 预取配方 / 冻结 / 锚点漂移 / 锚定重建 / 补缺口 / 新会话冷启动 / FETCH-ROWS 自死锁回归 / 平移保缓存）\n";
     return 0;
 }

@@ -408,26 +408,53 @@ func TestSurfaceSnapshotCarriesScrollbar(t *testing.T) {
 // 为什么只测规则、不测端到端：page 粒度裁剪在容量稳态下 total 会**持平**（探针实测：洪泛 4000 行
 // 后 total 停在 455 不再下降），「total 变小」只是增长期释放整页时的瞬态，端到端要靠时序碰运气。
 // 稳态下的行号滑动由**客户端的锚点探测**兜住（见客户端 surface_scroll 的单测与 design D3）。
+//
+// 2026-10-03 平移判据：total 回落分两类——平移型（len 不变、距底 total-offset 不变：真裁剪/
+// 清回滚/erase 前缀）客户端能自己平移缓存，**不再强制全量**；非平移（距底或 len 变化）仍走全量。
+// 旧判据只有「total 变小」，shell 重绘/清屏的正常回落全被当裁剪（真机：zsh 每条命令 total 锯齿
+// ±11 行 ⇒ 长历史会话每条命令一记全量快照风暴 ⇒ 滚动历史冻结）。
 func TestSurfaceLegNoteScrollbarTrimRule(t *testing.T) {
 	leg := newSurfaceLeg()
-	if leg.noteScrollbar(100) {
+	if !leg.takeSnapshotFlag() {
+		t.Fatal("新腿初始就应需要全量（首次 attach）")
+	}
+	if leg.noteScrollbar(vt.Scrollbar{Total: 100, Offset: 70, Len: 30}) {
 		t.Fatal("还没有基线时不该判定裁剪")
 	}
-	leg.lastSnapTotal, leg.hasSnapTotal = 100, true // 模拟「刚发过全量，基线 total=100」
-	if leg.noteScrollbar(100) {
+	// 模拟「刚发过一帧，基线 = {total:100, offset:70, len:30}」（视口在底部）。
+	leg.noteSentScrollbar(vt.Scrollbar{Total: 100, Offset: 70, Len: 30})
+	if leg.noteScrollbar(vt.Scrollbar{Total: 100, Offset: 70, Len: 30}) {
 		t.Fatal("total 持平不该判定裁剪")
 	}
-	if leg.noteScrollbar(120) {
-		t.Fatal("total 增长不该判定裁剪")
+	if leg.noteScrollbar(vt.Scrollbar{Total: 120, Offset: 90, Len: 30}) {
+		t.Fatal("total 增长（输出推进）不该判定裁剪")
 	}
-	if !leg.noteScrollbar(80) {
-		t.Fatal("total 变小必须判定裁剪")
+	// 平移型回落：total/offset 同步 -20、len 不变、距底（total-offset）=30 不变 ⇒ 差分继续。
+	if leg.noteScrollbar(vt.Scrollbar{Total: 80, Offset: 50, Len: 30}) {
+		t.Fatal("平移型回落（真裁剪/erase 前缀）不该强制全量——客户端自己平移缓存")
+	}
+	if leg.takeSnapshotFlag() {
+		t.Fatal("平移型回落不置 needSnapshot")
+	}
+	if got := leg.statsSnapshot().shifts; got != 1 {
+		t.Fatalf("shifts 计数应为 1，实际 %d", got)
+	}
+	// 基线推进到平移后的值，再验非平移回落（距底变化）：必须全量重锚。
+	leg.noteSentScrollbar(vt.Scrollbar{Total: 80, Offset: 50, Len: 30})
+	if !leg.noteScrollbar(vt.Scrollbar{Total: 60, Offset: 40, Len: 30}) {
+		t.Fatal("非平移回落（距底 total-offset 30→20 变化）必须判定全量重建")
 	}
 	if !leg.takeSnapshotFlag() {
-		t.Fatal("裁剪必须置 needSnapshot（本拍就该走全量）")
+		t.Fatal("非平移回落必须置 needSnapshot（本拍就该走全量）")
 	}
-	if leg.statsSnapshot().trims != 1 {
-		t.Fatalf("trims 计数应为 1，实际 %d", leg.statsSnapshot().trims)
+	if got := leg.statsSnapshot().trims; got != 1 {
+		t.Fatalf("trims 计数应为 1，实际 %d", got)
+	}
+	// len 变化（resize/reflow 混入）即使距底巧合也不放行：reflow 后行号语义全变。
+	leg2 := newSurfaceLeg()
+	leg2.noteSentScrollbar(vt.Scrollbar{Total: 100, Offset: 70, Len: 30})
+	if !leg2.noteScrollbar(vt.Scrollbar{Total: 80, Offset: 50, Len: 20}) {
+		t.Fatal("len 变化的回落必须判定全量（reflow 行号语义已变）")
 	}
 }
 

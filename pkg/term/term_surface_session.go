@@ -18,6 +18,8 @@ package term
 import (
 	"sync"
 	"time"
+
+	"github.com/zhaoyswd/homeway/pkg/term/vt"
 )
 
 // wakeSurface 通知投递循环「有东西要发」（非阻塞；已挂起时唤醒会被合并）。
@@ -98,12 +100,14 @@ func (s *termSession) flushSurface() {
 	cols, rows := s.cols, s.rows
 	title := s.scan.title
 
-	// 回滚裁剪检测（任务 3.3）：total 变小 ⇒ 绝对行号滑动 ⇒ 该腿强制全量重建。
-	// 放在 takeSnapshotFlag 之前，这样它置的 needSnapshot 会被本拍消费。
+	// 回滚回落检测（任务 3.3 + 2026-10-03 平移判据）：非平移回落（距底/len 变化，行号语义
+	// 不再纯平移）⇒ 该腿强制全量重建；平移型（真裁剪/erase 前缀）客户端自己平移缓存，
+	// 差分继续。放在 takeSnapshotFlag 之前，这样它置的 needSnapshot 会被本拍消费。
+	curSb := sv.SurfaceScrollbar()
 	for _, c := range legs {
-		if c.leg.noteScrollbar(sv.SurfaceScrollbar().Total) {
+		if c.leg.noteScrollbar(curSb) {
 			if s.svc.logf != nil {
-				s.svc.logf("term: 会话 %s 回滚裁剪 ⇒ 强制全量重建（绝对行号已滑动）", s.name)
+				s.svc.logf("term: 会话 %s 回滚条非平移回落 ⇒ 强制全量重建（行号语义已变）", s.name)
 			}
 		}
 	}
@@ -186,6 +190,10 @@ func (s *termSession) flushSurface() {
 		}
 		p.c.leg.noteSent(p.op, items)
 		p.c.leg.commitBaseline(p.st)
+		// 回滚条基线随**成功入队的帧**推进（快照与差分都算）——noteScrollbar 的回落判据
+		// 与客户端「上一帧已知的回滚条」对齐（2026-10-03：旧版只记快照时刻的 total，
+		// 输出增长期间的回落全部漏判，全量抬高基线后又连锁触发风暴）。
+		p.c.leg.noteSentScrollbar(vt.Scrollbar{Total: p.st.Total, Offset: p.st.Offset, Len: uint64(p.st.Len)})
 	}
 }
 
@@ -209,12 +217,8 @@ func (s *termSession) buildSnapshotForLegLocked(c *termClient, sv *sessionVT, co
 		// 镜像窗口：主屏才有意义（备用屏返回空，design D3 要求抑制）。
 		Mirror: sv.SurfaceMirror(cols, rows, mirrorViewports),
 	}
-	// 记下这一代的 total：回滚裁剪（page 粒度）会让**绝对行号滑动** ⇒ 该腿缓存的镜像/
-	// 拉取行全部失锚。判据用「total 变小」——total 只在裁剪时减少（写入时只增或持平）。
-	c.leg.mu.Lock()
-	c.leg.lastSnapTotal = st.Total
-	c.leg.hasSnapTotal = true
-	c.leg.mu.Unlock()
+	// 回滚条基线不在这里记（2026-10-03 起）：noteSentScrollbar 在入队成功后统一推进
+	// （本函数只建体；入队失败时基线不能前移，否则回落检测会漏判）。
 	return encSnapshotBody(body), st
 }
 

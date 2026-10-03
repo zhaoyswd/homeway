@@ -25,6 +25,31 @@ bool rowEqual(const Row& a, const Row& b) {
     return true;
 }
 
+// shiftRows 把缓存行号键整体 -shift（负键丢弃 = 行号空间平移后被裁掉的最旧行）。
+// 平移语义见 onSnapshot/onDiffScroll 的注释：内容不变、行号滑动，缓存按平移量跟住。
+static std::map<uint64_t, Row> shiftedRows(const std::map<uint64_t, Row>& rows, uint64_t shift) {
+    std::map<uint64_t, Row> out;
+    for (const auto& kv : rows) {
+        if (kv.first >= shift) {
+            out.emplace(kv.first - shift, kv.second);
+        }
+    }
+    return out;
+}
+
+// isPureShift 判「这拍回滚条是不是行号空间纯平移」：len 不变、距底（total-offset）不变、
+// 且 offset 与 total 同步减同一正量（D>0）。真裁剪（踢最旧页）/清回滚/erase 前缀都满足；
+// resize/reflow（len 变）与视口真被移动（距底变）不满足，维持清空重建。
+static bool isPureShift(const Scrollbar& oldSb, const Scrollbar& newSb) {
+    if (newSb.offset >= oldSb.offset || newSb.total >= oldSb.total) {
+        return false;  // 只处理回落（增长是输出推进，不是平移）
+    }
+    if (oldSb.len != newSb.len) {
+        return false;
+    }
+    return (oldSb.total - oldSb.offset) == (newSb.total - newSb.offset);
+}
+
 void ScrollModel::onSnapshot(const Geometry& geom, const std::vector<Row>& viewport,
                              const std::vector<Row>& mirror, const Scrollbar& sb) {
     // 锚定所需的前态（重建会覆盖它们）。
@@ -32,19 +57,30 @@ void ScrollModel::onSnapshot(const Geometry& geom, const std::vector<Row>& viewp
     const uint64_t oldOffset = m_offset;
     const float prevScroll = m_scrollRows;
     const uint16_t oldViewportRows = m_viewportRows;
+    const Scrollbar oldSb = m_sb;
 
-    m_rows.clear();
+    // 平移型快照（出口旧版对 total 回落强制全量时的表达路径）：深层缓存平移保留，
+    // 不清空——清空会让滚出镜像窗口的视图在快照风暴期永远补不回来（FETCH 应答被
+    // revision 推进判过期）。非平移（距底/len 变化）维持清空重建。
+    const bool pureShift = hadCache && isPureShift(oldSb, sb);
+    if (pureShift) {
+        m_rows = shiftedRows(m_rows, oldOffset - sb.offset);
+        m_haveCache = !m_rows.empty();
+    } else {
+        m_rows.clear();
+        m_haveCache = false;
+    }
     m_sb = sb;
     m_offset = sb.offset;
     m_viewportRows = geom.rows;
-    m_fetchPending = false;
+    m_fetchPending = false;  // 在飞应答的行号/revision 都是旧空间的，弃了让它重发
     m_probeActive = false;
     m_probeRow = 0;
     m_lastProbeMs = 0;
-    m_haveCache = false;
 
     // 镜像按**位置**编号：最后一行紧邻视口上方 ⇒ 基址 = offset - 行数。
     // （服务端给的 y 是视口相对值、分块还会重复，不能直接用——3.3 探针实测。）
+    // 平移保留的缓存与新镜像自然衔接：同键覆盖 = 新内容就地刷新。
     if (!mirror.empty() && sb.offset >= mirror.size()) {
         const uint64_t base = sb.offset - mirror.size();
         for (size_t i = 0; i < mirror.size(); i++) {
@@ -52,14 +88,15 @@ void ScrollModel::onSnapshot(const Geometry& geom, const std::vector<Row>& viewp
         }
         m_haveCache = true;
     }
-    // 滚动位置（见头文件 onSnapshot 的三分支）：首次/在底部/resize ⇒ 回到底部；
-    // 否则按绝对行号锚定（viewTop 不变）。
-    //   * **裁剪**（total 变小）不再特殊处理：行号整体滑动 D 行，保持同一个绝对行号 =
-    //     保持「距底部的距离」≈ 原地（内容最多滑动一个裁剪粒度）；回到底部反而是大跳。
+    // 滚动位置（见头文件 onSnapshot 的分支）：
+    //   * 平移型：滚动量**原样保留**——viewTop 与 offset 同步平移，距底关系不变；
+    //     锚定公式保持的是旧行号空间的 viewTop，平移场景下反而引入 D 行错位。
+    //   * 首次/在底部/resize ⇒ 回到底部；其余按绝对行号锚定（viewTop 不变）、不 clamp。
     //   * **resize**（行数变了，reflow 后行号语义全变）⇒ 回到底部。
-    //   * **不 clamp 到 maxRows**：视图可能落在新镜像之外，保留绝对位置、交给补缺口预取。
     const bool resized = oldViewportRows != 0 && oldViewportRows != geom.rows;
-    if (hadCache && prevScroll > 0.0f && !resized && sb.offset > 0) {
+    if (pureShift) {
+        // 保留 prevScroll；平移后行号空间变小，超出新缓存顶的部分由下面的钳制兜底。
+    } else if (hadCache && prevScroll > 0.0f && !resized && sb.offset > 0) {
         const float viewTop = static_cast<float>(oldOffset) - prevScroll;
         float next = static_cast<float>(sb.offset) - viewTop;
         if (next < 0.0f) next = 0.0f;
@@ -67,6 +104,7 @@ void ScrollModel::onSnapshot(const Geometry& geom, const std::vector<Row>& viewp
     } else {
         m_scrollRows = 0.0f;
     }
+    if (m_scrollRows < 0.0f) m_scrollRows = 0.0f;
     (void)viewport;  // 视口不进缓存：它由调用方每帧从实时网格给（差分不必动缓存）
 }
 
@@ -77,12 +115,13 @@ void ScrollModel::onDiffScroll(const Scrollbar& sb) {
         // （用户看的内容不动，新输出只把「距底距离」推大）。在底部（滚动量 0）自然跟随。
         if (m_scrollRows > 0.0f) m_scrollRows += static_cast<float>(delta);
     } else if (sb.offset < m_offset) {
-        // offset 变小（视口被服务端上移/重排）：往回缩，避免视图越过底部。
-        const uint64_t back = m_offset - sb.offset;
-        if (m_scrollRows > static_cast<float>(back)) {
-            m_scrollRows -= static_cast<float>(back);
-        } else {
-            m_scrollRows = 0.0f;
+        // offset 变小 = 行号空间平移（出口对平移型回落直接发差分：total/offset 同步减 D、
+        // 距底不变）。缓存键 -D 平移、滚动量不动（viewTop 与 offset 同步平移）。旧实现把
+        // 它当「视口被上移」往回缩滚动量——语义错了：服务端 vt 视口恒在底部，offset 减小
+        // 只能是行号空间滑动。非平移回落到不了这里（applyDiff 拒收 ⇒ 全量 ⇒ onSnapshot 判定）。
+        if (isPureShift(m_sb, sb)) {
+            m_rows = shiftedRows(m_rows, m_offset - sb.offset);
+            m_haveCache = m_haveCache && !m_rows.empty();
         }
     }
     m_offset = sb.offset;
