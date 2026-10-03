@@ -4,11 +4,17 @@
 // 3 视口窗 / 单飞 / 冻结在边缘）在 design D3 里是**钉死的数字**——真机只能看「卡不卡」，
 // 数字错了照样"能滚"，只是会多打几倍流量或停在空白上。这里把数字与失效路径一次钉死。
 #include <cassert>
+#include <chrono>
 #include <iostream>
 #include <string>
+#include <thread>
 #include <vector>
 
+#include <atomic>
+
 #include "surface/surface_scroll.h"
+#include "surface/surface_codec.h"  // 回归：经 SurfaceSession::onFrame 喂 FETCH-ROWS（自死锁）
+#include <zlib.h>  // 回归用例自备 gzip 体（wire 体 = [flags][gzip(…)]）
 
 using namespace tierterm;
 
@@ -476,10 +482,61 @@ int main() {
         check(m.takeFetchRequest(from, count) && count > 0, "滚到窗口边缘才继续拉下一窗");
     }
 
+    // ---- 回归（2026-10-03 自死锁）：经 onFrame 喂 FETCH-ROWS 应答 ----
+    // 修复前：onFrame 全程持 statsMu，kOpFetchRows 分支调 applyFetchRows（公开壳再取
+    // 同一把非递归锁）⇒ reader 线程当场死锁——真机 THREAD_BLOCK_3S/6S 连环杀进程的
+    // 直接根因（此前无任何用例经 onFrame 喂 FETCH-ROWS——golden 的短尾用例直接调
+    // decodeFetchRowsReply，零覆盖）。死锁与应答内容无关（锁获取在逻辑之前）；注意
+    // wire 体 = [flags][gzip(ver+…)]——裸字节会在攒片器的 gunzip 就失败早退、根本到
+    // 不了 switch（首版回归就因此空转通过）。线程+超时判：修复后 2s 内必须返回；再
+    // 死锁 = 本用例红（detached 线程残留不阻塞进程退出）。
+    {
+        SurfaceSession s;
+        std::vector<uint8_t> inner;  // 解压后的体：ver/revision/cols/rows/from/count
+        auto u8v = [&](uint8_t v) { inner.push_back(v); };
+        auto u16v = [&](uint16_t v) { u8v(v & 0xff); u8v((v >> 8) & 0xff); };
+        auto u32v = [&](uint32_t v) { for (int i = 0; i < 4; i++) u8v((v >> (8 * i)) & 0xff); };
+        auto u64v = [&](uint64_t v) { for (int i = 0; i < 8; i++) u8v((v >> (8 * i)) & 0xff); };
+        u8v(4 /*kSurfaceVer*/);
+        u32v(1 /*revision*/);
+        u16v(80 /*cols*/);
+        u16v(24 /*rows*/);
+        u64v(0 /*from*/);
+        u16v(0 /*count：0 行（短尾合法）*/);
+        uLongf bound = compressBound(inner.size()) + 64;
+        std::vector<uint8_t> gz(bound);
+        uLongf gzLen = bound;
+        // gzip 容器（windowBits 15+16）——攒片器按 gzip 魔数解压（zlib 容器会被拒）。
+        z_stream zs{};
+        deflateInit2(&zs, Z_DEFAULT_COMPRESSION, Z_DEFLATED, 15 + 16, 8, Z_DEFAULT_STRATEGY);
+        zs.next_in = inner.data();
+        zs.avail_in = static_cast<uInt>(inner.size());
+        zs.next_out = gz.data();
+        zs.avail_out = static_cast<uInt>(gzLen);
+        const int zrc = deflate(&zs, Z_FINISH);
+        gzLen = zs.total_out;
+        deflateEnd(&zs);
+        check(zrc == Z_STREAM_END, "回归用例自备 gzip 体失败（测试自身问题）");
+        gz.resize(gzLen);
+        std::vector<uint8_t> wire;  // flags=0（无后续片）+ gzip 体
+        wire.push_back(0);
+        wire.insert(wire.end(), gz.begin(), gz.end());
+        std::atomic<bool> fin{false};
+        std::thread th([&]() {
+            s.onFrame(kOpFetchRows, wire.data(), wire.size(), 0);
+            fin = true;
+        });
+        th.detach();
+        for (int waited = 0; waited < 200 && !fin.load(); waited++) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+        check(fin.load(), "onFrame(kOpFetchRows) 不得自死锁（statsMu 重入；2s 内必须返回）");
+    }
+
     if (failures > 0) {
         std::cerr << failures << " 项不一致\n";
         return 1;
     }
-    std::cout << "surface 回滚模型：全部通过（镜像基址 / 亚行偏移 / 预取配方 / 冻结 / 锚点漂移 / 锚定重建 / 补缺口 / 新会话冷启动）\n";
+    std::cout << "surface 回滚模型：全部通过（镜像基址 / 亚行偏移 / 预取配方 / 冻结 / 锚点漂移 / 锚定重建 / 补缺口 / 新会话冷启动 / FETCH-ROWS 自死锁回归）\n";
     return 0;
 }

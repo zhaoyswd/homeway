@@ -590,7 +590,8 @@ bool SurfaceSession::onFrame(uint8_t op, const uint8_t* payload, size_t len, uin
                 return false;  // 不进 patchRejects（不触发取全量），但必须留痕：原来这里全静默
             }
             // 漂移（锚点内容变了 ⇒ 绝对行号已滑动）⇒ 当「需要全量」返回，走既有自愈路径。
-            return !applyFetchRows(reply);
+            // FIX 2026-10-03：调无锁体（statsMu 已持有——见 applyFetchRows 注）。
+            return !applyFetchRowsLocked(reply);
         }
         case kOpSnapshotDone:
             // 完成标志本身不带数据；reveal 由调用方在收到它时解除渲染抑制（3.9）。
@@ -639,9 +640,18 @@ bool SurfaceSession::pollTimeout(uint64_t nowMs) {
     return true;
 }
 
+// FIX（2026-10-03，term-webview-render ②预采真机排查）：onFrame 全程持 m_statsMu，
+// 其 kOpFetchRows 分支调 applyFetchRows ⇒ 同一把非递归锁二次获取 = reader 线程
+// **自死锁**（真机 THREAD_BLOCK_3S/6S 连环杀进程的直接根因；此前子模块测试从未经
+// onFrame 喂 FETCH-ROWS 应答，零覆盖）。拆出无锁体 applyFetchRowsLocked 供 onFrame
+// 调用（statsMu 已由调用方持有）；公开壳保留自取锁，外部/测试调用面不变。
 bool SurfaceSession::applyFetchRows(const FetchRowsReply& reply) {
     std::lock_guard<std::mutex> slk(m_statsMu);
+    return applyFetchRowsLocked(reply);
+}
 
+// 无锁体：要求调用方已持 m_statsMu（m_stats 写入合法）；gridMu 在此获取。
+bool SurfaceSession::applyFetchRowsLocked(const FetchRowsReply& reply) {
     std::lock_guard<std::mutex> lk(m_gridMu);
     const Geometry g = m_grid.geometry();
     if (reply.geom.cols != g.cols || reply.geom.rows != g.rows) {
