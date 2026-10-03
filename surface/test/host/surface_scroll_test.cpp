@@ -230,10 +230,9 @@ int main() {
         check(!m2.scrolled() && m2.scrollRows() == 0.0f, "在底部时快照后仍在底部");
     }
 
-    // ⑦b 裁剪（total 变小、非平移——total -200 而 offset 只 -100）：2026-10-04 近似平移语义下
-    //     **滚动量保留、视图跟内容走**（旧行为按绝对行号锚定后钳回顶部 = 大跳）。视口上方
-    //     10 视口由新镜像就地刷新（同键覆盖），深层按 -D 平移；视图顶 600-50=550 落在
-    //     新镜像 [300,600) 内 ⇒ 可画、不冻结。
+    // ⑦b 裁剪（total 变小）：行号整体滑动，但**保持同一绝对行号 ≈ 原地**（距底距离不变），
+    //     不再回到底部（回到底部是大跳；内容最多滑动一个裁剪粒度）。
+    //     （2026-10-04 近似平移放宽已回退：非平移回落清空重建+锚定，内容正确性优先。）
     {
         ScrollModel m = setup();  // total=1000
         m.scrollByPixels(-50.0f * 40.0f, 40.0f);
@@ -246,12 +245,10 @@ int main() {
         sb.offset = 600;
         sb.len = kViewRows;
         m.onSnapshot(g, mkRows(600, kViewRows, kCols), mkRows(300, 300, kCols), sb);
-        check(m.scrollRows() > 49.0f && m.scrollRows() < 51.0f,
-              "非平移裁剪的快照应按近似平移保留滚动量（不弹回顶部/不瞬移）");
-        check(m.cachedTop() == 300, "缓存顶应随 D=100 平移到 300");
-        std::vector<Row> vp = mkRows(600, kViewRows, kCols);
-        auto w = m.window(vp, kCols, kViewRows);
-        check(w.valid && w.absTop == 550, "视图顶 = 新 offset - 滚动量 = 550（镜像内可画）");
+        // 旧 offset 700、旧位置 50 ⇒ viewTop = 650；新 offset 600 ⇒ 新位置 = 600 - 650 < 0
+        // ⇒ 钳到 0（视图顶已在新回滚区之外——被裁掉的就是它上面的内容）。
+        check(m.scrollRows() >= 0.0f && m.scrollRows() < 1.0f,
+              "裁剪后视图顶被裁掉时应落在回滚区顶部（不弹到别处）");
     }
 
     // ⑦c 差分带回滚条（v4）：滚回历史时 offset 增长 ⇒ 绝对视图位置不动；在底部时跟随。
@@ -621,11 +618,10 @@ int main() {
         check(!grid.applyDiff(d2), "非平移回落的差分必须拒收（行号语义已变，走全量重锚）");
     }
 
-    // ⑮ 非平移回落的全量快照也按近似平移保缓存（2026-10-04 放宽，zsh 主场景）：zsh 重绘
-    //     的 IL/DL 行重排让 total 与 offset 的变化量**不等**（距底变化）⇒ 出口判非平移 ⇒
-    //     全量快照——旧实现清空缓存，zsh 会话每条命令滚动历史归零（真机冻结主场景）。
-    //     len 不变即视为行号空间整体下滑：按键 -D 平移保留、滚动量不动；几行错位由
-    //     锚点探测就地纠偏。len 变化（resize）仍走清空重建。
+    // ⑮ 非平移回落清空重建（2026-10-04 回退「近似平移」后的钉死判据）：zsh 重绘的 IL/DL
+    //     行重排让 total 与 offset 变化量不等（距底变化）⇒ 按近似平移保缓存会引入内容错位
+    //     且逐次累积（真机实测「下拉历史与真实内容差四五条」）⇒ 内容正确性优先，只有
+    //     纯平移（len+距底不变+offset 与 total 同减）才保缓存。
     {
         ScrollModel m = setup();                       // [400,700)，offset=700，total=1000
         m.scrollByPixels(-50.0f * 40.0f, 40.0f);       // 滚 50 行
@@ -641,19 +637,8 @@ int main() {
         sb.offset = 660;
         sb.len = kViewRows;
         m.onSnapshot(g, mkRows(660, kViewRows, kCols), mkRows(360, 300, kCols), sb);
-        check(m.cachedTop() == 270, "非平移回落（len 同）也应保深层缓存（预取行 310 平移到 270）");
-        check(m.scrollRows() > 49.0f && m.scrollRows() < 51.0f, "非平移回落滚动量应保留");
-        // len 变化（resize/reflow）：清空重建（行号语义全变，近似平移不成立）。
-        Scrollbar sbR;
-        sbR.total = 970;
-        sbR.offset = 655;
-        sbR.len = kViewRows - 5;
-        Geometry gR;
-        gR.cols = kCols;
-        gR.rows = kViewRows - 5;
-        gR.revision = 11;
-        m.onSnapshot(gR, mkRows(655, kViewRows - 5, kCols), mkRows(355, 300, kCols), sbR);
-        check(m.cachedRows() == 300 && m.cachedTop() == 355, "len 变化必须清空按镜像重建（355,655)");
+        check(m.cachedRows() == 300 && m.cachedTop() == 360,
+              "非平移回落必须清空按镜像重建（360,660）——近似平移的内容错位已实测");
     }
 
     if (failures > 0) {

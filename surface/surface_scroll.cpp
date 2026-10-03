@@ -37,9 +37,13 @@ static std::map<uint64_t, Row> shiftedRows(const std::map<uint64_t, Row>& rows, 
     return out;
 }
 
-// isPureShift 判「这拍回滚条是不是行号空间纯平移」（差分路径用，CellGrid::applyDiff 同判据
-// 放行的帧才会到 onDiffScroll）：len 不变、距底（total-offset）不变、且 offset 与 total
-// 同步减同一正量（D>0）。
+// isPureShift 判「这拍回滚条是不是行号空间纯平移」（onSnapshot 保缓存与差分放行的共同
+// 判据）：len 不变、距底（total-offset）不变、且 offset 与 total 同步减同一正量（D>0）。
+//
+// ⚠️ 2026-10-04 回退「近似平移」放宽（曾放宽为 len 不变即按 offset 差平移）：zsh 重绘的
+// IL/DL 重排使 total 与 offset 变化量不等，按 offset 差平移会引入 (total差-offset差) 行的
+// 内容错位且逐次累积——真机实测「下拉历史与真实内容差四五条」。内容正确性优先：非平移
+// 回落一律清空重建（泵线程化后深层重拉不再卡渲染，代价可接受）。
 static bool isPureShift(const Scrollbar& oldSb, const Scrollbar& newSb) {
     if (newSb.offset >= oldSb.offset || newSb.total >= oldSb.total) {
         return false;  // 只处理回落（增长是输出推进，不是平移）
@@ -48,15 +52,6 @@ static bool isPureShift(const Scrollbar& oldSb, const Scrollbar& newSb) {
         return false;
     }
     return (oldSb.total - oldSb.offset) == (newSb.total - newSb.offset);
-}
-
-// isLenShift 判「全量快照是否可按近似平移保缓存」（onSnapshot 用，比 isPureShift 宽）：
-// 只要求 **len 不变**（非 resize/reflow）且 offset 下滑。zsh 重绘的 IL/DL 行重排是
-// 非平移回落（total 与 offset 变化量不等、距底变）——出口对它发全量快照——但行号空间
-// 整体下滑、内容基本没动，按键 -D 平移后仍有近似效度（错位几行由锚点探测就地纠偏）。
-// clear 大清屏（D 巨大）也走这条：平移后负键大面积丢弃、镜像重填，行为等价清空。
-static bool isLenShift(const Scrollbar& oldSb, const Scrollbar& newSb) {
-    return oldSb.len == newSb.len && newSb.offset < oldSb.offset;
 }
 
 void ScrollModel::onSnapshot(const Geometry& geom, const std::vector<Row>& viewport,
@@ -68,10 +63,11 @@ void ScrollModel::onSnapshot(const Geometry& geom, const std::vector<Row>& viewp
     const uint16_t oldViewportRows = m_viewportRows;
     const Scrollbar oldSb = m_sb;
 
-    // 近似平移快照：深层缓存平移保留，不清空——清空会让滚出镜像窗口的视图在快照风暴期
-    // 永远补不回来（FETCH 应答被 revision 推进判过期）。len 变化（resize/reflow）才清空重建。
-    const bool nearShift = hadCache && isLenShift(oldSb, sb);
-    if (nearShift) {
+    // 平移型快照（真裁剪/清回滚/erase 前缀，len 与距底不变）：深层缓存平移保留，不清空——
+    // 清空会让滚出镜像窗口的视图在快照风暴期永远补不回来。其余（zsh IL/DL 重排等非平移
+    // 回落、resize）一律清空重建：内容正确性优先（近似平移的错位会累积，已回退）。
+    const bool pureShift = hadCache && isPureShift(oldSb, sb);
+    if (pureShift) {
         m_rows = shiftedRows(m_rows, oldOffset - sb.offset);
         m_haveCache = !m_rows.empty();
     } else {
@@ -97,12 +93,12 @@ void ScrollModel::onSnapshot(const Geometry& geom, const std::vector<Row>& viewp
         m_haveCache = true;
     }
     // 滚动位置（见头文件 onSnapshot 的分支）：
-    //   * 近似平移：滚动量**原样保留**——viewTop 与 offset 同步平移，距底关系近似不变；
+    //   * 平移型：滚动量**原样保留**——viewTop 与 offset 同步平移，距底关系不变；
     //     锚定公式保持的是旧行号空间的 viewTop，平移场景下反而引入 D 行错位。
     //   * 首次/在底部/resize ⇒ 回到底部；其余按绝对行号锚定（viewTop 不变）、不 clamp。
     //   * **resize**（行数变了，reflow 后行号语义全变）⇒ 回到底部。
     const bool resized = oldViewportRows != 0 && oldViewportRows != geom.rows;
-    if (nearShift) {
+    if (pureShift) {
         // 保留 prevScroll；平移后行号空间变小，超出新缓存顶的部分由下面的钳制兜底。
     } else if (hadCache && prevScroll > 0.0f && !resized && sb.offset > 0) {
         const float viewTop = static_cast<float>(oldOffset) - prevScroll;
